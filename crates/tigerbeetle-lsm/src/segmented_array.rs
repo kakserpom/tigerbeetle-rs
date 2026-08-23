@@ -721,6 +721,32 @@ impl<S: SegmentedArraySpec> SegmentedArray<S> {
         }
     }
 
+    /// An iterator that yields nothing (mirrors upstream constructing `Iterator` with
+    /// `.done = true` when the query range provably intersects no tables).
+    #[must_use]
+    pub(crate) fn exhausted_iterator(&self, direction: Direction) -> SegmentedArrayIterator<'_, S> {
+        SegmentedArrayIterator {
+            array: self,
+            direction,
+            cursor: Cursor { node: 0, relative_index: 0 },
+            done: true,
+        }
+    }
+
+    /// Mutable access to one element by absolute index. Used to update `snapshot_max` in
+    /// place: it is not part of the ordering key (`(key_max, snapshot_min)`), so sorting is
+    /// unaffected.
+    ///
+    /// # Panics
+    /// Panics if the array is empty or `absolute_index >= self.len()` (upstream mutates
+    /// through a raw pointer guarded by a generation counter instead).
+    pub(crate) fn element_mut(&mut self, absolute_index: u32) -> &mut S::Value {
+        assert!(self.node_count > 0);
+        assert!(absolute_index < self.len());
+        let cursor = self.cursor_for_absolute_index(absolute_index);
+        &mut self.nodes[cursor.node as usize][cursor.relative_index as usize]
+    }
+
     /// Returns a cursor to the index of the key either exactly equal to the target key or,
     /// if there is no exact match, the next greatest key (sorted arrays only).
     ///
@@ -802,13 +828,9 @@ fn copy_backwards_two<T: Copy>(a: &mut [T], b: &mut [T], mut cursor: usize, sour
     }
 }
 
-/// Iteration direction for segmented-array iterators (upstream `Direction` restricted to the
-/// iterator API; the full enum lives in [`crate::direction`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Direction {
-    Ascending,
-    Descending,
-}
+// The iteration direction is shared with the rest of the crate (upstream: the same
+// `src/direction.zig` enum).
+pub use crate::direction::Direction;
 
 pub struct SegmentedArrayIterator<'a, S: SegmentedArraySpec> {
     array: &'a SegmentedArray<S>,
@@ -872,6 +894,18 @@ impl<'a, S: SegmentedArraySpec> SegmentedArrayIterator<'a, S> {
     /// Stops iteration early (upstream sets `done` directly).
     pub fn stop(&mut self) {
         self.done = true;
+    }
+
+    /// The position the iterator will resume from (upstream reads `it.cursor` directly).
+    #[must_use]
+    pub(crate) fn cursor(&self) -> Cursor {
+        self.cursor
+    }
+
+    /// Whether iteration has finished (upstream reads `it.done` directly).
+    #[must_use]
+    pub(crate) fn is_done(&self) -> bool {
+        self.done
     }
 }
 
