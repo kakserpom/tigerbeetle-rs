@@ -13,6 +13,8 @@
 //! In other words, `key_min` and `key_max` track natural ordering, while `key_lower` and
 //! `key_upper` are direction-aware.
 
+use crate::binary_search::{Config, Mode, binary_search_values_upsert_index};
+
 /// Upstream: `src/direction.zig`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Direction {
@@ -85,8 +87,54 @@ impl Direction {
         }
     }
 
-    // TODO(port): src/direction.zig:79 `slice_lower_bound` — needs binary_search.zig
-    // (`binary_search_values_upsert_index`), ported next.
+    /// Returns the subslice of `slice` whose keys are on the "near" side of `key` in iteration
+    /// order: everything from the first key `>= key` (ascending) or through the last key
+    /// `<= key` (descending). An empty result is represented by an empty slice.
+    ///
+    /// Upstream: `Direction.slice_lower_bound` (`src/direction.zig:79`). The comptime
+    /// `key_from_value` fn pointer becomes a closure parameter.
+    #[must_use]
+    pub fn slice_lower_bound<'a, Key, Value, K>(
+        self,
+        key_from_value: &K,
+        slice: &'a [Value],
+        key: Key,
+    ) -> &'a [Value]
+    where
+        Key: Ord + Copy + core::fmt::Debug,
+        K: Fn(&Value) -> Key,
+    {
+        match self {
+            Self::Ascending => {
+                let start = binary_search_values_upsert_index(
+                    key_from_value,
+                    slice,
+                    key,
+                    Config { mode: Mode::LowerBound },
+                );
+
+                if start as usize == slice.len() { &[] } else { &slice[start as usize..] }
+            }
+            Self::Descending => {
+                let end = {
+                    let index = binary_search_values_upsert_index(
+                        key_from_value,
+                        slice,
+                        key,
+                        Config { mode: Mode::UpperBound },
+                    );
+
+                    let index_usize = index as usize;
+                    index
+                        + u32::from(
+                            index_usize < slice.len() && key_from_value(&slice[index_usize]) <= key,
+                        )
+                };
+
+                if end == 0 { &[] } else { &slice[..end as usize] }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -138,5 +186,37 @@ mod tests {
         let (popped, rest) = Ascending.slice_pop(&values);
         assert_eq!(popped.0, 1);
         assert_eq!(rest.len(), 1);
+    }
+
+    #[test]
+    fn slice_lower_bound_ascending_and_descending() {
+        let key = |value: &(u64, char)| value.0;
+        // Sorted ascending by key, with a duplicated key.
+        let values = [(1_u64, 'a'), (3, 'b'), (3, 'c'), (5, 'd')];
+
+        // Ascending: everything at or after the first `key`.
+        assert_eq!(
+            Ascending.slice_lower_bound(&key, &values, 3),
+            &[(3_u64, 'b'), (3, 'c'), (5, 'd')]
+        );
+        assert_eq!(Ascending.slice_lower_bound(&key, &values, 0), &values[..]);
+        assert_eq!(Ascending.slice_lower_bound(&key, &values, 6), &[]);
+        // Lower bound: the duplicate run starts at its first occurrence.
+        assert_eq!(Ascending.slice_lower_bound(&key, &values, 4), &[(5_u64, 'd')]);
+
+        // Descending: everything up to and including the last `key` in storage order.
+        assert_eq!(
+            Descending.slice_lower_bound(&key, &values, 3),
+            &[(1_u64, 'a'), (3, 'b'), (3, 'c')]
+        );
+        assert_eq!(Descending.slice_lower_bound(&key, &values, 0), &[]);
+        assert_eq!(Descending.slice_lower_bound(&key, &values, 9), &values[..]);
+        // Upper bound + inclusive step: the duplicate run ends at its last occurrence.
+        assert_eq!(Descending.slice_lower_bound(&key, &values, 2), &[(1_u64, 'a')]);
+
+        // Empty input stays empty.
+        let empty: [(u64, char); 0] = [];
+        assert_eq!(Ascending.slice_lower_bound(&key, &empty, 1), &[]);
+        assert_eq!(Descending.slice_lower_bound(&key, &empty, 1), &[]);
     }
 }

@@ -7,5 +7,8 @@ pub mod binary_search;
 pub mod direction;
 pub mod free_set;
 pub mod k_way_merge;
+pub mod node_pool;
 pub mod scratch_memory;
+pub mod segmented_array;
 pub mod table_memory;
+pub mod timestamp_range;
