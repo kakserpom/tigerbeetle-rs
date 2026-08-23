@@ -1677,6 +1677,20 @@ impl BlockType {
     pub fn valid_ordinal(value: u8) -> bool {
         matches!(value, 0..=5)
     }
+
+    /// Decodes a raw on-disk ordinal (upstream `std.meta.intToEnum`).
+    #[must_use]
+    pub fn from_ordinal(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Reserved),
+            1 => Some(Self::FreeSet),
+            2 => Some(Self::ClientSessions),
+            3 => Some(Self::Manifest),
+            4 => Some(Self::Index),
+            5 => Some(Self::Value),
+            _ => None,
+        }
+    }
 }
 
 typed_header! {

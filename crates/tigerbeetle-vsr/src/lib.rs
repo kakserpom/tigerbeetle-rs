@@ -5,6 +5,7 @@
 
 pub use tigerbeetle_core::checksum::{ChecksumStream, checksum};
 
+pub mod checkpoint_trailer;
 pub mod clock;
 pub mod command;
 pub mod marzullo;
@@ -13,6 +14,7 @@ pub mod message_buffer;
 pub mod message_header;
 pub mod message_pool;
 pub mod multiversion;
+pub mod schema;
 pub mod testing;
 pub mod time;
 
@@ -268,6 +270,13 @@ impl Peer {
 /// Port of `vsr.Checkpoint` (operation-space helpers).
 ///
 /// TODO(port): src/vsr.zig Checkpoint — trigger_for_checkpoint, durable, ops diagram test.
+/// Port of `vsr.BlockReference` (src/vsr.zig) — identifies a block by checksum and address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockReference {
+    pub checksum: u128,
+    pub address: u64,
+}
+
 pub mod checkpoint {
     /// Port of `vsr.Checkpoint.valid`.
     #[must_use]

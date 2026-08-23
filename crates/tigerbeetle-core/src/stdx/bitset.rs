@@ -58,10 +58,10 @@ impl BitSet {
         self.bit_length == 0
     }
 
-    /// The number of bits allocated (a multiple of [`WORD_BITS`]; upstream `capacity()`).
+    /// The number of bits in this bit set (upstream `capacity()` returns `bit_length`).
     #[must_use]
-    pub fn capacity(&self) -> usize {
-        self.words.len() * WORD_BITS
+    pub const fn capacity(&self) -> usize {
+        self.bit_length
     }
 
     #[must_use]
@@ -267,7 +267,7 @@ mod tests {
     fn bit_set_full_and_empty_extremes() {
         let full = BitSet::new_full(130);
         assert_eq!(full.len(), 130);
-        assert_eq!(full.capacity(), 192);
+        assert_eq!(full.capacity(), 130); // upstream capacity() == bit_length
         assert!(full.full());
         assert_eq!(full.count(), 130);
         // Padding bits are not addressable and never yielded as unset either:
