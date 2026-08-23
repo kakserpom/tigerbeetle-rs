@@ -7,8 +7,12 @@
 pub mod bitset;
 pub mod bounded_array;
 pub mod prng;
+pub mod radix;
 pub mod ring_buffer;
 pub mod stack;
+
+/// Upstream: `src/stdx/stdx.zig` `pub const radix_sort = @import("radix.zig").sort`.
+pub use radix::sort as radix_sort;
 
 /// Upstream: `src/stdx/stdx.zig` KiB/MiB/GiB/TiB.
 pub const KIB: usize = 1 << 10;
