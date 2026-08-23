@@ -1,0 +1,14 @@
+[package]
+name = "tigerbeetle-server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tigerbeetle-core = { path = "../tigerbeetle-core" }
+
+[[bin]]
+name = "tigerbeetle"
+path = "src/main.rs"
+
+[lints]
+workspace = true

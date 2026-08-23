@@ -1,0 +1,10 @@
+[package]
+name = "tigerbeetle-lsm"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tigerbeetle-core = { path = "../tigerbeetle-core" }
+
+[lints]
+workspace = true
