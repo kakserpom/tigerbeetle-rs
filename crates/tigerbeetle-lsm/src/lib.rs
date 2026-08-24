@@ -13,3 +13,4 @@ pub mod scratch_memory;
 pub mod segmented_array;
 pub mod table_memory;
 pub mod timestamp_range;
+pub mod tree;

@@ -26,9 +26,8 @@ use tigerbeetle_core::stdx::bounded_array::BoundedArray;
 use crate::direction::Direction::{self, Ascending, Descending};
 use crate::segmented_array::{Cursor, SegmentedArray, SegmentedArrayIterator, SegmentedArraySpec};
 
-/// Upstream: `lsm/tree.zig snapshot_latest`. One greater than any persistable snapshot.
-// TODO(port): move to tree.rs when src/lsm/tree.zig is ported.
-pub const SNAPSHOT_LATEST: u64 = u64::MAX - 1;
+/// Upstream: `lsm/tree.zig snapshot_latest`.
+pub use crate::tree::SNAPSHOT_LATEST;
 
 /// [`LSM_GROWTH_FACTOR`] in the `usize` domain (the constant is small by definition).
 #[allow(clippy::cast_possible_truncation)]
