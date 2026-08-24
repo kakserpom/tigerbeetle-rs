@@ -117,14 +117,14 @@ mod tests {
 // pointer casts; this port keeps plain structs with explicit little-endian
 // wire codecs, mirroring `message_header.rs` / `schema.rs`.
 //
-// TODO(port): src/vsr/superblock.zig SuperBlockHeader.view_headers() — needs
-// Headers.ViewChangeSlice.
+// TODO(port): remaining SuperBlockHeader methods that need Storage (open/checkpoint
+// machinery) and ClientSessions codec.
 // ---------------------------------------------------------------------------
 
 use crate::message_header;
 use crate::message_header::TypedHeader as _;
 use crate::multiversion::Release;
-use crate::{Members, member_index};
+use crate::{Members, ViewChangeCommand, ViewChangeHeadersSlice, member_index};
 use tigerbeetle_core::constants::{BLOCK_SIZE, REPLICAS_MAX};
 
 pub use tigerbeetle_core::constants::CHECKPOINT_STATE_SIZE;
@@ -1183,6 +1183,40 @@ impl SuperBlockHeader {
         true
     }
 
+    /// Port of `SuperBlockHeader.view_headers`.
+    ///
+    /// DEVIATION: upstream stores decoded `Header.Prepare`s and returns a slice over them;
+    /// this port keeps `view_headers_all` as raw wire bytes (so that garbage beyond
+    /// `view_headers_count` still round-trips byte-exactly for checksum validation), so the
+    /// caller provides decode storage which the returned slice borrows.
+    ///
+    /// # Panics
+    /// Panics if an occupied slot does not decode as a Prepare header, or if the decoded
+    /// headers fail [`ViewChangeHeadersSlice::verify`] (upstream asserts in both cases).
+    pub fn view_headers<'s>(
+        &self,
+        decoded: &'s mut [message_header::Prepare; VIEW_HEADERS_MAX as usize],
+    ) -> ViewChangeHeadersSlice<'s> {
+        for (slot, wire) in decoded
+            .iter_mut()
+            .zip(&self.view_headers_all)
+            .take(usize::try_from(self.view_headers_count).unwrap_or(usize::MAX))
+        {
+            *slot = message_header::Prepare::from_wire(wire)
+                .unwrap_or_else(|| unreachable!("occupied view header must decode as Prepare"));
+        }
+
+        let command = if self.vsr_state.log_view < self.vsr_state.view {
+            ViewChangeCommand::JoinView
+        } else {
+            ViewChangeCommand::View
+        };
+        ViewChangeHeadersSlice::init(
+            command,
+            &decoded[..usize::try_from(self.view_headers_count).unwrap_or(usize::MAX)],
+        )
+    }
+
     /// Port of `SuperBlockHeader.manifest_references`.
     #[must_use]
     pub fn manifest_references(&self) -> ManifestReferences {
@@ -1237,6 +1271,7 @@ mod header_tests {
         VSRStateRootOptions,
     };
     use crate::message_header;
+    use crate::message_header::TypedHeader as _;
     use crate::multiversion::Release;
     use tigerbeetle_core::constants::{MEMBERS_MAX, VIEW_HEADERS_MAX};
 
@@ -1379,5 +1414,86 @@ mod header_tests {
     fn zeroed_view_headers() -> [[u8; message_header::SIZE]; VIEW_HEADERS_MAX as usize] {
         // Unoccupied slots are all-zero on disk (not a decodable Prepare).
         [[0u8; message_header::SIZE]; VIEW_HEADERS_MAX as usize]
+    }
+
+    #[test]
+    fn superblock_header_view_headers() {
+        use crate::command::Command;
+        use crate::headers;
+        use crate::{ViewChangeCommand, ViewRange};
+        use tigerbeetle_core::constants::VSR_OPERATIONS_RESERVED;
+
+        // Two consecutive valid prepares (ops 9, 8) followed by a JV blank gap (op 7).
+        // `parent` points at the previous prepare's checksum, so build low-to-high:
+        let mut op8 = message_header::Prepare {
+            client: 6,
+            request: 7,
+            command: Command::Prepare,
+            release: Release::MINIMUM,
+            operation: crate::Operation(VSR_OPERATIONS_RESERVED + 7),
+            op: 8,
+            view: 10,
+            timestamp: 10,
+            ..Default::default()
+        };
+        op8.set_checksum();
+
+        let mut op9 = message_header::Prepare {
+            client: 6,
+            request: 7,
+            command: Command::Prepare,
+            release: Release::MINIMUM,
+            operation: crate::Operation(VSR_OPERATIONS_RESERVED + 8),
+            op: 9,
+            view: 10,
+            timestamp: 11,
+            parent: op8.checksum,
+            ..Default::default()
+        };
+        op9.set_checksum();
+
+        let blank = headers::jv_blank(7);
+
+        let mut header = SuperBlockHeader {
+            checksum: 0,
+            checksum_padding: 0,
+            copy: 0,
+            version: SUPERBLOCK_VERSION,
+            release_format: Release::MINIMUM,
+            sequence: 42,
+            cluster: 9_001,
+            parent: 123,
+            parent_padding: 0,
+            vsr_state: root_vsr_state(9_001),
+            flags: 0,
+            view_headers_count: 3,
+            view_headers_all: zeroed_view_headers(),
+        };
+        header.view_headers_all[0] = op9.to_wire();
+        header.view_headers_all[1] = op8.to_wire();
+        header.view_headers_all[2] = blank.to_wire();
+        header.vsr_state.log_view = 12;
+        header.vsr_state.view = 13; // log_view < view → JV headers
+        header.set_checksum();
+
+        let mut decoded_storage = [message_header::Prepare::default(); VIEW_HEADERS_MAX as usize];
+        let view_change_headers = header.view_headers(&mut decoded_storage);
+        assert_eq!(view_change_headers.command, ViewChangeCommand::JoinView);
+        assert_eq!(view_change_headers.slice.len(), 3);
+
+        // The decoded slice behaves like upstream's: ops at or above the newest valid header
+        // pin to their own view; ops below the oldest valid header widen to {0, oldest.view}.
+        // Here the oldest valid header is op 8 (view 10):
+        assert_eq!(view_change_headers.view_for_op(9, 13), ViewRange { min: 10, max: 10 });
+        assert_eq!(view_change_headers.view_for_op(8, 13), ViewRange { min: 10, max: 10 });
+        assert_eq!(view_change_headers.view_for_op(7, 13), ViewRange { min: 0, max: 10 });
+        assert_eq!(view_change_headers.view_for_op(4, 13), ViewRange { min: 0, max: 10 });
+        assert_eq!(view_change_headers.view_for_op(14, 13), ViewRange { min: 13, max: 13 });
+
+        // With view == log_view the same bytes are interpreted as View headers:
+        header.vsr_state.log_view = 13;
+        header.set_checksum();
+        let view_change_headers = header.view_headers(&mut decoded_storage);
+        assert_eq!(view_change_headers.command, ViewChangeCommand::View);
     }
 }
