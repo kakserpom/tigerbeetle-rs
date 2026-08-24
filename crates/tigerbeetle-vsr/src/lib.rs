@@ -9,6 +9,7 @@ use crate::command::Command;
 use tigerbeetle_core::constants::{PIPELINE_PREPARE_QUEUE_MAX, VIEW_HEADERS_MAX};
 
 pub mod checkpoint_trailer;
+pub mod client_replies;
 pub mod client_sessions;
 pub mod clock;
 pub mod command;
