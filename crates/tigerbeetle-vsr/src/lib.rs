@@ -5,6 +5,9 @@
 
 pub use tigerbeetle_core::checksum::{ChecksumStream, checksum};
 
+use crate::command::Command;
+use tigerbeetle_core::constants::{PIPELINE_PREPARE_QUEUE_MAX, VIEW_HEADERS_MAX};
+
 pub mod checkpoint_trailer;
 pub mod clock;
 pub mod command;
@@ -543,5 +546,335 @@ mod zone_tests {
         assert_eq!(Zone::Grid.start(), Zone::GridPadding.start() + grid_padding as u64);
         assert_eq!(Zone::Grid.size(), None);
         let _ = client_replies_size;
+    }
+}
+
+/// Port of `vsr.Headers` (src/vsr.zig).
+pub mod headers {
+    use crate::Operation;
+    use crate::command::Command;
+    use crate::message_header::{self, TypedHeader as _};
+    use crate::multiversion::Release;
+    use tigerbeetle_core::constants::VIEW_HEADERS_MAX;
+    use tigerbeetle_core::stdx::bounded_array::BoundedArray;
+
+    /// Port of `Headers.Array`.
+    pub type Array = BoundedArray<message_header::Prepare, { VIEW_HEADERS_MAX as usize }>;
+
+    /// Port of `Headers.jv_header_type`'s anonymous result enum.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum JvHeaderType {
+        Blank,
+        Valid,
+    }
+
+    /// Port of `Headers.jv_blank`.
+    #[must_use]
+    pub fn jv_blank(op: u64) -> message_header::Prepare {
+        message_header::Prepare {
+            command: Command::Prepare,
+            release: Release::ZERO,
+            operation: Operation::RESERVED,
+            op,
+            ..Default::default()
+        }
+    }
+
+    /// Port of `Headers.jv_header_type`.
+    ///
+    /// # Panics
+    /// Panics if a non-blank header is invalid (upstream asserts).
+    #[must_use]
+    pub fn jv_header_type(header: &message_header::Prepare) -> JvHeaderType {
+        if *header == jv_blank(header.op) {
+            return JvHeaderType::Blank;
+        }
+
+        assert!(header.valid_checksum());
+        assert_eq!(header.command, Command::Prepare);
+        assert_ne!(header.operation, Operation::RESERVED);
+        assert!(header.invalid().is_none());
+        JvHeaderType::Valid
+    }
+}
+
+/// Port of `vsr.ViewChangeCommand`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ViewChangeCommand {
+    JoinView,
+    View,
+}
+
+/// Port of `vsr.ViewChangeHeadersSlice`.
+#[derive(Clone, Copy, Debug)]
+pub struct ViewChangeHeadersSlice<'a> {
+    pub command: ViewChangeCommand,
+    /// Headers are ordered from high-to-low op.
+    pub slice: &'a [message_header::Prepare],
+}
+
+impl<'a> ViewChangeHeadersSlice<'a> {
+    /// # Panics
+    /// Panics if the headers do not satisfy [`Self::verify`] (upstream asserts in `init`).
+    #[must_use]
+    pub fn init(command: ViewChangeCommand, slice: &'a [message_header::Prepare]) -> Self {
+        let headers = Self { command, slice };
+        headers.verify();
+        headers
+    }
+
+    /// # Panics
+    /// Panics if the header chain is malformed for the given command (upstream asserts).
+    pub fn verify(&self) {
+        assert!(!self.slice.is_empty());
+        assert!(self.slice.len() <= VIEW_HEADERS_MAX as usize);
+
+        let head = &self.slice[0];
+        // A JV's head op is never a gap or faulty.
+        // A View never includes gaps or faulty headers.
+        assert_eq!(headers::jv_header_type(head), headers::JvHeaderType::Valid);
+
+        let mut child = head;
+        for (index, header) in self.slice.iter().enumerate().skip(1) {
+            assert_eq!(header.command, Command::Prepare);
+            // maybe(header.operation == .reserved): upstream documents that only the head must be
+            // non-reserved; gaps elsewhere are allowed.
+            assert!(header.op < child.op);
+
+            // JV: Ops are consecutive (with explicit blank headers).
+            // View: The first "pipeline + 1" ops of the View are consecutive.
+            if self.command == ViewChangeCommand::JoinView
+                || (self.command == ViewChangeCommand::View
+                    && index < PIPELINE_PREPARE_QUEUE_MAX as usize + 1)
+            {
+                assert_eq!(header.op, head.op - index as u64);
+            }
+
+            match headers::jv_header_type(header) {
+                headers::JvHeaderType::Blank => {
+                    // We can't verify that View headers contain no gaps headers here:
+                    // superblock.checkpoint could make .join_view headers durable instead of
+                    // .view headers when view == log_view (see `commit_checkpoint_superblock`
+                    // in `replica.zig`). When these headers are loaded from the superblock on
+                    // startup, they are considered to be .view headers (see `view_headers` in
+                    // `superblock.zig`).
+                    continue; // Don't update "child".
+                }
+                headers::JvHeaderType::Valid => {
+                    assert!(header.view <= child.view);
+                    assert!(header.timestamp < child.timestamp);
+                    if header.op + 1 == child.op {
+                        assert_eq!(header.checksum, child.parent);
+                    }
+                }
+            }
+            child = header;
+        }
+    }
+
+    /// Returns the range of possible views (of prepare, not commit) for a message that is part of
+    /// the same log_view as these headers.
+    ///
+    /// - When these are JV headers for a log_view=V, we must be in view_change status working to
+    ///   transition to a view beyond V. So we will never prepare anything else as part of view V.
+    /// - When these are View headers for a log_view=V, we can continue to add to them (by preparing
+    ///   more ops), but those ops will always be part of the log_view. If they were prepared during
+    ///   a view prior to the log_view, they would already be part of the headers.
+    ///
+    /// # Panics
+    /// Panics if `op` falls inside a gap not bounded by two valid headers (upstream: unreachable).
+    #[must_use]
+    pub fn view_for_op(&self, op: u64, log_view: u32) -> ViewRange {
+        let header_newest = &self.slice[0];
+        let oldest_index = {
+            let mut oldest: Option<usize> = None;
+            for (index, header) in self.slice.iter().enumerate() {
+                match headers::jv_header_type(header) {
+                    headers::JvHeaderType::Blank => assert!(index > 0),
+                    headers::JvHeaderType::Valid => oldest = Some(index),
+                }
+            }
+            oldest.unwrap_or_else(|| unreachable!("head is always valid"))
+        };
+        let header_oldest = &self.slice[oldest_index];
+        assert!(header_newest.view <= log_view);
+        assert!(header_newest.view >= header_oldest.view);
+        assert!(header_newest.op >= header_oldest.op);
+
+        if op < header_oldest.op {
+            return ViewRange { min: 0, max: header_oldest.view };
+        }
+        if op > header_newest.op {
+            return ViewRange { min: log_view, max: log_view };
+        }
+
+        for header in self.slice {
+            if headers::jv_header_type(header) == headers::JvHeaderType::Valid && header.op == op {
+                return ViewRange { min: header.view, max: header.view };
+            }
+        }
+
+        let mut header_next = &self.slice[0];
+        assert_eq!(headers::jv_header_type(header_next), headers::JvHeaderType::Valid);
+
+        for header_prev in &self.slice[1..] {
+            if headers::jv_header_type(header_prev) == headers::JvHeaderType::Valid {
+                if header_prev.op < op && op < header_next.op {
+                    return ViewRange { min: header_prev.view, max: header_next.view };
+                }
+                header_next = header_prev;
+            }
+        }
+        unreachable!("op is between the oldest and newest ops");
+    }
+}
+
+/// Port of `ViewChangeHeadersSlice.ViewRange`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ViewRange {
+    /// Inclusive.
+    pub min: u32,
+    /// Inclusive.
+    pub max: u32,
+}
+
+impl ViewRange {
+    #[must_use]
+    pub fn contains(self, view: u32) -> bool {
+        self.min <= view && view <= self.max
+    }
+}
+
+/// Port of `vsr.ViewChangeHeadersArray`: the headers of a View or JV message.
+#[derive(Clone, Debug)]
+pub struct ViewChangeHeadersArray {
+    pub command: ViewChangeCommand,
+    pub array: headers::Array,
+}
+
+impl ViewChangeHeadersArray {
+    /// # Panics
+    /// Panics if the constructed headers do not satisfy [`headers`-level verification]
+    /// (upstream asserts).
+    #[must_use]
+    pub fn root(cluster: u128) -> Self {
+        Self::init(ViewChangeCommand::View, &[message_header::Prepare::root(cluster)])
+    }
+
+    /// # Panics
+    /// Panics if `slice` exceeds [`VIEW_HEADERS_MAX`] or fails verification (upstream asserts).
+    #[must_use]
+    pub fn init(command: ViewChangeCommand, slice: &[message_header::Prepare]) -> Self {
+        let Ok(array) = headers::Array::from_slice(slice) else {
+            unreachable!("slice fits view_headers_max")
+        };
+        let headers = Self { command, array };
+        headers.verify();
+        headers
+    }
+
+    /// # Panics
+    /// Panics if the replaced headers fail verification (upstream asserts).
+    pub fn replace(&mut self, command: ViewChangeCommand, slice: &[message_header::Prepare]) {
+        self.command = command;
+        self.array.clear();
+        for header in slice {
+            self.array.push(*header);
+        }
+        self.verify();
+    }
+
+    /// We don't do comprehensive validation here — assume that verify() will be called
+    /// after any series of appends.
+    ///
+    /// # Panics
+    /// Panics if the array is already full (upstream asserts).
+    pub fn append(&mut self, header: &message_header::Prepare) {
+        self.array.push(*header);
+    }
+
+    /// # Panics
+    /// Panics unless appending join-view blanks (upstream asserts).
+    pub fn append_blank(&mut self, op: u64) {
+        assert_eq!(self.command, ViewChangeCommand::JoinView);
+        assert!(self.array.count() > 0);
+        self.array.push(headers::jv_blank(op));
+    }
+
+    /// # Panics
+    /// Panics if the header chain is malformed for the given command (upstream asserts).
+    pub fn verify(&self) {
+        ViewChangeHeadersSlice { command: self.command, slice: self.array.slice() }.verify();
+    }
+}
+
+/// Port of `vsr.Snapshot`.
+pub mod snapshot {
+    /// A table with TableInfo.snapshot_min=S was written during some commit with op<S.
+    /// A block with snapshot_min=S is definitely readable at op=S.
+    #[must_use]
+    pub fn readable_at_commit(op: u64) -> u64 {
+        // TODO: This is going to become more complicated when snapshot numbers match the op
+        // acquiring the snapshot.
+        op + 1
+    }
+}
+
+#[cfg(test)]
+mod view_change_headers_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::{ViewChangeCommand, ViewChangeHeadersSlice, ViewRange, headers};
+    use crate::Operation;
+    use crate::command::Command;
+    use crate::message_header::{self, TypedHeader as _};
+    use crate::multiversion::Release;
+    use tigerbeetle_core::constants::VSR_OPERATIONS_RESERVED;
+
+    /// Port of upstream test "Headers.ViewChangeSlice.view_for_op".
+    #[test]
+    fn headers_view_change_slice_view_for_op() {
+        let mut headers_array = [
+            message_header::Prepare {
+                checksum: 0,
+                client: 6,
+                request: 7,
+                command: Command::Prepare,
+                release: Release::MINIMUM,
+                operation: Operation(VSR_OPERATIONS_RESERVED + 8),
+                op: 9,
+                view: 10,
+                timestamp: 11,
+                ..Default::default()
+            },
+            headers::jv_blank(8),
+            headers::jv_blank(7),
+            message_header::Prepare {
+                checksum: 0,
+                client: 3,
+                request: 4,
+                command: Command::Prepare,
+                release: Release::MINIMUM,
+                operation: Operation(VSR_OPERATIONS_RESERVED + 5),
+                op: 6,
+                view: 7,
+                timestamp: 8,
+                ..Default::default()
+            },
+            headers::jv_blank(5),
+        ];
+
+        headers_array[0].set_checksum();
+        headers_array[3].set_checksum();
+
+        let headers = ViewChangeHeadersSlice::init(ViewChangeCommand::JoinView, &headers_array);
+        assert_eq!(headers.view_for_op(11, 12), ViewRange { min: 12, max: 12 });
+        assert_eq!(headers.view_for_op(10, 12), ViewRange { min: 12, max: 12 });
+        assert_eq!(headers.view_for_op(9, 12), ViewRange { min: 10, max: 10 });
+        assert_eq!(headers.view_for_op(8, 12), ViewRange { min: 7, max: 10 });
+        assert_eq!(headers.view_for_op(7, 12), ViewRange { min: 7, max: 10 });
+        assert_eq!(headers.view_for_op(6, 12), ViewRange { min: 7, max: 7 });
+        assert_eq!(headers.view_for_op(5, 12), ViewRange { min: 0, max: 7 });
+        assert_eq!(headers.view_for_op(0, 12), ViewRange { min: 0, max: 7 });
     }
 }
