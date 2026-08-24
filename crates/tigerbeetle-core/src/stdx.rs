@@ -137,6 +137,20 @@ pub const fn div_ceil(a: usize, b: usize) -> usize {
     a.div_ceil(b)
 }
 
+/// Port of `stdx.fastrange()`: fast alternative to modulo reduction
+/// (note: it is *not* the same as modulo).
+///
+/// See <https://github.com/lemire/fastrange/> and
+/// <https://lemire.me/blog/2016/06/27/a-fast-alternative-to-the-modulo-reduction/>.
+#[must_use]
+pub const fn fastrange(word: u64, p: u64) -> u64 {
+    // DEVIATION: `u128::from()` is not yet callable in const fns on this toolchain; casts
+    // are equivalent for unsigned widening.
+    #[allow(clippy::cast_possible_truncation)]
+    let product = (word as u128).wrapping_mul(p as u128);
+    (product >> 64) as u64
+}
+
 /// Port of `std.mem.alignForward`: round `value` up to the next multiple of `alignment`.
 #[must_use]
 pub const fn align_forward(value: usize, alignment: usize) -> usize {
@@ -188,6 +202,18 @@ mod tests {
         assert_eq!(div_ceil(10, 5), 2);
         assert_eq!(div_ceil(11, 5), 3);
         assert_eq!(div_ceil(0, 5), 0);
+    }
+
+    #[test]
+    fn fastrange_maps_into_range() {
+        // Port of upstream expectations: uniform-ish spread over [0, p).
+        assert_eq!(fastrange(0, 100), 0);
+        assert_eq!(fastrange(u64::MAX, u64::MAX), u64::MAX - 1);
+        // (2^64-1 * p) >> 64 == p - 1 for any p.
+        for p in [1_u64, 2, 3, 7, 1024, u64::from(u32::MAX), u64::MAX] {
+            assert_eq!(fastrange(u64::MAX, p), p.wrapping_sub(1));
+            assert!(fastrange(1 << 32, p) < p);
+        }
     }
 
     #[test]

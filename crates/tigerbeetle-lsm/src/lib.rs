@@ -11,6 +11,7 @@ pub mod manifest_level;
 pub mod node_pool;
 pub mod scratch_memory;
 pub mod segmented_array;
+pub mod set_associative_cache;
 pub mod table_memory;
 pub mod timestamp_range;
 pub mod tree;
