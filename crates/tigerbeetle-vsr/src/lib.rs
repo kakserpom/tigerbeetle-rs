@@ -19,6 +19,7 @@ pub mod multiversion;
 pub mod repair_budget;
 pub mod schema;
 pub mod superblock;
+pub mod superblock_quorums;
 pub mod testing;
 pub mod time;
 
