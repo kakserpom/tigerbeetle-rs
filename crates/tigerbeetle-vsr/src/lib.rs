@@ -13,6 +13,7 @@ pub mod client_sessions;
 pub mod clock;
 pub mod command;
 pub mod fault_detector;
+pub mod journal;
 pub mod marzullo;
 pub mod message;
 pub mod message_buffer;
