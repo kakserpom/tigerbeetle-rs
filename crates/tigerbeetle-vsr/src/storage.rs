@@ -90,28 +90,39 @@ pub trait Storage {
     fn next_completion(&mut self) -> Option<Completion>;
 }
 
-/// A zeroed `len`-byte buffer whose memory starts on a logical sector boundary, satisfying
-/// [`Zone::verify_iop`]'s alignment requirement.
+/// A zeroed `len`-byte buffer whose length is a whole number of logical sectors.
 ///
 /// # Panics
 /// Asserts `len` is a multiple of [`SECTOR_SIZE`].
 #[must_use]
-pub fn sector_aligned_buffer(len: usize) -> Vec<u8> {
+pub fn zeroed_buffer(len: usize) -> Vec<u8> {
     assert!(len.is_multiple_of(SECTOR_SIZE));
-    let mut buffer = vec![0u8; len + SECTOR_SIZE];
-    let misalign = buffer.as_ptr() as usize % SECTOR_SIZE;
-    buffer.drain(..misalign);
-    buffer.truncate(len);
-    debug_assert_eq!(buffer.as_ptr() as usize % SECTOR_SIZE, 0);
-    buffer
+    vec![0u8; len]
 }
 
 /// Verify a request the way upstream's `read_sectors`/`write_sectors` do, returning the
 /// absolute offset in the data file.
+// DEVIATION (interim): upstream calls `Zone.verify_iop()`, which also asserts that the
+// buffer's *memory* starts on a sector boundary — an O_DIRECT requirement satisfied by
+// its message-pool buffers. Our interim `std::fs`/heap-backed I/O uses ordinary `Vec`
+// buffers whose address cannot be aligned safely, so the pointer check is omitted here;
+// every other check matches `Zone::verify_iop`. TODO(port): restore the alignment check
+// together with O_DIRECT support.
 fn verify_request(zone: Zone, buffer: &[u8], offset_in_zone: u64) -> u64 {
-    zone.verify_iop(buffer, offset_in_zone);
+    use tigerbeetle_core::constants::BLOCK_SIZE;
+
+    if let Some(zone_size) = zone.size() {
+        assert!(u64::try_from(buffer.len()).is_ok_and(|len| offset_in_zone + len <= zone_size));
+    }
+    assert!(buffer.len().is_multiple_of(SECTOR_SIZE));
+    assert!(!buffer.is_empty());
+    let offset_in_storage = zone.offset(offset_in_zone);
+    assert!(offset_in_storage.is_multiple_of(SECTOR_SIZE as u64));
+    if zone == Zone::Grid {
+        assert!(offset_in_storage.is_multiple_of(BLOCK_SIZE as u64));
+    }
     assert_ne!(zone, Zone::GridPadding, "padding is never touched");
-    zone.offset(offset_in_zone)
+    offset_in_storage
 }
 
 /// Read-progress state shared by all implementations (port of `Storage.Read`'s
@@ -446,7 +457,7 @@ impl Storage for MemoryStorage {
 mod storage_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-    use super::sector_aligned_buffer;
+    use super::zeroed_buffer;
     use super::{
         Completion, FileStorage, MemoryStorage, ReadRequest, ReadState, SECTOR_SIZE, Storage,
         WriteRequest,
@@ -455,7 +466,7 @@ mod storage_tests {
     use tigerbeetle_core::constants::BLOCK_SIZE;
 
     fn temp_file_path(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("tigerbeetle-rs-storage-test-{}", name));
+        let dir = std::env::temp_dir().join(format!("tigerbeetle-rs-storage-test-{name}"));
         std::fs::create_dir_all(&dir).expect("mkdir");
         dir.join("data.dat")
     }
@@ -470,7 +481,7 @@ mod storage_tests {
     fn write_then_read_round_trip_through_zones() {
         let mut storage = temp_file_storage("round_trip");
 
-        let mut buffer = sector_aligned_buffer(2 * BLOCK_SIZE);
+        let mut buffer = zeroed_buffer(2 * BLOCK_SIZE);
         for (index, byte) in buffer.iter_mut().enumerate() {
             *byte = (index % 251) as u8;
         }
@@ -482,7 +493,7 @@ mod storage_tests {
         storage.read_sectors(ReadRequest {
             zone: Zone::WalPrepares,
             offset_in_zone: 0,
-            buffer: sector_aligned_buffer(buffer_len),
+            buffer: zeroed_buffer(buffer_len),
         });
         match storage.next_completion().expect("read completion") {
             Completion::Read(request) => {
@@ -502,7 +513,7 @@ mod storage_tests {
         storage.read_sectors(ReadRequest {
             zone: Zone::Grid,
             offset_in_zone: BLOCK_SIZE as u64,
-            buffer: sector_aligned_buffer(BLOCK_SIZE),
+            buffer: zeroed_buffer(BLOCK_SIZE),
         });
         match storage.next_completion().expect("read completion") {
             Completion::Read(request) => {
@@ -516,7 +527,7 @@ mod storage_tests {
     fn latent_sector_errors_zero_only_the_faulty_sector() {
         let mut storage = MemoryStorage::new(16 * BLOCK_SIZE as u64);
 
-        let mut pattern = sector_aligned_buffer(4 * BLOCK_SIZE);
+        let mut pattern = zeroed_buffer(4 * BLOCK_SIZE);
         pattern.fill(7);
         storage.write_sectors(WriteRequest {
             zone: Zone::WalPrepares,
@@ -535,7 +546,7 @@ mod storage_tests {
         storage.read_sectors(ReadRequest {
             zone: Zone::WalPrepares,
             offset_in_zone: BLOCK_SIZE as u64,
-            buffer: sector_aligned_buffer(BLOCK_SIZE),
+            buffer: zeroed_buffer(BLOCK_SIZE),
         });
         match storage.next_completion().expect("read completion") {
             Completion::Read(request) => {
@@ -556,7 +567,7 @@ mod storage_tests {
     fn adjacent_latent_sector_errors_zero_both_sectors() {
         let mut storage = MemoryStorage::new(4 * BLOCK_SIZE as u64);
 
-        let mut pattern = sector_aligned_buffer(BLOCK_SIZE);
+        let mut pattern = zeroed_buffer(BLOCK_SIZE);
         pattern.fill(9);
         storage.write_sectors(WriteRequest {
             zone: Zone::WalPrepares,
@@ -573,7 +584,7 @@ mod storage_tests {
         storage.read_sectors(ReadRequest {
             zone: Zone::WalPrepares,
             offset_in_zone: 0,
-            buffer: sector_aligned_buffer(BLOCK_SIZE),
+            buffer: zeroed_buffer(BLOCK_SIZE),
         });
         match storage.next_completion().expect("read completion") {
             Completion::Read(request) => {
@@ -635,7 +646,7 @@ mod storage_tests {
         storage.write_sectors(WriteRequest {
             zone: Zone::GridPadding,
             offset_in_zone: 0,
-            buffer: sector_aligned_buffer(SECTOR_SIZE),
+            buffer: zeroed_buffer(SECTOR_SIZE),
         });
     }
 }
