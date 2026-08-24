@@ -386,6 +386,10 @@ pub struct MemoryStorage {
     /// Absolute sector offsets that behave as latent sector errors (reads fail with EIO).
     pub faulty_sectors: HashSet<u64>,
     completions: Vec<Completion>,
+    /// Number of read requests submitted (test instrumentation).
+    pub read_ops: u64,
+    /// Number of write requests submitted (test instrumentation).
+    pub write_ops: u64,
 }
 
 impl MemoryStorage {
@@ -400,6 +404,8 @@ impl MemoryStorage {
             image: vec![0; size as usize],
             faulty_sectors: HashSet::new(),
             completions: Vec::new(),
+            read_ops: 0,
+            write_ops: 0,
         }
     }
 
@@ -435,10 +441,12 @@ impl Storage for MemoryStorage {
     }
 
     fn read_sectors(&mut self, request: ReadRequest) {
+        self.read_ops += 1;
         self.completions.push(self.drive_read_request(request));
     }
 
     fn write_sectors(&mut self, request: WriteRequest) {
+        self.write_ops += 1;
         let base_offset = verify_request(request.zone, &request.buffer, request.offset_in_zone);
         let start = base_offset as usize;
         let end = start + request.buffer.len();
