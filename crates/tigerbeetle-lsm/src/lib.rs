@@ -5,6 +5,7 @@
 
 pub mod binary_search;
 pub mod cache_map;
+pub mod composite_key;
 pub mod direction;
 pub mod free_set;
 pub mod k_way_merge;
@@ -16,3 +17,4 @@ pub mod set_associative_cache;
 pub mod table_memory;
 pub mod timestamp_range;
 pub mod tree;
+pub mod unique_key;
