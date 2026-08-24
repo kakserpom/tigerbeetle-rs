@@ -6,6 +6,7 @@
 
 pub mod bitset;
 pub mod bounded_array;
+pub mod hash;
 pub mod prng;
 pub mod radix;
 pub mod ring_buffer;
