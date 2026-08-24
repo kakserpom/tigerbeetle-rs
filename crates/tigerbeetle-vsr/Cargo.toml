@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 tigerbeetle-core = { path = "../tigerbeetle-core" }
+tigerbeetle-lsm = { path = "../tigerbeetle-lsm" }
 
 [lints]
 workspace = true
