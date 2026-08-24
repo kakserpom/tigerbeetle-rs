@@ -279,6 +279,18 @@ impl<S: SetAssociativeCacheSpec> SetAssociativeCache<S> {
         Some(&self.values[index])
     }
 
+    /// Iterates over occupied slots (count != 0) as `(index, value)` pairs without
+    /// touching reference counts. Crate-visible for fuzz verification, where upstream
+    /// reads `cache.values`/`cache.counts` directly.
+    #[cfg(test)]
+    pub(crate) fn occupied_slots(&self) -> impl Iterator<Item = (usize, &S::Value)> + '_ {
+        self.values
+            .iter()
+            .enumerate()
+            // usize -> u64 is a lossless widening on all supported targets.
+            .filter(|(index, _)| self.counts.get(u64::try_from(*index).unwrap_or(u64::MAX)) != 0)
+    }
+
     /// Remove a key from the set associative cache if present.
     /// Returns the removed value, if any.
     pub fn remove(&mut self, key: S::Key) -> Option<S::Value> {

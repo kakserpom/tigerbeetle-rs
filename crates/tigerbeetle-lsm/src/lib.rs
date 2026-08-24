@@ -5,6 +5,8 @@
 
 pub mod binary_search;
 pub mod cache_map;
+#[cfg(test)]
+pub mod cache_map_fuzz;
 pub mod composite_key;
 pub mod direction;
 pub mod free_set;

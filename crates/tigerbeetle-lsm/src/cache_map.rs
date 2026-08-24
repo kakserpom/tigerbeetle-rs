@@ -54,8 +54,10 @@ pub trait CacheMapSpec: SetAssociativeCacheSpec<Key: Eq + std::hash::Hash> + 'st
 /// levels above. Evictions from the cache first flow into stash, with `.compact()` clearing
 /// it. When cache is null, the stash mirrors the mutable table.
 pub struct CacheMap<S: CacheMapSpec> {
-    cache: Option<SetAssociativeCache<S>>,
-    stash: HashMap<S::Key, S::Value>,
+    /// Crate-visible so that `cache_map_fuzz` can verify internal consistency
+    /// (upstream's fuzzer reaches into these directly).
+    pub(crate) cache: Option<SetAssociativeCache<S>>,
+    pub(crate) stash: HashMap<S::Key, S::Value>,
 
     /// Scopes allow performing operations on the CacheMap before either persisting or
     /// discarding them.
