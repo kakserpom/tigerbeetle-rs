@@ -16,6 +16,7 @@ pub mod message_header;
 pub mod message_pool;
 pub mod multi_batch;
 pub mod multiversion;
+pub mod repair_budget;
 pub mod schema;
 pub mod testing;
 pub mod time;
@@ -273,7 +274,7 @@ impl Peer {
 ///
 /// TODO(port): src/vsr.zig Checkpoint — trigger_for_checkpoint, durable, ops diagram test.
 /// Port of `vsr.BlockReference` (src/vsr.zig) — identifies a block by checksum and address.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct BlockReference {
     pub checksum: u128,
     pub address: u64,
