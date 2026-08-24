@@ -18,3 +18,4 @@ pub mod table_memory;
 pub mod timestamp_range;
 pub mod tree;
 pub mod unique_key;
+pub mod zig_zag_merge;
