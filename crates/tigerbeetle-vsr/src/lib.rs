@@ -18,6 +18,7 @@ pub mod multi_batch;
 pub mod multiversion;
 pub mod repair_budget;
 pub mod schema;
+pub mod superblock;
 pub mod testing;
 pub mod time;
 
@@ -272,7 +273,7 @@ impl Peer {
 
 /// Port of `vsr.Checkpoint` (operation-space helpers).
 ///
-/// TODO(port): src/vsr.zig Checkpoint — trigger_for_checkpoint, durable, ops diagram test.
+/// TODO(port): src/vsr.zig Checkpoint — ops diagram snapshot test.
 /// Port of `vsr.BlockReference` (src/vsr.zig) — identifies a block by checksum and address.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct BlockReference {
@@ -281,6 +282,10 @@ pub struct BlockReference {
 }
 
 pub mod checkpoint {
+    use tigerbeetle_core::constants::{
+        LSM_COMPACTION_OPS, PIPELINE_PREPARE_QUEUE_MAX, VSR_CHECKPOINT_OPS,
+    };
+
     /// Port of `vsr.Checkpoint.valid`.
     #[must_use]
     pub fn valid(op: u64) -> bool {
@@ -288,9 +293,224 @@ pub mod checkpoint {
         // although today in practice checkpoints are evenly spaced, the LSM layer doesn't assume
         // that. LSM allows any bar boundary to become a checkpoint which happens, e.g., in the
         // tree fuzzer.
-        op == 0 || (op + 1).is_multiple_of(tigerbeetle_core::constants::LSM_COMPACTION_OPS as u64)
+        op == 0 || (op + 1).is_multiple_of(LSM_COMPACTION_OPS as u64)
+    }
+
+    /// Port of `vsr.Checkpoint.checkpoint_after`.
+    ///
+    /// # Panics
+    /// Panics if `checkpoint` is not a valid checkpoint op (upstream asserts).
+    #[must_use]
+    pub fn checkpoint_after(checkpoint: u64) -> u64 {
+        assert!(valid(checkpoint));
+
+        let result = if checkpoint == 0 {
+            // First wrap: op_checkpoint_next = 6-1 = 5
+            // -1: vsr_checkpoint_ops is a count, result is an inclusive index.
+            VSR_CHECKPOINT_OPS as u64 - 1
+        } else {
+            // Second wrap: op_checkpoint_next = 5+6 = 11
+            // Third wrap: op_checkpoint_next = 11+6 = 17
+            checkpoint + VSR_CHECKPOINT_OPS as u64
+        };
+
+        assert!((result + 1).is_multiple_of(LSM_COMPACTION_OPS as u64));
+        assert!(valid(result));
+
+        result
+    }
+
+    /// Port of `vsr.Checkpoint.trigger_for_checkpoint`.
+    ///
+    /// # Panics
+    /// Panics if `checkpoint` is not a valid checkpoint op (upstream asserts).
+    #[must_use]
+    pub fn trigger_for_checkpoint(checkpoint: u64) -> Option<u64> {
+        assert!(valid(checkpoint));
+
+        if checkpoint == 0 { None } else { Some(checkpoint + LSM_COMPACTION_OPS as u64) }
+    }
+
+    /// Port of `vsr.Checkpoint.prepare_max_for_checkpoint`.
+    ///
+    /// # Panics
+    /// Panics if `checkpoint` is not a valid checkpoint op (upstream asserts).
+    #[must_use]
+    pub fn prepare_max_for_checkpoint(checkpoint: u64) -> Option<u64> {
+        assert!(valid(checkpoint));
+
+        trigger_for_checkpoint(checkpoint)
+            .map(|trigger| trigger + u64::from(PIPELINE_PREPARE_QUEUE_MAX) * 2)
+    }
+
+    /// Port of `vsr.Checkpoint.durable`.
+    ///
+    /// # Panics
+    /// Panics if `checkpoint` is not a valid checkpoint op (upstream asserts).
+    #[must_use]
+    pub fn durable(checkpoint: u64, commit: u64) -> bool {
+        assert!(valid(checkpoint));
+
+        match trigger_for_checkpoint(checkpoint) {
+            Some(trigger) => commit > trigger + u64::from(PIPELINE_PREPARE_QUEUE_MAX),
+            None => true,
+        }
     }
 }
 
 // Pin core's header-size placeholder to the real struct now that it exists:
 const _: () = assert!(tigerbeetle_core::constants::HEADER_SIZE == message_header::SIZE);
+
+/// Port of `vsr.Zone` (src/vsr.zig): layout of the data file's storage zones.
+///
+/// DEVIATION: an enum with methods rather than upstream's Zig enum-with-comptime-table; the
+/// zone order and size formulas match upstream exactly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Zone {
+    Superblock,
+    WalHeaders,
+    WalPrepares,
+    ClientReplies,
+    // Add padding between `client_replies` and `grid`, to make sure grid blocks are aligned to
+    // block size and not just to sector size. Aligning blocks this way makes it more likely that
+    // they are aligned to the underlying physical sector size. This padding is zeroed during
+    // format, but isn't used otherwise.
+    GridPadding,
+    Grid,
+}
+
+/// Add padding between `client_replies` and `grid` so that grid blocks start aligned to the
+/// block size (upstream: `Zone.size_grid_padding`).
+#[must_use]
+pub const fn zone_size_grid_padding() -> usize {
+    let grid_start_unaligned = tigerbeetle_core::constants::CLIENT_REPLIES_SIZE
+        + tigerbeetle_core::constants::JOURNAL_SIZE_PREPARES
+        + tigerbeetle_core::constants::JOURNAL_SIZE_HEADERS
+        + superblock::SUPERBLOCK_ZONE_SIZE;
+    let grid_start_aligned = tigerbeetle_core::stdx::align_forward(
+        grid_start_unaligned,
+        tigerbeetle_core::constants::BLOCK_SIZE,
+    );
+    grid_start_aligned - grid_start_unaligned
+}
+
+impl Zone {
+    /// Size of the zone, or `None` for the open-ended [`Zone::Grid`] (upstream: `Zone.size`).
+    #[must_use]
+    pub fn size(self) -> Option<u64> {
+        use tigerbeetle_core::constants::{
+            CLIENT_REPLIES_SIZE, JOURNAL_SIZE_HEADERS, JOURNAL_SIZE_PREPARES,
+        };
+        match self {
+            Self::Superblock => Some(superblock::SUPERBLOCK_ZONE_SIZE as u64),
+            Self::WalHeaders => Some(JOURNAL_SIZE_HEADERS as u64),
+            Self::WalPrepares => Some(JOURNAL_SIZE_PREPARES as u64),
+            Self::ClientReplies => Some(CLIENT_REPLIES_SIZE as u64),
+            Self::GridPadding => Some(zone_size_grid_padding() as u64),
+            Self::Grid => None,
+        }
+    }
+
+    /// Start offset of the zone within the data file (upstream: `Zone.start`).
+    #[must_use]
+    pub fn start(self) -> u64 {
+        use tigerbeetle_core::constants::{
+            CLIENT_REPLIES_SIZE, JOURNAL_SIZE_HEADERS, JOURNAL_SIZE_PREPARES,
+        };
+        match self {
+            Self::Superblock => 0,
+            Self::WalHeaders => superblock::SUPERBLOCK_ZONE_SIZE as u64,
+            Self::WalPrepares => Self::WalHeaders.start() + JOURNAL_SIZE_HEADERS as u64,
+            Self::ClientReplies => Self::WalPrepares.start() + JOURNAL_SIZE_PREPARES as u64,
+            Self::GridPadding => Self::ClientReplies.start() + CLIENT_REPLIES_SIZE as u64,
+            Self::Grid => Self::GridPadding.start() + zone_size_grid_padding() as u64,
+        }
+    }
+
+    /// Translates a logical offset within a zone into a file offset (upstream: `Zone.offset`).
+    ///
+    /// # Panics
+    /// Panics if the zone has a fixed size and `offset_logical` exceeds it (upstream asserts).
+    #[must_use]
+    pub fn offset(self, offset_logical: u64) -> u64 {
+        if let Some(zone_size) = self.size() {
+            assert!(offset_logical < zone_size);
+        }
+
+        self.start() + offset_logical
+    }
+
+    /// Ensures that the read or write is aligned correctly for Direct I/O.
+    /// If this is not the case, then the underlying syscall will return EINVAL.
+    /// We check this only at the start of a read or write because the physical sector size may be
+    /// less than our logical sector size so that partial IOs then leave us no longer aligned.
+    /// (upstream: `Zone.verify_iop`)
+    ///
+    /// # Panics
+    /// Panics if any of the alignment requirements are violated.
+    pub fn verify_iop(self, buffer: &[u8], offset_in_zone: u64) {
+        if let Some(zone_size) = self.size() {
+            assert!(u64::try_from(buffer.len()).is_ok_and(|len| offset_in_zone + len <= zone_size));
+        }
+        assert!(
+            (buffer.as_ptr() as usize).is_multiple_of(tigerbeetle_core::constants::SECTOR_SIZE),
+            "buffer must be sector-aligned"
+        );
+        assert!(buffer.len().is_multiple_of(tigerbeetle_core::constants::SECTOR_SIZE));
+        assert!(!buffer.is_empty());
+        let offset_in_storage = self.offset(offset_in_zone);
+        assert!(offset_in_storage.is_multiple_of(tigerbeetle_core::constants::SECTOR_SIZE as u64));
+        if self == Self::Grid {
+            assert!(
+                offset_in_storage.is_multiple_of(tigerbeetle_core::constants::BLOCK_SIZE as u64)
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod zone_tests {
+    use crate::{Zone, zone_size_grid_padding};
+    use tigerbeetle_core::constants::{BLOCK_SIZE, SECTOR_SIZE};
+
+    #[test]
+    fn zone_starts_are_sector_aligned_and_ordered() {
+        let zones = [
+            Zone::Superblock,
+            Zone::WalHeaders,
+            Zone::WalPrepares,
+            Zone::ClientReplies,
+            Zone::GridPadding,
+            Zone::Grid,
+        ];
+
+        let mut previous_end = 0;
+        for &zone in &zones {
+            let start = zone.start();
+            assert!(start >= previous_end);
+            assert_eq!(start % SECTOR_SIZE as u64, 0, "{zone:?} start not sector-aligned");
+            if let Some(size) = zone.size() {
+                assert_eq!(size % SECTOR_SIZE as u64, 0, "{zone:?} size not sector-aligned");
+                previous_end = start + size;
+            } else {
+                previous_end = start;
+            }
+        }
+
+        assert_eq!(Zone::Grid.start() % BLOCK_SIZE as u64, 0);
+    }
+
+    #[test]
+    fn zone_offset_bounds_check() {
+        assert_eq!(Zone::Superblock.offset(0), 0);
+        let wal_headers_start = Zone::WalHeaders.start();
+        assert_eq!(Zone::WalHeaders.offset(16), wal_headers_start + 16,);
+        let grid_padding = zone_size_grid_padding();
+        let client_replies_size =
+            Zone::ClientReplies.size().unwrap_or_else(|| unreachable!("sized"));
+        assert_eq!(Zone::GridPadding.size(), Some(grid_padding as u64));
+        assert_eq!(Zone::Grid.start(), Zone::GridPadding.start() + grid_padding as u64);
+        assert_eq!(Zone::Grid.size(), None);
+        let _ = client_replies_size;
+    }
+}
