@@ -132,13 +132,10 @@ pub use tigerbeetle_core::constants::CHECKPOINT_STATE_SIZE;
 /// Port of `vsr.checksum(&.{})`: the checksum of an empty body.
 use message_header::checksum_body_empty;
 
-/// Port of `vsr.ClientSessions.encode_size`
-/// (TODO(port): src/vsr/client_sessions.zig:80 — the ClientSessions codec itself).
-///
-/// Layout: vsr headers for all clients, then one u64 session per client; the leading
-/// alignment is trivially satisfied.
-pub const CLIENT_SESSIONS_ENCODE_SIZE: usize =
-    (message_header::SIZE + size_of::<u64>()) * CLIENTS_MAX as usize;
+/// Port of `vsr.ClientSessions.encode_size` (src/vsr/client_sessions.zig:80).
+pub use crate::client_sessions::ClientSessions;
+
+pub const CLIENT_SESSIONS_ENCODE_SIZE: usize = ClientSessions::ENCODE_SIZE;
 
 const _: () = assert!(CLIENT_SESSIONS_ENCODE_SIZE <= BLOCK_SIZE - message_header::SIZE);
 
