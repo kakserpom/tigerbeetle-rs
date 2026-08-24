@@ -22,6 +22,7 @@ pub mod multi_batch;
 pub mod multiversion;
 pub mod repair_budget;
 pub mod schema;
+pub mod storage;
 pub mod superblock;
 pub mod superblock_quorums;
 pub mod testing;
