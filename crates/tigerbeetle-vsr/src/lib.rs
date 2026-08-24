@@ -13,6 +13,7 @@ pub mod message;
 pub mod message_buffer;
 pub mod message_header;
 pub mod message_pool;
+pub mod multi_batch;
 pub mod multiversion;
 pub mod schema;
 pub mod testing;
