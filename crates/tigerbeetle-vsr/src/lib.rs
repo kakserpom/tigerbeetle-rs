@@ -8,6 +8,7 @@ pub use tigerbeetle_core::checksum::{ChecksumStream, checksum};
 pub mod checkpoint_trailer;
 pub mod clock;
 pub mod command;
+pub mod fault_detector;
 pub mod marzullo;
 pub mod message;
 pub mod message_buffer;
