@@ -271,6 +271,36 @@ impl Peer {
     }
 }
 
+/// Port of `vsr.valid_members` (src/vsr.zig).
+#[must_use]
+pub fn valid_members(members: &Members) -> bool {
+    for (i, &replica_i) in members.iter().enumerate() {
+        for &replica_j in &members[..i] {
+            if replica_j == 0 && replica_i != 0 {
+                return false;
+            }
+            if replica_j != 0 && replica_j == replica_i {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Port of `vsr.member_index` (src/vsr.zig).
+///
+/// # Panics
+/// Panics if `replica_id` is zero or `members` is not valid (upstream asserts).
+#[must_use]
+pub fn member_index(members: &Members, replica_id: u128) -> Option<u8> {
+    assert!(replica_id != 0);
+    assert!(valid_members(members));
+    members.iter().position(|&member| member == replica_id).map(|index| match u8::try_from(index) {
+        Ok(replica_index) => replica_index,
+        Err(_) => unreachable!("members_max fits u8"),
+    })
+}
+
 /// Port of `vsr.Checkpoint` (operation-space helpers).
 ///
 /// TODO(port): src/vsr.zig Checkpoint — ops diagram snapshot test.
