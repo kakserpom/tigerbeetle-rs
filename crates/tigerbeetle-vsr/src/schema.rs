@@ -42,9 +42,6 @@ use tigerbeetle_core::stdx;
 const BLOCK_SIZE: usize = constants::BLOCK_SIZE;
 const HEADER_SIZE: usize = constants::HEADER_SIZE;
 
-/// Block body capacity (upstream `block_body_size`).
-const BLOCK_BODY_SIZE: usize = BLOCK_SIZE - HEADER_SIZE;
-
 const ADDRESS_SIZE: usize = core::mem::size_of::<u64>();
 /// Upstream stores checksums on disk padded to u256 (`schema.Checksum`).
 const CHECKSUM_SIZE: usize = 32;
@@ -145,12 +142,6 @@ use metadata_wire::{
     assert_reserved_zeroed, get_u16, get_u32, get_u64, get_u128, put_u16, put_u32, put_u64,
     put_u128,
 };
-
-fn le_u32_at(bytes: &[u8], offset: usize) -> u32 {
-    let mut buf = [0_u8; 4];
-    buf.copy_from_slice(&bytes[offset..offset + 4]);
-    u32::from_le_bytes(buf)
-}
 
 /// Decoded `schema.TableIndex.Metadata`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -700,189 +691,13 @@ pub mod TrailerNode {
 // DEVIATION: upstream nests these under one file scope; a glob keeps the port diff-able.
 #[allow(clippy::wildcard_imports)]
 pub mod ManifestNode {
+    // The entry-level wire codecs (Metadata/Event/Label/TableInfo and their sizes) live in
+    // `tigerbeetle-lsm/src/schema.rs` (upstream: `src/lsm/schema.zig`); see that module's
+    // DEVIATION notes for why they sit below this crate.
     use super::*;
-
-    /// Wire size of one [`TableInfo`] entry.
-    /// DEVIATION: upstream derives this from `@sizeOf(TableInfo)` (extern struct with
-    /// trailing padding); our safe-Rust `TableInfo` carries no padding fields, so the size is
-    /// fixed by the on-disk layout instead.
-    pub const ENTRY_SIZE: usize = 128;
-
-    pub const ENTRY_COUNT_MAX: usize = BLOCK_BODY_SIZE / ENTRY_SIZE;
-
-    /// Bit 7 of the label is reserved to indicate whether the event is an insert or remove
-    /// (upstream asserts levels fit u6):
-    const _: () = assert!(constants::LSM_LEVELS <= 0b0011_1111 + 1);
-
-    /// Decoded `schema.ManifestNode.Metadata`.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub struct Metadata {
-        pub previous_manifest_block_checksum: u128,
-        pub previous_manifest_block_address: u64,
-        pub entry_count: u32,
-    }
-
-    impl Metadata {
-        /// Layout: prev_checksum(16) prev_padding(16) prev_address(8) entry_count(4)
-        /// reserved[52].
-        const OFFSET_PREV_CHECKSUM: usize = 0;
-        const OFFSET_PREV_CHECKSUM_PADDING: usize = 16;
-        const OFFSET_PREV_ADDRESS: usize = 32;
-        const OFFSET_ENTRY_COUNT: usize = 40;
-        const OFFSET_RESERVED: usize = 44;
-        const RESERVED_LEN: usize = METADATA_SIZE - Self::OFFSET_RESERVED;
-
-        /// # Panics
-        /// Panics if padding/reserved areas are nonzero.
-        #[must_use]
-        pub fn from_wire(bytes: &[u8; METADATA_SIZE]) -> Self {
-            assert_eq!(get_u128(bytes, Self::OFFSET_PREV_CHECKSUM_PADDING), 0);
-            assert_reserved_zeroed(bytes, Self::OFFSET_RESERVED, Self::RESERVED_LEN);
-            Self {
-                previous_manifest_block_checksum: get_u128(bytes, Self::OFFSET_PREV_CHECKSUM),
-                previous_manifest_block_address: get_u64(bytes, Self::OFFSET_PREV_ADDRESS),
-                entry_count: get_u32(bytes, Self::OFFSET_ENTRY_COUNT),
-            }
-        }
-
-        /// Serializes into the 96-byte metadata area (padding/reserved zeroed).
-        #[must_use]
-        pub fn to_wire(self) -> [u8; METADATA_SIZE] {
-            let mut bytes = [0_u8; METADATA_SIZE];
-            put_u128(&mut bytes, Self::OFFSET_PREV_CHECKSUM, self.previous_manifest_block_checksum);
-            put_u64(&mut bytes, Self::OFFSET_PREV_ADDRESS, self.previous_manifest_block_address);
-            put_u32(&mut bytes, Self::OFFSET_ENTRY_COUNT, self.entry_count);
-            bytes
-        }
-    }
-
-    /// Upstream `Event` (2 bits inside `Label`).
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub enum Event {
-        Reserved = 0,
-        Insert = 1,
-        Update = 2,
-        Remove = 3,
-    }
-
-    /// Upstream `Label` — packed u8: level in bits 0..6, event in bits 6..8.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub struct Label {
-        pub level: u8,
-        pub event: Event,
-    }
-
-    impl Label {
-        #[must_use]
-        pub fn to_u8(self) -> u8 {
-            assert!(self.level <= 0b0011_1111);
-            #[allow(clippy::identity_op)] // mirrors upstream packed-struct field placement
-            {
-                (self.level & 0b0011_1111)
-                    | ((self.event as u8).checked_shl(6).unwrap_or(u8::MAX & 0b1100_0000))
-            }
-        }
-
-        /// # Panics
-        /// Panics if the event ordinal is invalid.
-        #[must_use]
-        pub fn from_u8(bits: u8) -> Self {
-            let level = bits & 0b0011_1111;
-            let event_ordinal = bits >> 6;
-            let event = match event_ordinal {
-                0 => Event::Reserved,
-                1 => Event::Insert,
-                2 => Event::Update,
-                3 => Event::Remove,
-                _ => panic!("invalid label event"),
-            };
-            Self { level, event }
-        }
-    }
-
-    /// See manifest.zig's TreeTableInfoType declaration for field documentation
-    /// (upstream `TableInfo`, 128 bytes on disk).
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub struct TableInfo {
-        /// All keys must fit within 32 bytes (upstream `KeyPadded`).
-        pub key_min: [u8; 32],
-        pub key_max: [u8; 32],
-        pub checksum: u128,
-        pub address: u64,
-        pub snapshot_min: u64,
-        pub snapshot_max: u64,
-        pub value_count: u32,
-        pub tree_id: u16,
-        pub label: Label,
-    }
-
-    impl TableInfo {
-        /// Wire offsets within the 128-byte entry (checksums padded to u256).
-        const OFFSET_KEY_MIN: usize = 0;
-        const OFFSET_KEY_MAX: usize = 32;
-        const OFFSET_CHECKSUM: usize = 64;
-        const OFFSET_CHECKSUM_PADDING: usize = 80;
-        const OFFSET_ADDRESS: usize = 96;
-        const OFFSET_SNAPSHOT_MIN: usize = 104;
-        const OFFSET_SNAPSHOT_MAX: usize = 112;
-        const OFFSET_VALUE_COUNT: usize = 120;
-        const OFFSET_TREE_ID: usize = 124;
-        const OFFSET_LABEL: usize = 126;
-        const OFFSET_RESERVED: usize = 127;
-        pub const SIZE: usize = 128;
-
-        /// # Panics
-        /// Panics if padding/reserved areas are nonzero.
-        #[must_use]
-        pub fn from_wire(bytes: &[u8; Self::SIZE]) -> Self {
-            assert_eq!(le_u128_at(bytes, Self::OFFSET_CHECKSUM_PADDING), 0);
-            assert_eq!(bytes[Self::OFFSET_RESERVED], 0);
-
-            let mut key_min = [0_u8; 32];
-            key_min.copy_from_slice(&bytes[Self::OFFSET_KEY_MIN..Self::OFFSET_KEY_MAX]);
-            let mut key_max = [0_u8; 32];
-            key_max.copy_from_slice(&bytes[Self::OFFSET_KEY_MAX..Self::OFFSET_CHECKSUM]);
-
-            Self {
-                key_min,
-                key_max,
-                checksum: le_u128_at(bytes, Self::OFFSET_CHECKSUM),
-                address: le_u64_at(bytes, Self::OFFSET_ADDRESS),
-                snapshot_min: le_u64_at(bytes, Self::OFFSET_SNAPSHOT_MIN),
-                snapshot_max: le_u64_at(bytes, Self::OFFSET_SNAPSHOT_MAX),
-                value_count: le_u32_at(bytes, Self::OFFSET_VALUE_COUNT),
-                tree_id: u16::from_le_bytes(
-                    bytes[Self::OFFSET_TREE_ID..Self::OFFSET_TREE_ID + 2]
-                        .try_into()
-                        .map_err(|_| "len")
-                        .unwrap_or([0; 2]),
-                ),
-                label: Label::from_u8(bytes[Self::OFFSET_LABEL]),
-            }
-        }
-
-        /// Serializes into the 128-byte on-disk entry (padding/reserved zeroed).
-        #[must_use]
-        pub fn to_wire(self) -> [u8; Self::SIZE] {
-            let mut bytes = [0_u8; Self::SIZE];
-            bytes[Self::OFFSET_KEY_MIN..Self::OFFSET_KEY_MAX].copy_from_slice(&self.key_min);
-            bytes[Self::OFFSET_KEY_MAX..Self::OFFSET_CHECKSUM].copy_from_slice(&self.key_max);
-            bytes[Self::OFFSET_CHECKSUM..Self::OFFSET_CHECKSUM + 16]
-                .copy_from_slice(&self.checksum.to_le_bytes());
-            bytes[Self::OFFSET_ADDRESS..Self::OFFSET_ADDRESS + 8]
-                .copy_from_slice(&self.address.to_le_bytes());
-            bytes[Self::OFFSET_SNAPSHOT_MIN..Self::OFFSET_SNAPSHOT_MIN + 8]
-                .copy_from_slice(&self.snapshot_min.to_le_bytes());
-            bytes[Self::OFFSET_SNAPSHOT_MAX..Self::OFFSET_SNAPSHOT_MAX + 8]
-                .copy_from_slice(&self.snapshot_max.to_le_bytes());
-            bytes[Self::OFFSET_VALUE_COUNT..Self::OFFSET_VALUE_COUNT + 4]
-                .copy_from_slice(&self.value_count.to_le_bytes());
-            bytes[Self::OFFSET_TREE_ID..Self::OFFSET_TREE_ID + 2]
-                .copy_from_slice(&self.tree_id.to_le_bytes());
-            bytes[Self::OFFSET_LABEL] = self.label.to_u8();
-            bytes
-        }
-    }
+    pub use tigerbeetle_lsm::schema::manifest_node::{
+        ENTRY_COUNT_MAX, ENTRY_SIZE, Event, Label, Metadata, TableInfo,
+    };
 
     /// Upstream `ManifestNode.metadata()`.
     ///

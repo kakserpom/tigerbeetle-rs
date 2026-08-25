@@ -272,6 +272,22 @@ impl<S: ManifestLevelSpec> ManifestLevel<S> {
         self.generation = self.generation.wrapping_add(1);
     }
 
+    /// Returns the key range of tables visible to `SNAPSHOT_LATEST` (upstream
+    /// `key_range_latest.key_range`).
+    pub fn key_range_latest(&self) -> Option<KeyRange<S::Key>> {
+        self.key_range_latest
+    }
+
+    /// The number of tables visible to `SNAPSHOT_LATEST`.
+    pub fn table_count_visible(&self) -> u32 {
+        self.table_count_visible
+    }
+
+    /// The total number of values across all tables visible to `SNAPSHOT_LATEST`.
+    pub fn value_count_visible(&self) -> u64 {
+        self.value_count_visible
+    }
+
     /// Inserts the given table into the level.
     ///
     /// # Panics
@@ -479,7 +495,7 @@ impl<S: ManifestLevelSpec> ManifestLevel<S> {
         assert!(current.key_min <= current.key_max);
     }
 
-    fn key_range_latest_contains(&self, key: S::Key) -> bool {
+    pub fn key_range_latest_contains(&self, key: S::Key) -> bool {
         match self.key_range_latest {
             Some(range) => range.key_min <= key && key <= range.key_max,
             None => false,
