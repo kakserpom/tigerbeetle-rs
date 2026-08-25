@@ -28,6 +28,7 @@ pub mod schema;
 pub mod storage;
 pub mod superblock;
 pub mod superblock_quorums;
+pub mod table;
 pub mod testing;
 pub mod time;
 
