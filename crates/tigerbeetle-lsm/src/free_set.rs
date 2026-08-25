@@ -314,6 +314,12 @@ impl FreeSet {
         self.blocks_acquired.capacity() - self.blocks_acquired.count()
     }
 
+    /// Returns whether the set has been opened from its checkpoint trailers.
+    #[must_use]
+    pub fn opened(&self) -> bool {
+        self.opened
+    }
+
     /// Returns the number of acquired blocks.
     ///
     /// # Panics
@@ -643,6 +649,12 @@ impl FreeSet {
         assert!(self.checkpoint_durable);
         assert_eq!(self.blocks_released_prior_checkpoint_durability.count(), 0);
         self.checkpoint_durable = false;
+    }
+
+    /// Returns whether the current checkpoint is marked durable.
+    #[must_use]
+    pub fn checkpoint_durable(&self) -> bool {
+        self.checkpoint_durable
     }
 
     /// Now that the checkpoint is durable on a commit quorum of replicas:

@@ -9,11 +9,15 @@
 //!
 //! Remaining upstream surface:
 //!
-//! TODO(port): `src/vsr/grid.zig` — `open`/`checkpoint`/
-//! `mark_checkpoint_not_durable`/`checkpoint_durable`/`cancel` (need the full
-//! SuperBlock + CheckpointTrailer), `blocks_missing` repair bookkeeping (currently
-//! `repair_block` skips its asserts/hooks), `checkpoint_id`/`checkpoint_durable`
-//! stamps on reads/writes, `verify_table`/`assert_coherent`/`madv_dont_dump`.
+//! TODO(port): `src/vsr/grid.zig` — `cancel` (needs storage next-tick machinery),
+//! `blocks_missing` repair bookkeeping (currently `repair_block`/`checkpoint_durable`
+//! skip its hooks), `checkpoint_id`/`checkpoint_durable` stamps on reads/writes,
+//! `verify_table`/`assert_coherent`/`madv_dont_dump`.
+//!
+//! DEVIATION: the grid does not own a superblock; the owner pushes a
+//! [`SuperBlockView`] snapshot (`cluster`/`release`/`storage_size`) via
+//! [`Grid::attach_superblock_view`] before `open()`/`checkpoint()` (upstream reaches
+//! into `grid.superblock.working.*`).
 //!
 //! DEVIATION: upstream hands out `*align(sector_size) [block_size]u8` pointers into a
 //! single allocation; safe Rust forbids aliasing pointers, so blocks are identified by
@@ -39,6 +43,7 @@
 
 use std::collections::{HashSet, VecDeque};
 
+use tigerbeetle_core::checksum::ChecksumStream;
 use tigerbeetle_core::constants::{BLOCK_SIZE, SECTOR_SIZE};
 use tigerbeetle_lsm::free_set::{FreeSet, Reservation};
 use tigerbeetle_lsm::set_associative_cache::{
@@ -46,10 +51,15 @@ use tigerbeetle_lsm::set_associative_cache::{
 };
 
 use crate::Zone;
+use crate::checkpoint_trailer::{
+    Callback, CheckpointTrailer, Chunk, TrailerType, block_count_for_trailer_size,
+};
 use crate::command::Command;
 use crate::message_header::{self, TypedHeader};
+use crate::multiversion::Release;
 use crate::schema;
 use crate::storage::{Completion, ReadRequest, Storage, WriteRequest};
+use crate::superblock::{DATA_FILE_SIZE_MIN, TrailerReference};
 
 /// Upstream `set_associative_cache_ways = 16` and its cache-line override.
 struct GridCacheAddress;
@@ -120,10 +130,17 @@ pub struct GridOptions {
     pub write_iops_max: usize,
     /// Test/bootstrap constructor for the free set: `Some(blocks_count)` builds an
     /// opened, entirely-free set (upstream populates the free set from checkpoint
-    /// trailers inside `Grid.open()`, which lands with the superblock lifecycle —
-    /// TODO(port): src/vsr/grid.zig `open`). Must be a multiple of
-    /// [`tigerbeetle_lsm::free_set::SHARD_BITS`].
+    /// trailers inside `Grid.open()` — ported, see [`Grid::open`]). Must be a multiple
+    /// of [`tigerbeetle_lsm::free_set::SHARD_BITS`].
     pub free_set_blocks_count: Option<usize>,
+    /// Address-space capacity (in blocks) of the free set constructed *without* the
+    /// bootstrap (`free_set_blocks_count: None`); `None` derives it from
+    /// `cache_blocks_count`.
+    ///
+    /// DEVIATION: upstream sizes the free set from
+    /// `superblock.working.vsr_state.checkpoint.storage_size`; our grid does not own
+    /// the superblock (see the module docs), so the owner passes the capacity in.
+    pub free_set_blocks_capacity: Option<usize>,
 }
 
 /// Whether an address is currently being written, and why
@@ -166,6 +183,17 @@ pub enum Event {
         /// Set iff `result == Valid`: where to copy the block bytes from.
         valid_location: Option<u32>,
     },
+    /// [`Grid::open`] completed: the free set was loaded from its checkpoint trailers
+    /// (upstream invokes the `open` callback).
+    OpenDone,
+    /// [`Grid::checkpoint`] completed: both free-set trailers are on disk and their
+    /// references are available via [`Grid::free_set_checkpoint_references`] (upstream
+    /// invokes the `checkpoint` callback; the caller then drives the superblock's own
+    /// checkpoint).
+    CheckpointDone,
+    /// [`Grid::checkpoint_durable`] completed (upstream invokes the `checkpoint_durable`
+    /// callback).
+    CheckpointDurableDone,
 }
 
 /// The `(address, checksum)` pair a read expects to find
@@ -174,6 +202,44 @@ pub enum Event {
 pub struct ExpectBlock {
     pub address: u64,
     pub checksum: u128,
+}
+
+/// Snapshot of the superblock working-state fields the grid reads (upstream
+/// `grid.superblock.working.{cluster, vsr_state.checkpoint.release, ...}`). See the
+/// module-level deviation note.
+#[derive(Clone, Copy, Debug)]
+pub struct SuperBlockView {
+    pub cluster: u128,
+    /// The release of the current checkpoint (upstream reads it for trailer block headers).
+    pub release: Release,
+    /// The data-file size of the current checkpoint (cross-checked when opening).
+    pub storage_size: u64,
+}
+
+/// Which grid-owned checkpoint trailer a state-machine step applies to.
+///
+/// Upstream has two distinct `CheckpointTrailer` fields with duplicated callbacks; an
+/// index keeps the ported step functions shared.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Slot {
+    Acquired,
+    Released,
+}
+
+/// Upstream `Grid.callback` tag (the callback pointers become events).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GridCallback {
+    Open,
+    Checkpoint,
+}
+
+/// The checkpoint-trailer references a grid open/checkpoint consumes/produces
+/// (upstream: the superblock working header's `free_set_reference()` pair /
+/// `UpdateCheckpoint.free_set_references`).
+#[derive(Clone, Copy, Debug)]
+pub struct GridOpenReferences {
+    pub blocks_acquired: TrailerReference,
+    pub blocks_released: TrailerReference,
 }
 
 /// Validates a freshly-read block against the expected address/checksum
@@ -343,6 +409,15 @@ pub struct Grid {
 
     free_set: FreeSet,
 
+    /// Superblock working-state snapshot (see [`SuperBlockView`]); `None` until attached.
+    view: Option<SuperBlockView>,
+    /// Upstream `free_set_checkpoint_blocks_acquired`.
+    free_set_checkpoint_blocks_acquired: CheckpointTrailer,
+    /// Upstream `free_set_checkpoint_blocks_released`.
+    free_set_checkpoint_blocks_released: CheckpointTrailer,
+    /// The grid-level lifecycle operation in flight, if any (upstream `Grid.callback`).
+    callback: Option<GridCallback>,
+
     /// Writes executing on storage, by IOP slot.
     writes_exec: Vec<Option<WriteOp>>,
     /// FIFO order of occupied write slots (matches storage completion order).
@@ -417,9 +492,14 @@ impl Grid {
         let free_set = if let Some(blocks_count) = options.free_set_blocks_count {
             FreeSet::open_empty(blocks_count)
         } else {
-            let grid_size_limit = options.cache_blocks_count * BLOCK_SIZE;
-            FreeSet::new(grid_size_limit, 0)
+            let capacity_blocks =
+                options.free_set_blocks_capacity.unwrap_or(options.cache_blocks_count);
+            FreeSet::new(capacity_blocks * BLOCK_SIZE, 0)
         };
+
+        // Upstream sizes the trailers with `free_set.encode_size_max()`.
+        let trailer_buffer_size = free_set.encode_size_max();
+        assert!(block_count_for_trailer_size(trailer_buffer_size as u64) > 0);
 
         let grid = Self {
             blocks,
@@ -435,6 +515,16 @@ impl Grid {
             read_iop_blocks,
             read_iops_free: (0..options.read_iops_max).collect(),
             free_set,
+            view: None,
+            free_set_checkpoint_blocks_acquired: CheckpointTrailer::init(
+                TrailerType::FreeSet,
+                trailer_buffer_size,
+            ),
+            free_set_checkpoint_blocks_released: CheckpointTrailer::init(
+                TrailerType::FreeSet,
+                trailer_buffer_size,
+            ),
+            callback: None,
             writes_exec: (0..options.write_iops_max).map(|_| None).collect(),
             write_exec_order: VecDeque::new(),
             write_queue: VecDeque::new(),
@@ -1152,7 +1242,8 @@ impl Grid {
     }
 
     /// Drive IO completions. Must be called repeatedly until quiescent; events are
-    /// collected for [`Grid::take_events`].
+    /// collected for [`Grid::take_events`]. Also advances any in-flight
+    /// open/checkpoint state machine (see [`Event::OpenDone`]/[`Event::CheckpointDone`]).
     pub fn poll(&mut self, storage: &mut dyn Storage) {
         self.reap();
         while let Some(completion) = storage.next_completion() {
@@ -1161,6 +1252,7 @@ impl Grid {
                 Completion::Read(request) => self.complete_read(&request, storage),
             }
         }
+        self.poll_lifecycle(storage);
     }
 
     /// Drain accumulated events.
@@ -1169,11 +1261,692 @@ impl Grid {
         self.events.drain(..).collect()
     }
 
+    /// Attach the superblock working-state snapshot used by `open`/`checkpoint`
+    /// (DEVIATION: upstream reaches into `grid.superblock.working.*`; see
+    /// [`SuperBlockView`]).
+    ///
+    /// # Panics
+    /// Panics if a lifecycle operation is in flight (upstream has the same coupling via
+    /// `grid.callback`).
+    pub fn attach_superblock_view(&mut self, view: SuperBlockView) {
+        assert!(self.callback.is_none());
+        self.view = Some(view);
+    }
+
+    /// The free set (opened by [`Grid::open`], mutated by [`Grid::checkpoint`] et al).
+    #[must_use]
+    pub fn free_set(&self) -> &FreeSet {
+        &self.free_set
+    }
+
+    /// The checkpoint-trailer references produced by the last [`Grid::checkpoint`]
+    /// (upstream reads them off each trailer for `UpdateCheckpoint.free_set_references`).
+    ///
+    /// # Panics
+    /// Panics if no checkpoint completed or one is in flight (upstream asserts the same
+    /// inside `CheckpointTrailer.checkpoint_reference()`).
+    #[must_use]
+    pub fn free_set_checkpoint_references(&self) -> GridOpenReferences {
+        GridOpenReferences {
+            blocks_acquired: self.trailer(Slot::Acquired).checkpoint_reference(),
+            blocks_released: self.trailer(Slot::Released).checkpoint_reference(),
+        }
+    }
+
+    /// Load the free set from its checkpoint trailers
+    /// (upstream `GridType.open(grid, references)`).
+    ///
+    /// Completes with [`Event::OpenDone`] once both trailers are read and decoded.
+    ///
+    /// # Panics
+    /// Panics if a lifecycle operation is in flight, the free set is already open, or no
+    /// superblock view is attached (mirrors upstream's asserts).
+    pub fn open(&mut self, storage: &mut dyn Storage, references: GridOpenReferences) {
+        assert!(self.callback.is_none());
+        assert!(!self.free_set.opened());
+        assert!(!self.free_set.checkpoint_durable());
+        let _ = self.view_attached();
+
+        self.callback = Some(GridCallback::Open);
+
+        // Prepare both trailers before starting either one: an empty-size trailer
+        // completes synchronously, and preparing upfront keeps its completion from
+        // observing the other trailer unstarted (upstream defers via next-tick).
+        self.trailer_prepare(Slot::Acquired, references.blocks_acquired);
+        self.trailer_prepare(Slot::Released, references.blocks_released);
+
+        self.trailer_start(
+            storage,
+            Slot::Acquired,
+            references.blocks_acquired.last_block_address,
+            references.blocks_acquired.last_block_checksum,
+        );
+        self.trailer_start(
+            storage,
+            Slot::Released,
+            references.blocks_released.last_block_address,
+            references.blocks_released.last_block_checksum,
+        );
+    }
+
+    /// Begin a checkpoint: encode the free set into fresh trailer blocks and write them
+    /// to disk (upstream `GridType.checkpoint(grid)`).
+    ///
+    /// Completes with [`Event::CheckpointDone`]; the references are then available via
+    /// [`Grid::free_set_checkpoint_references`].
+    ///
+    /// # Panics
+    /// Panics if a lifecycle operation is in flight, remote repairs are pending, free-set
+    /// reservations are outstanding, or no superblock view is attached (mirrors upstream).
+    pub fn checkpoint(&mut self, storage: &mut dyn Storage) {
+        assert!(self.callback.is_none());
+        assert!(self.read_global_queue.is_empty());
+        assert_eq!(self.free_set.count_reservations(), 0);
+        let view = self.view_attached();
+        _ = view;
+
+        // Refresh the trailer blocks, then encode the free set into them to learn the
+        // encoded sizes (upstream does this per trailer before computing checksums):
+        self.refresh_trailer_blocks(Slot::Acquired);
+        self.refresh_trailer_blocks(Slot::Released);
+
+        let (size_acquired, size_released) = self.encode_free_set();
+        for (slot, size) in [(Slot::Acquired, size_acquired), (Slot::Released, size_released)] {
+            let item_size = self.trailer(slot).trailer_type.item_size();
+            assert_eq!(size % item_size as u64, 0);
+            let trailer = self.trailer_mut(slot);
+            trailer.size = size;
+            trailer.size_transferred = 0;
+        }
+
+        self.callback = Some(GridCallback::Checkpoint);
+
+        // Mark both trailers checkpointing before starting either (see `open` — upstream
+        // relies on next-tick deferral for the same premature-join protection).
+        self.trailer_mut(Slot::Acquired).callback = Callback::Checkpoint;
+        self.trailer_mut(Slot::Released).callback = Callback::Checkpoint;
+
+        self.trailer_checkpoint(storage, Slot::Acquired);
+        self.trailer_checkpoint(storage, Slot::Released);
+    }
+
+    /// Roll back to the previous durable checkpoint: the just-written trailer blocks are
+    /// released again (upstream `GridType.mark_checkpoint_not_durable`).
+    ///
+    /// Upstream releases the trailer blocks *after* marking the free set not durable,
+    /// since `free_set.release()` asserts the checkpoint is not durable. Order matters:
+    /// the released addresses must be freed exactly when the bitset bits clear.
+    ///
+    /// # Panics
+    /// Panics if the current checkpoint is already non-durable.
+    pub fn mark_checkpoint_not_durable(&mut self) {
+        assert!(self.free_set.checkpoint_durable());
+        self.free_set.mark_checkpoint_not_durable();
+
+        let mut addresses = Vec::new();
+        addresses.extend(self.trailer_addresses(Slot::Acquired));
+        addresses.extend(self.trailer_addresses(Slot::Released));
+        self.release(&addresses);
+    }
+
+    /// Mark the current checkpoint durable (upstream
+    /// `GridType.checkpoint_durable`, which awaits repair writes first).
+    ///
+    /// TODO(port): src/vsr/grid.zig checkpoint_durable — upstream waits for outstanding
+    /// repair writes (`blocks_missing`) here; we require quiet write queues instead.
+    ///
+    /// Completes with [`Event::CheckpointDurableDone`].
+    ///
+    /// # Panics
+    /// Panics if the checkpoint is already durable or writes are in flight.
+    pub fn checkpoint_durable(&mut self) {
+        assert!(!self.free_set.checkpoint_durable());
+        assert!(self.write_queue.is_empty());
+        assert!(self.writes_exec.iter().all(Option::is_none));
+        self.free_set.mark_checkpoint_durable();
+        self.events.push_back(Event::CheckpointDurableDone);
+    }
+
+    fn view_attached(&self) -> SuperBlockView {
+        self.view.unwrap_or_else(|| {
+            unreachable!("attach_superblock_view() must precede open/checkpoint")
+        })
+    }
+
+    fn trailer(&self, slot: Slot) -> &CheckpointTrailer {
+        match slot {
+            Slot::Acquired => &self.free_set_checkpoint_blocks_acquired,
+            Slot::Released => &self.free_set_checkpoint_blocks_released,
+        }
+    }
+
+    fn trailer_mut(&mut self, slot: Slot) -> &mut CheckpointTrailer {
+        match slot {
+            Slot::Acquired => &mut self.free_set_checkpoint_blocks_acquired,
+            Slot::Released => &mut self.free_set_checkpoint_blocks_released,
+        }
+    }
+
+    /// Upstream `CheckpointTrailer.open`: claim trailer state and a fresh block per
+    /// buffer (all `block_count_max` of them, like upstream).
+    fn trailer_prepare(&mut self, slot: Slot, reference: TrailerReference) {
+        let trailer = self.trailer_mut(slot);
+        assert_eq!(trailer.callback, Callback::None);
+        assert!(!trailer.attached);
+        assert_eq!(trailer.size, 0);
+        assert_eq!(trailer.size_transferred, 0);
+        assert_eq!(reference.trailer_size % trailer.trailer_type.item_size() as u64, 0);
+        let block_count = block_count_for_trailer_size(reference.trailer_size);
+        assert!(block_count <= trailer.block_count_max());
+
+        trailer.attached = true;
+        trailer.callback = Callback::Open;
+        trailer.size = reference.trailer_size;
+        trailer.checksum = reference.checksum;
+
+        for index in 0..trailer.locations.len() {
+            // Grab a fresh block for every trailer chunk buffer (upstream init loop).
+            let location = self.get_block();
+            self.trailer_mut(slot).locations[index] = location;
+        }
+        self.trailer_mut(slot).block_index = block_count;
+    }
+
+    fn trailer_start(
+        &mut self,
+        storage: &mut dyn Storage,
+        slot: Slot,
+        address: u64,
+        checksum: u128,
+    ) {
+        assert_eq!(self.trailer(slot).callback, Callback::Open);
+
+        if self.trailer(slot).size == 0 {
+            assert_eq!(address, 0);
+            assert_eq!(checksum, 0);
+            // DEVIATION: completes inline instead of on the next tick; `open()` prepared
+            // both trailers upfront so the premature join cannot happen.
+            self.trailer_open_done(slot);
+        } else {
+            assert_ne!(address, 0);
+            self.trailer_open_read_next(storage, slot, address, checksum);
+        }
+    }
+
+    /// Read the next (previous on disk) trailer block, counting `block_index` down.
+    fn trailer_open_read_next(
+        &mut self,
+        storage: &mut dyn Storage,
+        slot: Slot,
+        address: u64,
+        checksum: u128,
+    ) {
+        assert_eq!(self.trailer(slot).callback, Callback::Open);
+        assert!(address > 0);
+        assert_ne!(checksum, 0);
+
+        let block_count = self.trailer(slot).block_count();
+        let trailer = self.trailer_mut(slot);
+        trailer.block_index -= 1;
+        let index = trailer.block_index as usize;
+        trailer.addresses[index] = address;
+        trailer.checksums[index] = checksum;
+
+        // Trailer block addresses must be unique within a trailer (they are acquired
+        // sequentially during the checkpoint that wrote them).
+        for &other in &trailer.addresses[index + 1..block_count as usize] {
+            assert_ne!(other, address);
+        }
+
+        // `.from_local_or_global_storage` ⇒ coherent, cache_read, no cache_write.
+        // Safe before the free set is opened: `is_free()` conservatively answers false.
+        let token = self.read_block(
+            storage,
+            address,
+            checksum,
+            true,
+            ReadOptions { cache_read: true, cache_write: false },
+        );
+        self.trailer_mut(slot).outstanding_read = Some(token);
+    }
+
     fn reap(&mut self) {
         let locations = std::mem::take(&mut self.pending_reap);
         for location in locations {
             self.block_unref(location);
         }
+    }
+
+    /// Upstream `open_read_next_callback`: validate, adopt the read's block, follow
+    /// the linked list towards block 0.
+    fn trailer_open_read_done(
+        &mut self,
+        storage: &mut dyn Storage,
+        slot: Slot,
+        valid_location: u32,
+    ) {
+        let (index, chunk_size) = {
+            let trailer = self.trailer(slot);
+            assert_eq!(trailer.callback, Callback::Open);
+            assert!(trailer.size_transferred < trailer.size);
+            let index = trailer.block_index as usize;
+            (index, Chunk::size(trailer.block_index, trailer.block_count(), trailer.size))
+        };
+
+        // The block must be one of ours (misdirected IO would have failed validation).
+        let header = schema::header_from_block(&self.blocks[valid_location as usize]);
+        assert_eq!(
+            message_header::BlockType::from_ordinal(header.block_type_ordinal),
+            Some(self.trailer(slot).trailer_type.block_type()),
+            "unexpected trailer block type"
+        );
+
+        // Adopt the read's buffer: release our held block and take a reference to the
+        // freshly-read one (upstream swaps the `BlockPtr`s; the extra reference keeps
+        // the read-IOP block alive past its poll-time reaping).
+        let held = self.trailer(slot).locations[index];
+        self.block_unref(held);
+        self.block_ref(valid_location);
+        self.trailer_mut(slot).locations[index] = valid_location;
+
+        let trailer = self.trailer_mut(slot);
+        trailer.size_transferred += u64::from(chunk_size);
+
+        if let Some(next) = schema::TrailerNode::previous(&self.blocks[valid_location as usize]) {
+            assert!(index > 0);
+            self.trailer_open_read_next(storage, slot, next.address, next.checksum);
+        } else {
+            assert_eq!(index, 0);
+            self.trailer_open_done(slot);
+        }
+    }
+
+    /// Upstream `open_done`: verify the whole-trailer checksum.
+    fn trailer_open_done(&mut self, slot: Slot) {
+        {
+            let trailer = self.trailer(slot);
+            assert_eq!(trailer.callback, Callback::Open);
+            assert_eq!(trailer.block_index, 0);
+            assert_eq!(trailer.size_transferred, trailer.size);
+        }
+
+        let computed = {
+            let trailer = self.trailer(slot);
+            let mut stream = ChecksumStream::new();
+            for chunk in Self::trailer_chunk_bodies(
+                &trailer.locations,
+                &self.blocks,
+                trailer.block_count(),
+                trailer.size,
+            ) {
+                stream.add(chunk);
+            }
+            stream.checksum()
+        };
+        assert_eq!(computed, self.trailer(slot).checksum, "trailer checksum mismatch");
+
+        self.trailer_mut(slot).callback = Callback::None;
+        self.open_join();
+    }
+
+    /// Encoded-trailer chunk bodies for the first `block_count` blocks
+    /// (upstream derives `block_bodies[i][0..Chunk.size]`; we slice on demand).
+    ///
+    /// # Panics
+    /// Panics unless `locations` holds at least `block_count` entries.
+    fn trailer_chunk_bodies<'a>(
+        locations: &[u32],
+        blocks: &'a [Vec<u8>],
+        block_count: u32,
+        trailer_size: u64,
+    ) -> Vec<&'a [u8]> {
+        locations[..block_count as usize]
+            .iter()
+            .enumerate()
+            .map(|(index, &location)| {
+                let end = message_header::SIZE
+                    + Chunk::size(index as u32, block_count, trailer_size) as usize;
+                &blocks[location as usize][message_header::SIZE..end]
+            })
+            .collect()
+    }
+
+    /// Move the trailer's held blocks out of [`Grid::blocks`] so their bodies can be
+    /// handed to `FreeSet::{open,encode_chunks}` without aliasing borrows; pair with
+    /// [`Grid::put_trailer_blocks`]. Takes *all* `block_count_max` buffers (the
+    /// encoder fills them regardless of the previous encoded size).
+    fn take_trailer_blocks(&mut self, slot: Slot) -> Vec<Vec<u8>> {
+        let locations = self.trailer(slot).locations.clone();
+        locations.iter().map(|&l| std::mem::take(&mut self.blocks[l as usize])).collect()
+    }
+
+    fn put_trailer_blocks(&mut self, slot: Slot, taken: Vec<Vec<u8>>) {
+        let locations = self.trailer(slot).locations.clone();
+        assert_eq!(taken.len(), locations.len());
+        for (block, &location) in taken.into_iter().zip(&locations) {
+            assert!(self.blocks[location as usize].is_empty(), "taken block was not restored");
+            self.blocks[location as usize] = block;
+        }
+    }
+
+    /// Upstream `open_free_set_callback`: decode both trailers into the free set and
+    /// cross-check against the superblock working state.
+    fn open_join(&mut self) {
+        assert_eq!(self.callback, Some(GridCallback::Open));
+        if self.trailer(Slot::Acquired).callback == Callback::Open
+            || self.trailer(Slot::Released).callback == Callback::Open
+        {
+            return;
+        }
+
+        let view = self.view_attached();
+
+        let count_acquired = self.trailer(Slot::Acquired).block_count();
+        let count_released = self.trailer(Slot::Released).block_count();
+        let size_acquired = self.trailer(Slot::Acquired).size;
+        let size_released = self.trailer(Slot::Released).size;
+        let addresses_acquired =
+            self.trailer(Slot::Acquired).addresses[..count_acquired as usize].to_vec();
+        let addresses_released =
+            self.trailer(Slot::Released).addresses[..count_released as usize].to_vec();
+
+        // Hand the encoded chunks to the free set. The blocks are moved out and back so
+        // the immutable chunk slices do not alias the `&mut self.free_set`.
+        let taken_acquired = self.take_trailer_blocks(Slot::Acquired);
+        let taken_released = self.take_trailer_blocks(Slot::Released);
+
+        let encoded_acquired: Vec<&[u8]> = taken_acquired
+            .iter()
+            .take(count_acquired as usize)
+            .enumerate()
+            .map(|(index, block)| {
+                let end = message_header::SIZE
+                    + Chunk::size(index as u32, count_acquired, size_acquired) as usize;
+                &block[message_header::SIZE..end]
+            })
+            .collect();
+        let encoded_released: Vec<&[u8]> = taken_released
+            .iter()
+            .take(count_released as usize)
+            .enumerate()
+            .map(|(index, block)| {
+                let end = message_header::SIZE
+                    + Chunk::size(index as u32, count_released, size_released) as usize;
+                &block[message_header::SIZE..end]
+            })
+            .collect();
+
+        self.free_set.open(
+            &encoded_acquired,
+            &encoded_released,
+            &addresses_acquired,
+            &addresses_released,
+        );
+
+        self.put_trailer_blocks(Slot::Acquired, taken_acquired);
+        self.put_trailer_blocks(Slot::Released, taken_released);
+
+        let highest_address =
+            addresses_acquired.iter().chain(addresses_released.iter()).copied().max().unwrap_or(0);
+        if view.storage_size == 0 {
+            assert_eq!(count_acquired, 0);
+            assert_eq!(count_released, 0);
+            assert_eq!(highest_address, 0);
+        } else {
+            assert_eq!(
+                DATA_FILE_SIZE_MIN as u64 + highest_address * BLOCK_SIZE as u64,
+                view.storage_size
+            );
+        }
+
+        assert_eq!(self.free_set.count_reservations(), 0);
+        // The freshly constructed (unopened) set starts empty, so everything acquired
+        // now comes from the decoded trailers:
+        assert!(self.free_set.count_acquired() >= count_acquired as usize);
+        assert!(self.free_set.count_released() >= (count_acquired + count_released) as usize);
+
+        self.callback = None;
+        self.events.push_back(Event::OpenDone);
+    }
+
+    /// Swap every held trailer block for a fresh stash block (upstream refreshes the
+    /// `BlockPtr`s at the top of `GridType.checkpoint` — all `block_count_max` of them,
+    /// since the encoder fills the full buffers).
+    fn refresh_trailer_blocks(&mut self, slot: Slot) {
+        let count = self.trailer(slot).locations.len();
+        for index in 0..count {
+            let location = self.trailer(slot).locations[index];
+            self.block_unref(location);
+            let fresh = self.get_block();
+            self.trailer_mut(slot).locations[index] = fresh;
+        }
+    }
+
+    /// Encode the free set into the trailer blocks; returns
+    /// `(encoded_size_blocks_acquired, encoded_size_blocks_released)`
+    /// (upstream encodes per trailer inside `GridType.checkpoint`).
+    fn encode_free_set(&mut self) -> (u64, u64) {
+        // Move the blocks out so the mutable chunk slices do not alias the
+        // `&self.free_set` borrow inside `encode_chunks`.
+        let mut taken_acquired = self.take_trailer_blocks(Slot::Acquired);
+        let mut taken_released = self.take_trailer_blocks(Slot::Released);
+
+        let mut chunks_acquired: Vec<&mut [u8]> =
+            taken_acquired.iter_mut().map(|block| block[message_header::SIZE..].as_mut()).collect();
+        let mut chunks_released: Vec<&mut [u8]> =
+            taken_released.iter_mut().map(|block| block[message_header::SIZE..].as_mut()).collect();
+
+        let (size_acquired, size_released) =
+            self.free_set.encode_chunks(&mut chunks_acquired, &mut chunks_released);
+
+        self.put_trailer_blocks(Slot::Acquired, taken_acquired);
+        self.put_trailer_blocks(Slot::Released, taken_released);
+
+        (size_acquired as u64, size_released as u64)
+    }
+
+    /// Upstream `CheckpointTrailer.checkpoint`: checksum the encoded chunks, claim
+    /// addresses and issue every trailer-block write in one pass.
+    ///
+    /// DEVIATION: upstream defers the zero-size completion to the next tick; here both
+    /// trailers are marked checkpointing upfront, so inline completion is safe.
+    fn trailer_checkpoint(&mut self, storage: &mut dyn Storage, slot: Slot) {
+        assert_eq!(self.trailer(slot).callback, Callback::Checkpoint);
+        assert_eq!(self.trailer(slot).size_transferred, 0);
+
+        if self.trailer(slot).size == 0 {
+            self.trailer_checkpoint_done(slot);
+            return;
+        }
+
+        let view = self.view_attached();
+        let block_count = self.trailer(slot).block_count();
+        let trailer_size = self.trailer(slot).size;
+        let block_type = self.trailer(slot).trailer_type.block_type();
+
+        // Checksum the just-encoded chunks (upstream streams them in `grid.checkpoint`):
+        let computed = {
+            let trailer = self.trailer(slot);
+            let mut stream = ChecksumStream::new();
+            for chunk in Self::trailer_chunk_bodies(
+                &trailer.locations,
+                &self.blocks,
+                block_count,
+                trailer_size,
+            ) {
+                stream.add(chunk);
+            }
+            stream.checksum()
+        };
+        self.trailer_mut(slot).checksum = computed;
+
+        let reservation = self.reserve(block_count as usize);
+
+        for index in 0..block_count as usize {
+            let address = self.acquire(reservation);
+
+            // Undefined fields stay zeroed for deterministic output (upstream notes the
+            // same about its allocator-backed buffers).
+            let metadata_wire = if index == 0 {
+                schema::TrailerNode::Metadata {
+                    previous_trailer_block_checksum: 0,
+                    previous_trailer_block_address: 0,
+                }
+                .to_wire()
+            } else {
+                let (previous_address, previous_checksum) = {
+                    let trailer = self.trailer(slot);
+                    (trailer.addresses[index - 1], trailer.checksums[index - 1])
+                };
+                schema::TrailerNode::Metadata {
+                    previous_trailer_block_checksum: previous_checksum,
+                    previous_trailer_block_address: previous_address,
+                }
+                .to_wire()
+            };
+
+            let chunk_size = Chunk::size(index as u32, block_count, trailer_size);
+            let location = self.trailer(slot).locations[index];
+
+            let block_checksum = {
+                let block = &mut self.blocks[location as usize];
+                let mut header = message_header::Block::default();
+                header.cluster = view.cluster;
+                header.metadata_bytes = metadata_wire;
+                header.size = (message_header::SIZE + chunk_size as usize) as u32;
+                header.address = address;
+                header.snapshot = 0;
+                header.release = view.release;
+                header.block_type_ordinal = block_type as u8;
+
+                let body = &block[message_header::SIZE..message_header::SIZE + chunk_size as usize];
+                header.set_checksum_body(body);
+                header.set_checksum();
+
+                block[..message_header::SIZE].copy_from_slice(&header.to_wire());
+                header.checksum()
+            };
+
+            {
+                let trailer = self.trailer_mut(slot);
+                trailer.addresses[index] = address;
+                trailer.checksums[index] = block_checksum;
+            }
+
+            schema::TrailerNode::assert_valid_header(&self.blocks[location as usize]);
+
+            let token = self.create_block(storage, address, location);
+            self.trailer_mut(slot).outstanding_writes.push((token, index as u32));
+        }
+        self.forfeit(reservation);
+
+        self.trailer_mut(slot).block_index = block_count;
+    }
+
+    fn trailer_checkpoint_done(&mut self, slot: Slot) {
+        {
+            let trailer = self.trailer(slot);
+            assert_eq!(trailer.callback, Callback::Checkpoint);
+            assert_eq!(trailer.block_index, trailer.block_count());
+            assert_eq!(trailer.size_transferred, trailer.size);
+        }
+        self.trailer_mut(slot).callback = Callback::None;
+        self.checkpoint_join();
+    }
+
+    fn checkpoint_join(&mut self) {
+        assert_eq!(self.callback, Some(GridCallback::Checkpoint));
+        assert!(self.read_global_queue.is_empty());
+
+        if self.trailer(Slot::Acquired).callback == Callback::Checkpoint
+            || self.trailer(Slot::Released).callback == Callback::Checkpoint
+        {
+            return;
+        }
+
+        self.callback = None;
+        self.events.push_back(Event::CheckpointDone);
+    }
+
+    /// Trailer block addresses recorded by the last checkpoint.
+    fn trailer_addresses(&self, slot: Slot) -> Vec<u64> {
+        let trailer = self.trailer(slot);
+        trailer.addresses[..trailer.block_count() as usize].to_vec()
+    }
+
+    /// Route IO completions to the in-flight lifecycle state machine
+    /// (upstream dispatches through per-trailer callbacks).
+    ///
+    /// Events owned by a trailer are consumed; everything else is queued back in order.
+    /// The loop terminates when no owned event was consumed — chained reads resolve
+    /// inline into [`Grid::events`] and are picked up by the next iteration.
+    fn poll_lifecycle(&mut self, storage: &mut dyn Storage) {
+        if self.callback.is_none() {
+            return;
+        }
+        loop {
+            let mut advanced = false;
+            let events = std::mem::take(&mut self.events);
+            let mut deferred = VecDeque::with_capacity(events.len());
+            for event in events {
+                match event {
+                    Event::ReadDone {
+                        token,
+                        result: ReadBlockResult::Valid,
+                        valid_location: Some(valid_location),
+                        ..
+                    } => match self.trailer_slot_owning_read(token) {
+                        Some(slot) => {
+                            self.trailer_mut(slot).outstanding_read = None;
+                            self.trailer_open_read_done(storage, slot, valid_location);
+                            advanced = true;
+                        }
+                        None => deferred.push_back(event),
+                    },
+                    Event::WriteDone { token, fresh_location, .. } => {
+                        match self.trailer_slot_owning_write(token) {
+                            Some((slot, index)) => {
+                                let trailer = self.trailer_mut(slot);
+                                trailer.outstanding_writes.retain(|&(t, _)| t != token);
+                                trailer.locations[index as usize] = fresh_location;
+                                trailer.size_transferred += u64::from(Chunk::size(
+                                    index,
+                                    trailer.block_count(),
+                                    trailer.size,
+                                ));
+                                if trailer.size_transferred == trailer.size {
+                                    self.trailer_checkpoint_done(slot);
+                                }
+                                advanced = true;
+                            }
+                            None => deferred.push_back(event),
+                        }
+                    }
+                    other => deferred.push_back(other),
+                }
+            }
+            self.events.extend(deferred);
+            if !advanced {
+                break;
+            }
+        }
+    }
+
+    fn trailer_slot_owning_read(&self, token: u32) -> Option<Slot> {
+        [Slot::Acquired, Slot::Released]
+            .into_iter()
+            .find(|&slot| self.trailer(slot).outstanding_read == Some(token))
+    }
+
+    fn trailer_slot_owning_write(&self, token: u32) -> Option<(Slot, u32)> {
+        for &slot in &[Slot::Acquired, Slot::Released] {
+            for &(owned_token, index) in &self.trailer(slot).outstanding_writes {
+                if owned_token == token {
+                    return Some((slot, index));
+                }
+            }
+        }
+        None
     }
 
     /// # Panics
@@ -1206,9 +1979,11 @@ mod tests {
         block_offset, read_block_validate,
     };
     use crate::Zone;
+    use crate::checkpoint_trailer::block_count_for_trailer_size;
     use crate::message_header::{self, TypedHeader};
     use crate::multiversion::Release;
     use crate::storage::MemoryStorage;
+    use crate::superblock::DATA_FILE_SIZE_MIN;
     use tigerbeetle_core::constants::SECTOR_SIZE;
     use tigerbeetle_lsm::free_set::SHARD_BITS;
 
@@ -1219,6 +1994,12 @@ mod tests {
     /// `SHARD_BITS`).
     const FREE_SET_BLOCKS: usize = 2 * SHARD_BITS;
 
+    /// Storage image size for the single-block-trailer round trip.
+    const STORAGE_BLOCKS_CAPACITY: u64 = 256;
+
+    /// Stash headroom for two multi-block trailers plus IO slots.
+    const MULTI_BLOCK_STASH: usize = 32;
+
     fn grid_options(read_iops_max: usize, write_iops_max: usize) -> GridOptions {
         GridOptions {
             cache_blocks_count: CACHE_BLOCKS_COUNT,
@@ -1226,6 +2007,7 @@ mod tests {
             read_iops_max,
             write_iops_max,
             free_set_blocks_count: Some(FREE_SET_BLOCKS),
+            free_set_blocks_capacity: None,
         }
     }
 
@@ -1240,6 +2022,7 @@ mod tests {
             read_iops_max: 0,
             write_iops_max: 0,
             free_set_blocks_count: None,
+            free_set_blocks_capacity: None,
         })
     }
 
@@ -1552,7 +2335,7 @@ mod tests {
                 assert_eq!(done_address, address);
                 assert_ne!(fresh_location, location);
             }
-            other @ Event::ReadDone { .. } => panic!("unexpected first event: {other:?}"),
+            other => panic!("unexpected first event: {other:?}"),
         }
         match events[1] {
             Event::ReadDone { token: read_token, result, valid_location, .. } => {
@@ -1561,7 +2344,7 @@ mod tests {
                 let location = valid_location.unwrap_or_else(|| panic!("valid read has location"));
                 assert_eq!(env.grid.block(location), &expected[..]);
             }
-            other @ Event::WriteDone { .. } => panic!("unexpected second event: {other:?}"),
+            other => panic!("unexpected second event: {other:?}"),
         }
         assert_eq!(env.storage.read_ops, 1);
     }
@@ -1612,7 +2395,7 @@ mod tests {
             .iter()
             .map(|event| match event {
                 Event::ReadDone { token, .. } => *token,
-                other @ Event::WriteDone { .. } => panic!("unexpected event: {other:?}"),
+                other => panic!("unexpected event: {other:?}"),
             })
             .collect();
         // Upstream resolves merged reads before the root:
@@ -1663,7 +2446,7 @@ mod tests {
             .iter()
             .map(|event| match event {
                 Event::ReadDone { token, .. } => *token,
-                other @ Event::WriteDone { .. } => panic!("unexpected event: {other:?}"),
+                other => panic!("unexpected event: {other:?}"),
             })
             .collect();
         assert_eq!(tokens, vec![token_a, token_b]);
@@ -1783,5 +2566,296 @@ mod tests {
         assert_ne!(next_first, next_second);
         assert_ne!(next_first, first);
         assert_ne!(next_first, second);
+    }
+
+    /// A grid whose free set is *not* opened yet, sized for `blocks_capacity` addresses.
+    fn new_unopened_grid(blocks_capacity: usize) -> Grid {
+        Grid::new(GridOptions {
+            cache_blocks_count: CACHE_BLOCKS_COUNT,
+            stash_blocks_count: STASH_BLOCKS_COUNT,
+            read_iops_max: READ_IOPS_MAX,
+            write_iops_max: WRITE_IOPS_MAX,
+            free_set_blocks_count: None,
+            free_set_blocks_capacity: Some(blocks_capacity),
+        })
+    }
+
+    fn empty_reference() -> crate::superblock::TrailerReference {
+        crate::superblock::TrailerReference {
+            checksum: tigerbeetle_core::checksum::checksum(&[]),
+            last_block_address: 0,
+            last_block_checksum: 0,
+            trailer_size: 0,
+        }
+    }
+
+    fn empty_references() -> super::GridOpenReferences {
+        super::GridOpenReferences {
+            blocks_acquired: empty_reference(),
+            blocks_released: empty_reference(),
+        }
+    }
+
+    /// Polls until `want` matches a drained event (upstream: the callback fires).
+    fn drive_until(grid: &mut Grid, storage: &mut MemoryStorage, want: &dyn Fn(&Event) -> bool) {
+        for _ in 0..1000 {
+            grid.poll(storage);
+            if grid.take_events().iter().any(want) {
+                return;
+            }
+        }
+        panic!("expected lifecycle event never arrived");
+    }
+
+    #[test]
+    fn open_with_empty_trailers_loads_an_empty_free_set() {
+        let mut storage = MemoryStorage::new(Zone::Grid.start() + 64 * BLOCK_SIZE as u64);
+        let mut grid = new_unopened_grid(FREE_SET_BLOCKS);
+
+        grid.attach_superblock_view(super::SuperBlockView {
+            cluster: 0xAB,
+            release: Release { value: 7 },
+            storage_size: 0,
+        });
+        grid.open(&mut storage, empty_references());
+        drive_until(&mut grid, &mut storage, &|event| matches!(event, Event::OpenDone));
+
+        assert!(grid.free_set().opened());
+        assert!(!grid.free_set().checkpoint_durable());
+        assert_eq!(grid.free_set().count_acquired(), 0);
+        assert_eq!(grid.free_set().count_free(), FREE_SET_BLOCKS);
+    }
+
+    #[test]
+    fn open_panics_without_attached_view_or_when_opened() {
+        let mut storage = MemoryStorage::new(Zone::Grid.start() + 64 * BLOCK_SIZE as u64);
+
+        let mut grid = new_unopened_grid(FREE_SET_BLOCKS);
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                grid.open(&mut storage, empty_references());
+            }))
+            .is_err(),
+            "open without a superblock view must panic"
+        );
+
+        let mut bootstrapped = new_grid();
+        bootstrapped.attach_superblock_view(super::SuperBlockView {
+            cluster: 0xAB,
+            release: Release { value: 7 },
+            storage_size: 0,
+        });
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                bootstrapped.open(&mut storage, empty_references());
+            }))
+            .is_err(),
+            "open on an already-open free set must panic"
+        );
+    }
+
+    #[test]
+    fn checkpoint_round_trip_reopens_from_storage() {
+        const USER_BLOCKS: usize = 8;
+
+        let cluster: u128 = 0xAB_CD;
+        let release = Release { value: 7 };
+
+        let mut storage =
+            MemoryStorage::new(Zone::Grid.start() + STORAGE_BLOCKS_CAPACITY * BLOCK_SIZE as u64);
+
+        // Grid #1: start from an unopened free set and go through the full lifecycle —
+        // open (empty trailers, like a fresh format), mark durable, acquire, checkpoint.
+        let mut grid = new_unopened_grid(FREE_SET_BLOCKS);
+        grid.attach_superblock_view(super::SuperBlockView { cluster, release, storage_size: 0 });
+        grid.open(&mut storage, empty_references());
+        drive_until(&mut grid, &mut storage, &|event| matches!(event, Event::OpenDone));
+        grid.checkpoint_durable();
+
+        let reservation = grid.reserve(USER_BLOCKS);
+        let acquired: Vec<u64> = (0..USER_BLOCKS).map(|_| grid.acquire(reservation)).collect();
+        grid.forfeit(reservation);
+        assert_eq!(acquired, (1..=USER_BLOCKS as u64).collect::<Vec<u64>>());
+
+        grid.checkpoint(&mut storage);
+        drive_until(&mut grid, &mut storage, &|event| matches!(event, Event::CheckpointDone));
+
+        let references = grid.free_set_checkpoint_references();
+        // The released trailer stays empty — nothing was released yet (upstream skips
+        // encoding trailing zero runs).
+        let blocks_acquired_trailer =
+            block_count_for_trailer_size(references.blocks_acquired.trailer_size) as usize;
+        let blocks_released_trailer =
+            block_count_for_trailer_size(references.blocks_released.trailer_size) as usize;
+        assert!(blocks_acquired_trailer > 0);
+        assert_eq!(references.blocks_released.trailer_size, 0);
+        assert_eq!(
+            grid.free_set().count_acquired(),
+            USER_BLOCKS + blocks_acquired_trailer + blocks_released_trailer
+        );
+
+        // What upstream's superblock checkpoint records as the new storage size:
+        let highest_address = references
+            .blocks_acquired
+            .last_block_address
+            .max(references.blocks_released.last_block_address);
+        let storage_size_new = DATA_FILE_SIZE_MIN as u64 + highest_address * BLOCK_SIZE as u64;
+
+        // Grid #2: reopen the same storage from the checkpoint references.
+        let mut reopened = new_unopened_grid(FREE_SET_BLOCKS);
+        reopened.attach_superblock_view(super::SuperBlockView {
+            cluster,
+            release,
+            storage_size: storage_size_new,
+        });
+        reopened.open(&mut storage, references);
+        drive_until(&mut reopened, &mut storage, &|event| matches!(event, Event::OpenDone));
+
+        assert_eq!(reopened.free_set().count_acquired(), USER_BLOCKS + blocks_acquired_trailer);
+        for address in 1..=USER_BLOCKS as u64 {
+            assert!(!reopened.free_set().is_free(address));
+        }
+        // The trailer blocks themselves load released (they are rewritten by the next
+        // checkpoint before they can be freed) — released implies acquired:
+        assert_eq!(
+            reopened.free_set().count_released(),
+            blocks_acquired_trailer + blocks_released_trailer
+        );
+
+        // The loaded checkpoint starts non-durable; run the replica commit-pipeline
+        // sequence: durability flip moves the loaded trailer addresses from the staged
+        // bucket into `blocks_released`, the next checkpoint rolls them back and
+        // rewrites them, and the following flip frees them.
+        assert!(!reopened.free_set().checkpoint_durable());
+        reopened.checkpoint_durable();
+        assert!(reopened.free_set().checkpoint_durable());
+        assert_eq!(
+            reopened.free_set().count_released(),
+            blocks_acquired_trailer + blocks_released_trailer,
+            "staged trailer addresses become released"
+        );
+
+        // Full cycle, in the replica commit-pipeline order: write the next generation
+        // of trailers, roll back the just-superseded checkpoint (releasing the new
+        // trailer addresses into the staged bucket), then flip durability — freeing the
+        // previous generation and moving the staged releases into `blocks_released`.
+        reopened.checkpoint(&mut storage);
+        drive_until(&mut reopened, &mut storage, &|event| matches!(event, Event::CheckpointDone));
+        let references_second = reopened.free_set_checkpoint_references();
+        let blocks_acquired_second =
+            block_count_for_trailer_size(references_second.blocks_acquired.trailer_size) as usize;
+        let blocks_released_second =
+            block_count_for_trailer_size(references_second.blocks_released.trailer_size) as usize;
+
+        reopened.mark_checkpoint_not_durable();
+        assert!(!reopened.free_set().checkpoint_durable());
+
+        reopened.checkpoint_durable();
+        assert_eq!(
+            reopened.free_set().count_released(),
+            blocks_acquired_second + blocks_released_second,
+            "previous generation freed, current generation staged"
+        );
+        assert_eq!(
+            reopened.free_set().count_acquired(),
+            USER_BLOCKS + blocks_acquired_second + blocks_released_second
+        );
+    }
+
+    #[test]
+    fn checkpoint_round_trip_with_multi_block_trailers() {
+        // One released address per 64-block word keeps every covered word hybrid-
+        // incompressible (neither all-zero nor all-one), so the released trailer
+        // exceeds one chunk (`CHUNK_SIZE_MAX`) and spans several blocks. The last
+        // shard stays entirely free — room for the trailer block reservations.
+        const CAPACITY: usize = 9 * SHARD_BITS;
+        const ACQUIRED_SPAN: usize = 8 * SHARD_BITS;
+        const WORDS: usize = ACQUIRED_SPAN / 64;
+        const { assert!(WORDS * 10 > crate::checkpoint_trailer::CHUNK_SIZE_MAX) };
+
+        let cluster: u128 = 0xFE_ED;
+        let release = Release { value: 3 };
+
+        // The image covers the whole address space; only the trailer blocks are ever
+        // written to it (bitset operations never touch storage).
+        let mut storage =
+            MemoryStorage::new(Zone::Grid.start() + CAPACITY as u64 * BLOCK_SIZE as u64);
+
+        let mut grid = Grid::new(GridOptions {
+            cache_blocks_count: CACHE_BLOCKS_COUNT,
+            stash_blocks_count: MULTI_BLOCK_STASH,
+            read_iops_max: READ_IOPS_MAX,
+            write_iops_max: WRITE_IOPS_MAX,
+            free_set_blocks_count: None,
+            free_set_blocks_capacity: Some(CAPACITY),
+        });
+        grid.attach_superblock_view(super::SuperBlockView { cluster, release, storage_size: 0 });
+        grid.open(&mut storage, empty_references());
+        drive_until(&mut grid, &mut storage, &|event| matches!(event, Event::OpenDone));
+        grid.checkpoint_durable();
+
+        // Acquire everything but the free tail, then release one address per word:
+        let reservation = grid.reserve(ACQUIRED_SPAN);
+        for _ in 0..ACQUIRED_SPAN {
+            let _ = grid.acquire(reservation);
+        }
+        grid.forfeit(reservation);
+
+        let mut scattered = Vec::with_capacity(WORDS);
+        for word in 0..WORDS {
+            scattered.push((word * 64 + 1) as u64);
+        }
+        grid.release(&scattered);
+
+        grid.checkpoint(&mut storage);
+        drive_until(&mut grid, &mut storage, &|event| matches!(event, Event::CheckpointDone));
+
+        let references = grid.free_set_checkpoint_references();
+        assert!(
+            references.blocks_released.trailer_size
+                > crate::checkpoint_trailer::CHUNK_SIZE_MAX as u64,
+            "expected multi-block released trailer, size={}",
+            references.blocks_released.trailer_size
+        );
+
+        let highest_address = references
+            .blocks_acquired
+            .last_block_address
+            .max(references.blocks_released.last_block_address);
+        let storage_size_new = DATA_FILE_SIZE_MIN as u64 + highest_address * BLOCK_SIZE as u64;
+
+        let mut reopened = Grid::new(GridOptions {
+            cache_blocks_count: CACHE_BLOCKS_COUNT,
+            stash_blocks_count: MULTI_BLOCK_STASH,
+            read_iops_max: READ_IOPS_MAX,
+            write_iops_max: WRITE_IOPS_MAX,
+            free_set_blocks_count: None,
+            free_set_blocks_capacity: Some(CAPACITY),
+        });
+        reopened.attach_superblock_view(super::SuperBlockView {
+            cluster,
+            release,
+            storage_size: storage_size_new,
+        });
+        reopened.open(&mut storage, references);
+        drive_until(&mut reopened, &mut storage, &|event| matches!(event, Event::OpenDone));
+
+        let trailer_blocks_total =
+            block_count_for_trailer_size(references.blocks_acquired.trailer_size) as usize
+                + block_count_for_trailer_size(references.blocks_released.trailer_size) as usize;
+        assert_eq!(reopened.free_set().count_released(), scattered.len() + trailer_blocks_total);
+        for &address in &scattered[..8] {
+            assert!(!reopened.free_set().is_free(address));
+            assert!(!reopened.free_set().is_free(address + 1));
+        }
+
+        // Durability flip: frees the previous checkpoint's released blocks (the
+        // scattered ones) and stages the loaded trailer addresses into
+        // `blocks_released` (freed by the next flip).
+        reopened.checkpoint_durable();
+        assert_eq!(reopened.free_set().count_released(), trailer_blocks_total);
+        for &address in &scattered[..8] {
+            assert!(reopened.free_set().is_free(address));
+        }
     }
 }
