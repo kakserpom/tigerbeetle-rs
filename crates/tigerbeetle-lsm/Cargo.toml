@@ -8,3 +8,8 @@ tigerbeetle-core = { path = "../tigerbeetle-core" }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+# Tests must observe the same `CONFIG` (test_min) that upstream tests use; see the
+# `test-min` feature docs in tigerbeetle-core.
+tigerbeetle-core = { path = "../tigerbeetle-core", features = ["test-min"] }

@@ -9,13 +9,17 @@ use tigerbeetle_core::constants::{
 };
 use tigerbeetle_core::stdx::align_forward;
 
-/// Port of `superblock.SuperBlockVersion`.
+/// Port of `superblock.SuperBlockVersion` (src/vsr/superblock.zig:45).
 ///
-/// DEVIATION: upstream selects `0` for development builds (release == minimum) and `2` for
-/// production releases, based on build-injected config (`config.process.release`) which this
-/// port does not model yet (`crates/tigerbeetle-core/src/config.rs`). We are a development
-/// build, so the version is 0.
-pub const SUPERBLOCK_VERSION: u16 = 0;
+/// Upstream selects `0` only for development builds whose own injected release is exactly
+/// the minimum, and `2` otherwise — which is every real build (tests use 65535.0.0,
+/// production uses an actual release). Verified byte-for-byte against upstream's
+/// `SuperBlock.format()` output (see `format_matches_upstream_zig_golden`).
+///
+/// DEVIATION: build-time release injection isn't ported yet (`ConfigProcess` lacks
+/// `release`), so we hard-code the value every upstream build takes in practice.
+/// TODO(port): src/config.zig BuildOptions — derive from `CONFIG.process.release`.
+pub const SUPERBLOCK_VERSION: u16 = 2;
 
 /// Leave enough padding after every superblock copy so that it is feasible, in the future, to
 /// modify the `pipeline_prepare_queue_max` of an existing cluster (up to a maximum of
@@ -121,11 +125,16 @@ mod tests {
 // machinery) and ClientSessions codec.
 // ---------------------------------------------------------------------------
 
+use crate::Zone;
 use crate::message_header;
 use crate::message_header::TypedHeader as _;
 use crate::multiversion::Release;
+use crate::storage::{Completion, ReadRequest, Storage, WriteRequest};
+use crate::superblock_quorums;
 use crate::{Members, ViewChangeCommand, ViewChangeHeadersSlice, member_index};
-use tigerbeetle_core::constants::{BLOCK_SIZE, REPLICAS_MAX};
+use tigerbeetle_core::constants::{
+    BLOCK_SIZE, MEMBERS_MAX, REPLICAS_MAX, STANDBYS_MAX, STORAGE_SIZE_LIMIT_MAX,
+};
 
 pub use tigerbeetle_core::constants::CHECKPOINT_STATE_SIZE;
 
@@ -345,13 +354,18 @@ impl CheckpointState {
             assert_eq!(get_u128(offset), 0, "checksum padding != 0 @{offset}");
         }
 
+        // DEVIATION: upstream treats the superblock as raw memory, so a corrupt copy may hold
+        // garbage where a valid `Header.Prepare` should be. Such bytes cannot re-encode to
+        // what was on disk, so they shift `SuperBlockHeader::calculate_checksum` and the copy
+        // is rejected by checksum validation — we substitute a zeroed header instead of
+        // rejecting the decode outright.
         Self {
             header: message_header::Prepare::from_wire(
                 &bytes[Self::OFFSET_HEADER..Self::OFFSET_HEADER + message_header::SIZE]
                     .try_into()
                     .unwrap_or_else(|_| unreachable!("slice length checked")),
             )
-            .unwrap_or_else(|| unreachable!("stored prepare header must be valid")),
+            .unwrap_or_else(header_prepare_zeroed),
             free_set_blocks_acquired_last_block_checksum: get_u128(
                 Self::OFFSET_ACQUIRED_LB_CHECKSUM,
             ),
@@ -1492,5 +1506,1986 @@ mod header_tests {
         header.set_checksum();
         let view_change_headers = header.view_headers(&mut decoded_storage);
         assert_eq!(view_change_headers.command, ViewChangeCommand::View);
+    }
+}
+
+/// Port of `superblock.SuperBlock.Caller`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Caller {
+    Format,
+    Open,
+    Checkpoint,
+    ViewChange,
+}
+
+impl Caller {
+    /// Port of `Caller.transitions`: the set of callers that may be queued directly behind this
+    /// one.
+    ///
+    /// Beyond formatting and opening of the superblock, which are mutually exclusive of all
+    /// other operations, only the following queue combinations are allowed:
+    ///
+    /// from state → to states
+    #[must_use]
+    pub fn transitions(self) -> &'static [Self] {
+        match self {
+            Self::Format | Self::Open => &[],
+            Self::Checkpoint => &[Self::ViewChange],
+            Self::ViewChange => &[Self::Checkpoint],
+        }
+    }
+
+    /// Port of `Caller.updates_view_headers`.
+    ///
+    /// # Panics
+    /// Panics for [`Caller::Open`] (upstream: `unreachable`).
+    #[must_use]
+    pub fn updates_view_headers(self) -> bool {
+        match self {
+            Self::Format | Self::Checkpoint | Self::ViewChange => true,
+            Self::Open => unreachable!("open does not update view headers"),
+        }
+    }
+}
+
+/// Events drained via [`SuperBlock::take_events`] (upstream: context callback invocations).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Event {
+    FormatDone,
+    OpenDone,
+    CheckpointDone,
+    ViewChangeDone,
+}
+
+/// Upstream: `SuperBlock.FormatOptions`.
+#[derive(Clone, Copy, Debug)]
+pub struct FormatOptions {
+    pub cluster: u128,
+    pub release: Release,
+    pub replica: u8,
+    pub replica_count: u8,
+    /// Set to `None` during initial cluster formatting.
+    /// Set to the target view when constructing a new data file for a reformatted replica.
+    pub view: Option<u32>,
+}
+
+/// Upstream: `SuperBlock.UpdateCheckpoint`.
+///
+/// DEVIATION: upstream holds pointers (`view_attributes.headers`,
+/// `client_sessions_reference` is by-value already); here every payload is owned.
+#[derive(Clone, Debug)]
+pub struct UpdateCheckpoint {
+    /// Must update the commit_min and commit_min_checksum.
+    pub header: message_header::Prepare,
+    pub view_attributes: Option<ViewAttributes>,
+    pub commit_max: u64,
+    pub sync_op_min: u64,
+    pub sync_op_max: u64,
+    pub manifest_references: ManifestReferences,
+    pub free_set_references: FreeSetReferences,
+    pub client_sessions_reference: TrailerReference,
+    pub storage_size: u64,
+    pub release: Release,
+}
+
+/// Upstream: the anonymous `view_attributes` struct of [`UpdateCheckpoint`].
+#[derive(Clone, Debug)]
+pub struct ViewAttributes {
+    pub log_view: u32,
+    pub view: u32,
+    pub headers: crate::ViewChangeHeadersArray,
+}
+
+/// Upstream: the anonymous `free_set_references` struct of [`UpdateCheckpoint`].
+#[derive(Clone, Copy, Debug)]
+pub struct FreeSetReferences {
+    pub blocks_acquired: TrailerReference,
+    pub blocks_released: TrailerReference,
+}
+
+/// Upstream: `SuperBlock.UpdateViewChange`.
+///
+/// The replica calls view_change():
+///
+/// - to persist its view/log_view — it cannot advertise either value until it is certain
+///   they will never backtrack.
+/// - to update checkpoint during sync
+///
+/// The update must advance view/log_view (monotonically increasing) or checkpoint.
+// TODO(port): upstream notes the current naming is confusing and needs changing: during sync,
+// this function doesn't necessarily advance the view (superblock.zig `view_change`).
+#[derive(Clone, Debug)]
+pub struct UpdateViewChange {
+    pub commit_max: u64,
+    pub log_view: u32,
+    pub view: u32,
+    pub headers: crate::ViewChangeHeadersArray,
+    pub sync_checkpoint: Option<SyncCheckpoint>,
+}
+
+/// Upstream: the anonymous `sync_checkpoint` struct of [`UpdateViewChange`].
+#[derive(Clone, Debug)]
+pub struct SyncCheckpoint {
+    pub checkpoint: CheckpointState,
+    pub sync_op_min: u64,
+    pub sync_op_max: u64,
+}
+
+/// Per-operation state (upstream: `superblock.Context`, with our storage completions taking
+/// the role of the embedded `Storage.Read`/`Storage.Write` slots).
+struct Context {
+    caller: Caller,
+
+    /// Write/read progress within the operation (upstream: `context.copy`).
+    copy: Option<u8>,
+    /// Set while a sequence of superblock reads is in flight (upstream: `read_threshold`).
+    read_threshold: Option<superblock_quorums::Threshold>,
+
+    /// Format/checkpoint/view_change: the VSR state to install into the staging header.
+    vsr_state: Option<VSRState>,
+    /// Format/checkpoint/view_change: the View/JV headers to install.
+    view_headers: Option<crate::ViewChangeHeadersArray>,
+
+    /// Open only: the repair plan derived from the working quorum.
+    repairs: Option<superblock_quorums::RepairIterator>,
+}
+
+/// Port of `superblock.SuperBlock` (the runtime half — format and open).
+///
+/// DEVIATION: upstream stores a `*Storage` pointer; here the owner passes the storage to each
+/// I/O-driving call (`format`/`open`/`poll`), matching this repo's convention in
+/// `client_replies`. A future `Replica` will hand us the same storage on every poll.
+pub struct SuperBlock {
+    /// The current superblock header.
+    working: SuperBlockHeader,
+    /// The next superblock header (a work-in-progress copy of `working`).
+    staging: SuperBlockHeader,
+    /// The superblock copies being read from storage.
+    reading: [SuperBlockHeader; SUPERBLOCK_COPIES],
+
+    /// Whether the superblock has been opened. An open superblock may not be formatted.
+    opened: bool,
+
+    /// Runtime limit on the size of the datafile.
+    storage_size_limit: u64,
+
+    /// The active operation, if any (upstream: `queue_head`).
+    queue_head: Option<Context>,
+    /// An operation queued behind the active one (upstream: `queue_tail`). Only
+    /// checkpoint/view_change may be queued, and only behind each other.
+    queue_tail: Option<Context>,
+
+    /// Set after format(); finalized by open(). Used for logging.
+    replica_index: Option<u8>,
+
+    events: std::collections::VecDeque<Event>,
+}
+
+/// An all-zero header (upstream leaves working/staging/reading `undefined` until an operation
+/// installs them; Rust needs *something*, and all-zeros round-trips the wire codec).
+fn header_zeroed() -> SuperBlockHeader {
+    SuperBlockHeader {
+        checksum: 0,
+        checksum_padding: 0,
+        copy: 0,
+        version: 0,
+        release_format: Release::ZERO,
+        sequence: 0,
+        cluster: 0,
+        parent: 0,
+        parent_padding: 0,
+        vsr_state: VSRState {
+            checkpoint: checkpoint_state_zeroed(),
+            replica_id: 0,
+            members: [0; MEMBERS_MAX],
+            commit_max: 0,
+            sync_op_min: 0,
+            sync_op_max: 0,
+            sync_view: 0,
+            log_view: 0,
+            view: 0,
+            replica_count: 0,
+        },
+        flags: 0,
+        view_headers_count: 0,
+        view_headers_all: [[0; message_header::SIZE]; VIEW_HEADERS_MAX as usize],
+    }
+}
+
+/// An all-zero `CheckpointState` (upstream: field-by-field zeroing in `format()`).
+fn checkpoint_state_zeroed() -> CheckpointState {
+    CheckpointState {
+        header: header_prepare_zeroed(),
+        free_set_blocks_acquired_last_block_checksum: 0,
+        free_set_blocks_acquired_last_block_checksum_padding: 0,
+        free_set_blocks_released_last_block_checksum: 0,
+        free_set_blocks_released_last_block_checksum_padding: 0,
+        client_sessions_last_block_checksum: 0,
+        client_sessions_last_block_checksum_padding: 0,
+        manifest_oldest_checksum: 0,
+        manifest_oldest_checksum_padding: 0,
+        manifest_newest_checksum: 0,
+        manifest_newest_checksum_padding: 0,
+        snapshots_block_checksum: 0,
+        snapshots_block_checksum_padding: 0,
+        free_set_blocks_acquired_checksum: 0,
+        free_set_blocks_released_checksum: 0,
+        client_sessions_checksum: 0,
+        parent_checkpoint_id: 0,
+        grandparent_checkpoint_id: 0,
+        free_set_blocks_acquired_last_block_address: 0,
+        free_set_blocks_released_last_block_address: 0,
+        client_sessions_last_block_address: 0,
+        manifest_oldest_address: 0,
+        manifest_newest_address: 0,
+        snapshots_block_address: 0,
+        storage_size: 0,
+        free_set_blocks_acquired_size: 0,
+        free_set_blocks_released_size: 0,
+        client_sessions_size: 0,
+        manifest_block_count: 0,
+        release: Release::ZERO,
+    }
+}
+
+/// An all-zero `vsr.Header.Prepare` (upstream: `mem.zeroes(vsr.Header.Prepare)`). Note that
+/// `Prepare::default()` is *not* zeroed: it fills in size/protocol/command.
+fn header_prepare_zeroed() -> message_header::Prepare {
+    use crate::command::Command;
+
+    message_header::Prepare {
+        size: 0,
+        protocol: 0,
+        command: Command::Reserved,
+        ..message_header::Prepare::default()
+    }
+}
+
+/// Decodes a copy read from disk, tolerating garbage in the areas that valid headers keep
+/// zeroed. Upstream reads raw bytes into the struct and lets the checksum reject corruption;
+/// here, sanitizing first keeps `from_wire`'s reserved-area assertions intact while producing
+/// the same outcome (garbage shifts the checksum input, so such copies fail validation).
+fn reading_decode(bytes: &[u8; SUPERBLOCK_HEADER_SIZE]) -> SuperBlockHeader {
+    let mut sanitized = *bytes;
+    sanitized[SuperBlockHeader::OFFSET_RESERVED
+        ..SuperBlockHeader::OFFSET_RESERVED + SuperBlockHeader::RESERVED_LEN]
+        .fill(0);
+    sanitized[SuperBlockHeader::OFFSET_VIEW_HEADERS_RESERVED..].fill(0);
+    SuperBlockHeader::from_wire(&sanitized)
+        .unwrap_or_else(|| unreachable!("sanitized bytes satisfy from_wire's checks"))
+}
+
+impl SuperBlock {
+    /// Port of `SuperBlock.init`.
+    ///
+    /// # Panics
+    /// Panics unless `storage_size_limit` is sector-aligned and within
+    /// `[data_file_size_min, storage_size_limit_max]` (upstream asserts).
+    #[must_use]
+    pub fn new(storage_size_limit: u64) -> Self {
+        assert!(storage_size_limit >= DATA_FILE_SIZE_MIN as u64);
+        assert!(storage_size_limit <= STORAGE_SIZE_LIMIT_MAX as u64);
+        assert_eq!(storage_size_limit % SECTOR_SIZE as u64, 0);
+
+        Self {
+            working: header_zeroed(),
+            staging: header_zeroed(),
+            reading: core::array::from_fn(|_| header_zeroed()),
+            opened: false,
+            storage_size_limit,
+            queue_head: None,
+            queue_tail: None,
+            replica_index: None,
+            events: std::collections::VecDeque::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn opened(&self) -> bool {
+        self.opened
+    }
+
+    #[must_use]
+    pub fn working(&self) -> &SuperBlockHeader {
+        &self.working
+    }
+
+    #[must_use]
+    pub fn staging(&self) -> &SuperBlockHeader {
+        &self.staging
+    }
+
+    #[must_use]
+    pub fn replica_index(&self) -> Option<u8> {
+        self.replica_index
+    }
+
+    /// Port of `SuperBlock.grid_size_limit`.
+    #[must_use]
+    pub fn grid_size_limit(&self) -> u64 {
+        self.storage_size_limit - DATA_FILE_SIZE_MIN as u64
+    }
+
+    /// Port of `SuperBlock.format`.
+    ///
+    /// # Panics
+    /// Panics if the superblock was already opened/formatted or an operation is active, and
+    /// on invalid options (upstream asserts).
+    pub fn format(&mut self, storage: &mut dyn Storage, options: FormatOptions) {
+        assert!(!self.opened);
+        assert!(self.replica_index.is_none());
+        assert!(self.queue_head.is_none(), "another superblock operation is active");
+
+        assert!(options.release.value > 0);
+        assert!(options.replica_count > 0);
+        assert!(options.replica_count as usize <= REPLICAS_MAX);
+        assert!((options.replica as usize) < options.replica_count as usize + STANDBYS_MAX);
+        if let Some(view) = options.view {
+            assert!(view > 1);
+            assert!(options.replica < options.replica_count);
+        }
+
+        let members = crate::root_members(options.cluster);
+        let replica_id = members[usize::from(options.replica)];
+
+        self.replica_index = member_index(&members, replica_id);
+
+        // This working copy provides the parent checksum, and will not be written to disk.
+        // We therefore use zero values to make this parent checksum as stable as possible.
+        self.working = SuperBlockHeader {
+            checksum: 0,
+            checksum_padding: 0,
+            copy: 0,
+            version: SUPERBLOCK_VERSION,
+            sequence: 0,
+            release_format: options.release,
+            cluster: options.cluster,
+            parent: 0,
+            parent_padding: 0,
+            vsr_state: VSRState {
+                checkpoint: checkpoint_state_zeroed(),
+                replica_id,
+                members,
+                commit_max: 0,
+                sync_op_min: 0,
+                sync_op_max: 0,
+                sync_view: 0,
+                log_view: 0,
+                view: 0,
+                replica_count: options.replica_count,
+            },
+            flags: 0,
+            view_headers_count: 0,
+            view_headers_all: [[0; message_header::SIZE]; VIEW_HEADERS_MAX as usize],
+        };
+
+        self.working.set_checksum();
+
+        self.acquire(
+            storage,
+            Context {
+                caller: Caller::Format,
+                copy: None,
+                read_threshold: None,
+                vsr_state: Some(VSRState::root(VSRStateRootOptions {
+                    cluster: options.cluster,
+                    release: options.release,
+                    replica_id,
+                    members,
+                    replica_count: options.replica_count,
+                    view: options.view.unwrap_or(0),
+                })),
+                view_headers: Some(crate::ViewChangeHeadersArray::root(options.cluster)),
+                repairs: None,
+            },
+        );
+    }
+
+    /// Port of `SuperBlock.open`.
+    ///
+    /// # Panics
+    /// Panics if the superblock was already opened or another operation is active, and (via
+    /// `poll`) when no valid quorum can be restored from disk.
+    pub fn open(&mut self, storage: &mut dyn Storage) {
+        assert!(!self.opened);
+        assert!(self.queue_head.is_none(), "another superblock operation is active");
+
+        self.acquire(
+            storage,
+            Context {
+                caller: Caller::Open,
+                copy: None,
+                read_threshold: None,
+                vsr_state: None,
+                view_headers: None,
+                repairs: None,
+            },
+        );
+    }
+
+    /// Port of `SuperBlock.checkpoint`.
+    ///
+    /// Must update the commit_min and commit_min_checksum.
+    ///
+    /// # Panics
+    /// Panics unless the superblock is open and the update advances the checkpoint validly,
+    /// and when another operation is active that may not be queued behind (upstream asserts).
+    pub fn checkpoint(&mut self, storage: &mut dyn Storage, update: &UpdateCheckpoint) {
+        assert!(self.opened);
+        assert!(update.header.op <= update.commit_max);
+        assert!(update.header.op > self.staging.vsr_state.checkpoint.header.op);
+        assert_ne!(
+            update.header.checksum, self.staging.vsr_state.checkpoint.header.checksum,
+            "the checkpoint header must update the commit_min_checksum"
+        );
+        assert!(update.sync_op_min <= update.sync_op_max);
+        assert!(
+            update.release.value >= self.staging.vsr_state.checkpoint.release.value,
+            "release downgrade: new={} staging={}",
+            update.release.value,
+            self.staging.vsr_state.checkpoint.release.value
+        );
+
+        assert!(update.storage_size <= self.storage_size_limit);
+        assert!(update.storage_size >= DATA_FILE_SIZE_MIN as u64);
+        assert_eq!(
+            update.storage_size == DATA_FILE_SIZE_MIN as u64,
+            update.free_set_references.blocks_acquired.empty()
+                && update.free_set_references.blocks_released.empty(),
+        );
+
+        // NOTE: Upstream reads `staging.vsr_state` through a copy (`vsr_state_staging`) to dodge
+        // a Zig 0.11.0 miscompilation; in Rust plain reads are fine, but we keep the same shape.
+        let vsr_state_staging = self.staging.vsr_state;
+
+        let mut vsr_state = self.staging.vsr_state;
+        vsr_state.checkpoint = CheckpointState {
+            header: update.header,
+
+            parent_checkpoint_id: self.staging.checkpoint_id(),
+            grandparent_checkpoint_id: vsr_state_staging.checkpoint.parent_checkpoint_id,
+
+            free_set_blocks_acquired_checksum: update.free_set_references.blocks_acquired.checksum,
+            free_set_blocks_released_checksum: update.free_set_references.blocks_released.checksum,
+
+            free_set_blocks_acquired_size: update.free_set_references.blocks_acquired.trailer_size,
+            free_set_blocks_released_size: update.free_set_references.blocks_released.trailer_size,
+
+            free_set_blocks_acquired_last_block_checksum: update
+                .free_set_references
+                .blocks_acquired
+                .last_block_checksum,
+            free_set_blocks_released_last_block_checksum: update
+                .free_set_references
+                .blocks_released
+                .last_block_checksum,
+
+            free_set_blocks_acquired_last_block_address: update
+                .free_set_references
+                .blocks_acquired
+                .last_block_address,
+            free_set_blocks_released_last_block_address: update
+                .free_set_references
+                .blocks_released
+                .last_block_address,
+
+            client_sessions_checksum: update.client_sessions_reference.checksum,
+            client_sessions_last_block_checksum: update
+                .client_sessions_reference
+                .last_block_checksum,
+            client_sessions_last_block_address: update.client_sessions_reference.last_block_address,
+            client_sessions_size: update.client_sessions_reference.trailer_size,
+
+            manifest_oldest_checksum: update.manifest_references.oldest_checksum,
+            manifest_oldest_address: update.manifest_references.oldest_address,
+            manifest_newest_checksum: update.manifest_references.newest_checksum,
+            manifest_newest_address: update.manifest_references.newest_address,
+            manifest_block_count: update.manifest_references.block_count,
+
+            storage_size: update.storage_size,
+            snapshots_block_checksum: vsr_state_staging.checkpoint.snapshots_block_checksum,
+            snapshots_block_address: vsr_state_staging.checkpoint.snapshots_block_address,
+            release: update.release,
+
+            ..checkpoint_state_zeroed()
+        };
+        vsr_state.commit_max = update.commit_max;
+        vsr_state.sync_op_min = update.sync_op_min;
+        vsr_state.sync_op_max = update.sync_op_max;
+        vsr_state.sync_view = 0;
+        if let Some(view_attributes) = &update.view_attributes {
+            assert!(view_attributes.log_view <= view_attributes.view);
+            view_attributes.headers.verify();
+            vsr_state.log_view = view_attributes.log_view;
+            vsr_state.view = view_attributes.view;
+        }
+
+        assert!(VSRState::would_be_updated_by(&self.staging.vsr_state, &vsr_state));
+
+        let view_headers = if let Some(view_attributes) = &update.view_attributes {
+            view_attributes.headers.clone()
+        } else {
+            let mut decoded = [message_header::Prepare::default(); VIEW_HEADERS_MAX as usize];
+            let slice = self.staging.view_headers(&mut decoded);
+            crate::ViewChangeHeadersArray::init(slice.command, slice.slice)
+        };
+
+        self.acquire(
+            storage,
+            Context {
+                caller: Caller::Checkpoint,
+                copy: None,
+                read_threshold: None,
+                vsr_state: Some(vsr_state),
+                view_headers: Some(view_headers),
+                repairs: None,
+            },
+        );
+    }
+
+    /// Port of `SuperBlock.view_change`.
+    ///
+    /// # Panics
+    /// Panics unless the superblock is open and the update advances view/log_view (or installs
+    /// a sync checkpoint) validly, and when another operation is active that may not be queued
+    /// behind (upstream asserts).
+    pub fn view_change(&mut self, storage: &mut dyn Storage, update: UpdateViewChange) {
+        assert!(self.opened);
+        assert!(self.staging.vsr_state.commit_max <= update.commit_max);
+        assert!(self.staging.vsr_state.view <= update.view);
+        assert!(self.staging.vsr_state.log_view <= update.log_view);
+        assert!(
+            self.staging.vsr_state.log_view < update.log_view
+                || self.staging.vsr_state.view < update.view
+                || update.sync_checkpoint.is_some()
+        );
+        assert!(
+            (update.headers.command == crate::ViewChangeCommand::View
+                && update.log_view == update.view)
+                || (update.headers.command == crate::ViewChangeCommand::JoinView
+                    && update.log_view < update.view)
+        );
+        assert!(
+            self.staging.vsr_state.checkpoint.header.op <= update.headers.array.slice()[0].op,
+            "the checkpoint must not be ahead of the view change headers"
+        );
+
+        update.headers.verify();
+        assert!(update.view >= update.log_view);
+
+        let mut vsr_state = self.staging.vsr_state;
+        vsr_state.commit_max = update.commit_max;
+        vsr_state.log_view = update.log_view;
+        vsr_state.view = update.view;
+        if let Some(sync_checkpoint) = &update.sync_checkpoint {
+            assert!(
+                self.staging.vsr_state.checkpoint.header.op < sync_checkpoint.checkpoint.header.op
+            );
+
+            let checkpoint_next =
+                crate::checkpoint::checkpoint_after(self.staging.vsr_state.checkpoint.header.op);
+            let checkpoint_next_next = crate::checkpoint::checkpoint_after(checkpoint_next);
+
+            if sync_checkpoint.checkpoint.header.op == checkpoint_next {
+                assert_eq!(
+                    sync_checkpoint.checkpoint.parent_checkpoint_id,
+                    self.staging.checkpoint_id(),
+                    "sync checkpoint parent mismatch"
+                );
+            } else if sync_checkpoint.checkpoint.header.op == checkpoint_next_next {
+                assert_eq!(
+                    sync_checkpoint.checkpoint.grandparent_checkpoint_id,
+                    self.staging.checkpoint_id(),
+                    "sync checkpoint grandparent mismatch"
+                );
+            }
+
+            vsr_state.checkpoint = sync_checkpoint.checkpoint;
+            vsr_state.sync_op_min = sync_checkpoint.sync_op_min;
+            vsr_state.sync_op_max = sync_checkpoint.sync_op_max;
+        }
+        assert!(VSRState::would_be_updated_by(&self.staging.vsr_state, &vsr_state));
+
+        self.acquire(
+            storage,
+            Context {
+                caller: Caller::ViewChange,
+                copy: None,
+                read_threshold: None,
+                vsr_state: Some(vsr_state),
+                view_headers: Some(update.headers),
+                repairs: None,
+            },
+        );
+    }
+
+    /// Port of `SuperBlock.updating`: whether an operation with this caller is queued or
+    /// running.
+    ///
+    /// # Panics
+    /// Panics unless the superblock is open (upstream asserts).
+    #[must_use]
+    pub fn updating(&self, caller: Caller) -> bool {
+        assert!(self.opened);
+
+        if let Some(head) = &self.queue_head
+            && head.caller == caller
+        {
+            return true;
+        }
+
+        if let Some(tail) = &self.queue_tail {
+            return tail.caller == caller;
+        }
+
+        false
+    }
+
+    /// Drives storage completions, emitting [`Event`]s (upstream: callback invocations).
+    ///
+    /// The superblock issues at most one I/O at a time (see `read_working`), so every
+    /// completion correlates with the active operation's current step.
+    ///
+    /// # Panics
+    /// Panics on completions without an active operation, foreign zones, quorum failures
+    /// (fork / not found / quorum lost / …), incompatible versions, failed post-write
+    /// verification, and oversized data files (all mirroring upstream panics/fatals).
+    pub fn poll(&mut self, storage: &mut dyn Storage) {
+        while let Some(completion) = storage.next_completion() {
+            assert_eq!(completion.zone(), Zone::Superblock);
+            match completion {
+                Completion::Read(request) => self.poll_read(storage, request),
+                Completion::Write(request) => self.poll_write(storage, request),
+            }
+        }
+    }
+
+    /// Drains accumulated events (upstream: callbacks invoked synchronously).
+    pub fn take_events(&mut self) -> Vec<Event> {
+        self.events.drain(..).collect()
+    }
+
+    fn op_mut(&mut self) -> &mut Context {
+        self.queue_head.as_mut().unwrap_or_else(|| unreachable!("operation is active"))
+    }
+
+    /// Port of `SuperBlock.acquire`: starts the operation immediately if none is running,
+    /// otherwise queues it behind the active one.
+    fn acquire(&mut self, storage: &mut dyn Storage, context: Context) {
+        if let Some(head) = &self.queue_head {
+            let head_caller = head.caller;
+            // All operations are mutually exclusive with themselves.
+            assert_ne!(
+                head_caller, context.caller,
+                "all operations are mutually exclusive with themselves"
+            );
+            assert!(
+                head_caller.transitions().contains(&context.caller),
+                "{head_caller:?} may not be followed by {:?}",
+                context.caller
+            );
+            assert!(self.queue_tail.is_none());
+
+            self.queue_tail = Some(context);
+        } else {
+            assert!(self.queue_tail.is_none());
+
+            let caller = context.caller;
+            self.queue_head = Some(context);
+
+            match caller {
+                Caller::Open => self.read_working(storage, superblock_quorums::Threshold::Open),
+                _ => self.write_staging(storage),
+            }
+        }
+    }
+
+    /// Port of `SuperBlock.release`: completes the head operation, fires its event, and starts
+    /// the queued operation (if any).
+    fn release(&mut self, storage: &mut dyn Storage) {
+        let op = self.queue_head.take().unwrap_or_else(|| unreachable!("operation is active"));
+        let queued = self.queue_tail.take();
+
+        match op.caller {
+            Caller::Format => {}
+            Caller::Open => {
+                assert!(!self.opened);
+                self.opened = true;
+                let replica_index = member_index(
+                    &self.working.vsr_state.members,
+                    self.working.vsr_state.replica_id,
+                )
+                .unwrap_or_else(|| unreachable!("working vsr_state carries a known member"));
+                self.replica_index = Some(replica_index);
+            }
+            Caller::Checkpoint | Caller::ViewChange => {
+                // read_working_done() installed the staged header into working via a verified
+                // quorum; both must carry exactly the state this operation committed to.
+                let vsr_state =
+                    op.vsr_state.as_ref().unwrap_or_else(|| unreachable!("writer carries state"));
+                assert_eq!(&self.staging.vsr_state, vsr_state);
+                assert_eq!(&self.working.vsr_state, vsr_state);
+            }
+        }
+
+        // The next operation in the queue may start now (if any).
+        if let Some(tail) = queued {
+            self.acquire(storage, tail);
+        }
+
+        let event = match op.caller {
+            Caller::Format => Event::FormatDone,
+            Caller::Open => Event::OpenDone,
+            Caller::Checkpoint => Event::CheckpointDone,
+            Caller::ViewChange => Event::ViewChangeDone,
+        };
+        self.events.push_back(event);
+    }
+
+    /// Port of `SuperBlock.write_staging`.
+    fn write_staging(&mut self, storage: &mut dyn Storage) {
+        let caller = self.op_mut().caller;
+        assert_ne!(caller, Caller::Open);
+        if caller != Caller::Format {
+            assert!(self.opened);
+        }
+        assert!(self.queue_tail.is_none());
+        assert!(caller.updates_view_headers());
+
+        // Snapshot the context inputs first (upstream reads context.* freely; here the
+        // mutable context borrow must end before mutating working/staging).
+        let (vsr_state, view_headers_wires) = {
+            let op = self.op_mut();
+            assert!(op.copy.is_none());
+
+            let vsr_state =
+                op.vsr_state.as_ref().unwrap_or_else(|| unreachable!("writer carries vsr_state"));
+            vsr_state.assert_internally_consistent();
+
+            let headers = op
+                .view_headers
+                .as_ref()
+                .unwrap_or_else(|| unreachable!("format/checkpoint/view_change update headers"));
+            let view_headers_wires: Vec<[u8; message_header::SIZE]> =
+                headers.array.slice().iter().map(message_header::TypedHeader::to_wire).collect();
+
+            (*vsr_state, view_headers_wires)
+        };
+
+        self.staging = self.working.clone();
+        self.staging.sequence += 1;
+        self.staging.parent = self.staging.checksum;
+        self.staging.vsr_state = vsr_state;
+
+        let count = view_headers_wires.len();
+        self.staging.view_headers_count =
+            u32::try_from(count).unwrap_or_else(|_| unreachable!("view_headers_max fits u32"));
+        for (slot, wire) in self.staging.view_headers_all.iter_mut().zip(view_headers_wires.iter())
+        {
+            *slot = *wire;
+        }
+        for slot in self.staging.view_headers_all.iter_mut().skip(count) {
+            *slot = [0; message_header::SIZE];
+        }
+
+        self.op_mut().copy = Some(0);
+        self.staging.set_checksum();
+        self.write_header(storage);
+    }
+
+    /// Port of `SuperBlock.write_header`.
+    fn write_header(&mut self, storage: &mut dyn Storage) {
+        let caller = self.op_mut().caller;
+
+        // We update the working superblock for a checkpoint/format/view_change:
+        // open() does not update the working superblock, since it only writes to repair.
+        if caller == Caller::Open {
+            assert_eq!(self.staging.sequence, self.working.sequence);
+        } else {
+            assert_eq!(self.staging.sequence, self.working.sequence + 1);
+            assert_eq!(self.staging.parent, self.working.checksum);
+        }
+
+        // The superblock cluster and replica should never change once formatted:
+        assert_eq!(self.staging.cluster, self.working.cluster);
+        assert_eq!(self.staging.vsr_state.replica_id, self.working.vsr_state.replica_id);
+
+        let storage_size = self.staging.vsr_state.checkpoint.storage_size;
+        assert!(storage_size >= DATA_FILE_SIZE_MIN as u64);
+        assert!(storage_size <= STORAGE_SIZE_LIMIT_MAX as u64);
+
+        let copy = self.op_mut().copy.unwrap_or_else(|| unreachable!("copy is set"));
+        assert!((copy as usize) < SUPERBLOCK_COPIES);
+        self.staging.copy = u16::from(copy);
+        // Updating the copy number should not affect the checksum, which was previously set:
+        assert!(self.staging.valid_checksum());
+
+        let buffer = self.staging.to_wire().to_vec();
+        let offset = SUPERBLOCK_COPY_SIZE as u64 * u64::from(copy);
+        assert_bounds(offset, buffer.len());
+
+        storage.write_sectors(WriteRequest {
+            zone: Zone::Superblock,
+            offset_in_zone: offset,
+            buffer,
+        });
+    }
+
+    fn poll_write(&mut self, storage: &mut dyn Storage, request: WriteRequest) {
+        let caller = self.op_mut().caller;
+        let copy = self.op_mut().copy.unwrap_or_else(|| unreachable!("write was in flight"));
+        assert_eq!(
+            request.offset_in_zone,
+            SUPERBLOCK_COPY_SIZE as u64 * u64::from(copy),
+            "unexpected write completion"
+        );
+        drop(request.buffer);
+
+        if caller == Caller::Open {
+            self.op_mut().copy = None;
+            self.repair(storage);
+            return;
+        }
+
+        if (copy as usize) + 1 == SUPERBLOCK_COPIES {
+            self.op_mut().copy = None;
+            self.read_working(storage, superblock_quorums::Threshold::Verify);
+        } else {
+            self.op_mut().copy = Some(copy + 1);
+            self.write_header(storage);
+        }
+    }
+
+    /// Port of `SuperBlock.read_working`.
+    fn read_working(
+        &mut self,
+        storage: &mut dyn Storage,
+        threshold: superblock_quorums::Threshold,
+    ) {
+        {
+            let op = self.op_mut();
+            assert!(op.copy.is_none());
+            assert!(op.read_threshold.is_none());
+
+            // We do not submit reads in parallel, as while this would shave off 1ms, it would
+            // also increase the risk that a single fault applies to more reads due to temporal
+            // locality. See "An Analysis of Data Corruption in the Storage Stack".
+            op.copy = Some(0);
+            op.read_threshold = Some(threshold);
+        }
+        self.reading = core::array::from_fn(|_| header_zeroed());
+        self.read_header(storage);
+    }
+
+    /// Port of `SuperBlock.read_header`.
+    fn read_header(&mut self, storage: &mut dyn Storage) {
+        let copy = self.op_mut().copy.unwrap_or_else(|| unreachable!("copy is set"));
+        assert!((copy as usize) < SUPERBLOCK_COPIES);
+        assert!(self.op_mut().read_threshold.is_some());
+
+        let offset = SUPERBLOCK_COPY_SIZE as u64 * u64::from(copy);
+        assert_bounds(offset, SUPERBLOCK_HEADER_SIZE);
+
+        storage.read_sectors(ReadRequest {
+            zone: Zone::Superblock,
+            offset_in_zone: offset,
+            buffer: crate::storage::zeroed_buffer(SUPERBLOCK_HEADER_SIZE),
+        });
+    }
+
+    fn poll_read(&mut self, storage: &mut dyn Storage, request: ReadRequest) {
+        let copy = self.op_mut().copy.unwrap_or_else(|| unreachable!("read was in flight"));
+        assert_eq!(
+            request.offset_in_zone,
+            SUPERBLOCK_COPY_SIZE as u64 * u64::from(copy),
+            "unexpected read completion"
+        );
+
+        let bytes: [u8; SUPERBLOCK_HEADER_SIZE] = request
+            .buffer
+            .try_into()
+            .unwrap_or_else(|_| unreachable!("read buffers are SUPERBLOCK_HEADER_SIZE bytes"));
+        self.reading[usize::from(copy)] = reading_decode(&bytes);
+
+        if usize::from(copy) + 1 != SUPERBLOCK_COPIES {
+            self.op_mut().copy = Some(copy + 1);
+            self.read_header(storage);
+            return;
+        }
+
+        let threshold = self
+            .op_mut()
+            .read_threshold
+            .take()
+            .unwrap_or_else(|| unreachable!("threshold is set while reading"));
+        self.op_mut().copy = None;
+
+        self.read_working_done(storage, threshold);
+    }
+
+    /// Port of the second half of `read_header_callback`: quorum decision, installation,
+    /// and dispatch to repair/release.
+    fn read_working_done(
+        &mut self,
+        storage: &mut dyn Storage,
+        threshold: superblock_quorums::Threshold,
+    ) {
+        let caller = self.op_mut().caller;
+        // True when this read pass verifies completed repairs (upstream: `context.repairs`).
+        let verifying_repairs = caller == Caller::Open
+            && self
+                .queue_head
+                .as_ref()
+                .unwrap_or_else(|| unreachable!("operation is active"))
+                .repairs
+                .is_some();
+
+        // DEVIATION: upstream keeps Quorums as a SuperBlock field; the lifetime tying the
+        // quorum to the copies slice forces us to extract everything needed while the
+        // decision is alive and drop it before mutating working/staging.
+        let (working, planned_repairs) = {
+            let mut quorums = superblock_quorums::SuperBlockQuorums::default();
+            let quorum = match quorums.working(&self.reading, threshold) {
+                Ok(quorum) => quorum,
+                Err(err) => quorum_error_panic(err),
+            };
+            assert!(quorum.valid());
+            assert!(
+                quorum.copies_count()
+                    >= usize::from(superblock_quorums::Threshold::count::<SUPERBLOCK_COPIES>(
+                        threshold
+                    ))
+            ); // `copy` may be corrupt.
+
+            let working = quorum.header().clone();
+
+            assert_eq!(
+                working.version, SUPERBLOCK_VERSION,
+                "cannot read superblock with incompatible version"
+            );
+
+            if threshold == superblock_quorums::Threshold::Verify {
+                assert_eq!(
+                    working.checksum, self.staging.checksum,
+                    "superblock failed verification after writing"
+                );
+                assert!(working.equal(&self.staging));
+            }
+
+            if caller == Caller::Format {
+                assert_eq!(working.sequence, 1);
+                assert_eq!(
+                    working.vsr_state.checkpoint.header.checksum,
+                    message_header::Prepare::root(working.cluster).checksum
+                );
+                assert_eq!(working.vsr_state.checkpoint.free_set_blocks_acquired_size, 0);
+                assert_eq!(working.vsr_state.checkpoint.free_set_blocks_released_size, 0);
+                assert_eq!(working.vsr_state.checkpoint.client_sessions_size, 0);
+                assert_eq!(working.vsr_state.checkpoint.storage_size, DATA_FILE_SIZE_MIN as u64);
+                assert_eq!(working.vsr_state.checkpoint.header.op, 0);
+                assert_eq!(working.vsr_state.commit_max, 0);
+                assert_eq!(working.vsr_state.log_view, 0);
+                // On reformat view≠0.
+                assert_eq!(working.view_headers_count, 1);
+
+                assert!(working.vsr_state.replica_count as usize <= REPLICAS_MAX);
+                assert!(
+                    member_index(&working.vsr_state.members, working.vsr_state.replica_id)
+                        .is_some()
+                );
+            }
+
+            let planned_repairs = if caller == Caller::Open && !verifying_repairs {
+                Some(quorum.repairs())
+            } else {
+                None
+            };
+            (working, planned_repairs)
+        };
+
+        self.working = working;
+        self.staging = self.working.clone();
+
+        // Reset the copies, which may be nonzero due to corruption.
+        self.working.copy = 0;
+        self.staging.copy = 0;
+
+        assert!(
+            self.working.vsr_state.checkpoint.storage_size <= self.storage_size_limit,
+            "data file too large size={} > limit={}, restart the replica increasing \
+             '--limit-storage'",
+            self.working.vsr_state.checkpoint.storage_size,
+            self.storage_size_limit
+        );
+
+        if caller == Caller::Open {
+            if verifying_repairs {
+                // We just verified that the repair completed.
+                assert_eq!(threshold, superblock_quorums::Threshold::Verify);
+                self.release(storage);
+            } else {
+                assert_eq!(threshold, superblock_quorums::Threshold::Open);
+                {
+                    let op = self.op_mut();
+                    op.repairs =
+                        Some(planned_repairs.unwrap_or_else(|| unreachable!("planned above")));
+                    op.copy = None;
+                }
+                self.repair(storage);
+            }
+        } else {
+            self.release(storage);
+        }
+    }
+
+    /// Port of `SuperBlock.repair`.
+    fn repair(&mut self, storage: &mut dyn Storage) {
+        assert_eq!(self.op_mut().caller, Caller::Open);
+        assert!(self.op_mut().copy.is_none());
+
+        let repair_copy = self
+            .op_mut()
+            .repairs
+            .as_mut()
+            .unwrap_or_else(|| unreachable!("repair requires a plan"))
+            .next_slot();
+
+        if let Some(repair_copy) = repair_copy {
+            self.op_mut().copy = Some(repair_copy);
+
+            self.staging = self.working.clone();
+            self.write_header(storage);
+        } else {
+            self.release(storage);
+        }
+    }
+}
+
+/// Mirrors upstream's per-error panics in `read_header_callback`.
+fn quorum_error_panic(error: superblock_quorums::QuorumError) -> ! {
+    match error {
+        superblock_quorums::QuorumError::Fork => panic!("superblock forked"),
+        superblock_quorums::QuorumError::NotFound => panic!("superblock not found"),
+        superblock_quorums::QuorumError::QuorumLost => panic!("superblock quorum lost"),
+        superblock_quorums::QuorumError::ParentNotConnected => {
+            panic!("superblock parent not connected")
+        }
+        superblock_quorums::QuorumError::ParentSkipped => panic!("superblock parent superseded"),
+        superblock_quorums::QuorumError::VSRStateNotMonotonic => {
+            panic!("superblock vsr state not monotonic")
+        }
+    }
+}
+
+/// Port of `SuperBlock.assert_bounds`.
+fn assert_bounds(offset: u64, size: usize) {
+    assert!(offset + size as u64 <= SUPERBLOCK_ZONE_SIZE as u64);
+}
+
+#[cfg(test)]
+mod superblock_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::{
+        Caller, DATA_FILE_SIZE_MIN, Event, FormatOptions, FreeSetReferences, ManifestReferences,
+        SUPERBLOCK_COPIES, SUPERBLOCK_COPY_SIZE, SUPERBLOCK_HEADER_SIZE, SUPERBLOCK_ZONE_SIZE,
+        SuperBlock, SyncCheckpoint, TrailerReference, UpdateCheckpoint, UpdateViewChange,
+    };
+    use crate::Zone;
+    use crate::message_header::{self, TypedHeader as _};
+    use crate::multiversion::Release;
+    use crate::storage::{
+        Completion, MemoryStorage, ReadRequest, Storage, WriteRequest, zeroed_buffer,
+    };
+    use tigerbeetle_core::constants::VIEW_HEADERS_MAX;
+
+    const CLUSTER: u128 = 0x00A1_B2C3;
+
+    fn format_options(replica_count: u8) -> FormatOptions {
+        FormatOptions {
+            cluster: CLUSTER,
+            release: Release::MINIMUM,
+            replica: 0,
+            replica_count,
+            view: None,
+        }
+    }
+
+    /// Drives the storage until no completions remain, then drains events.
+    fn poll(sb: &mut SuperBlock, storage: &mut MemoryStorage) -> Vec<Event> {
+        sb.poll(storage);
+        sb.take_events()
+    }
+
+    fn formatted(storage: &mut MemoryStorage, options: FormatOptions) -> SuperBlock {
+        let mut sb = SuperBlock::new(DATA_FILE_SIZE_MIN as u64);
+        sb.format(storage, options);
+        assert_eq!(poll(&mut sb, storage), vec![Event::FormatDone]);
+        assert!(!sb.opened(), "format() must not set opened");
+        assert_eq!(sb.replica_index(), Some(0));
+        sb
+    }
+
+    /// A superblock that has been formatted *and* opened (the fuzzer's steady state).
+    fn opened(storage: &mut MemoryStorage, options: FormatOptions) -> SuperBlock {
+        let mut sb = formatted(storage, options);
+        sb.open(storage);
+        assert_eq!(poll(&mut sb, storage), vec![Event::OpenDone]);
+        assert!(sb.opened());
+        sb
+    }
+
+    /// Reads a raw superblock copy straight from disk.
+    fn raw_read(storage: &mut MemoryStorage, copy: usize) -> [u8; SUPERBLOCK_HEADER_SIZE] {
+        storage.read_sectors(ReadRequest {
+            zone: Zone::Superblock,
+            offset_in_zone: SUPERBLOCK_COPY_SIZE as u64 * copy as u64,
+            buffer: zeroed_buffer(SUPERBLOCK_HEADER_SIZE),
+        });
+        match storage.next_completion() {
+            Some(Completion::Read(request)) => request.buffer.try_into().ok().unwrap(),
+            _ => unreachable!("one read in, one completion out"),
+        }
+    }
+
+    fn raw_write(storage: &mut MemoryStorage, copy: usize, bytes: &[u8; SUPERBLOCK_HEADER_SIZE]) {
+        storage.write_sectors(WriteRequest {
+            zone: Zone::Superblock,
+            offset_in_zone: SUPERBLOCK_COPY_SIZE as u64 * copy as u64,
+            buffer: bytes.to_vec(),
+        });
+        assert!(storage.next_completion().is_some());
+    }
+
+    /// Marks every sector of `copy` as a latent sector error (reads zero-fill, so the copy
+    /// fails checksum validation — an effective "corrupt copy" for these tests).
+    fn corrupt_copy(storage: &mut MemoryStorage, copy: usize) {
+        let base = Zone::Superblock.offset(SUPERBLOCK_COPY_SIZE as u64 * copy as u64);
+        let sectors = SUPERBLOCK_HEADER_SIZE / tigerbeetle_core::constants::SECTOR_SIZE;
+        for i in 0..sectors {
+            storage
+                .faulty_sectors
+                .insert((base / tigerbeetle_core::constants::SECTOR_SIZE as u64) + i as u64);
+        }
+    }
+
+    /// Port of upstream's format/open smoke flow (simulator-style).
+    #[test]
+    fn format_then_open_round_trip() {
+        let mut storage = MemoryStorage::new(DATA_FILE_SIZE_MIN as u64);
+
+        let sb = formatted(&mut storage, format_options(1));
+
+        // Sequential I/O: exactly one write per copy, then a full verification read pass.
+        assert_eq!(storage.write_ops, SUPERBLOCK_COPIES as u64);
+        assert_eq!(storage.read_ops, SUPERBLOCK_COPIES as u64);
+
+        assert_eq!(sb.working().sequence, 1);
+        assert_eq!(sb.working().cluster, CLUSTER);
+        assert_eq!(sb.working().view_headers_count, 1);
+        assert_eq!(sb.working().copy, 0);
+
+        // Every on-disk copy is valid, self-consistent, and equals the working header.
+        for copy in 0..SUPERBLOCK_COPIES {
+            let header = super::reading_decode(&raw_read(&mut storage, copy));
+            assert!(header.valid_checksum(), "copy {copy} invalid");
+            assert_eq!(header.copy as usize, copy);
+            assert!(header.equal(sb.working()));
+        }
+        let (reads_before_open, writes_before_open) = (storage.read_ops, storage.write_ops);
+
+        // Reopen from disk with a fresh instance.
+        let mut reopened = SuperBlock::new(DATA_FILE_SIZE_MIN as u64);
+        reopened.open(&mut storage);
+        assert_eq!(poll(&mut reopened, &mut storage), vec![Event::OpenDone]);
+
+        assert!(reopened.opened());
+        assert_eq!(reopened.replica_index(), Some(0));
+        assert_eq!(reopened.working().sequence, 1);
+        assert_eq!(reopened.working().checksum, sb.working().checksum);
+
+        // A clean open repairs nothing: one read per copy, zero writes.
+        assert_eq!(
+            storage.read_ops - reads_before_open,
+            SUPERBLOCK_COPIES as u64,
+            "open must read every copy"
+        );
+        assert_eq!(storage.write_ops - writes_before_open, 0, "clean open must not repair");
+    }
+
+    #[test]
+    fn open_repairs_faulty_copies() {
+        let mut storage = MemoryStorage::new(DATA_FILE_SIZE_MIN as u64);
+        let sb = formatted(&mut storage, format_options(1));
+        let working_checksum = sb.working().checksum;
+        drop(sb);
+
+        // Two faults: still within the open threshold (2/4).
+        corrupt_copy(&mut storage, 1);
+        corrupt_copy(&mut storage, 2);
+
+        let mut sb = SuperBlock::new(DATA_FILE_SIZE_MIN as u64);
+        sb.open(&mut storage);
+        assert_eq!(poll(&mut sb, &mut storage), vec![Event::OpenDone]);
+
+        assert!(sb.opened());
+        assert_eq!(sb.working().sequence, 1);
+        assert_eq!(sb.working().checksum, working_checksum);
+
+        // The rewrite cleared the simulated sector faults; read them back.
+        storage.faulty_sectors.clear();
+
+        // The faulty copies were rewritten and now match the working header.
+        for copy in [1usize, 2] {
+            let header = super::reading_decode(&raw_read(&mut storage, copy));
+            assert!(header.valid_checksum(), "repaired copy {copy} invalid");
+            assert_eq!(header.copy as usize, copy);
+            assert!(header.equal(sb.working()));
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "superblock not found")]
+    fn open_panics_on_fresh_storage() {
+        let mut storage = MemoryStorage::new(DATA_FILE_SIZE_MIN as u64);
+        let mut sb = SuperBlock::new(DATA_FILE_SIZE_MIN as u64);
+        sb.open(&mut storage);
+        poll(&mut sb, &mut storage);
+    }
+
+    #[test]
+    #[should_panic(expected = "superblock quorum lost")]
+    fn open_panics_when_quorum_lost() {
+        let mut storage = MemoryStorage::new(DATA_FILE_SIZE_MIN as u64);
+        let sb = formatted(&mut storage, format_options(1));
+        drop(sb);
+
+        // Three faults exceed the open threshold (needs 2/4 valid copies).
+        corrupt_copy(&mut storage, 0);
+        corrupt_copy(&mut storage, 1);
+        corrupt_copy(&mut storage, 2);
+
+        let mut sb = SuperBlock::new(DATA_FILE_SIZE_MIN as u64);
+        sb.open(&mut storage);
+        poll(&mut sb, &mut storage);
+    }
+
+    /// Two valid quorums with the same cluster/replica/sequence but different checksums:
+    /// a fork, which we refuse to resolve.
+    #[test]
+    #[should_panic(expected = "superblock forked")]
+    fn open_panics_on_fork() {
+        // Same cluster, same replica slot, but different replica_count → same sequence,
+        // same replica_id, different vsr_state → different checksum.
+        let mut merged = MemoryStorage::new(DATA_FILE_SIZE_MIN as u64);
+        let mut other = MemoryStorage::new(DATA_FILE_SIZE_MIN as u64);
+        let _a = formatted(&mut merged, format_options(1));
+        let _b = formatted(&mut other, format_options(3));
+
+        // Splice copies 2..4 from B into A's image.
+        for copy in [2usize, 3] {
+            let bytes = raw_read(&mut other, copy);
+            raw_write(&mut merged, copy, &bytes);
+        }
+
+        let mut sb = SuperBlock::new(DATA_FILE_SIZE_MIN as u64);
+        sb.open(&mut merged);
+        poll(&mut sb, &mut merged);
+    }
+
+    #[test]
+    #[should_panic(expected = "another superblock operation is active")]
+    fn operations_are_mutually_exclusive() {
+        let mut storage = MemoryStorage::new(DATA_FILE_SIZE_MIN as u64);
+        let mut sb = SuperBlock::new(DATA_FILE_SIZE_MIN as u64);
+        sb.format(&mut storage, format_options(1));
+        // The format operation is still in flight (no poll yet): a second caller is refused.
+        sb.open(&mut storage);
+    }
+
+    /// Mirrors upstream test "SuperBlockHeader" (kept close to its source here because it
+    /// exercises set_checksum/valid_checksum through the runtime path too).
+    #[test]
+    fn header_checksum_ignores_copy_field() {
+        let mut storage = MemoryStorage::new(DATA_FILE_SIZE_MIN as u64);
+        let sb = formatted(&mut storage, format_options(1));
+
+        let mut wire = sb.working().to_wire();
+        let mut decoded = super::reading_decode(&wire);
+        assert!(decoded.valid_checksum());
+
+        let copies =
+            u16::try_from(SUPERBLOCK_COPIES).unwrap_or_else(|_| unreachable!("copies fit"));
+        decoded.copy = (decoded.copy + 1) % copies;
+        wire[..].copy_from_slice(&decoded.to_wire());
+        let redone = super::reading_decode(&wire);
+        assert!(redone.valid_checksum(), "copy field must not affect the checksum");
+    }
+
+    /// The quorums module drives repair ordering; assert the plan covers all missing slots
+    /// (upstream RepairIterator semantics, exercised through the runtime's use of it).
+    #[test]
+    fn repair_plan_covers_every_missing_slot() {
+        let mut storage = MemoryStorage::new(DATA_FILE_SIZE_MIN as u64);
+        let sb = formatted(&mut storage, format_options(1));
+        drop(sb);
+
+        corrupt_copy(&mut storage, 3);
+
+        let mut sb = SuperBlock::new(DATA_FILE_SIZE_MIN as u64);
+        sb.open(&mut storage);
+        assert_eq!(poll(&mut sb, &mut storage), vec![Event::OpenDone]);
+
+        storage.faulty_sectors.clear();
+        let repaired = super::reading_decode(&raw_read(&mut storage, 3));
+        assert!(repaired.valid_checksum());
+        assert_eq!(repaired.checksum, sb.working().checksum);
+    }
+
+    /// Reads a full on-disk superblock copy (header + padding) straight from disk.
+    fn raw_read_full_copy(storage: &mut MemoryStorage, copy: usize) -> Vec<u8> {
+        storage.read_sectors(ReadRequest {
+            zone: Zone::Superblock,
+            offset_in_zone: SUPERBLOCK_COPY_SIZE as u64 * copy as u64,
+            buffer: zeroed_buffer(SUPERBLOCK_COPY_SIZE),
+        });
+        match storage.next_completion() {
+            Some(Completion::Read(request)) => request.buffer,
+            _ => unreachable!("one read in, one completion out"),
+        }
+    }
+
+    /// Golden values produced by running upstream's real `SuperBlock.format()` + `open()`
+    /// (Zig 0.14.1, test_min config) via `reference/tigerbeetle/src/tbcross_format.zig`.
+    ///
+    /// Pins the formatted superblock zone byte-for-byte (through region checksums): header
+    /// layout, VSRState/checkpoint encoding, root prepare header, checksum chaining, and the
+    /// per-copy `checksum` field. Upstream parameters: fixtures.cluster=0, replica=0,
+    /// replica_count=6, release minimum, view=null.
+    #[test]
+    fn format_matches_upstream_zig_golden() {
+        let mut storage = MemoryStorage::new(DATA_FILE_SIZE_MIN as u64);
+        // Upstream's test Storage allocates through a Zig allocator, which poisons fresh
+        // memory with 0xAA in safe builds; never-written superblock padding therefore reads
+        // as 0xAA there (the convention replica_format.zig formalizes for checksum
+        // comparisons). Replicate it so regions cover the padding too.
+        storage.poison_image();
+        let sb = formatted(
+            &mut storage,
+            FormatOptions {
+                cluster: 0,
+                release: Release::MINIMUM,
+                replica: 0,
+                replica_count: 6,
+                view: None,
+            },
+        );
+
+        assert_eq!(sb.working().sequence, 1);
+        assert_eq!(sb.working().cluster, 0);
+        assert_eq!(sb.working().vsr_state.replica_id, crate::root_members(0)[0]);
+        assert_eq!(sb.working().checksum, 0xe741_49b8_992b_5101_1bc1_5348_f1b5_dd77);
+        assert_eq!(
+            tigerbeetle_core::checksum::checksum(&sb.working().vsr_state.to_wire()),
+            0x3037_99b6_add2_362c_af2c_353a_f793_f683
+        );
+        assert_eq!(
+            sb.working().vsr_state.checkpoint.header.checksum,
+            0x5146_b8d0_e1f6_9ca2_e686_7c42_bb82_63b7
+        );
+
+        // Every stored copy (including padding) matches upstream's disk image.
+        for (copy, expected) in [
+            0x1973_db40_4ead_e7a9_998d_eaf1_33e8_2f3e,
+            0xfa6f_a111_10d4_18cd_dc1f_8b4e_e19c_fa65,
+            0x8f05_6af4_9265_3ab8_4ff5_192e_c8d8_ad95,
+            0xcac7_a8c1_cfac_d517_cdbb_35b7_0aba_2548,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(
+                tigerbeetle_core::checksum::checksum(&raw_read_full_copy(&mut storage, copy)),
+                expected,
+                "copy {copy} diverges from upstream"
+            );
+        }
+
+        // And the whole zone as one region:
+        let mut whole = Vec::with_capacity(SUPERBLOCK_ZONE_SIZE);
+        for copy in 0..SUPERBLOCK_COPIES {
+            whole.extend_from_slice(&raw_read_full_copy(&mut storage, copy));
+        }
+        assert_eq!(
+            tigerbeetle_core::checksum::checksum(&whole),
+            0x4a8b_265e_05af_09a5_1bae_99d0_b631_d601
+        );
+    }
+
+    /// Cross-validation of a full checkpoint transition against real upstream output
+    /// (`reference/tigerbeetle/src/tbcross_format.zig`, checkpoint phase): format → open →
+    /// checkpoint with the same synthetic update, then compare the resulting disk image.
+    #[test]
+    fn checkpoint_matches_upstream_zig_golden() {
+        let mut storage = MemoryStorage::new(DATA_FILE_SIZE_MIN as u64);
+        // See `format_matches_upstream_zig_golden` for why the image is poisoned first.
+        storage.poison_image();
+
+        let mut sb = SuperBlock::new(DATA_FILE_SIZE_MIN as u64);
+        sb.format(
+            &mut storage,
+            FormatOptions {
+                cluster: 0,
+                release: Release::MINIMUM,
+                replica: 0,
+                replica_count: 6,
+                view: None,
+            },
+        );
+        assert_eq!(poll(&mut sb, &mut storage), vec![Event::FormatDone]);
+        sb.open(&mut storage);
+        assert_eq!(poll(&mut sb, &mut storage), vec![Event::OpenDone]);
+
+        // The synthetic update must match the harness byte-for-byte; upstream prints the new
+        // commit_min header's checksum in its checkpoint log line.
+        let op = crate::checkpoint::checkpoint_after(0);
+        assert_eq!(op, 19);
+        let header = prepare_at_op(op, 0);
+        assert_eq!(header.checksum, 0x58bb_86d5_5b14_a17c_17a4_86f8_f486_4cb4);
+
+        sb.checkpoint(&mut storage, &checkpoint_update(header));
+        assert_eq!(poll(&mut sb, &mut storage), vec![Event::CheckpointDone]);
+
+        assert_eq!(sb.working().sequence, 2);
+        assert_eq!(sb.working().vsr_state.checkpoint.header.op, op);
+        assert_eq!(sb.working().checksum, 0xc720_ae02_eddf_2d37_328c_7a69_e3aa_930b);
+        assert_eq!(
+            tigerbeetle_core::checksum::checksum(&sb.working().vsr_state.to_wire()),
+            0xd6a4_150f_4475_b794_aaef_27fd_af01_7914
+        );
+
+        for (copy, expected) in [
+            0xc844_2b67_2e8f_a9b0_8168_0ee6_eb0c_50c1,
+            0x3496_2a61_c9ac_c425_3c74_ff72_cb22_931a,
+            0x0523_9950_ac9a_b112_1486_569c_61a6_9253,
+            0x6426_74d4_98ee_a627_d011_b675_6236_d4e7,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(
+                tigerbeetle_core::checksum::checksum(&raw_read_full_copy(&mut storage, copy)),
+                expected,
+                "copy {copy} diverges from upstream"
+            );
+        }
+
+        let mut whole = Vec::with_capacity(SUPERBLOCK_ZONE_SIZE);
+        for copy in 0..SUPERBLOCK_COPIES {
+            whole.extend_from_slice(&raw_read_full_copy(&mut storage, copy));
+        }
+        assert_eq!(
+            tigerbeetle_core::checksum::checksum(&whole),
+            0x7708_a02a_79a9_2bff_e79a_1cf4_ff0b_fa8b
+        );
+    }
+
+    /// Cross-validation of a sync `view_change` against real upstream output
+    /// (`tbcross_format.zig`, sync phase): replays format → open → checkpoint → view_change
+    /// with a `sync_checkpoint` replacing the whole checkpoint state (op 19 → 39).
+    #[test]
+    fn view_change_sync_checkpoint_matches_upstream_zig_golden() {
+        let mut storage = MemoryStorage::new(DATA_FILE_SIZE_MIN as u64);
+        // See `format_matches_upstream_zig_golden` for why the image is poisoned first.
+        storage.poison_image();
+
+        let mut sb = SuperBlock::new(DATA_FILE_SIZE_MIN as u64);
+        sb.format(
+            &mut storage,
+            FormatOptions {
+                cluster: 0,
+                release: Release::MINIMUM,
+                replica: 0,
+                replica_count: 6,
+                view: None,
+            },
+        );
+        assert_eq!(poll(&mut sb, &mut storage), vec![Event::FormatDone]);
+        sb.open(&mut storage);
+        assert_eq!(poll(&mut sb, &mut storage), vec![Event::OpenDone]);
+
+        // Phase 2 (matches `checkpoint_matches_upstream_zig_golden`): commit_min → op 19.
+        let op_checkpoint = crate::checkpoint::checkpoint_after(0);
+        sb.checkpoint(&mut storage, &checkpoint_update(prepare_at_op(op_checkpoint, 0)));
+        assert_eq!(poll(&mut sb, &mut storage), vec![Event::CheckpointDone]);
+
+        // Phase 3: sync view_change jumps the checkpoint to op 39 and advances the view.
+        let op_sync = crate::checkpoint::checkpoint_after(op_checkpoint);
+        assert_eq!(op_sync, 39);
+
+        let mut sync_checkpoint_state = super::checkpoint_state_zeroed();
+        sync_checkpoint_state.header = prepare_at_op(op_sync, 0);
+        sync_checkpoint_state.parent_checkpoint_id = sb.staging().checkpoint_id();
+        sync_checkpoint_state.free_set_blocks_acquired_checksum =
+            message_header::checksum_body_empty();
+        sync_checkpoint_state.free_set_blocks_released_checksum =
+            message_header::checksum_body_empty();
+        sync_checkpoint_state.client_sessions_checksum = message_header::checksum_body_empty();
+        sync_checkpoint_state.storage_size = DATA_FILE_SIZE_MIN as u64;
+        sync_checkpoint_state.release = Release::MINIMUM;
+
+        let head = prepare_at_op(op_sync + 1, 1);
+        sb.view_change(
+            &mut storage,
+            UpdateViewChange {
+                commit_max: op_sync,
+                log_view: 1,
+                view: 1,
+                headers: crate::ViewChangeHeadersArray::init(
+                    crate::ViewChangeCommand::View,
+                    &[head],
+                ),
+                sync_checkpoint: Some(SyncCheckpoint {
+                    checkpoint: sync_checkpoint_state,
+                    sync_op_min: 0,
+                    sync_op_max: op_sync,
+                }),
+            },
+        );
+        assert_eq!(poll(&mut sb, &mut storage), vec![Event::ViewChangeDone]);
+
+        assert_eq!(sb.working().sequence, 3);
+        assert_eq!(sb.working().checksum, 0x3352_08db_27bd_d33e_6dc3_ffc6_5f47_77cb);
+        assert_eq!(
+            tigerbeetle_core::checksum::checksum(&sb.working().vsr_state.to_wire()),
+            0x015d_bc2f_6ad6_eea3_db9c_fc2d_50ca_2c73
+        );
+
+        for (copy, expected) in [
+            0x9aeb_f596_f641_853f_5273_c14d_e340_efa5,
+            0xa26a_a7b9_92ce_04ee_3aa4_e035_0a0f_4899,
+            0x5f2b_22b0_1ce0_bf7d_8ae7_b174_6bee_42b7,
+            0x561f_de1a_dfbf_613a_0438_2112_9259_ead0,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(
+                tigerbeetle_core::checksum::checksum(&raw_read_full_copy(&mut storage, copy)),
+                expected,
+                "copy {copy} diverges from upstream"
+            );
+        }
+
+        let mut whole = Vec::with_capacity(SUPERBLOCK_ZONE_SIZE);
+        for copy in 0..SUPERBLOCK_COPIES {
+            whole.extend_from_slice(&raw_read_full_copy(&mut storage, copy));
+        }
+        assert_eq!(
+            tigerbeetle_core::checksum::checksum(&whole),
+            0xbdbb_b309_cd1a_15b7_827b_50b6_112a_368a
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // checkpoint / view_change (deterministic ports of `superblock_fuzz.zig` scenarios)
+    // ---------------------------------------------------------------------------------------------
+
+    /// A valid prepare at (`op`, `view`) with a non-reserved operation and a real release
+    /// (the root operation itself is pinned to op=0, so the fuzzer uses a normal op here).
+    fn prepare_at_op(op: u64, view: u32) -> message_header::Prepare {
+        let mut header = message_header::Prepare {
+            release: Release::MINIMUM,
+            operation: crate::Operation(tigerbeetle_core::constants::VSR_OPERATIONS_RESERVED),
+            client: 1,
+            request: 1,
+            timestamp: 1,
+            ..message_header::Prepare::default()
+        };
+        header.op = op;
+        header.view = view;
+        header.set_checksum_body(&[]);
+        header.set_checksum();
+        header
+    }
+
+    /// Upstream: an empty trailer reference (`TrailerReference.empty() == true`).
+    fn empty_reference() -> TrailerReference {
+        TrailerReference {
+            checksum: message_header::checksum_body_empty(),
+            last_block_address: 0,
+            last_block_checksum: 0,
+            trailer_size: 0,
+        }
+    }
+
+    /// The minimal valid checkpoint update: advances commit_min to `header.op` and keeps
+    /// everything else (storage size, free set, sessions, manifest, release) unchanged —
+    /// exactly what a fresh replica's first checkpoint looks like in the fuzzer.
+    fn checkpoint_update(header: message_header::Prepare) -> UpdateCheckpoint {
+        UpdateCheckpoint {
+            header,
+            view_attributes: None,
+            commit_max: header.op,
+            sync_op_min: 0,
+            sync_op_max: 0,
+            manifest_references: ManifestReferences {
+                oldest_checksum: 0,
+                oldest_address: 0,
+                newest_checksum: 0,
+                newest_address: 0,
+                block_count: 0,
+            },
+            free_set_references: FreeSetReferences {
+                blocks_acquired: empty_reference(),
+                blocks_released: empty_reference(),
+            },
+            client_sessions_reference: empty_reference(),
+            storage_size: DATA_FILE_SIZE_MIN as u64,
+            release: Release::MINIMUM,
+        }
+    }
+
+    /// Port of the fuzzer's format → open → checkpoint flow: the checkpoint installs
+    /// commit_min durably across all copies and survives reopen.
+    #[test]
+    fn checkpoint_advances_commit_min_and_persists() {
+        let mut storage = MemoryStorage::new(DATA_FILE_SIZE_MIN as u64);
+        let mut sb = opened(&mut storage, format_options(1));
+
+        let op = crate::checkpoint::checkpoint_after(0);
+        let parent_checkpoint_id = sb.working().checkpoint_id();
+        sb.checkpoint(&mut storage, &checkpoint_update(prepare_at_op(op, 0)));
+
+        // While in flight, updating() reports only the running operation.
+        assert!(sb.updating(Caller::Checkpoint));
+        assert!(!sb.updating(Caller::ViewChange));
+        assert_eq!(poll(&mut sb, &mut storage), vec![Event::CheckpointDone]);
+        assert!(!sb.updating(Caller::Checkpoint));
+
+        let working = sb.working();
+        assert_eq!(working.sequence, 2);
+        assert_eq!(working.vsr_state.commit_max, op);
+        assert_eq!(working.vsr_state.sync_op_min, 0);
+        assert_eq!(working.vsr_state.sync_op_max, 0);
+        assert_eq!(working.vsr_state.checkpoint.header.op, op);
+        assert_eq!(working.vsr_state.checkpoint.header.checksum, prepare_at_op(op, 0).checksum);
+        // The new checkpoint chains onto the previously installed one.
+        assert_eq!(working.vsr_state.checkpoint.parent_checkpoint_id, parent_checkpoint_id);
+        // The grandparent is whatever the previous checkpoint pointed at (zero here).
+        assert_eq!(working.vsr_state.checkpoint.grandparent_checkpoint_id, 0);
+
+        // Every on-disk copy carries the staged state; verification passed on completion.
+        for copy in 0..SUPERBLOCK_COPIES {
+            let header = super::reading_decode(&raw_read(&mut storage, copy));
+            assert!(header.valid_checksum(), "copy {copy} invalid after checkpoint");
+            assert_eq!(header.sequence, 2);
+            assert!(header.equal(sb.working()));
+        }
+
+        let working_checksum = sb.working().checksum;
+        drop(sb);
+
+        // Reopen from disk: the checkpoint survives.
+        let mut reopened = SuperBlock::new(DATA_FILE_SIZE_MIN as u64);
+        reopened.open(&mut storage);
+        assert_eq!(poll(&mut reopened, &mut storage), vec![Event::OpenDone]);
+        assert_eq!(reopened.working().checksum, working_checksum);
+        assert_eq!(reopened.working().vsr_state.checkpoint.header.op, op);
+        assert_eq!(reopened.working().vsr_state.commit_max, op);
+    }
+
+    /// Port of the fuzzer's format → open → view_change flow (.view headers): the view is
+    /// persisted and survives reopen.
+    #[test]
+    fn view_change_persists_view() {
+        let mut storage = MemoryStorage::new(DATA_FILE_SIZE_MIN as u64);
+        let mut sb = opened(&mut storage, format_options(1));
+
+        let head = prepare_at_op(1, 1);
+        let headers = crate::ViewChangeHeadersArray::init(crate::ViewChangeCommand::View, &[head]);
+        sb.view_change(
+            &mut storage,
+            UpdateViewChange {
+                commit_max: 0,
+                log_view: 1,
+                view: 1,
+                headers,
+                sync_checkpoint: None,
+            },
+        );
+
+        assert!(sb.updating(Caller::ViewChange));
+        assert_eq!(poll(&mut sb, &mut storage), vec![Event::ViewChangeDone]);
+        assert!(!sb.updating(Caller::ViewChange));
+
+        let working = sb.working();
+        assert_eq!(working.sequence, 2);
+        assert_eq!(working.vsr_state.log_view, 1);
+        assert_eq!(working.vsr_state.view, 1);
+        // Checkpoint state is untouched by a plain view change.
+        assert_eq!(working.vsr_state.checkpoint.header.op, 0);
+
+        for copy in 0..SUPERBLOCK_COPIES {
+            let header = super::reading_decode(&raw_read(&mut storage, copy));
+            assert!(header.valid_checksum());
+            assert!(header.equal(sb.working()));
+        }
+
+        let working_checksum = sb.working().checksum;
+        drop(sb);
+
+        let mut reopened = SuperBlock::new(DATA_FILE_SIZE_MIN as u64);
+        reopened.open(&mut storage);
+        assert_eq!(poll(&mut reopened, &mut storage), vec![Event::OpenDone]);
+        assert_eq!(reopened.working().checksum, working_checksum);
+        assert_eq!(reopened.working().vsr_state.view, 1);
+    }
+
+    /// The .join_view variant: log_view < view, JV headers installed verbatim.
+    #[test]
+    fn view_change_join_view_persists_log_view_and_view() {
+        let mut storage = MemoryStorage::new(DATA_FILE_SIZE_MIN as u64);
+        let mut sb = opened(&mut storage, format_options(1));
+
+        let head = prepare_at_op(1, 0);
+        let headers =
+            crate::ViewChangeHeadersArray::init(crate::ViewChangeCommand::JoinView, &[head]);
+        sb.view_change(
+            &mut storage,
+            UpdateViewChange {
+                commit_max: 0,
+                log_view: 0,
+                view: 1,
+                headers,
+                sync_checkpoint: None,
+            },
+        );
+        assert_eq!(poll(&mut sb, &mut storage), vec![Event::ViewChangeDone]);
+
+        assert_eq!(sb.working().vsr_state.log_view, 0);
+        assert_eq!(sb.working().vsr_state.view, 1);
+
+        // Reopened, log_view < view means the stored headers read back as JoinView.
+        let working_checksum = sb.working().checksum;
+        drop(sb);
+
+        let mut reopened = SuperBlock::new(DATA_FILE_SIZE_MIN as u64);
+        reopened.open(&mut storage);
+        assert_eq!(poll(&mut reopened, &mut storage), vec![Event::OpenDone]);
+        assert_eq!(reopened.working().checksum, working_checksum);
+        let mut decoded = [message_header::Prepare::default(); VIEW_HEADERS_MAX as usize];
+        let stored_headers = reopened.working().view_headers(&mut decoded);
+        assert_eq!(stored_headers.command, crate::ViewChangeCommand::JoinView);
+        assert_eq!(stored_headers.slice[0].op, 1);
+    }
+
+    /// checkpoint ↔ view_change are allowed to queue behind each other (one deep), and run
+    /// strictly in queue order. Ports the fuzzer's interleaved scenario.
+    #[test]
+    fn checkpoint_and_view_change_may_queue_in_either_order() {
+        let mut storage = MemoryStorage::new(DATA_FILE_SIZE_MIN as u64);
+        let mut sb = opened(&mut storage, format_options(1));
+
+        let op1 = crate::checkpoint::checkpoint_after(0);
+        // checkpoint starts; view_change queues behind it.
+        sb.checkpoint(&mut storage, &checkpoint_update(prepare_at_op(op1, 0)));
+        let vc_head = prepare_at_op(op1 + 1, 1);
+        sb.view_change(
+            &mut storage,
+            UpdateViewChange {
+                commit_max: op1,
+                log_view: 1,
+                view: 1,
+                headers: crate::ViewChangeHeadersArray::init(
+                    crate::ViewChangeCommand::View,
+                    &[vc_head],
+                ),
+                sync_checkpoint: None,
+            },
+        );
+        assert!(sb.updating(Caller::Checkpoint));
+        assert!(sb.updating(Caller::ViewChange));
+
+        assert_eq!(poll(&mut sb, &mut storage), vec![Event::CheckpointDone, Event::ViewChangeDone]);
+        assert!(!sb.updating(Caller::Checkpoint));
+        assert!(!sb.updating(Caller::ViewChange));
+        assert_eq!(sb.working().sequence, 3);
+        assert_eq!(sb.working().vsr_state.checkpoint.header.op, op1);
+        assert_eq!(sb.working().vsr_state.view, 1);
+
+        // Reverse order: view_change runs while checkpoint queues behind it.
+        let op2 = crate::checkpoint::checkpoint_after(op1);
+        let head_second = prepare_at_op(op2 + 1, 2);
+        sb.view_change(
+            &mut storage,
+            UpdateViewChange {
+                commit_max: op2,
+                log_view: 2,
+                view: 2,
+                headers: crate::ViewChangeHeadersArray::init(
+                    crate::ViewChangeCommand::View,
+                    &[head_second],
+                ),
+                sync_checkpoint: None,
+            },
+        );
+        sb.checkpoint(&mut storage, &checkpoint_update(prepare_at_op(op2, 2)));
+        assert!(sb.updating(Caller::ViewChange));
+        assert!(sb.updating(Caller::Checkpoint));
+
+        assert_eq!(poll(&mut sb, &mut storage), vec![Event::ViewChangeDone, Event::CheckpointDone]);
+        assert_eq!(sb.working().sequence, 5);
+        assert_eq!(sb.working().vsr_state.checkpoint.header.op, op2);
+        assert_eq!(sb.working().vsr_state.view, 2);
+    }
+
+    /// An operation may not queue behind itself (upstream:
+    /// `assert(head.caller != context.caller)`).
+    #[test]
+    #[should_panic(expected = "mutually exclusive with themselves")]
+    fn queue_rejects_same_caller_twice() {
+        let mut storage = MemoryStorage::new(DATA_FILE_SIZE_MIN as u64);
+        let mut sb = opened(&mut storage, format_options(1));
+
+        let op1 = crate::checkpoint::checkpoint_after(0);
+        sb.checkpoint(&mut storage, &checkpoint_update(prepare_at_op(op1, 0)));
+        let op2 = crate::checkpoint::checkpoint_after(op1);
+        sb.checkpoint(&mut storage, &checkpoint_update(prepare_at_op(op2, 0)));
+    }
+
+    /// A `view_change` carrying a `sync_checkpoint` replaces the whole checkpoint state: the
+    /// fuzzer's sync scenario. The checkpoint jumps to the next checkpoint op and installs
+    /// sync_op_min/max.
+    #[test]
+    fn view_change_sync_checkpoint_installs_state() {
+        let mut storage = MemoryStorage::new(DATA_FILE_SIZE_MIN as u64);
+        let mut sb = opened(&mut storage, format_options(1));
+
+        // The synced checkpoint is exactly one checkpoint interval ahead of the current one.
+        let checkpoint_next = crate::checkpoint::checkpoint_after(0);
+        let mut sync_checkpoint_state = super::checkpoint_state_zeroed();
+        sync_checkpoint_state.header = prepare_at_op(checkpoint_next, 0);
+        sync_checkpoint_state.parent_checkpoint_id = sb.working().checkpoint_id();
+        sync_checkpoint_state.free_set_blocks_acquired_checksum =
+            message_header::checksum_body_empty();
+        sync_checkpoint_state.free_set_blocks_released_checksum =
+            message_header::checksum_body_empty();
+        sync_checkpoint_state.client_sessions_checksum = message_header::checksum_body_empty();
+        sync_checkpoint_state.storage_size = DATA_FILE_SIZE_MIN as u64;
+        sync_checkpoint_state.release = Release::MINIMUM;
+
+        let head = prepare_at_op(checkpoint_next + 1, 1);
+        sb.view_change(
+            &mut storage,
+            UpdateViewChange {
+                commit_max: checkpoint_next,
+                log_view: 1,
+                view: 1,
+                headers: crate::ViewChangeHeadersArray::init(
+                    crate::ViewChangeCommand::View,
+                    &[head],
+                ),
+                sync_checkpoint: Some(SyncCheckpoint {
+                    checkpoint: sync_checkpoint_state,
+                    sync_op_min: 0,
+                    sync_op_max: checkpoint_next,
+                }),
+            },
+        );
+        assert_eq!(poll(&mut sb, &mut storage), vec![Event::ViewChangeDone]);
+
+        let working = sb.working();
+        assert_eq!(working.sequence, 2);
+        assert_eq!(working.vsr_state.checkpoint.header.op, checkpoint_next);
+        assert_eq!(working.vsr_state.sync_op_min, 0);
+        assert_eq!(working.vsr_state.sync_op_max, checkpoint_next);
+        assert_eq!(working.vsr_state.commit_max, checkpoint_next);
+        assert_eq!(working.vsr_state.log_view, 1);
+        assert_eq!(working.vsr_state.view, 1);
+
+        for copy in 0..SUPERBLOCK_COPIES {
+            let header = super::reading_decode(&raw_read(&mut storage, copy));
+            assert!(header.valid_checksum());
+            assert!(header.equal(sb.working()));
+        }
+
+        let working_checksum = sb.working().checksum;
+        drop(sb);
+
+        let mut reopened = SuperBlock::new(DATA_FILE_SIZE_MIN as u64);
+        reopened.open(&mut storage);
+        assert_eq!(poll(&mut reopened, &mut storage), vec![Event::OpenDone]);
+        assert_eq!(reopened.working().checksum, working_checksum);
+        assert_eq!(reopened.working().vsr_state.checkpoint.header.op, checkpoint_next);
+    }
+
+    /// A sync checkpoint at the next checkpoint op must chain onto *this* superblock's
+    /// checkpoint (upstream asserts `parent_checkpoint_id == staging.checkpoint_id()`).
+    #[test]
+    #[should_panic(expected = "sync checkpoint parent mismatch")]
+    fn view_change_sync_checkpoint_rejects_wrong_parent() {
+        let mut storage = MemoryStorage::new(DATA_FILE_SIZE_MIN as u64);
+        let mut sb = opened(&mut storage, format_options(1));
+
+        let checkpoint_next = crate::checkpoint::checkpoint_after(0);
+        let mut sync_checkpoint_state = super::checkpoint_state_zeroed();
+        sync_checkpoint_state.header = prepare_at_op(checkpoint_next, 0);
+        sync_checkpoint_state.parent_checkpoint_id = 0xdead_beef; // wrong
+        sync_checkpoint_state.free_set_blocks_acquired_checksum =
+            message_header::checksum_body_empty();
+        sync_checkpoint_state.free_set_blocks_released_checksum =
+            message_header::checksum_body_empty();
+        sync_checkpoint_state.client_sessions_checksum = message_header::checksum_body_empty();
+        sync_checkpoint_state.storage_size = DATA_FILE_SIZE_MIN as u64;
+        sync_checkpoint_state.release = Release::MINIMUM;
+
+        let head = prepare_at_op(checkpoint_next + 1, 1);
+        sb.view_change(
+            &mut storage,
+            UpdateViewChange {
+                commit_max: checkpoint_next,
+                log_view: 1,
+                view: 1,
+                headers: crate::ViewChangeHeadersArray::init(
+                    crate::ViewChangeCommand::View,
+                    &[head],
+                ),
+                sync_checkpoint: Some(SyncCheckpoint {
+                    checkpoint: sync_checkpoint_state,
+                    sync_op_min: 0,
+                    sync_op_max: checkpoint_next,
+                }),
+            },
+        );
+    }
+
+    /// A corrupted copy after a checkpoint is repaired by the next open.
+    #[test]
+    fn open_after_checkpoint_repairs_corrupted_copy() {
+        let mut storage = MemoryStorage::new(DATA_FILE_SIZE_MIN as u64);
+        let mut sb = opened(&mut storage, format_options(1));
+
+        let op = crate::checkpoint::checkpoint_after(0);
+        sb.checkpoint(&mut storage, &checkpoint_update(prepare_at_op(op, 0)));
+        assert_eq!(poll(&mut sb, &mut storage), vec![Event::CheckpointDone]);
+
+        let working_checksum = sb.working().checksum;
+        drop(sb);
+
+        corrupt_copy(&mut storage, 1);
+
+        let mut sb = SuperBlock::new(DATA_FILE_SIZE_MIN as u64);
+        sb.open(&mut storage);
+        assert_eq!(poll(&mut sb, &mut storage), vec![Event::OpenDone]);
+
+        assert_eq!(sb.working().sequence, 2);
+        assert_eq!(sb.working().checksum, working_checksum);
+        assert_eq!(sb.working().vsr_state.checkpoint.header.op, op);
+
+        storage.faulty_sectors.clear();
+        let header = super::reading_decode(&raw_read(&mut storage, 1));
+        assert!(header.valid_checksum(), "repaired copy invalid");
+        assert!(header.equal(sb.working()));
     }
 }

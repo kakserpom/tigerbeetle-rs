@@ -105,7 +105,11 @@ mod tests {
     #[test]
     fn constants_match_upstream_defaults() {
         assert_eq!(SNAPSHOT_LATEST, u64::MAX - 1);
-        // Default config: growth factor 8, lsm_levels 7 → sum of the level-0..6 counts.
-        assert_eq!(TABLE_COUNT_MAX, 8 + 64 + 512 + 4096 + 32768 + 262_144 + 2_097_152);
+        // table_count_max derives from the active CONFIG, like upstream
+        // (`lsm_growth_factor`: 4 under test_min → 21_844, 8 in production → 2_396_744).
+        let expected: u32 = (0..u32::from(tigerbeetle_core::constants::LSM_LEVELS))
+            .map(|level| tigerbeetle_core::constants::LSM_GROWTH_FACTOR.pow(level + 1))
+            .sum();
+        assert_eq!(TABLE_COUNT_MAX, expected);
     }
 }

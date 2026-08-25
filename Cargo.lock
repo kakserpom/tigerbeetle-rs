@@ -25,4 +25,5 @@ name = "tigerbeetle-vsr"
 version = "0.1.0"
 dependencies = [
  "tigerbeetle-core",
+ "tigerbeetle-lsm",
 ]

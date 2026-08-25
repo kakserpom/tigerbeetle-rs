@@ -280,6 +280,42 @@ impl Peer {
     }
 }
 
+/// Deterministically assigns replica_ids for the initial configuration.
+///
+/// Eventually, we want to identify replicas using random u128 ids to prevent operator errors.
+/// However, that requires unergonomic two-step process for spinning a new cluster up. To avoid
+/// needlessly compromising the experience until reconfiguration is fully implemented, derive
+/// replica ids for the initial cluster deterministically.
+///
+/// Port of `vsr.root_members` (src/vsr.zig).
+///
+/// DEVIATION: upstream packs an `extern struct { u128 align(1), u128 align(1), u8 }` (33 bytes,
+/// no padding) and hashes its memory. Rust padding would differ, so the seed is serialized
+/// manually as little-endian fields in declaration order.
+///
+/// # Panics
+/// Panics if the derived member ids are not valid (upstream asserts; a checksum collision
+/// would be required).
+#[must_use]
+pub fn root_members(cluster: u128) -> Members {
+    const SEED_SIZE: usize = 16 + 16 + 1;
+    assert_eq!(SEED_SIZE, 33); // upstream comptime: @sizeOf(IdSeed) == 33
+
+    let mut result: Members = [0; tigerbeetle_core::constants::MEMBERS_MAX];
+    // IdSeed { cluster_config_checksum, cluster, replica }, little-endian, no padding.
+    let mut seed = [0u8; SEED_SIZE];
+    seed[..16]
+        .copy_from_slice(&tigerbeetle_core::constants::CONFIG.cluster.checksum().to_le_bytes());
+    seed[16..32].copy_from_slice(&cluster.to_le_bytes());
+    for (replica, slot) in result.iter_mut().enumerate() {
+        seed[32] = u8::try_from(replica).unwrap_or_else(|_| unreachable!("members_max fits u8"));
+        *slot = checksum(&seed);
+    }
+
+    assert!(valid_members(&result));
+    result
+}
+
 /// Port of `vsr.valid_members` (src/vsr.zig).
 #[must_use]
 pub fn valid_members(members: &Members) -> bool {
@@ -551,6 +587,99 @@ mod zone_tests {
         assert_eq!(Zone::Grid.start(), Zone::GridPadding.start() + grid_padding as u64);
         assert_eq!(Zone::Grid.size(), None);
         let _ = client_replies_size;
+    }
+}
+
+#[cfg(test)]
+mod members_tests {
+    use super::{Members, member_index, root_members, valid_members};
+    use tigerbeetle_core::constants::MEMBERS_MAX;
+
+    /// Port of upstream test "vsr: root_members valid" (src/vsr.zig).
+    #[test]
+    fn root_members_are_valid_and_distinct() {
+        let big = u128::from(u64::MAX);
+        for cluster in [0u128, 1, 2, big, big << 64] {
+            let members = root_members(cluster);
+            assert!(valid_members(&members));
+
+            let non_zero = members.iter().filter(|&&m| m != 0).count();
+            assert_eq!(non_zero, MEMBERS_MAX);
+
+            // All ids distinct.
+            for i in 0..MEMBERS_MAX {
+                for j in 0..i {
+                    assert_ne!(members[i], members[j]);
+                }
+            }
+
+            // Deterministic.
+            assert_eq!(root_members(cluster), members);
+        }
+    }
+
+    #[test]
+    fn root_members_depend_on_cluster() {
+        assert_ne!(root_members(0), root_members(1));
+    }
+
+    /// Golden values produced by running upstream `vsr.root_members()` (Zig 0.14.1,
+    /// test_min config) via `reference/tigerbeetle/src/tbcross_main.zig`.
+    /// Pins the AEGIS checksum, IdSeed byte layout, and endianness against upstream.
+    #[test]
+    fn root_members_match_upstream_zig() {
+        let expected_zero = [
+            "459d6840872cd4709b6b08975dc2a6bb",
+            "98bd1945b69568664d59ea1827288a22",
+            "2db1caea465eae11497ac773dc80fc09",
+            "378bd9dfed0df6c5996f2b9f4b64df1b",
+            "cc1c24b3d56ea1fdb8a5dc65f425bab7",
+            "7d13f0e77af77c389c8fc7c5e6773085",
+            "90689d9dd8f712be32ef0a4d0de013b7",
+            "8070f283e793e1a592bf4407cf1b18cc",
+            "a3f9b3795c747ab772e63a335c94cefc",
+            "4fe89fb4498beae769732d5bc5f91874",
+            "49aa0b4b9ca1306d1030be36f4a436de",
+            "8515e6f59ba6ce02f5cea27fa04e87b0",
+        ];
+        let members = root_members(0);
+        for (member, expected) in members.iter().zip(expected_zero) {
+            assert_eq!(format!("{member:032x}"), expected);
+        }
+
+        let expected_a1b2c3 = [
+            "4caed0935a541ea4cabd2cb09675414e",
+            "125f138234740dc6ae256afc0ef123ea",
+            "035eb83da3734f8f626aef5a74652408",
+            "88defe97db4dc4faacffb4e278cd1fd1",
+            "427f6aaef304ea3eb8ee974f1ced77ea",
+            "d770df1931473aba661bff188aa3b3f4",
+            "ebef947b2ecb5eb6cb699625209a148a",
+            "6aa376781ffef044d775b23bb10984ec",
+            "6ef9b37849603c83f0043ea3a134cb53",
+            "2985c5add5d5adeace28f84209b5f2e8",
+            "420b3771ef9b4bdb4c23e3c19b305ee3",
+            "00bf7bb43a94357bd899ba6aa433d891",
+        ];
+        let members_a1b2c3 = root_members(0x00A1_B2C3);
+        for (member, expected) in members_a1b2c3.iter().zip(expected_a1b2c3) {
+            assert_eq!(format!("{member:032x}"), expected);
+        }
+    }
+
+    /// Port of upstream test "vsr: member_index" (src/vsr.zig).
+    #[test]
+    fn finds_member_index() {
+        let mut members: Members = [0; MEMBERS_MAX];
+        for (i, slot) in members.iter_mut().enumerate() {
+            *slot = u128::try_from(i + 1).unwrap_or_else(|_| unreachable!("fits"));
+        }
+        assert_eq!(member_index(&members, 1), Some(0));
+        assert_eq!(
+            member_index(&members, u128::try_from(MEMBERS_MAX).unwrap_or_else(|_| unreachable!())),
+            Some(u8::try_from(MEMBERS_MAX - 1).unwrap_or_else(|_| unreachable!("fits")))
+        );
+        assert_eq!(member_index(&members, MEMBERS_MAX as u128 + 1), None);
     }
 }
 

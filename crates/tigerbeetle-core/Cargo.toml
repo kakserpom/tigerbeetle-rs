@@ -3,6 +3,13 @@ name = "tigerbeetle-core"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# Selects `configs::test_min` for `CONFIG` in downstream builds. Upstream switches on
+# `builtin.is_test`, which recompiles constants per consumer; cargo features are the Rust
+# equivalent. Enable via a dev-dependency edge so every crate's tests see the same config
+# upstream's tests use, while release binaries keep `default_production`.
+test-min = []
+
 [dependencies]
 
 [lints]

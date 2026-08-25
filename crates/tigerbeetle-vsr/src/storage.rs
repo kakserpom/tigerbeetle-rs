@@ -393,6 +393,14 @@ pub struct MemoryStorage {
 }
 
 impl MemoryStorage {
+    /// Fills the image with 0xAA, mirroring upstream's test Storage: it allocates through a
+    /// Zig allocator that poisons fresh memory with 0xAA (safe builds), so never-written
+    /// bytes read as 0xAA there — the convention `replica_format.zig` relies on for checksum
+    /// comparisons. Our default is zero-filled (real sparse-file semantics).
+    pub fn poison_image(&mut self) {
+        self.image.fill(0xAA);
+    }
+
     /// Creates an all-zero image of `size` bytes.
     ///
     /// # Panics
@@ -533,7 +541,8 @@ mod storage_tests {
 
     #[test]
     fn latent_sector_errors_zero_only_the_faulty_sector() {
-        let mut storage = MemoryStorage::new(16 * BLOCK_SIZE as u64);
+        // Size relative to the zone layout: zone offsets shift between configs.
+        let mut storage = MemoryStorage::new(Zone::WalPrepares.start() + 4 * BLOCK_SIZE as u64);
 
         let mut pattern = zeroed_buffer(4 * BLOCK_SIZE);
         pattern.fill(7);
@@ -573,7 +582,8 @@ mod storage_tests {
 
     #[test]
     fn adjacent_latent_sector_errors_zero_both_sectors() {
-        let mut storage = MemoryStorage::new(4 * BLOCK_SIZE as u64);
+        // Size relative to the zone layout: zone offsets shift between configs.
+        let mut storage = MemoryStorage::new(Zone::WalPrepares.start() + BLOCK_SIZE as u64);
 
         let mut pattern = zeroed_buffer(BLOCK_SIZE);
         pattern.fill(9);
@@ -648,13 +658,20 @@ mod storage_tests {
     }
 
     #[test]
-    #[should_panic(expected = "padding is never touched")]
     fn grid_padding_is_rejected() {
+        // When block_size == sector_size there is no padding zone at all; upstream guards all
+        // grid-padding access with `.size().? > 0`.
+        if Zone::GridPadding.size() == Some(0) {
+            return;
+        }
         let mut storage = MemoryStorage::new(BLOCK_SIZE as u64);
-        storage.write_sectors(WriteRequest {
-            zone: Zone::GridPadding,
-            offset_in_zone: 0,
-            buffer: zeroed_buffer(SECTOR_SIZE),
-        });
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            storage.write_sectors(WriteRequest {
+                zone: Zone::GridPadding,
+                offset_in_zone: 0,
+                buffer: zeroed_buffer(SECTOR_SIZE),
+            });
+        }));
+        assert!(result.is_err(), "padding is never touched");
     }
 }

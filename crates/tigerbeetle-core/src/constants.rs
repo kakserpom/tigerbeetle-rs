@@ -809,9 +809,6 @@ pub const BUS_MESSAGE_BURST_WARN_MIN: usize = 8;
 
 const MIB64: i64 = 1 << 20;
 
-#[cfg(not(test))]
-const _: () = assert!(CONFIG.cluster.journal_slot_count == 1024);
-
 #[cfg(test)]
 mod tests {
     use super::*;
