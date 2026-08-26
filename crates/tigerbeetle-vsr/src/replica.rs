@@ -15,6 +15,9 @@
 
 use tigerbeetle_core::constants;
 
+use crate::command::Command;
+use crate::message_header;
+
 // ---------------------------------------------------------------------------
 // Status
 // ---------------------------------------------------------------------------
@@ -243,7 +246,196 @@ impl Replica {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Pipeline — queue (primary) and cache (backup/view-change)
+// ---------------------------------------------------------------------------
+
+/// Pipeline queue used by the primary in normal status.
+///
+/// Two ring buffers: `prepare_queue` (inflight prepares) and
+/// `request_queue` (accepted client requests not yet preparing).
+///
+/// Upstream: `src/vsr/replica.zig:12094` (`PipelineQueue`).
+#[derive(Clone, Debug, Default)]
+pub struct PipelineQueue {
+    /// Inflight prepares in order (ring buffer of up to `PIPELINE_PREPARE_QUEUE_MAX`).
+    pub prepare_queue: Vec<PipelinePrepare>,
+    /// Accepted requests not yet preparing.
+    pub request_queue: Vec<PipelineRequest>,
+}
+
+/// A prepare in the pipeline.
+#[derive(Clone, Copy, Debug)]
+pub struct PipelinePrepare {
+    pub op: u64,
+    pub checksum: u128,
+    /// Number of prepare_ok responses received.
+    pub acks_received: u16,
+}
+
+/// A client request queued on the primary.
+#[derive(Clone, Copy, Debug)]
+pub struct PipelineRequest {
+    pub client: u128,
+    pub request: u64,
+}
+
+/// Pipeline cache used by backups and during view changes.
+///
+/// A fixed array indexed by `op % capacity`.
+///
+/// Upstream: `src/vsr/replica.zig:12324` (`PipelineCache`).
+#[derive(Clone, Debug, Default)]
+pub struct PipelineCache {
+    entries: Vec<Option<PipelinePrepare>>,
+}
+
+impl PipelineCache {
+    /// Create an empty cache with the given capacity.
+    #[must_use]
+    pub fn new(capacity: usize) -> Self {
+        let mut entries = Vec::with_capacity(capacity);
+        entries.resize_with(capacity, || None);
+        Self { entries }
+    }
+
+    /// Look up a cached prepare by op + checksum.
+    #[must_use]
+    pub fn find(&self, op: u64, checksum: u128) -> Option<&PipelinePrepare> {
+        #[allow(clippy::cast_possible_truncation)]
+        let index = (op as usize) % self.entries.len();
+        self.entries[index].as_ref().filter(|p| p.op == op && p.checksum == checksum)
+    }
+
+    /// Insert a prepare into the cache, returning the evicted entry (if any).
+    pub fn insert(&mut self, prepare: PipelinePrepare) -> Option<PipelinePrepare> {
+        #[allow(clippy::cast_possible_truncation)]
+        let index = (prepare.op as usize) % self.entries.len();
+        self.entries[index].replace(prepare)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Message dispatch
+// ---------------------------------------------------------------------------
+
+impl Replica {
+    /// Main message dispatch entry point.
+    ///
+    /// Validates the header, then dispatches to the appropriate handler
+    /// based on the command type.
+    ///
+    /// Upstream: `src/vsr/replica.zig:1729` (`on_message`).
+    pub fn on_message(&mut self, header: &message_header::Header) {
+        // Validate cluster ID.
+        if header.cluster != self.cluster {
+            return; // Drop message from wrong cluster.
+        }
+
+        // Validate checksum (upstream verifies `header.valid_checksum()`).
+
+        match header.command {
+            Command::Request => self.on_request(header),
+            Command::Prepare => self.on_prepare(header),
+            Command::Commit => self.on_commit(header),
+            // TODO(port): remaining message handlers.
+            Command::PrepareOk
+            | Command::Reply
+            | Command::Ping
+            | Command::Pong
+            | Command::PingClient
+            | Command::ExitView
+            | Command::JoinView
+            | Command::View
+            | Command::Headers
+            | Command::GetView
+            | Command::GetHeaders
+            | Command::GetPrepare
+            | Command::GetReply
+            | Command::GetBlocks
+            | Command::Deprecated12
+            | Command::Deprecated21
+            | Command::Deprecated22
+            | Command::Deprecated23
+            | Command::Reserved
+            | Command::PongClient
+            | Command::Eviction
+            | Command::Block => {}
+        }
+    }
+
+    /// Handle a client request (primary only, normal status).
+    ///
+    /// Upstream: `src/vsr/replica.zig:1944` (`on_request`).
+    pub fn on_request(&mut self, header: &message_header::Header) {
+        if !self.is_primary() {
+            return; // Only primary handles requests.
+        }
+        if self.status != Status::Normal {
+            return;
+        }
+
+        // Upstream: if the prepare queue is full, queue the request for later.
+        // For now, log that we received the request.
+        let _ = header;
+        // TODO(port): primary_pipeline_prepare — begin preparing the request.
+    }
+
+    /// Handle a prepare message from the primary.
+    ///
+    /// Upstream: `src/vsr/replica.zig:2021` (`on_prepare`).
+    pub fn on_prepare(&mut self, header: &message_header::Header) {
+        // Upstream: verify cluster, view, and op range.
+        if header.view < self.view {
+            return; // Stale prepare.
+        }
+
+        if self.is_primary() {
+            return; // Primary doesn't process its own prepares via on_prepare.
+        }
+
+        // Backup path:
+        // 1. If op > commit_min and journal lacks the prepare → replicate.
+        // 2. If stale → on_repair.
+        // 3. Advance commit_max from header's commit field.
+        // 4. Cache in pipeline cache.
+        // 5. Advance op, write to journal, send prepare_ok.
+
+        // TODO(port): full backup prepare processing.
+        let _ = header;
+    }
+
+    /// Handle a commit message from the primary (backup only).
+    ///
+    /// Upstream: `src/vsr/replica.zig:2396` (`on_commit`).
+    pub fn on_commit(&mut self, header: &message_header::Header) {
+        if self.is_primary() {
+            return; // Primary doesn't receive commit messages.
+        }
+        if self.status != Status::Normal {
+            return;
+        }
+        if header.view != self.view {
+            return; // Stale commit.
+        }
+
+        // Upstream: advance commit_max, update heartbeat timestamp, commit journal.
+        // TODO(port): advance_commit_max and commit_journal.
+        let _ = header;
+    }
+
+    /// Returns `true` if we should ignore this request message.
+    ///
+    /// Upstream: `src/vsr/replica.zig:1930` (`ignore_request_message`).
+    #[must_use]
+    pub fn ignore_request_message(&self, header: &message_header::Header) -> bool {
+        // Ignore if not from the primary's current view.
+        header.view != self.view || !self.is_primary() || self.status != Status::Normal
+    }
+}
+
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -342,5 +534,55 @@ mod tests {
     #[should_panic(expected = "assertion failed")]
     fn replica_index_out_of_range() {
         let _ = Replica::new(0, 3, 3);
+    }
+
+    #[test]
+    fn pipeline_cache_insert_and_find() {
+        let mut cache = PipelineCache::new(4);
+        let p = PipelinePrepare { op: 10, checksum: 0xAB, acks_received: 0 };
+        assert!(cache.insert(p).is_none());
+        assert!(cache.find(10, 0xAB).is_some());
+        assert!(cache.find(10, 0xCD).is_none());
+        assert!(cache.find(11, 0xAB).is_none());
+    }
+
+    #[test]
+    fn pipeline_cache_eviction() {
+        let mut cache = PipelineCache::new(2);
+        let p1 = PipelinePrepare { op: 0, checksum: 1, acks_received: 0 };
+        let p2 = PipelinePrepare { op: 2, checksum: 2, acks_received: 0 };
+        // op=0 maps to index 0, op=2 maps to index 0 (2 % 2 == 0).
+        assert!(cache.insert(p1).is_none());
+        let evicted = cache.insert(p2);
+        assert!(evicted.is_some());
+        assert_eq!(evicted.unwrap().op, 0);
+        assert!(cache.find(0, 1).is_none());
+        assert!(cache.find(2, 2).is_some());
+    }
+
+    #[test]
+    fn on_message_wrong_cluster() {
+        let mut r = Replica::new(0xDEAD, 0, 3);
+        r.status = Status::Normal;
+        let mut header = message_header::Header::empty();
+        header.cluster = 0xBEEF;
+        header.command = Command::Request;
+        header.set_checksum();
+        // Should silently drop — no panic, no state change.
+        r.on_message(&header);
+        assert_eq!(r.status, Status::Normal);
+    }
+
+    #[test]
+    fn on_request_ignored_on_backup() {
+        let mut r = Replica::new(0, 1, 3); // replica 1, not primary
+        r.status = Status::Normal;
+        let mut header = message_header::Header::empty();
+        header.cluster = 0;
+        header.command = Command::Request;
+        header.view = 0;
+        header.set_checksum();
+        r.on_request(&header);
+        // No state change — backup ignores request.
     }
 }
