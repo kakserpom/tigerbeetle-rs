@@ -159,6 +159,68 @@ impl U256 {
 
 const _: () = assert!(core::mem::size_of::<U256>() == 32);
 
+impl super::k_way_merge::TournamentKey for U256 {
+    const SENTINEL_KEY: Self = Self::MAX;
+    const MIN_KEY: Self = Self { hi: 0, lo: 0 };
+}
+
+impl tigerbeetle_core::stdx::radix::RadixKey for U256 {
+    const BITS: u32 = 256;
+
+    #[allow(clippy::cast_possible_truncation)] // mask fits usize; same pattern as u128 impl
+    fn digit(self, shift: u32, bits: u32) -> usize {
+        // For 256-bit radix, we need to handle cross-word extraction.
+        // Convert to bytes and extract the digit manually.
+        assert!(shift + bits <= 256);
+        if bits == 0 {
+            return 0;
+        }
+        // Extract the u64-sized digit at the given bit position.
+        let byte_offset = (shift / 8) as usize;
+        let bit_offset = shift % 8;
+        let mut buf = [0u8; 40]; // enough for any aligned u64 extraction
+        buf[..16].copy_from_slice(&self.hi.to_le_bytes());
+        buf[16..24].copy_from_slice(&self.lo.to_le_bytes());
+        // We need `bits` bits starting at `shift`.
+        // Extract a u64 from the byte stream at byte_offset, then mask.
+        let mut word = [0u8; 8];
+        let end = byte_offset + 8;
+        if end <= buf.len() {
+            word.copy_from_slice(&buf[byte_offset..end]);
+        } else {
+            let available = buf.len() - byte_offset;
+            word[..available].copy_from_slice(&buf[byte_offset..]);
+        }
+        let value = u64::from_le_bytes(word);
+        let mask = if bits >= 64 { u64::MAX } else { (1_u64 << bits) - 1 };
+        ((value >> bit_offset) & mask) as usize
+    }
+}
+
+impl super::manifest::TableKey for U256 {
+    const MAX: Self = Self::MAX;
+    const ZERO: Self = Self { hi: 0, lo: 0 };
+
+    fn to_bytes(self) -> [u8; 32] {
+        let mut buf = [0u8; 32];
+        buf[..16].copy_from_slice(&self.hi.to_le_bytes());
+        buf[16..24].copy_from_slice(&self.lo.to_le_bytes());
+        buf
+    }
+
+    fn from_bytes(bytes: &[u8; 32]) -> Self {
+        let mut hi_bytes = [0u8; 16];
+        hi_bytes.copy_from_slice(&bytes[..16]);
+        let mut lo_bytes = [0u8; 8];
+        lo_bytes.copy_from_slice(&bytes[16..24]);
+        Self::from_parts(u128::from_le_bytes(hi_bytes), u64::from_le_bytes(lo_bytes))
+    }
+
+    fn to_sort_key_high(self) -> u64 {
+        (self.hi >> 64) as u64
+    }
+}
+
 /// The `u128`-prefix instantiation (`CompositeKeyType(u128)`), sized like a `u256`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(C)]

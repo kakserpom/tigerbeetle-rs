@@ -13,9 +13,13 @@ pub mod client_replies;
 pub mod client_sessions;
 pub mod clock;
 pub mod command;
+pub mod compaction;
 pub mod fault_detector;
+pub mod forest;
 pub mod grid;
+pub mod groove;
 pub mod journal;
+pub mod manifest_log;
 pub mod marzullo;
 pub mod message;
 pub mod message_buffer;
@@ -24,13 +28,16 @@ pub mod message_pool;
 pub mod multi_batch;
 pub mod multiversion;
 pub mod repair_budget;
+pub mod replica;
 pub mod schema;
+pub mod state_machine;
 pub mod storage;
 pub mod superblock;
 pub mod superblock_quorums;
 pub mod table;
 pub mod testing;
 pub mod time;
+pub mod tree;
 
 /// The version of our Viewstamped Replication protocol in use, including customizations.
 /// For backwards compatibility through breaking changes (e.g. upgrading checksums/ciphers).

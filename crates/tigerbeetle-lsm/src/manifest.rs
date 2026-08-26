@@ -24,9 +24,9 @@ use core::fmt::Debug;
 use tigerbeetle_core::constants::{self, LSM_LEVELS, LSM_MANIFEST_NODE_SIZE};
 
 use crate::direction::Direction;
+pub use crate::manifest_level::TableInfoReference;
 use crate::manifest_level::{
-    KeyRange, LevelTableInfo, ManifestLevel, NextTableParameters, OverlapRange, TableInfoReference,
-    Visibility,
+    KeyRange, LevelTableInfo, ManifestLevel, NextTableParameters, OverlapRange, Visibility,
 };
 use crate::schema::manifest_node::{self, Event, TableInfo as WireTableInfo};
 use crate::segmented_array::node_capacity_for;

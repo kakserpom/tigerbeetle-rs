@@ -207,6 +207,8 @@ pub struct ExpectBlock {
 /// Snapshot of the superblock working-state fields the grid reads (upstream
 /// `grid.superblock.working.{cluster, vsr_state.checkpoint.release, ...}`). See the
 /// module-level deviation note.
+///
+/// Extended with manifest-checkpoint fields used by [`crate::manifest_log`].
 #[derive(Clone, Copy, Debug)]
 pub struct SuperBlockView {
     pub cluster: u128,
@@ -214,6 +216,17 @@ pub struct SuperBlockView {
     pub release: Release,
     /// The data-file size of the current checkpoint (cross-checked when opening).
     pub storage_size: u64,
+
+    // Manifest checkpoint state (used by manifest_log).
+    /// The total number of manifest blocks at the last checkpoint.
+    /// Used by manifest_log.open to know when to stop reading the linked list.
+    pub manifest_block_count: u32,
+    /// The oldest manifest block in the chain at the last checkpoint.
+    /// When open reaches this block, it stops reading.
+    pub manifest_oldest_address: u64,
+    pub manifest_oldest_checksum: u128,
+    /// Whether the given op has already been compacted (upstream `op_compacted`).
+    pub op_compacted: bool,
 }
 
 /// Which grid-owned checkpoint trailer a state-machine step applies to.
@@ -675,6 +688,22 @@ impl Grid {
     #[must_use]
     pub fn blocks_count(&self) -> usize {
         self.blocks.len()
+    }
+
+    /// Whether the given address has been released (freed) in the free set.
+    ///
+    /// Used by compaction assertions to verify block lifetime invariants.
+    #[must_use]
+    pub fn free_set_is_released(&self, address: u64) -> bool {
+        self.free_set.is_released(address)
+    }
+
+    /// Whether the given address is free (never allocated or fully released) in the free set.
+    ///
+    /// Used by compaction assertions to verify block lifetime invariants.
+    #[must_use]
+    pub fn free_set_is_free(&self, address: u64) -> bool {
+        self.free_set.is_free(address)
     }
 
     /// Contents of a block (read-only view for tests and upcoming slices).
@@ -2616,6 +2645,10 @@ mod tests {
             cluster: 0xAB,
             release: Release { value: 7 },
             storage_size: 0,
+            manifest_block_count: 0,
+            manifest_oldest_address: 0,
+            manifest_oldest_checksum: 0,
+            op_compacted: false,
         });
         grid.open(&mut storage, empty_references());
         drive_until(&mut grid, &mut storage, &|event| matches!(event, Event::OpenDone));
@@ -2644,6 +2677,10 @@ mod tests {
             cluster: 0xAB,
             release: Release { value: 7 },
             storage_size: 0,
+            manifest_block_count: 0,
+            manifest_oldest_address: 0,
+            manifest_oldest_checksum: 0,
+            op_compacted: false,
         });
         assert!(
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -2667,7 +2704,15 @@ mod tests {
         // Grid #1: start from an unopened free set and go through the full lifecycle —
         // open (empty trailers, like a fresh format), mark durable, acquire, checkpoint.
         let mut grid = new_unopened_grid(FREE_SET_BLOCKS);
-        grid.attach_superblock_view(super::SuperBlockView { cluster, release, storage_size: 0 });
+        grid.attach_superblock_view(super::SuperBlockView {
+            cluster,
+            release,
+            storage_size: 0,
+            manifest_block_count: 0,
+            manifest_oldest_address: 0,
+            manifest_oldest_checksum: 0,
+            op_compacted: false,
+        });
         grid.open(&mut storage, empty_references());
         drive_until(&mut grid, &mut storage, &|event| matches!(event, Event::OpenDone));
         grid.checkpoint_durable();
@@ -2707,6 +2752,10 @@ mod tests {
             cluster,
             release,
             storage_size: storage_size_new,
+            manifest_block_count: 0,
+            manifest_oldest_address: 0,
+            manifest_oldest_checksum: 0,
+            op_compacted: false,
         });
         reopened.open(&mut storage, references);
         drive_until(&mut reopened, &mut storage, &|event| matches!(event, Event::OpenDone));
@@ -2789,7 +2838,15 @@ mod tests {
             free_set_blocks_count: None,
             free_set_blocks_capacity: Some(CAPACITY),
         });
-        grid.attach_superblock_view(super::SuperBlockView { cluster, release, storage_size: 0 });
+        grid.attach_superblock_view(super::SuperBlockView {
+            cluster,
+            release,
+            storage_size: 0,
+            manifest_block_count: 0,
+            manifest_oldest_address: 0,
+            manifest_oldest_checksum: 0,
+            op_compacted: false,
+        });
         grid.open(&mut storage, empty_references());
         drive_until(&mut grid, &mut storage, &|event| matches!(event, Event::OpenDone));
         grid.checkpoint_durable();
@@ -2836,6 +2893,10 @@ mod tests {
             cluster,
             release,
             storage_size: storage_size_new,
+            manifest_block_count: 0,
+            manifest_oldest_address: 0,
+            manifest_oldest_checksum: 0,
+            op_compacted: false,
         });
         reopened.open(&mut storage, references);
         drive_until(&mut reopened, &mut storage, &|event| matches!(event, Event::OpenDone));

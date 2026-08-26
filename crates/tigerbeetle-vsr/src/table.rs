@@ -96,7 +96,7 @@ impl TableLayout {
     /// Panics if the layout exceeds a single block (upstream asserts the same).
     #[must_use]
     #[allow(clippy::cast_possible_truncation)] // constants fit u32; upstream uses comptime
-    pub fn compute(key_size: u32, value_size: u32, value_count_max: u32) -> Self {
+    pub const fn compute(key_size: u32, value_size: u32, value_count_max: u32) -> Self {
         assert!(key_size > 0);
         assert!(key_size <= 32);
         assert!(key_size >= 8);
@@ -570,9 +570,28 @@ impl TableKey for u128 {
     const SENTINEL_KEY: Self = Self::MAX;
 }
 
-// ---------------------------------------------------------------------------
-// Value trait — encode/decode values for value block storage
-// ---------------------------------------------------------------------------
+impl TableKey for tigerbeetle_lsm::composite_key::U256 {
+    fn to_le_bytes_padded(self) -> [u8; 32] {
+        let mut buf = [0u8; 32];
+        buf[..16].copy_from_slice(&self.hi().to_le_bytes());
+        buf[16..24].copy_from_slice(&self.low_word().to_le_bytes());
+        buf
+    }
+
+    fn from_le_bytes_padded(bytes: &[u8; 32]) -> Self {
+        let mut hi_bytes = [0u8; 16];
+        hi_bytes.copy_from_slice(&bytes[..16]);
+        let mut lo_bytes = [0u8; 8];
+        lo_bytes.copy_from_slice(&bytes[16..24]);
+        Self::from_parts(u128::from_le_bytes(hi_bytes), u64::from_le_bytes(lo_bytes))
+    }
+
+    fn to_u128(self) -> u128 {
+        self.hi()
+    }
+
+    const SENTINEL_KEY: Self = Self::MAX;
+}
 
 /// Trait for values stored in value blocks.
 ///

@@ -679,6 +679,47 @@ impl<T: Table> TableMemory<T> {
         }
         table_max
     }
+
+    /// Read-only view of the value context (for scope snapshotting in tree).
+    #[must_use]
+    pub fn value_context(&self) -> &ValueContext {
+        &self.value_context
+    }
+
+    /// Read the current mutability state.
+    #[must_use]
+    pub fn mutability(&self) -> &Mutability {
+        &self.mutability
+    }
+
+    /// Mark the immutable table as flushed (called by compaction after disk write).
+    ///
+    /// # Panics
+    /// Panics if the table is not immutable (upstream asserts).
+    pub fn set_flushed(&mut self) {
+        match &mut self.mutability {
+            Mutability::Immutable(state) => {
+                assert!(!state.flushed);
+                state.flushed = true;
+            }
+            Mutability::Mutable => panic!("set_flushed called on mutable table"),
+        }
+    }
+
+    /// Restore a previously snapshotted value context (for scope discard in tree).
+    ///
+    /// # Panics
+    /// Panics if `count` exceeds the table capacity (upstream asserts).
+    pub fn restore_value_context(&mut self, ctx: ValueContext) {
+        assert!(ctx.count <= self.values.len() as u32);
+        self.value_context = ctx;
+    }
+
+    /// The total capacity of the values array (upstream `values.len`).
+    #[must_use]
+    pub fn values_capacity(&self) -> usize {
+        self.values.len()
+    }
 }
 
 /// Upstream: `KeyRange`.

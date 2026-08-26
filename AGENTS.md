@@ -130,3 +130,61 @@ cd reference/tigerbeetle/src && ../zig/zig build-exe \
   too; introducing tokio et al. requires updating this section first.
 - Crate layout: **decided** — workspace crates from the start (`tigerbeetle-core`,
   `tigerbeetle-lsm`, `tigerbeetle-vsr`, `tigerbeetle-server`, `tigerbeetle-client`).
+
+## Compaction porting notes
+
+- Pure helper functions (`snapshot_max_for_table_input`, `snapshot_min_for_table_output`,
+  `compaction_op_min`) live in `tigerbeetle-lsm/src/compaction.rs`.
+- `Compaction` struct lives in `tigerbeetle-vsr/src/compaction.rs`, generic over `S: TreeSpec`.
+- **No ResourcePool:** block allocation/IOPS management deferred to Phase 3.
+- **No I/O dispatch:** `compaction_dispatch`, read/write callbacks deferred to Phase 3.
+- **Lifecycle stubs:** `half_bar_commence`, `half_bar_complete`, `beat_commence` deferred to
+  Phase 2 (need Manifest operations).
+- **`TableInfoA` simplified:** upstream stores `ImmutableTableIterator` in a union; Rust
+  ownership makes this self-referential. Instead, we track `Immutable`/`Disk` variant and
+  re-create the iterator when needed during the dispatch loop.
+
+## State machine porting notes
+
+- State machine lives in `tigerbeetle-vsr/src/state_machine.rs` (not core) — it depends on
+  grooves which are in vsr.
+- **Batch orchestrator implemented:** `execute_create_accounts` and `execute_create_transfers`
+  handle linked chains, imported batch validation, timestamp assignment, and scope management
+  (scope_open/close deferred to prefetch integration).
+- **Post/void pending transfers implemented:** `post_or_void_pending_transfer` validates flags,
+  pending_id, account/ledger/code matching, amount bounds, pending status, closed accounts.
+  Returns `PostVoidPendingResult` with amount and is_post flag.
+- **No imported timestamp validation:** Key-range checks (`objects.key_range`) and
+  `indirect_lookup` calls deferred.
+- **No `account_event` CDC:** The `AccountEvent` groove (history/CDC) does not exist yet.
+- **No expiry scheduling:** `expire_pending_transfers.pulse_next_timestamp` scheduling
+  deferred.
+- **Standalone functions:** `create_account` and `create_transfer` are pure functions taking
+  references + lookup results, not methods on a `StateMachine` struct.
+
+## Groove porting notes
+
+- Groove lives in `tigerbeetle-vsr/src/groove.rs` (not `lsm`) — it owns `Tree<S>` which
+  is in vsr; putting groove in lsm would create circular dep.
+- **No comptime code generation:** upstream uses `GrooveType()` comptime function to
+  auto-generate `IndexTrees`, `UniqueKey`, `PrefetchKeys`, `IndexHelperType`. This port
+  manually defines concrete structs for Account (9 trees) and Transfer (14 trees).
+- **Index tree spec types** (`AccountObjectSpec`, `TransferObjectSpec`,
+  `CompositeKey128Spec`, `CompositeKey64Spec`, `CompositeKeyUnitSpec`, `UniqueKey128Spec`)
+  implement both `table_memory::Table` and `tree::TreeSpec`.
+- **`U256` traits:** `TournamentKey`, `RadixKey`, `manifest::TableKey` impls live in
+  `composite_key.rs` (lsm crate). `vsr::table::TableKey` impl lives in `vsr/table.rs`.
+- **`TableLayout::compute` is `const fn`** — allows `const LAYOUT` on tree spec types.
+  `TableIndex::init` and `TableValue::init` in schema.rs are also `const fn`.
+- **No `Grid` stored on `Tree`:** methods needing Grid take `grid: &mut Grid` param.
+- **No `ScratchMemory` stored on `Tree`:** passed per-call to `compact()` and
+  `swap_mutable_and_immutable()`.
+- **`ObjectsCache` deferred:** CacheMap is ported but not yet wired into groove.
+  Temporary `HashMap<u128, V>` (`id_map`) provides `get()` for primary-key lookups.
+- **Prefetch deferred:** ~480 lines, needs async I/O; stubs only for now.
+- **`cached_value_block_search` is a static fn** (no `&mut self`) — avoids borrow-checker
+  tension in `lookup_from_levels_cache`.
+- **`open_complete` takes `checkpoint_op: u64`** instead of reaching into
+  `grid.superblock`.
+- **`open_table` bypasses ManifestLog:** Direct `manifest.levels[l].insert_table()`.
+- **No Tracer:** `grid.trace.start/stop` calls deferred (TODO).

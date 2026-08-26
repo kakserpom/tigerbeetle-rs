@@ -210,7 +210,7 @@ impl TableIndex {
     /// Panics if parameters are zero/out-of-range or the layout exceeds a block
     /// (upstream asserts the same).
     #[must_use]
-    pub fn init(key_size: u32, value_block_count_max: u32) -> Self {
+    pub const fn init(key_size: u32, value_block_count_max: u32) -> Self {
         assert!(key_size > 0);
         assert!(value_block_count_max > 0);
         assert!(value_block_count_max <= constants::LSM_TABLE_VALUE_BLOCKS_MAX as u32);
@@ -465,7 +465,7 @@ impl TableValue {
     /// # Panics
     /// Panics if parameters are zero or `value_size` is not a power of two.
     #[must_use]
-    pub fn init(value_count_max: u32, value_size: u32) -> Self {
+    pub const fn init(value_count_max: u32, value_size: u32) -> Self {
         assert!(value_count_max > 0);
         assert!(value_size > 0);
         assert!(value_size.is_power_of_two());
