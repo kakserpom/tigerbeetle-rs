@@ -112,6 +112,15 @@ pub struct Replica {
     pub exit_view_from_all_replicas: u64,
     /// Whether the primary has started abdicating.
     pub primary_abdicating: bool,
+
+    // ── Outbound messages (sans-IO) ──────────────────────────────────────
+    /// Outbound headers awaiting delivery.
+    ///
+    /// DEVIATION: upstream broadcasts through `message_bus` immediately. This
+    /// sans-IO skeleton instead queues outbound headers here; the integration
+    /// layer drains the queue. Body-carrying messages (JoinView/View) will
+    /// require upgrading this queue to full [`crate::message::Message`]s.
+    pub send_queue: Vec<message_header::Header>,
 }
 
 // ---------------------------------------------------------------------------
@@ -358,6 +367,7 @@ impl Replica {
             exit_view_from_all_replicas: 0,
             primary_abdicating: false,
             journal: crate::journal::Journal::new(cluster, replica_index),
+            send_queue: Vec::new(),
         }
     }
 
@@ -473,8 +483,7 @@ impl Replica {
 
         let mut header = message_header::Prepare {
             cluster: self.cluster,
-            #[allow(clippy::cast_possible_truncation)] // replica_count ≤ u8::MAX
-            replica: self.replica_index as u8,
+            replica: self.replica_u8(),
             view: self.view,
             op,
             commit: self.commit_max,
@@ -1081,8 +1090,35 @@ impl Replica {
             return;
         }
 
-        // TODO(port): broadcast Commit{commit_max, checkpoint_op, timestamp: now} to replicas.
-        let _ = now;
+        // Upstream takes the checksum from the superblock checkpoint when
+        // `commit_max` is the checkpoint op, otherwise from the journal head.
+        // The superblock is not yet ported, so for the checkpoint op (= 0) we
+        // fall back to the root prepare's checksum.
+        let commit_checksum = if let Some(entry) = self.journal.header_with_op(self.commit_max) {
+            entry.checksum()
+        } else {
+            assert_eq!(self.commit_max, 0);
+            message_header::Prepare::root(self.cluster).checksum()
+        };
+
+        let mut commit = message_header::Commit::default();
+        commit.cluster = self.cluster;
+        // DEVIATION: upstream sets `view`/`replica`/`timestamp_monotonic` from
+        // the current header and the synchronous clock. The sans-IO skeleton
+        // has no clock, so the caller's `now` is used directly as the
+        // timestamp (units: ms rather than upstream's ns).
+        commit.view = self.view;
+        commit.replica = self.replica_u8();
+        commit.commit = self.commit_max;
+        commit.commit_checksum = commit_checksum;
+        commit.timestamp_monotonic = now;
+        // TODO(port): checkpoint_op/checkpoint_id from the superblock.
+        commit.set_checksum_body(&[]);
+        commit.set_checksum();
+
+        let header = message_header::Header::from_wire(&commit.to_wire())
+            .unwrap_or_else(|| panic!("send_commit: failed to encode Commit header"));
+        self.send_queue.push(header);
     }
 
     /// Handle a ping message — reply with a pong.
@@ -1105,6 +1141,16 @@ impl Replica {
     #[allow(clippy::unused_self)]
     pub fn on_pong(&mut self, _header: &message_header::Header) {
         // TODO(port): clock.learn(m0, t1, m2) with the three-clock exchange.
+    }
+
+    /// `self.replica_index` as the wire `u8` replica field.
+    ///
+    /// Truncation is safe: `replica_count ≤ u8::MAX` (constrained by cluster
+    /// tuples in `constants`), so each replica index fits in a byte.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    fn replica_u8(&self) -> u8 {
+        self.replica_index as u8
     }
 
     /// Handle a commit heartbeat from the primary (backup only).
@@ -2021,6 +2067,46 @@ mod tests {
         r.on_message(&commit, 200);
         assert_eq!(r.commit_max, 0);
         assert_eq!(r.commit_min, 0);
+    }
+
+    #[test]
+    fn primary_send_commit_broadcasts_real_commit_header() {
+        let mut r = Replica::new(0, 0, 3); // primary
+        r.status = Status::Normal;
+        let h1 = make_prepare_for_replica(0, 0, 1, 0, 0);
+        r.on_prepare(&h1);
+        r.commit_op(1); // commit_min == commit_max == 1
+
+        r.send_commit(1_000);
+        assert_eq!(r.send_queue.len(), 1);
+        let commit = r.send_queue[0].into_typed::<message_header::Commit>().unwrap();
+        assert_eq!(commit.commit, 1);
+        assert_eq!(commit.commit_checksum, h1.checksum());
+        assert_eq!(commit.timestamp_monotonic, 1_000);
+        assert_eq!(commit.view, 0);
+        assert_eq!(commit.replica, 0);
+    }
+
+    #[test]
+    fn primary_commit_reaches_backup_through_send_queue() {
+        let mut primary = Replica::new(0, 0, 3);
+        primary.status = Status::Normal;
+        let h1 = make_prepare_for_replica(0, 0, 1, 0, 0);
+        primary.on_prepare(&h1);
+        primary.commit_op(1);
+
+        // Primary broadcasts a Commit; the backup receives it through the
+        // sans-IO send_queue.
+        primary.send_commit(1_000);
+        let commit = primary.send_queue.pop().unwrap();
+
+        let mut backup = Replica::new(0, 1, 3);
+        backup.status = Status::Normal;
+        assert_eq!(backup.on_prepare(&h1), OnPrepareResult::Accepted);
+        backup.on_message(&commit, 1_100);
+        assert_eq!(backup.commit_min, 1);
+        assert_eq!(backup.commit_max, 1);
+        assert!(backup.journal.has_prepare(&h1));
     }
 
     #[test]
