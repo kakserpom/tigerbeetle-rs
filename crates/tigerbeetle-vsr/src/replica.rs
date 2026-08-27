@@ -2273,6 +2273,7 @@ impl Replica {
             Command::JoinView => self.on_join_view(message, now),
             Command::View => self.on_view(message, now),
             Command::PrepareOk => self.on_prepare_ok_message(message),
+            Command::GetPrepare => self.on_get_prepare(&header),
             // TODO(port): remaining message handlers.
             Command::Reply
             | Command::Ping
@@ -2281,7 +2282,6 @@ impl Replica {
             | Command::Headers
             | Command::GetView
             | Command::GetHeaders
-            | Command::GetPrepare
             | Command::GetReply
             | Command::GetBlocks
             | Command::Deprecated12
@@ -2822,6 +2822,95 @@ impl Replica {
         if !self.is_primary() {
             self.send_prepare_ok(&prepare);
         }
+    }
+
+    /// Request a peer to re-serve the prepare for `op`.
+    ///
+    /// Uses the explicit-checksum form of `GetPrepare` (`view == 0`), which
+    /// the responder can satisfy without referencing its own view of the log:
+    /// `checksum` is typically known to the requester from the hash chain of a
+    /// later prepare (its `parent`) or from a `Commit` (`commit_checksum`).
+    ///
+    /// DEVIATION: upstream (`repair_prepare`, replica.zig:8387) omits the
+    /// checksum and sets `view = self.view` when it has no journal entry for
+    /// the op, letting the responder resolve the op in its own log. That form
+    /// is unsatisfiable for `view == 0` (the responder treats `view == 0` as
+    /// requiring the explicit checksum), so the port always sends the explicit
+    /// checksum. Upstream also picks `to` via the repair-message budget
+    /// (`journal_repair_message_budget.decrement`); sans-IO has no budgets, the
+    /// caller supplies the destination. The flat `send_queue` carries no
+    /// routing metadata, so the single queued `GetPrepare` must be delivered to
+    /// `to`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the replica is single, or if `to` is not a valid replica.
+    ///
+    /// Upstream: `src/vsr/replica.zig:8311` (`repair_prepare`).
+    pub fn send_get_prepare(&mut self, to: u8, op: u64, checksum: u128) {
+        assert!(u16::from(to) < self.replica_count);
+        assert_ne!(to, self.replica_u8());
+        let mut get_prepare = message_header::GetPrepare {
+            cluster: self.cluster,
+            view: 0,
+            replica: self.replica_u8(),
+            prepare_op: op,
+            prepare_checksum: checksum,
+            ..message_header::GetPrepare::default()
+        };
+        get_prepare.set_checksum_body(&[]);
+        get_prepare.set_checksum();
+        self.enqueue_header(&get_prepare);
+    }
+
+    /// Serve a prepare from our journal in response to a `GetPrepare` request.
+    ///
+    /// The requester references the prepare either by an explicit checksum
+    /// (`view == 0`) or by op alone (`view != 0`, `prepare_checksum == 0`), in
+    /// which case the checksum is resolved from our own entry for the op. If we
+    /// do not hold the requested checksum — because we are missing the op or
+    /// hold a different one — we do not answer, and the requester will retry
+    /// against another peer.
+    ///
+    /// DEVIATION: upstream (replica.zig:3084-3157) serves the pipeline first,
+    /// then reads the WAL prepare with `read_prepare_with_op_and_checksum` so
+    /// the response carries the prepare body. The sans-IO journal is in-memory
+    /// with deferred bodies, so the stored header is served directly; the
+    /// recipient validates it via the hash chain as usual. The flat
+    /// `send_queue` carries no routing metadata, so the single queued `Prepare`
+    /// must be delivered to `get_prepare.replica`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `replica_count <= 1` or if the request claims to originate
+    /// from this replica.
+    ///
+    /// Upstream: `src/vsr/replica.zig:3056` (`on_get_prepare`).
+    pub fn on_get_prepare(&mut self, header: &message_header::Header) {
+        let Some(get_prepare) = header.into_typed::<message_header::GetPrepare>() else {
+            return; // Command mismatch or invalid header.
+        };
+        assert!(self.replica_count > 1);
+        assert_ne!(get_prepare.replica, self.replica_u8());
+
+        // Resolve the checksum the requester expects (upstream 3064-3079):
+        let checksum = if get_prepare.view == 0 {
+            get_prepare.prepare_checksum
+        } else {
+            assert_eq!(get_prepare.prepare_checksum, 0);
+            let Some(entry) = self.journal.header_with_op(get_prepare.prepare_op) else {
+                return; // We don't hold the op the requester assumes we hold.
+            };
+            entry.checksum()
+        };
+
+        // Only answer if we hold the exact prepare requested:
+        let Some(prepare) =
+            self.journal.header_with_op_and_checksum(get_prepare.prepare_op, checksum)
+        else {
+            return;
+        };
+        self.enqueue_header(&prepare.clone());
     }
 
     /// Handle a Commit message from the primary (backup only, normal status).
@@ -3492,6 +3581,152 @@ mod tests {
         assert_eq!(backup.commit_min, 1);
         assert_eq!(backup.commit_max, 1);
         assert!(backup.journal.has_prepare(&h1));
+    }
+
+    #[test]
+    fn on_get_prepare_serves_prepare_matching_explicit_checksum() {
+        let mut r = Replica::new(0, 0, 3); // primary
+        r.status = Status::Normal;
+        let h1 = make_prepare_for_replica(0, 0, 1, 0, 0);
+        let h2 = make_prepare_for_replica(0, 0, 2, h1.checksum(), 0);
+        r.on_prepare(&h1);
+        r.on_prepare(&h2);
+
+        // Replica 2 asks for op 2 by reference to its checksum (view == 0):
+        let mut get_prepare = message_header::GetPrepare {
+            cluster: 0,
+            replica: 2,
+            prepare_op: 2,
+            prepare_checksum: h2.checksum(),
+            ..message_header::GetPrepare::default()
+        };
+        get_prepare.set_checksum_body(&[]);
+        get_prepare.set_checksum();
+        let mut message = crate::message::Message::new();
+        message.set_header(&get_prepare);
+        r.on_message(&message, 100);
+
+        assert_eq!(r.send_queue.len(), 1);
+        let served = r.send_queue[0].header::<message_header::Prepare>().unwrap();
+        assert_eq!(served.op, 2);
+        assert_eq!(served.checksum(), h2.checksum());
+        assert_eq!(served.parent, h1.checksum());
+        assert_eq!(served.replica, 0);
+    }
+
+    #[test]
+    fn on_get_prepare_resolves_op_in_own_journal_for_view_nonzero() {
+        let mut r = Replica::new(0, 0, 3); // primary
+        r.status = Status::Normal;
+        let h1 = make_prepare_for_replica(0, 0, 1, 0, 0);
+        let h2 = make_prepare_for_replica(0, 0, 2, h1.checksum(), 0);
+        r.on_prepare(&h1);
+        r.on_prepare(&h2);
+
+        // No explicit checksum; the responder resolves op 2 in its own log:
+        let mut get_prepare = message_header::GetPrepare {
+            cluster: 0,
+            replica: 2,
+            view: 7,
+            prepare_op: 2,
+            ..message_header::GetPrepare::default()
+        };
+        get_prepare.set_checksum_body(&[]);
+        get_prepare.set_checksum();
+        let mut message = crate::message::Message::new();
+        message.set_header(&get_prepare);
+        r.on_message(&message, 100);
+
+        assert_eq!(r.send_queue.len(), 1);
+        let served = r.send_queue[0].header::<message_header::Prepare>().unwrap();
+        assert_eq!(served.op, 2);
+        assert_eq!(served.checksum(), h2.checksum());
+    }
+
+    #[test]
+    fn on_get_prepare_is_silent_when_request_cannot_be_satisfied() {
+        let mut r = Replica::new(0, 0, 3);
+        r.status = Status::Normal;
+        let h1 = make_prepare_for_replica(0, 0, 1, 0, 0);
+        r.on_prepare(&h1);
+
+        // Wrong checksum for an op we do hold:
+        let mut get_prepare = message_header::GetPrepare {
+            cluster: 0,
+            replica: 2,
+            prepare_op: 1,
+            prepare_checksum: 0xDEAD,
+            ..message_header::GetPrepare::default()
+        };
+        get_prepare.set_checksum_body(&[]);
+        get_prepare.set_checksum();
+        let mut message = crate::message::Message::new();
+        message.set_header(&get_prepare);
+        r.on_message(&message, 100);
+        assert!(r.send_queue.is_empty());
+
+        // A view != 0 request for an op we do not hold:
+        let mut get_prepare = message_header::GetPrepare {
+            cluster: 0,
+            replica: 2,
+            view: 7,
+            prepare_op: 2,
+            ..message_header::GetPrepare::default()
+        };
+        get_prepare.set_checksum_body(&[]);
+        get_prepare.set_checksum();
+        let mut message = crate::message::Message::new();
+        message.set_header(&get_prepare);
+        r.on_message(&message, 100);
+        assert!(r.send_queue.is_empty());
+    }
+
+    #[test]
+    fn get_prepare_repairs_single_missed_op_and_backup_commits() {
+        // Primary r0 prepares and commits ops 1..=2:
+        let mut primary = Replica::new(0, 0, 3);
+        primary.status = Status::Normal;
+        let h1 = make_prepare_for_replica(0, 0, 1, 0, 0);
+        let h2 = make_prepare_for_replica(0, 0, 2, h1.checksum(), 0);
+        assert_eq!(primary.on_prepare(&h1), OnPrepareResult::Accepted);
+        assert_eq!(primary.on_prepare(&h2), OnPrepareResult::Accepted);
+        primary.commit_op(1);
+        primary.commit_op(2);
+        assert_eq!(primary.commit_min, 2);
+        assert_eq!(primary.commit_max, 2);
+
+        // Backup r2 only ever received op 1. It later sees a prepare for a
+        // future op 3 (out of order); the gap at op 2 is rejected, but the
+        // future op's parent reveals op 2's checksum:
+        let mut backup = Replica::new(0, 2, 3);
+        backup.status = Status::Normal;
+        assert_eq!(backup.on_prepare(&h1), OnPrepareResult::Accepted);
+        let h3 = make_prepare_for_replica(0, 0, 3, h2.checksum(), 0);
+        assert_eq!(backup.on_prepare(&h3), OnPrepareResult::FutureOp);
+        assert_eq!(backup.op, 1);
+
+        // The backup asks the primary to re-serve op 2:
+        backup.send_get_prepare(0, 2, h3.parent);
+        let get_prepare = backup.send_queue.pop().unwrap();
+        assert!(get_prepare.header::<message_header::GetPrepare>().is_some());
+
+        // The primary answers from its journal:
+        primary.on_message(&get_prepare, 50);
+        assert_eq!(primary.send_queue.len(), 1);
+        let rehearsed = primary.send_queue.pop().unwrap();
+        let served = rehearsed.header::<message_header::Prepare>().unwrap();
+        assert_eq!(served.op, 2);
+        assert_eq!(served.checksum(), h2.checksum());
+
+        // The backup installs the repaired prepare and acks it, then commits:
+        backup.on_message(&rehearsed, 100);
+        assert_eq!(backup.op, 2);
+        let commit = make_commit_message(0, 0, 2, h2.checksum(), 100);
+        backup.on_message(&commit, 200);
+        assert_eq!(backup.commit_min, 2);
+        assert_eq!(backup.commit_max, 2);
+        // The commit marks the repaired prepare's slot clean:
+        assert!(backup.journal.has_prepare(&h2));
     }
 
     #[test]
