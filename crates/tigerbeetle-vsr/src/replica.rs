@@ -486,9 +486,11 @@ impl Replica {
         header.set_checksum_body(&[]);
         header.set_checksum();
 
-        // Advance op and record the prepare in the journal (upstream `on_prepare`):
-        self.op = op;
-        self.journal.set_header_as_dirty(&header);
+        // The primary "self-sends" the prepare through the shared accept path
+        // (upstream: `primary_pipeline_prepare` → `on_prepare`), which advances
+        // `op` and records the header in the journal:
+        let result = self.on_prepare(&header);
+        assert_eq!(result, OnPrepareResult::Accepted);
 
         let prepare = PipelinePrepare {
             op,
@@ -508,6 +510,49 @@ impl Replica {
         // TODO(port): serialize the prepare message, send to backups.
 
         Ok(op)
+    }
+
+    /// Accept a Prepare replicated from the primary (or self-sent on the
+    /// primary). Advances `op` by exactly one and records the header as dirty
+    /// in the journal.
+    ///
+    /// Out-of-order prepares (a gap of more than one op) are rejected with
+    /// [`OnPrepareResult::FutureOp`] — upstream recovers via
+    /// `jump_to_newer_op_in_normal_status`, which needs the message bus.
+    ///
+    /// # Panics
+    /// Panics if the replica is not `.normal`, if the header's cluster/view/
+    /// replica do not match ours, if the operation is `.reserved`/`.root`, or if
+    /// the header breaks the journal hash chain within this view.
+    ///
+    /// Upstream: `src/vsr/replica.zig:2021` (`on_prepare`).
+    pub fn on_prepare(&mut self, header: &message_header::Prepare) -> OnPrepareResult {
+        assert_eq!(self.status, Status::Normal);
+        assert_eq!(header.cluster, self.cluster);
+        assert_eq!(header.view, self.view);
+        assert!(u64::from(header.replica) < u64::from(self.replica_count));
+        assert_ne!(header.operation, crate::Operation::RESERVED);
+        assert_ne!(header.operation, crate::Operation::ROOT);
+
+        if header.op <= self.op {
+            return OnPrepareResult::Stale;
+        }
+        if header.op > self.op + 1 {
+            return OnPrepareResult::FutureOp;
+        }
+        assert_eq!(header.op, self.op + 1);
+
+        // The parent must link to our current head (an older/newer entry may be
+        // a whole journal's worth of ops behind due to ring wrapping):
+        if let Some(previous) = self.journal.previous_entry(header) {
+            assert_eq!(previous.checksum(), header.parent, "hash chain break in view");
+        }
+
+        // Advance op and record the prepare in the journal:
+        self.op = header.op;
+        self.journal.set_header_as_dirty(header);
+
+        OnPrepareResult::Accepted
     }
 
     /// Handle a prepare_ok from a backup.
@@ -784,10 +829,40 @@ impl Replica {
             self.commit_start_pipeline();
             true
         } else {
-            // TODO(port): commit_start_journal — read from journal (async).
-            // For now, return ready (nothing to commit from journal).
-            true
+            self.commit_start_journal()
         }
+    }
+
+    /// Backup (or recovering) replica: take the next committed op from the
+    /// journal.
+    ///
+    /// Commits forward while `commit_min < commit_max`, as long as the next op
+    /// is already journaled. The prepare *body* read is async and deferred with
+    /// the message bus — the header's op is all the pipeline needs for now.
+    ///
+    /// Upstream: `src/vsr/replica.zig:4606` (`commit_start_journal`).
+    fn commit_start_journal(&mut self) -> bool {
+        assert_eq!(self.commit_stage, CommitStage::Start);
+        assert!(self.commit_prepare.is_none());
+        assert!(self.status == Status::Normal || self.status == Status::ViewChange);
+        assert!(!self.is_primary());
+        assert!(self.commit_min <= self.commit_max);
+        assert!(self.commit_min <= self.op);
+
+        // We may receive commit numbers for ops we do not yet have
+        // (`commit_max > self.op`):
+        if self.commit_min < self.commit_max && self.commit_min < self.op {
+            let op = self.commit_min + 1;
+            // The prepare header must be present; without it there is nothing to
+            // commit yet (a stale/nonexistent entry leaves the pipeline idle).
+            if self.journal.header_with_op(op).is_none() {
+                return true;
+            }
+            // TODO(port): `valid_hash_chain` check (deferred).
+            // TODO(port): async prepare body read (`journal.read_prepare`).
+            self.commit_prepare = Some(op);
+        }
+        true
     }
 
     /// Primary: take the head of the pipeline as the prepare to commit.
@@ -859,8 +934,7 @@ impl Replica {
 
         // Execute on state machine.
         // TODO(port): state_machine.execute(commit_prepare.body_used())
-        self.commit_min = op;
-        self.advance_commit_max(op);
+        self.commit_op(op);
         assert!(self.commit_min <= self.commit_max);
 
         if self.status == Status::Normal && self.is_primary() {
@@ -1258,6 +1332,17 @@ pub enum PrepareReject {
     PipelineFull,
 }
 
+/// Result of accepting a Prepare message (`on_prepare`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OnPrepareResult {
+    /// The prepare advanced the log (by one op) and was recorded in the journal.
+    Accepted,
+    /// `header.op <= self.op` — duplicate or already superseded.
+    Stale,
+    /// `header.op > self.op + 1` — a gap; `jump_to_newer_op` is deferred.
+    FutureOp,
+}
+
 /// Result of processing a prepare_ok message.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PrepareOkResult {
@@ -1367,7 +1452,7 @@ impl Replica {
 
         match header.command {
             Command::Request => self.on_request(header),
-            Command::Prepare => self.on_prepare(header),
+            Command::Prepare => self.on_prepare_message(header),
             Command::Commit => self.on_commit(header),
             // TODO(port): remaining message handlers.
             Command::PrepareOk
@@ -1412,28 +1497,15 @@ impl Replica {
         // TODO(port): primary_pipeline_prepare — begin preparing the request.
     }
 
-    /// Handle a prepare message from the primary.
+    /// Handle a Prepare message from the primary — decode and forward to
+    /// [`Self::on_prepare`].
     ///
     /// Upstream: `src/vsr/replica.zig:2021` (`on_prepare`).
-    pub fn on_prepare(&mut self, header: &message_header::Header) {
-        // Upstream: verify cluster, view, and op range.
-        if header.view < self.view {
-            return; // Stale prepare.
-        }
-
-        if self.is_primary() {
-            return; // Primary doesn't process its own prepares via on_prepare.
-        }
-
-        // Backup path:
-        // 1. If op > commit_min and journal lacks the prepare → replicate.
-        // 2. If stale → on_repair.
-        // 3. Advance commit_max from header's commit field.
-        // 4. Cache in pipeline cache.
-        // 5. Advance op, write to journal, send prepare_ok.
-
-        // TODO(port): full backup prepare processing.
-        let _ = header;
+    pub fn on_prepare_message(&mut self, header: &message_header::Header) {
+        let Some(prepare) = header.into_typed::<message_header::Prepare>() else {
+            return; // Command mismatch or invalid header.
+        };
+        self.on_prepare(&prepare);
     }
 
     /// Handle a commit message from the primary (backup only).
@@ -1761,6 +1833,112 @@ mod tests {
         let mut r = Replica::new(0, 0, 3);
         r.status = Status::Normal;
         let _ = r.primary_pipeline_prepare(1, 100, crate::Operation::RESERVED, 64);
+    }
+
+    #[test]
+    fn backup_on_prepare_journals_chain() {
+        let mut r = Replica::new(0, 1, 3); // backup
+        r.status = Status::Normal;
+
+        let h1 = make_prepare_for_replica(0, 0, 1, 0, 0);
+        assert_eq!(r.on_prepare(&h1), OnPrepareResult::Accepted);
+        assert_eq!(r.op, 1);
+
+        let h2 = make_prepare_for_replica(0, 0, 2, h1.checksum(), 0);
+        assert_eq!(r.on_prepare(&h2), OnPrepareResult::Accepted);
+        assert_eq!(r.op, 2);
+
+        // Hash chain is recorded in the journal:
+        assert_eq!(r.journal.header_with_op(2).unwrap().parent, h1.checksum());
+        assert_eq!(r.journal.op_maximum(), 2);
+
+        // Duplicate and future ops:
+        assert_eq!(r.on_prepare(&h2), OnPrepareResult::Stale);
+        let h5 = make_prepare_for_replica(0, 0, 5, h2.checksum(), 0);
+        assert_eq!(r.on_prepare(&h5), OnPrepareResult::FutureOp);
+        assert_eq!(r.op, 2); // unchanged
+    }
+
+    #[test]
+    #[should_panic = "hash chain break in view"]
+    fn backup_on_prepare_panics_on_hash_chain_break() {
+        let mut r = Replica::new(0, 1, 3);
+        r.status = Status::Normal;
+        let h1 = make_prepare_for_replica(0, 0, 1, 0, 0);
+        r.on_prepare(&h1);
+        let h2 = make_prepare_for_replica(0, 0, 2, 0xDEAD, 0); // wrong parent
+        r.on_prepare(&h2);
+    }
+
+    #[test]
+    fn backup_commits_from_journal() {
+        let mut r = Replica::new(0, 1, 3); // backup
+        r.status = Status::Normal;
+
+        let h1 = make_prepare_for_replica(0, 0, 1, 0, 0);
+        assert_eq!(r.on_prepare(&h1), OnPrepareResult::Accepted);
+        let h2 = make_prepare_for_replica(0, 0, 2, h1.checksum(), 0);
+        assert_eq!(r.on_prepare(&h2), OnPrepareResult::Accepted);
+        let h3 = make_prepare_for_replica(0, 0, 3, h2.checksum(), 0);
+        assert_eq!(r.on_prepare(&h3), OnPrepareResult::Accepted);
+        assert_eq!(r.op, 3);
+
+        // Backup learns commit_max=1 and commits op 1 from its journal:
+        r.commit_max = 1;
+        r.commit_dispatch_enter();
+        assert_eq!(r.commit_stage, CommitStage::Idle);
+        assert_eq!(r.commit_min, 1);
+        // The prepare write completes with the commit:
+        assert!(r.journal.has_prepare(&h1));
+
+        // Then it catches up op by op:
+        r.commit_max = 2;
+        r.commit_dispatch_enter();
+        assert_eq!(r.commit_min, 2);
+        assert!(r.journal.has_prepare(&h2));
+
+        r.commit_max = 3;
+        r.commit_dispatch_enter();
+        assert_eq!(r.commit_min, 3);
+        assert!(r.journal.has_prepare(&h3));
+    }
+
+    #[test]
+    fn backup_does_not_commit_unacquired_op() {
+        // commit_max advances to 2, but only op 1 is in the journal:
+        let mut r = Replica::new(0, 1, 3);
+        r.status = Status::Normal;
+        let h1 = make_prepare_for_replica(0, 0, 1, 0, 0);
+        r.on_prepare(&h1);
+
+        r.commit_max = 2;
+        r.commit_dispatch_enter();
+        // Op 1 commits; op 2 has no header in the journal, so the pipeline stops.
+        assert_eq!(r.commit_min, 1);
+        assert_eq!(r.commit_stage, CommitStage::Idle);
+    }
+
+    /// Build a checksum-valid Prepare header as a primary would, for feeding
+    /// `on_prepare` from the primary's point of view.
+    fn make_prepare_for_replica(
+        cluster: u128,
+        view: u32,
+        op: u64,
+        parent: u128,
+        commit: u64,
+    ) -> message_header::Prepare {
+        let mut header = message_header::Prepare {
+            cluster,
+            view,
+            op,
+            parent,
+            commit,
+            operation: crate::Operation::NOOP,
+            ..message_header::Prepare::default()
+        };
+        header.set_checksum_body(&[]);
+        header.set_checksum();
+        header
     }
 
     #[test]
