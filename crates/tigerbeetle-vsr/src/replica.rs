@@ -1323,7 +1323,11 @@ impl Replica {
         // TODO(port): checkpoint_op/checkpoint_id from the superblock.
         commit.set_checksum_body(&[]);
         commit.set_checksum();
-        self.enqueue_header(&commit);
+        // Broadcast to every backup (upstream: `send_commit` →
+        // `send_header_to_other_replicas_and_standbys`, replica.zig:11370).
+        for _ in 1..self.replica_count {
+            self.enqueue_header(&commit);
+        }
     }
 
     /// Enqueue an outbound message for the integration layer.
@@ -3457,13 +3461,15 @@ mod tests {
         r.commit_op(1); // commit_min == commit_max == 1
 
         r.send_commit(1_000);
-        assert_eq!(r.send_queue.len(), 1);
-        let commit = r.send_queue[0].header::<message_header::Commit>().unwrap();
-        assert_eq!(commit.commit, 1);
-        assert_eq!(commit.commit_checksum, h1.checksum());
-        assert_eq!(commit.timestamp_monotonic, 1_000);
-        assert_eq!(commit.view, 0);
-        assert_eq!(commit.replica, 0);
+        assert_eq!(r.send_queue.len(), 2); // one Commit per backup
+        for message in &r.send_queue {
+            let commit = message.header::<message_header::Commit>().unwrap();
+            assert_eq!(commit.commit, 1);
+            assert_eq!(commit.commit_checksum, h1.checksum());
+            assert_eq!(commit.timestamp_monotonic, 1_000);
+            assert_eq!(commit.view, 0);
+            assert_eq!(commit.replica, 0);
+        }
     }
 
     #[test]
