@@ -659,7 +659,17 @@ impl Replica {
         }
 
         let _ = body_size;
-        // TODO(port): serialize the prepare message, send to backups.
+
+        // Replicate the prepare to every backup (upstream: `replicate` →
+        // `send_message_to_other_replicas_and_standbys`, replica.zig:8550-8552).
+        // DEVIATION: upstream serializes the request body into the message;
+        // sans-IO bodies are deferred, so a header-only prepare is broadcast
+        // (receivers dispatch on the header alone).
+        let mut message = crate::message::Message::new();
+        message.set_header(&header);
+        for _ in 1..self.replica_count {
+            self.send_queue.push(message.clone());
+        }
 
         Ok(op)
     }
@@ -3076,6 +3086,21 @@ mod tests {
     }
 
     #[test]
+    fn primary_pipeline_prepare_broadcasts_to_backups() {
+        let mut r = Replica::new(0, 0, 3);
+        r.status = Status::Normal;
+        r.primary_pipeline_prepare(1, 1, crate::Operation::NOOP, 0).unwrap();
+        // One broadcast Prepare per backup, carrying the journaled op.
+        assert_eq!(r.send_queue.len(), 2);
+        for message in &r.send_queue {
+            let prepare = message.header::<message_header::Prepare>().unwrap();
+            assert_eq!(prepare.op, 1);
+            assert_eq!(prepare.checksum(), r.journal.header_with_op(1).unwrap().checksum());
+            assert_eq!(u16::from(prepare.replica), 0);
+        }
+    }
+
+    #[test]
     fn on_prepare_ok_quorum_3() {
         let mut r = Replica::new(0, 0, 3); // primary, quorum=2
         r.status = Status::Normal;
@@ -3137,6 +3162,7 @@ mod tests {
         let mut r = Replica::new(0, 0, 3);
         r.status = Status::Normal;
         let op = r.primary_pipeline_prepare(1, 1, crate::Operation::NOOP, 0).unwrap();
+        r.send_queue.clear(); // the initial broadcast is not under test
 
         // No backup has acked → both replicas 1 and 2 are waiting; the
         // timeout re-sends the pending prepare to each.
@@ -3165,6 +3191,7 @@ mod tests {
         r.status = Status::Normal;
         r.primary_pipeline_prepare(1, 1, crate::Operation::NOOP, 0).unwrap();
         r.primary_pipeline_prepare(2, 2, crate::Operation::NOOP, 0).unwrap();
+        r.send_queue.clear(); // the initial broadcasts are not under test
 
         // Quorum op 1 and commit it; op 2 remains pending.
         let checksum = r.journal.header_with_op(1).unwrap().checksum();
@@ -3184,20 +3211,20 @@ mod tests {
 
     #[test]
     fn backup_acks_prepare_on_the_wire_and_primary_commits() {
-        // The primary prepares op 1 through its pipeline; the backup receives
-        // the Prepare on the wire, accepts it, and acks; the primary counts the
-        // ack toward quorum and commits through its commit dispatch.
+        // The primary prepares op 1 through its pipeline and broadcasts it to
+        // both backups; the backup receives it on the wire, accepts it, and
+        // acks; the primary counts the ack toward quorum and commits.
         let mut r1 = Replica::new(0, 0, 3); // primary, view 0
         r1.status = Status::Normal;
         r1.primary_pipeline_prepare(1, 100, crate::Operation(6), 64).unwrap();
         assert_eq!(r1.pipeline_queue.prepare_queue.len(), 1);
+        assert_eq!(r1.send_queue.len(), 2); // one broadcast Prepare per backup
 
         let mut r2 = Replica::new(0, 2, 3); // backup
         r2.status = Status::Normal;
-        let prepare = *r1.journal.header_with_op(1).unwrap();
+        let prepare = r1.send_queue[0].header::<message_header::Prepare>().unwrap();
         assert_eq!(prepare.command, Command::Prepare);
-        let mut prepare_msg = crate::message::Message::new();
-        prepare_msg.set_header(&prepare);
+        let prepare_msg = r1.send_queue[0].clone();
         r2.on_message(&prepare_msg, 20_000);
         assert_eq!(r2.op, 1);
         assert_eq!(r2.send_queue.len(), 1); // exactly one PrepareOk
