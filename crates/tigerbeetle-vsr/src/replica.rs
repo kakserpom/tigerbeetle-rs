@@ -737,6 +737,42 @@ impl Replica {
         PrepareOkResult::AckCounted
     }
 
+    /// Wire handler: route a PrepareOk message to `on_prepare_ok`.
+    ///
+    /// After counting the ack, drives the commit dispatch so the primary can
+    /// commit the op (or the next queued op) once a quorum of prepare_oks has
+    /// arrived — upstream `on_prepare_ok` finishes with `commit_pipeline()`.
+    fn on_prepare_ok_message(&mut self, message: &crate::message::Message) {
+        let Some(prepare_ok) = message.header::<message_header::PrepareOk>() else {
+            return; // Command mismatch or malformed header.
+        };
+        // DEVIATION: upstream validates checksums at the message_bus receive
+        // path; sans-IO messages are constructed locally, so guard anyway.
+        if !prepare_ok.valid_checksum() || !prepare_ok.valid_checksum_body(message.body_used()) {
+            return;
+        }
+        if prepare_ok.cluster != self.cluster {
+            return;
+        }
+        assert!(u16::from(prepare_ok.replica) < self.replica_count);
+
+        match self.on_prepare_ok(
+            prepare_ok.op,
+            prepare_ok.prepare_checksum,
+            u16::from(prepare_ok.replica),
+        ) {
+            PrepareOkResult::Ignored
+            | PrepareOkResult::UnknownOp
+            | PrepareOkResult::ChecksumMismatch
+            | PrepareOkResult::DuplicateAck => {}
+            PrepareOkResult::AckCounted | PrepareOkResult::QuorumReached { .. } => {
+                if self.status == Status::Normal && self.is_primary() {
+                    self.commit_dispatch_enter();
+                }
+            }
+        }
+    }
+
     /// Commit a single op on the backup.
     ///
     /// Advances commit_min and calls execute on the state machine.
@@ -1396,8 +1432,10 @@ impl Replica {
     ///
     /// # Panics
     ///
-    /// Panics unless the replica is a backup in `ViewChange` status with the
-    /// View's headers installed.
+    /// Panics unless the replica is in `ViewChange` status with the new log
+    /// established — a backup whose journal carries `op`, or the new primary
+    /// whose journal is contiguously clean and whose pipeline holds the
+    /// survivor prepares.
     ///
     /// Upstream: `src/vsr/replica.zig:10056`
     /// (`transition_to_normal_from_view_change_status`).
@@ -1414,34 +1452,58 @@ impl Replica {
         // Headers array records the command of the stored messages); the
         // sans-IO `Vec<Prepare>` carries no command, and `on_view_set_journal`
         // has just installed the View's headers.
-
-        // DEVIATION: only the backup arm is ported. The primary arm (upstream
-        // :10065) additionally asserts `primary_journal_repaired()`,
-        // `commit_min == commit_max`, and the pipeline shape, then restarts the
-        // prepare/commit timers — the primary returns to Normal via its own
-        // `repair()` I/O path in the I/O increment.
-        assert!(!self.is_primary());
         assert!(!self.prepare_timeout.active);
         assert!(!self.primary_abdicate_timeout.active);
-        // Upstream asserts `pipeline == .cache` (and `get_view_message_timeout`
-        // ticking, which does not exist sans-IO); the skeleton's only pipeline
-        // is the primary's queue, emptied at transition_to_view_change_status.
-        assert!(self.pipeline_queue.prepare_queue.is_empty());
 
         self.status = Status::Normal;
         self.commit_fault.reset(now);
-        // DEVIATION: upstream does not set view/log_view when we recovered
-        // into the same view we crashed in (log_view == view_new, via
-        // recovering_head); sans-IO replicas only reach this from a View whose
-        // log_view is the previous one, so the assignment always runs.
-        self.view = view_new;
-        self.log_view = view_new;
-        // TODO(port): `view_durable_update()` needs the superblock.
-        self.ping_timeout = Timeout::start(constants::PING_TIMEOUT);
-        self.commit_message_timeout.stop();
-        self.exit_view_window_timeout.stop();
-        self.exit_view_message_timeout = Timeout::start(constants::EXIT_VIEW_MESSAGE_TIMEOUT);
-        self.view_change_status_timeout.stop();
+
+        if self.is_primary() {
+            assert_eq!(self.view, view_new);
+            assert_eq!(self.log_view, view_new);
+            assert_eq!(self.commit_min, self.commit_max);
+            // DEVIATION: upstream asserts `primary_journal_repaired()` and
+            // `pipeline == .queue` (with the survivors asserted contiguous and
+            // clean). Sans-IO the journal is already verified, and the pipeline
+            // was rebuilt by `primary_start_view_as_the_new_primary`.
+            assert_eq!(
+                self.commit_max + self.pipeline_queue.prepare_queue.len() as u64,
+                self.op
+            );
+
+            self.ping_timeout = Timeout::start(constants::PING_TIMEOUT);
+            // DEVIATION: upstream additionally stops join_view_message_timeout
+            // and get_view_message_timeout (sans-IO timeouts do not exist).
+            self.commit_message_timeout = Timeout::start(constants::COMMIT_MESSAGE_TIMEOUT);
+            self.exit_view_window_timeout.stop();
+            self.exit_view_message_timeout = Timeout::start(constants::EXIT_VIEW_MESSAGE_TIMEOUT);
+            self.view_change_status_timeout.stop();
+
+            // Do not reset the pipeline as there may be uncommitted ops to
+            // drive to completion (upstream `replica.zig:10095`).
+            if !self.pipeline_queue.prepare_queue.is_empty() {
+                self.prepare_timeout = Timeout::start(constants::PIPELINE_PREPARE_QUEUE_MAX);
+                self.primary_abdicate_timeout = Timeout::start(constants::PRIMARY_ABDICATE_TIMEOUT);
+            }
+        } else {
+            // DEVIATION: upstream does not set view/log_view when we recovered
+            // into the same view we crashed in (log_view == view_new, via
+            // recovering_head); sans-IO replicas only reach this from a View
+            // whose log_view is the previous one, so the assignment always runs.
+            self.view = view_new;
+            self.log_view = view_new;
+            // TODO(port): `view_durable_update()` needs the superblock.
+            self.ping_timeout = Timeout::start(constants::PING_TIMEOUT);
+            self.commit_message_timeout.stop();
+            self.exit_view_window_timeout.stop();
+            self.exit_view_message_timeout = Timeout::start(constants::EXIT_VIEW_MESSAGE_TIMEOUT);
+            self.view_change_status_timeout.stop();
+
+            // Upstream asserts `pipeline == .cache` (and `get_view_message_timeout`
+            // ticking, which does not exist sans-IO); the skeleton's only pipeline
+            // is the primary's queue, emptied at transition_to_view_change_status.
+            assert!(self.pipeline_queue.prepare_queue.is_empty());
+        }
 
         // DEVIATION: upstream additionally starts get_view_message_timeout,
         // repair_sync_timeout, journal_repair_timeout, grid_repair/scrub
@@ -1452,10 +1514,71 @@ impl Replica {
         // A replica reports its own ExitView only while it thinks the primary
         // is faulty (`reset_quorum_exit_view`).
         self.exit_view_from_all_replicas = 0;
-        // Upstream `reset_quorum_join_view`:
+        // Upstream `reset_quorum_join_view` (also clears the flag on a primary that
+        // collected the quorum it just transitioned out of):
         self.join_view_from_all_replicas.fill(None);
-        assert!(!self.join_view_quorum);
         self.join_view_quorum = false;
+    }
+
+    /// Become a `Normal` primary over the quorum's log (the new primary's tail
+    /// of `on_join_view`).
+    ///
+    /// Upstream, the View is broadcast and the pipeline rebuilt only after CTRL
+    /// journal repairs complete (`repair()` → `primary_start_view_as_the_new_primary`,
+    /// `replica.zig:5983`). Sans-IO journals are clean by construction, so this
+    /// runs synchronously after the View broadcast: the survivor prepares
+    /// (`commit_max+1..=op`) are loaded into the pipeline, we return to Normal,
+    /// and our own prepare_oks are contributed toward the re-confirmation
+    /// quorum for each survivor.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the replica is not the newly-elected primary in `ViewChange`
+    /// status, or if the journal is missing a survivor header (cannot happen by
+    /// construction — the log was just installed from the quorum).
+    fn primary_start_view_as_the_new_primary(&mut self, now: u64) {
+        assert_eq!(self.status, Status::ViewChange);
+        assert!(self.is_primary());
+        assert_eq!(self.view, self.log_view);
+        assert!(self.join_view_quorum);
+        assert_eq!(self.commit_min, self.commit_max);
+        assert!(self.commit_max <= self.op);
+
+        // Rebuild the pipeline from the survivor prepares (upstream
+        // `primary_repair_pipeline_done`, sans-IO: nothing to verify).
+        self.pipeline_queue = PipelineQueue::default();
+        self.ok_from_all_replicas.clear();
+        for op in self.commit_max + 1..=self.op {
+            let Some(header) = self.journal.header_with_op(op).copied() else {
+                panic!("new primary journal must hold survivor op {op}");
+            };
+            self.pipeline_queue.prepare_queue.push(PipelinePrepare {
+                op,
+                checksum: header.checksum(),
+                acks_received: 0,
+                ok_quorum_received: false,
+            });
+            self.ok_from_all_replicas.push(0);
+        }
+
+        self.transition_to_normal_from_view_change_status(self.view, now);
+
+        // Contribute our own prepare_oks (upstream
+        // `send_prepare_oks_after_view_change`, with the primary's prepare_oks
+        // self-routed through `on_prepare_ok`).
+        let survivors: Vec<(u64, u128)> = self
+            .pipeline_queue
+            .prepare_queue
+            .iter()
+            .map(|prepare| (prepare.op, prepare.checksum))
+            .collect();
+        for (op, checksum) in survivors {
+            let result = self.on_prepare_ok(op, checksum, self.replica_index);
+            assert!(
+                matches!(result, PrepareOkResult::AckCounted | PrepareOkResult::DuplicateAck),
+                "self prepare_ok cannot quorum a survivor op"
+            );
+        }
     }
 
     /// Rebuild the JoinView headers from the journal suffix.
@@ -2066,11 +2189,11 @@ impl Replica {
             Command::Prepare => self.on_prepare_message(&header),
             Command::Commit => self.on_commit(&header, now),
             Command::ExitView => self.on_exit_view(&header),
-            Command::JoinView => self.on_join_view(message),
+            Command::JoinView => self.on_join_view(message, now),
             Command::View => self.on_view(message, now),
+            Command::PrepareOk => self.on_prepare_ok_message(message),
             // TODO(port): remaining message handlers.
-            Command::PrepareOk
-            | Command::Reply
+            Command::Reply
             | Command::Ping
             | Command::Pong
             | Command::PingClient
@@ -2186,7 +2309,7 @@ impl Replica {
     /// Upstream: `src/vsr/replica.zig:2608` (`on_join_view`),
     /// `primary_receive_join_view` (:4045), and
     /// `primary_set_log_from_join_view_messages` (:9705).
-    pub fn on_join_view(&mut self, message: &crate::message::Message) {
+    pub fn on_join_view(&mut self, message: &crate::message::Message, now: u64) {
         let Some(join_view) = message.header::<message_header::JoinView>() else {
             return; // Command mismatch or malformed header.
         };
@@ -2258,9 +2381,11 @@ impl Replica {
         );
 
         // DEVIATION: upstream starts CTRL journal repairs (`repair()`) and
-        // broadcasts the View only once the journal is contiguously clean.
+        // broadcasts the View only once the journal is contiguously clean, then
+        // transitions to Normal via `primary_start_view_as_the_new_primary`.
         // Sans-IO journals are clean by construction, so the log is ready now.
         self.send_view();
+        self.primary_start_view_as_the_new_primary(now);
     }
 
     /// Decode the body of a JoinView message into prepare headers.
@@ -3572,12 +3697,16 @@ mod tests {
 
         r1.on_message(&peer_jv, 20_000);
 
-        // Quorum reached; log established; View broadcast.
-        assert!(r1.join_view_quorum);
+        // Quorum reached; log established; View broadcast; the new primary
+        // returned to Normal (its quorum flag reset by the transition).
+        assert!(!r1.join_view_quorum);
+        assert_eq!(r1.status, Status::Normal);
+        assert!(r1.is_primary());
         assert_eq!(r1.log_view, 1);
         assert_eq!(r1.view, 1);
         assert_eq!(r1.op, 1); // nacked suffix truncated
         assert_eq!(r1.commit_max, 1);
+        assert_eq!(r1.commit_min, 1);
         assert_eq!(r1.send_queue.len(), 2); // JoinView + View
 
         let view = r1.send_queue[1].header::<message_header::View>().unwrap();
@@ -3817,6 +3946,73 @@ mod tests {
         assert!(r2.send_queue.is_empty());
         assert_eq!(r2.log_view, 1);
         assert_eq!(r2.op, 1);
+    }
+
+    #[test]
+    fn view_change_commits_survivors_after_prepare_ok_flood() {
+        // Ops 2,3 survived as durable, so the quorum keeps a log headed at op 3.
+        // The new primary returns to Normal with the survivors in its pipeline,
+        // the backup re-acks them after the View, and the survivors commit —
+        // then the commit heartbeat carries the result back to the backup.
+        let mut r1 = Replica::new(0, 1, 3);
+        r1.status = Status::Normal;
+        prepare_and_commit_suffix(&mut r1, 0, 3, 1);
+        mark_suffix_durable(&mut r1, 1, 3);
+        r1.transition_to_view_change_status(1);
+
+        let mut r2 = Replica::new(0, 2, 3);
+        r2.status = Status::Normal;
+        prepare_and_commit_suffix(&mut r2, 0, 3, 1);
+        mark_suffix_durable(&mut r2, 1, 3);
+        r2.transition_to_view_change_status(1);
+        let r2_jv = r2.send_queue.pop().unwrap();
+
+        // The new primary transitions to Normal with the survivors in pipeline,
+        // having contributed its own prepare_oks toward each.
+        r1.on_message(&r2_jv, 20_000);
+        assert_eq!(r1.status, Status::Normal);
+        assert!(r1.is_primary());
+        assert_eq!(r1.view, 1);
+        assert_eq!(r1.log_view, 1);
+        assert_eq!(r1.op, 3);
+        assert_eq!(r1.commit_min, 1);
+        assert_eq!(r1.commit_max, 1);
+        let survivor_ops: Vec<u64> = r1.pipeline_queue.prepare_queue.iter().map(|p| p.op).collect();
+        assert_eq!(survivor_ops, [2, 3]);
+        assert_eq!(r1.send_queue.len(), 2); // JoinView + View
+        assert!(!r1.join_view_quorum); // reset by the transition to Normal
+
+        // The backup installs the log (op 3) and floods prepare_oks for 2,3.
+        r2.on_message(&r1.send_queue[1], 20_001);
+        assert_eq!(r2.status, Status::Normal);
+        assert_eq!(r2.op, 3);
+        assert_eq!(r2.commit_max, 1);
+        assert_eq!(r2.send_queue.len(), 2);
+        let ok2 = r2.send_queue[0].header::<message_header::PrepareOk>().unwrap();
+        let ok3 = r2.send_queue[1].header::<message_header::PrepareOk>().unwrap();
+        assert_eq!(ok2.op, 2);
+        assert_eq!(ok3.op, 3);
+
+        // Each backup ack completes the quorum (self + r2) of a survivor.
+        r1.on_message(&r2.send_queue[0], 20_002);
+        assert_eq!(r1.commit_min, 2);
+        assert_eq!(r1.commit_max, 2);
+        let survivor_ops: Vec<u64> = r1.pipeline_queue.prepare_queue.iter().map(|p| p.op).collect();
+        assert_eq!(survivor_ops, [3]);
+
+        r1.on_message(&r2.send_queue[1], 20_003);
+        assert_eq!(r1.commit_min, 3);
+        assert_eq!(r1.commit_max, 3);
+        assert!(r1.pipeline_queue.prepare_queue.is_empty());
+
+        // The commit heartbeat reached the backup, which commits its (clean)
+        // op 2,3 from the journal.
+        r1.send_commit(20_004);
+        let commit = r1.send_queue.pop().unwrap();
+        assert!(commit.header::<message_header::Commit>().is_some());
+        r2.on_message(&commit, 20_005);
+        assert_eq!(r2.commit_min, 3);
+        assert_eq!(r2.commit_max, 3);
     }
 
     #[test]
