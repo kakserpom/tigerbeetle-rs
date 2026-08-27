@@ -90,6 +90,19 @@ pub struct Replica {
     pub prepare_timeout: Timeout,
     pub commit_message_timeout: Timeout,
     pub view_change_status_timeout: Timeout,
+    pub exit_view_message_timeout: Timeout,
+    pub exit_view_window_timeout: Timeout,
+    pub primary_abdicate_timeout: Timeout,
+
+    // ── Fault detection ──────────────────────────────────────────────────
+    /// EWMA fault detector for commit heartbeats from the primary.
+    pub commit_fault: FaultDetector,
+    /// Timestamp of the last fresh commit heartbeat received.
+    pub heartbeat_timestamp: u64,
+    /// Bitmask of replicas that have sent ExitView for the current view.
+    pub exit_view_from_all_replicas: u64,
+    /// Whether the primary has started abdicating.
+    pub primary_abdicating: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -134,6 +147,84 @@ impl Timeout {
 
     pub fn stop(&mut self) {
         self.active = false;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FaultDetector — sliding-window EWMA of signal intervals
+// ---------------------------------------------------------------------------
+
+/// Tardiness level reported by the fault detector.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tardiness {
+    /// elapsed ≤ 1.5× ewma — primary is alive.
+    Green,
+    /// 1.5× < elapsed ≤ 3× ewma — signal may be delayed.
+    Yellow,
+    /// elapsed > 3× ewma — primary likely dead.
+    Red,
+}
+
+/// Sans-IO sliding-window EWMA of inter-signal intervals.
+///
+/// Two signals feed it: `on_prepare` (new prepares replicated) and
+/// `on_commit` (commit heartbeats).  The `tardy()` method compares
+/// elapsed time since the last signal against the EWMA to classify
+/// liveness as green/yellow/red.
+///
+/// Upstream: `src/vsr/fault_detector.zig:1` (`FaultDetector`).
+#[derive(Clone, Copy, Debug)]
+pub struct FaultDetector {
+    /// Minimum interval clamp (milliseconds).
+    interval_min: u64,
+    /// Maximum interval clamp (milliseconds).
+    interval_max: u64,
+    /// EWMA of the interval between signals (milliseconds).
+    interval_ewma: u64,
+    /// Timestamp of the last signal (milliseconds).
+    last_signal_timestamp: u64,
+}
+
+impl FaultDetector {
+    /// Create a new fault detector.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `interval_min >= interval_max`.
+    ///
+    /// Upstream: `src/vsr/fault_detector.zig:40` (`init`).
+    #[must_use]
+    pub fn new(now: u64, interval_min: u64, interval_max: u64) -> Self {
+        assert!(interval_min < interval_max);
+        Self { interval_min, interval_max, interval_ewma: interval_max, last_signal_timestamp: now }
+    }
+
+    /// Record a signal at the given monotonic timestamp (milliseconds).
+    ///
+    /// Upstream: `src/vsr/fault_detector.zig:57` (`signal`).
+    pub fn signal(&mut self, now: u64) {
+        let elapsed = now.saturating_sub(self.last_signal_timestamp);
+        let clamped = elapsed.clamp(self.interval_min, self.interval_max);
+
+        // EWMA: new = (4 * old + sample) / 5
+        self.interval_ewma = (self.interval_ewma * 4 + clamped) / 5;
+        self.last_signal_timestamp = now;
+    }
+
+    /// Classify the current tardiness based on elapsed time since last signal.
+    ///
+    /// Upstream: `src/vsr/fault_detector.zig:86` (`tardy`).
+    #[must_use]
+    pub fn tardy(&self, now: u64) -> Tardiness {
+        let elapsed = now.saturating_sub(self.last_signal_timestamp);
+
+        if elapsed * 2 <= self.interval_ewma * 3 {
+            Tardiness::Green
+        } else if elapsed <= self.interval_ewma * 3 {
+            Tardiness::Yellow
+        } else {
+            Tardiness::Red
+        }
     }
 }
 
@@ -211,6 +302,13 @@ impl Replica {
             prepare_timeout: Timeout::default(),
             commit_message_timeout: Timeout::default(),
             view_change_status_timeout: Timeout::default(),
+            exit_view_message_timeout: Timeout::default(),
+            exit_view_window_timeout: Timeout::default(),
+            primary_abdicate_timeout: Timeout::default(),
+            commit_fault: FaultDetector::new(0, 100, 2_000),
+            heartbeat_timestamp: 0,
+            exit_view_from_all_replicas: 0,
+            primary_abdicating: false,
         }
     }
 
@@ -425,6 +523,179 @@ impl Replica {
         self.ok_from_all_replicas.remove(0);
         Some(prepare)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Fault detection — ping/pong, heartbeats, view changes
+// ---------------------------------------------------------------------------
+
+impl Replica {
+    /// Called every tick to check the commit heartbeat fault detector.
+    ///
+    /// - **Primary, yellow**: resets commit_message_timeout, sends extra Commit.
+    /// - **Backup, red**: sends ExitView to begin view change.
+    ///
+    /// Upstream: `src/vsr/replica.zig:1591` (`tick_normal_heartbeat_fault`).
+    pub fn tick_normal_heartbeat_fault(&mut self, now: u64) {
+        if self.status != Status::Normal {
+            return;
+        }
+
+        match self.commit_fault.tardy(now) {
+            Tardiness::Green => {}
+            Tardiness::Yellow => {
+                if self.is_primary() {
+                    // Primary: resend commit to re-smooth the interval.
+                    self.commit_message_timeout.reset(constants::COMMIT_MESSAGE_TIMEOUT);
+                    // TODO(port): send_commit to all replicas.
+                }
+                // Backup: wait — don't trigger view change yet.
+            }
+            Tardiness::Red => {
+                if self.is_primary() {
+                    // Primary: resend commit to re-smooth.
+                    self.commit_message_timeout.reset(constants::COMMIT_MESSAGE_TIMEOUT);
+                    // TODO(port): send_commit to all replicas.
+                } else {
+                    // Backup: primary is dead — begin view change.
+                    self.send_exit_view();
+                }
+            }
+        }
+    }
+
+    /// Handle a ping message — reply with a pong.
+    ///
+    /// Upstream: `src/vsr/replica.zig:1849` (`on_ping`).
+    ///
+    /// DEVIATION: upstream extracts `ping_timestamp_monotonic` from the typed
+    /// Ping header.  This stub accepts the raw Header; typed field access is
+    /// deferred until the typed-header integration is complete.
+    #[allow(clippy::unused_self)]
+    #[must_use]
+    pub fn on_ping(&self, _header: &message_header::Header) -> PingReply {
+        // TODO(port): extract ping_timestamp_monotonic from typed Ping header.
+        PingReply { ping_timestamp_monotonic: 0, pong_timestamp_wall: 0 }
+    }
+
+    /// Handle a pong message — feed clock learning.
+    ///
+    /// Upstream: `src/vsr/replica.zig:1898` (`on_pong`).
+    #[allow(clippy::unused_self)]
+    pub fn on_pong(&mut self, _header: &message_header::Header) {
+        // TODO(port): clock.learn(m0, t1, m2) with the three-clock exchange.
+    }
+
+    /// Handle a commit heartbeat from the primary (backup only).
+    ///
+    /// Updates heartbeat timestamp and signals the fault detector.
+    ///
+    /// Upstream: `src/vsr/replica.zig:2428` (`on_commit` heartbeat path).
+    ///
+    /// DEVIATION: upstream reads `header.timestamp` and `header.commit` from the
+    /// typed Commit header.  This stub takes the values directly.
+    pub fn on_commit_heartbeat(&mut self, view: u32, vrs_timestamp: u64, commit: u64, now: u64) {
+        if self.is_primary() {
+            return;
+        }
+        if self.status != Status::Normal {
+            return;
+        }
+        if view != self.view {
+            return;
+        }
+
+        // Fresh heartbeat: monotonically increasing VSR timestamp.
+        if vrs_timestamp > self.heartbeat_timestamp {
+            self.heartbeat_timestamp = vrs_timestamp;
+            // Feed the fault detector with the monotonic clock time.
+            self.commit_fault.signal(now);
+            // Clear our own bit in exit_view_from_all_replicas (rescind EV).
+            self.exit_view_from_all_replicas &= !(1u64 << self.replica_index);
+        }
+
+        self.advance_commit_max(commit);
+    }
+
+    /// Begin a view change by broadcasting ExitView.
+    ///
+    /// Upstream: `src/vsr/replica.zig:8762` (`send_exit_view`).
+    pub fn send_exit_view(&mut self) {
+        self.status = Status::ViewChange;
+        // Set our own bit.
+        self.exit_view_from_all_replicas |= 1u64 << self.replica_index;
+        // Start the exit-view window timeout (5s) and message timeout (500ms).
+        self.exit_view_window_timeout = Timeout::start(constants::EXIT_VIEW_WINDOW_TIMEOUT);
+        self.exit_view_message_timeout = Timeout::start(constants::EXIT_VIEW_MESSAGE_TIMEOUT);
+        // TODO(port): broadcast ExitView{view} to all replicas + self loopback.
+    }
+
+    /// Handle an ExitView message from another replica.
+    ///
+    /// Collects ExitView messages; when quorum is reached, transitions to
+    /// view change status for the next view.
+    ///
+    /// Upstream: `src/vsr/replica.zig:2549` (`on_exit_view`).
+    pub fn on_exit_view(&mut self, header: &message_header::Header) {
+        if self.status != Status::Normal && self.status != Status::ViewChange {
+            return;
+        }
+        if header.view < self.view {
+            return;
+        }
+
+        let replica = header.replica;
+        let bit = 1u64 << replica;
+        self.exit_view_from_all_replicas |= bit;
+
+        let quorum = u64::from(quorums(self.replica_count).view_change);
+        if self.exit_view_from_all_replicas >= (1u64 << quorum) - 1 {
+            // Quorum reached — transition to view change.
+            let new_view = self.view + 1;
+            self.transition_to_view_change_status(new_view);
+        }
+    }
+
+    /// Transition to view change status.
+    ///
+    /// Upstream: `src/vsr/replica.zig` (`transition_to_view_change_status`).
+    fn transition_to_view_change_status(&mut self, new_view: u32) {
+        self.status = Status::ViewChange;
+        self.view = new_view;
+        self.log_view = new_view;
+        self.exit_view_from_all_replicas = 0;
+        self.pipeline_queue = PipelineQueue::default();
+        self.ok_from_all_replicas.clear();
+        self.view_change_status_timeout = Timeout::start(constants::VIEW_CHANGE_STATUS_TIMEOUT);
+        // TODO(port): send JoinView to all replicas.
+    }
+
+    /// Called every tick — advances all timeouts.
+    pub fn tick(&mut self) {
+        if self.ping_timeout.tick() {
+            // TODO(port): broadcast Ping.
+        }
+        if self.commit_message_timeout.tick() {
+            // TODO(port): broadcast Commit heartbeat.
+        }
+        if self.exit_view_message_timeout.tick() {
+            // TODO(port): resend ExitView if own bit still set.
+        }
+        if self.exit_view_window_timeout.tick() {
+            // Reset exit_view_from_all_replicas, keeping only own bit.
+            self.exit_view_from_all_replicas = 1u64 << self.replica_index;
+        }
+        if self.primary_abdicate_timeout.tick() {
+            self.primary_abdicating = true;
+        }
+    }
+}
+
+/// Reply to a ping message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PingReply {
+    pub ping_timestamp_monotonic: u64,
+    pub pong_timestamp_wall: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -898,5 +1169,164 @@ mod tests {
         assert!(r.pipeline_queue.prepare_queue.is_empty());
 
         assert!(r.pop_committed().is_none());
+    }
+
+    // ── FaultDetector tests ──────────────────────────────────────────────
+
+    #[test]
+    fn fault_detector_green_when_no_signal() {
+        let fd = FaultDetector::new(0, 100, 2_000);
+        assert_eq!(fd.tardy(1000), Tardiness::Green);
+    }
+
+    #[test]
+    fn fault_detector_converges_to_interval() {
+        let mut fd = FaultDetector::new(0, 100, 2_000);
+
+        // EWMA starts at interval_max (2000).
+        assert_eq!(fd.interval_ewma, 2_000);
+
+        // Signal at t=500: elapsed=500, clamped=500, ewma = (2000*4+500)/5 = 1700
+        fd.signal(500);
+        assert_eq!(fd.interval_ewma, 1_700);
+
+        // Signal at t=1000: elapsed=500, ewma = (1700*4+500)/5 = 1460
+        fd.signal(1_000);
+        assert_eq!(fd.interval_ewma, 1_460);
+
+        // After many signals, converges to 500.
+        for i in 2..20 {
+            fd.signal(i * 500);
+        }
+        assert!(fd.interval_ewma < 600);
+    }
+
+    #[test]
+    fn fault_detector_green_yellow_red() {
+        let mut fd = FaultDetector::new(0, 100, 2_000);
+
+        // Signal at t=500, ewma starts at 2000, first sample: (2000*4+500)/5=1700
+        fd.signal(500);
+
+        // Green: elapsed(100)*2=200 ≤ ewma(1700)*3=5100
+        assert_eq!(fd.tardy(600), Tardiness::Green);
+
+        // Yellow: elapsed(2900)*2=5800 > 5100, but elapsed(2900) ≤ 5100
+        assert_eq!(fd.tardy(3_400), Tardiness::Yellow);
+
+        // Red: elapsed(6000)*2=12000 > ewma(1700)*3=5100, and elapsed(6000) > 5100
+        assert_eq!(fd.tardy(6_500), Tardiness::Red);
+    }
+
+    #[test]
+    fn fault_detector_signal_resets_tardiness() {
+        let mut fd = FaultDetector::new(0, 100, 2_000);
+        fd.signal(500); // ewma = (2000*4+500)/5 = 1700
+
+        // Red at t=6500
+        assert_eq!(fd.tardy(6_500), Tardiness::Red);
+
+        // Signal resets — now green again
+        fd.signal(6_500);
+        assert_eq!(fd.tardy(6_500), Tardiness::Green);
+    }
+
+    #[test]
+    fn on_commit_heartbeat_advances_commit_max() {
+        let mut r = Replica::new(0, 1, 3);
+        r.status = Status::Normal;
+
+        r.on_commit_heartbeat(r.view, 100, 42, 100);
+        assert_eq!(r.commit_max, 42);
+        assert_eq!(r.heartbeat_timestamp, 100);
+    }
+
+    #[test]
+    fn on_commit_heartbeat_rejects_wrong_view() {
+        let mut r = Replica::new(0, 1, 3);
+        r.status = Status::Normal;
+        r.on_commit_heartbeat(r.view + 1, 100, 42, 100);
+        assert_eq!(r.commit_max, 0);
+    }
+
+    #[test]
+    fn on_commit_heartbeat_rejects_stale_timestamp() {
+        let mut r = Replica::new(0, 1, 3);
+        r.status = Status::Normal;
+        r.on_commit_heartbeat(r.view, 100, 42, 100);
+        // Stale VSR timestamp (50 < 100) — heartbeat_timestamp stays, but commit advances.
+        r.on_commit_heartbeat(r.view, 50, 99, 200);
+        assert_eq!(r.heartbeat_timestamp, 100);
+        assert_eq!(r.commit_max, 99); // commit=99 > commit_max=42
+    }
+
+    #[test]
+    fn on_commit_heartbeat_rejects_primary() {
+        let mut r = Replica::new(0, 0, 3);
+        r.status = Status::Normal;
+        r.on_commit_heartbeat(r.view, 100, 42, 100);
+        assert_eq!(r.commit_max, 0);
+    }
+
+    #[test]
+    fn on_commit_heartbeat_signals_fault_detector() {
+        let mut r = Replica::new(0, 1, 3);
+        r.status = Status::Normal;
+        r.on_commit_heartbeat(r.view, 100, 42, 500);
+        assert_eq!(r.commit_fault.tardy(500), Tardiness::Green);
+    }
+
+    #[test]
+    fn send_exit_view_sets_status_and_bit() {
+        let mut r = Replica::new(0, 1, 3);
+        r.status = Status::Normal;
+        assert_eq!(r.status, Status::Normal);
+
+        r.send_exit_view();
+        assert_eq!(r.status, Status::ViewChange);
+        assert_ne!(r.exit_view_from_all_replicas & (1u64 << 1), 0);
+    }
+
+    #[test]
+    fn on_exit_view_collects_quorum() {
+        let mut r = Replica::new(0, 0, 3);
+
+        // Primary already in view change with own bit set.
+        r.status = Status::ViewChange;
+        r.exit_view_from_all_replicas = 1u64 << 0;
+
+        // Simulate ExitView from replica 1.
+        let header =
+            message_header::Header { view: r.view, replica: 1, ..message_header::Header::empty() };
+        r.on_exit_view(&header);
+        assert_eq!(r.status, Status::ViewChange);
+        assert_eq!(r.view, 1);
+
+        // Simulate ExitView from replica 2 in the new view — already transitioned.
+        let header =
+            message_header::Header { view: r.view, replica: 2, ..message_header::Header::empty() };
+        r.on_exit_view(&header);
+        assert_eq!(r.status, Status::ViewChange);
+    }
+
+    #[test]
+    fn on_exit_view_ignores_old_view() {
+        let mut r = Replica::new(0, 0, 3);
+        r.view = 5;
+
+        let header =
+            message_header::Header { view: 3, replica: 1, ..message_header::Header::empty() };
+        r.on_exit_view(&header);
+        assert_eq!(r.exit_view_from_all_replicas, 0);
+    }
+
+    #[test]
+    fn tick_normal_heartbeat_fault_backup_red_triggers_exit() {
+        let mut r = Replica::new(0, 1, 3);
+        r.status = Status::Normal;
+        // Simulate: one signal long ago, now very stale.
+        r.commit_fault.signal(0);
+        r.tick_normal_heartbeat_fault(10_000);
+        assert_eq!(r.status, Status::ViewChange);
     }
 }

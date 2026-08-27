@@ -422,6 +422,23 @@ const _: () = {
 pub const CONNECTION_DELAY_MIN: Duration = CONFIG.process.connection_delay_min;
 pub const CONNECTION_DELAY_MAX: Duration = CONFIG.process.connection_delay_max;
 
+// ── VSR timeout tick counts (upstream: src/vsr/replica.zig:1361–1408) ────────
+// These are in ticks; upstream divides milliseconds by `tick_ms`.
+// For now we use millisecond values directly since our tick rate is 1ms.
+
+/// How often the replica broadcasts a Ping (upstream: 1000ms).
+pub const PING_TIMEOUT: u32 = 1_000;
+/// How often the primary broadcasts a Commit heartbeat (upstream: 500ms).
+pub const COMMIT_MESSAGE_TIMEOUT: u32 = 500;
+/// How long the primary waits without a prepare_ok quorum before abdicating (upstream: 10s).
+pub const PRIMARY_ABDICATE_TIMEOUT: u32 = 10_000;
+/// Window for collecting ExitView messages before resetting (upstream: 5s).
+pub const EXIT_VIEW_WINDOW_TIMEOUT: u32 = 5_000;
+/// How often ExitView is resent (upstream: 500ms).
+pub const EXIT_VIEW_MESSAGE_TIMEOUT: u32 = 500;
+/// How long to wait in view change before timing out (upstream: 5s).
+pub const VIEW_CHANGE_STATUS_TIMEOUT: u32 = 5_000;
+
 /// The maximum number of outgoing messages that may be queued on a replica connection.
 pub const CONNECTION_SEND_QUEUE_MAX_REPLICA: usize = umax(umin(CLIENTS_MAX as usize, 4), 2);
 
