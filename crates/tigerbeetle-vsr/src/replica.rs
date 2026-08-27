@@ -1115,9 +1115,16 @@ impl Replica {
         // TODO(port): checkpoint_op/checkpoint_id from the superblock.
         commit.set_checksum_body(&[]);
         commit.set_checksum();
+        self.enqueue_header(&commit);
+    }
 
-        let header = message_header::Header::from_wire(&commit.to_wire())
-            .unwrap_or_else(|| panic!("send_commit: failed to encode Commit header"));
+    /// Enqueue an outbound message header for the integration layer.
+    ///
+    /// DEVIATION: upstream hands the message to `message_bus` immediately; the
+    /// sans-IO skeleton records it in [`Self::send_queue`] instead.
+    fn enqueue_header<H: TypedHeader>(&mut self, typed: &H) {
+        let header = message_header::Header::from_wire(&typed.to_wire())
+            .unwrap_or_else(|| panic!("failed to encode outgoing message"));
         self.send_queue.push(header);
     }
 
@@ -1194,7 +1201,16 @@ impl Replica {
         // Start the exit-view window timeout (5s) and message timeout (500ms).
         self.exit_view_window_timeout = Timeout::start(constants::EXIT_VIEW_WINDOW_TIMEOUT);
         self.exit_view_message_timeout = Timeout::start(constants::EXIT_VIEW_MESSAGE_TIMEOUT);
-        // TODO(port): broadcast ExitView{view} to all replicas + self loopback.
+
+        let mut exit_view = message_header::ExitView {
+            cluster: self.cluster,
+            view: self.view,
+            replica: self.replica_u8(),
+            ..message_header::ExitView::default()
+        };
+        exit_view.set_checksum_body(&[]);
+        exit_view.set_checksum();
+        self.enqueue_header(&exit_view);
     }
 
     /// Handle an ExitView message from another replica.
@@ -1528,13 +1544,13 @@ impl Replica {
             Command::Request => self.on_request(header),
             Command::Prepare => self.on_prepare_message(header),
             Command::Commit => self.on_commit(header, now),
+            Command::ExitView => self.on_exit_view(header),
             // TODO(port): remaining message handlers.
             Command::PrepareOk
             | Command::Reply
             | Command::Ping
             | Command::Pong
             | Command::PingClient
-            | Command::ExitView
             | Command::JoinView
             | Command::View
             | Command::Headers
@@ -2354,6 +2370,52 @@ mod tests {
         r.tick_normal_heartbeat_fault(10_000);
         assert_eq!(r.status, Status::ViewChange);
         assert_ne!(r.commit_fault.tardy(10_000), Tardiness::Red);
+    }
+
+    #[test]
+    fn tick_normal_heartbeat_fault_backup_red_broadcasts_exit_view() {
+        let mut r = Replica::new(0, 1, 3);
+        r.status = Status::Normal;
+        r.commit_fault.signal(0);
+        r.tick_normal_heartbeat_fault(10_000);
+
+        assert_eq!(r.status, Status::ViewChange);
+        assert_eq!(r.send_queue.len(), 1);
+        let exit_view = r.send_queue[0].into_typed::<message_header::ExitView>().unwrap();
+        assert_eq!(exit_view.view, 0);
+        assert_eq!(exit_view.replica, 1);
+        assert_eq!(r.exit_view_from_all_replicas, 1 << 1);
+    }
+
+    #[test]
+    fn view_change_reached_by_exchange_of_exit_views() {
+        // Backups 1 and 2 both lose the primary (0) and broadcast ExitView for
+        // view 0. When they exchange those messages they reach the view-change
+        // quorum (2 of 3) and transition to view 1.
+        let mut r1 = Replica::new(0, 1, 3);
+        r1.status = Status::Normal;
+        r1.commit_fault.signal(0);
+        r1.tick_normal_heartbeat_fault(10_000);
+
+        let mut r2 = Replica::new(0, 2, 3);
+        r2.status = Status::Normal;
+        r2.commit_fault.signal(0);
+        r2.tick_normal_heartbeat_fault(10_000);
+
+        assert_eq!(r1.status, Status::ViewChange);
+        assert_eq!(r2.status, Status::ViewChange);
+        assert_eq!(r1.send_queue.len(), 1);
+        assert_eq!(r2.send_queue.len(), 1);
+
+        // Exchange the queued ExitViews. Each replica already has its own bit
+        // set, so a second distinct bit reaches the quorum.
+        r1.on_message(&r2.send_queue[0], 10_001);
+        r2.on_message(&r1.send_queue[0], 10_001);
+
+        assert_eq!(r1.view, 1);
+        assert_eq!(r1.log_view, 1);
+        assert_eq!(r1.status, Status::ViewChange);
+        assert_eq!(r2.view, 1);
     }
 
     #[test]
