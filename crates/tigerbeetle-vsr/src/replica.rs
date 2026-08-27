@@ -114,6 +114,19 @@ pub struct Replica {
     /// (descending op), broadcast in JoinView messages so the next primary can
     /// rebuild the log. Upstream `vsr.Headers.ViewChangeArray`.
     pub join_view_headers: Vec<message_header::Prepare>,
+    /// JoinView messages collected for the current view change, indexed by
+    /// replica. The new primary's own slot is filled when it broadcasts (modulo
+    /// upstream's synchronous loopback). Upstream `join_view_from_all_replicas`.
+    pub join_view_from_all_replicas: Vec<Option<crate::jv_quorum::JoinedView>>,
+    /// Whether the JoinView quorum has been collected and validated: the new
+    /// log is established for `self.view`.
+    ///
+    /// Upstream `src/vsr/replica.zig:144` (`join_view_quorum`).
+    pub join_view_quorum: bool,
+    /// The headers attached to the next View message: the journal suffix from
+    /// `op` down (descending op), plus at most two checkpoint-boundary headers.
+    /// Upstream `view_headers` (`vsr.Headers.ViewChangeArray`).
+    pub view_headers: Vec<message_header::Prepare>,
     /// Whether the primary has started abdicating.
     pub primary_abdicating: bool,
 
@@ -398,6 +411,9 @@ impl Replica {
             // Upstream boots from a superblock whose checkpoint holds the root
             // prepare at op 0; a fresh replica's JV always includes it.
             join_view_headers: vec![message_header::Prepare::root(cluster)],
+            join_view_from_all_replicas: vec![None; constants::REPLICAS_MAX],
+            join_view_quorum: false,
+            view_headers: Vec::new(),
         }
     }
 
@@ -1287,6 +1303,11 @@ impl Replica {
         self.status = Status::ViewChange;
         self.view = new_view;
         self.exit_view_from_all_replicas = 0;
+        // Do not let messages from the previous (aborted) view change count
+        // towards this one — the quorum-intersection property depends on it
+        // (upstream `reset_quorum_join_view`).
+        self.join_view_from_all_replicas.fill(None);
+        self.join_view_quorum = false;
         self.pipeline_queue = PipelineQueue::default();
         self.ok_from_all_replicas.clear();
         self.view_change_status_timeout = Timeout::start(constants::VIEW_CHANGE_STATUS_TIMEOUT);
@@ -1407,6 +1428,143 @@ impl Replica {
         message.set_body(&body);
         message.set_header(&join_view);
         self.send_queue.push(message);
+
+        // Record our own JV for the quorum. Upstream loopbacks to `self` and
+        // `on_join_view` fills the slot; the sans-IO skeleton emulates that
+        // here. Only the new primary ever consumes its own slot — backups
+        // never collect JVs (upstream `ignore_view_change_message` asserts
+        // `join_view_from_all_replicas` is all null for them).
+        if Self::primary_index_for_view(self.view, self.replica_count) == self.replica_index {
+            let slot = usize::from(self.replica_index);
+            assert!(self.join_view_from_all_replicas[slot].is_none());
+            self.join_view_from_all_replicas[slot] = Some(crate::jv_quorum::JoinedView {
+                header: join_view,
+                headers: self.join_view_headers.clone(),
+            });
+        }
+    }
+
+    /// Build and enqueue the View message announcing the new log to the other
+    /// replicas (the new primary's first broadcast of the view).
+    ///
+    /// The body carries a `CheckpointState` prefix (zeroed — no superblock yet)
+    /// followed by the `view_headers` frames.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless the replica is the primary with `view == log_view`.
+    ///
+    /// Upstream: `src/vsr/replica.zig:9499` (`primary_send_view`) and :5795
+    /// (`create_view_message`).
+    #[allow(clippy::cast_possible_truncation)] // body length is bounded by the fixed buffer
+    fn send_view(&mut self) {
+        assert!(self.status == Status::Normal || self.status == Status::ViewChange);
+        assert!(self.is_primary());
+        assert_eq!(self.view, self.log_view);
+        assert!(self.commit_min <= self.op);
+
+        self.primary_update_view_headers();
+        assert_eq!(self.view_headers[0].op, self.op);
+
+        // DEVIATION: upstream serializes `vsr.CheckpointState` (1024 bytes, the
+        // working superblock checkpoint) as the View body prefix; sans-IO has
+        // no superblock yet, so a zeroed prefix keeps the wire layout stable.
+        let body_len =
+            constants::CHECKPOINT_STATE_SIZE + self.view_headers.len() * message_header::SIZE;
+        let mut view = message_header::View {
+            cluster: self.cluster,
+            replica: self.replica_u8(),
+            view: self.view,
+            checkpoint_op: 0, // TODO(port): op_checkpoint from the superblock.
+            op: self.op,
+            commit_max: self.commit_max,
+            nonce: 0,
+            size: (message_header::SIZE + body_len) as u32,
+            ..message_header::View::default()
+        };
+
+        let mut body = Vec::with_capacity(body_len);
+        body.extend_from_slice(&[0; constants::CHECKPOINT_STATE_SIZE]);
+        for header in &self.view_headers {
+            body.extend_from_slice(&header.to_wire());
+        }
+        view.set_checksum_body(&body);
+        view.set_checksum();
+
+        let mut message = crate::message::Message::new();
+        message.set_body(&body);
+        message.set_header(&view);
+        self.send_queue.push(message);
+    }
+
+    /// The journal header for `op`, falling back to the root prepare when
+    /// `op == 0`: the sans-IO journal may not hold the root until the first
+    /// prepare lands, whereas upstream's always does (superblock checkpoint).
+    fn journal_header_or_root(&self, op: u64) -> message_header::Prepare {
+        if let Some(header) = self.journal.header_with_op(op) {
+            *header
+        } else {
+            assert_eq!(op, 0);
+            message_header::Prepare::root(self.cluster)
+        }
+    }
+
+    /// Rebuild [`Self::view_headers`]: the unbroken journal suffix from the
+    /// head op downward (capacity permitting), plus at most two
+    /// checkpoint-boundary headers to help backups repair across `op_hook`s.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the journal is missing a header within the suffix range (an
+    /// invariant violation; upstream `header_with_op(op).?` un-wraps the same).
+    ///
+    /// Upstream: `src/vsr/replica.zig:5939` (`primary_update_view_headers`)
+    /// and :5853 (`update_view_headers`).
+    fn primary_update_view_headers(&mut self) {
+        assert!(self.status == Status::Normal || self.status == Status::ViewChange);
+        assert_eq!(self.view, self.log_view);
+        assert!(self.is_primary());
+
+        let op_max = self.op;
+        // The oldest op that may still be in the journal
+        // (`op_max + 1 -| journal_slot_count`, equivalently).
+        let journal_start = op_max.saturating_sub(u64::from(constants::JOURNAL_SLOT_COUNT) - 1);
+        let header_break = self.journal.find_latest_headers_break_between(journal_start, op_max);
+        // The suffix must be an unbroken chain; a break would bound it further.
+        let op_min = match header_break {
+            Some(break_range) => break_range.op_max + 1,
+            None => journal_start,
+        };
+
+        self.view_headers.clear();
+        let mut op = op_max + 1;
+        while op > 0 && self.view_headers.len() < constants::VIEW_CHANGE_HEADERS_SUFFIX_MAX as usize
+        {
+            op -= 1;
+            self.view_headers.push(self.journal_header_or_root(op));
+        }
+        assert!(self.view_headers.len() + 2 <= constants::VIEW_HEADERS_MAX as usize);
+
+        // Include the headers at the preceding checkpoint triggers (`op_hook`)
+        // so backups can repair across a checkpoint boundary (at most 2).
+        for op_hook in [
+            op_max.saturating_sub(constants::VSR_CHECKPOINT_OPS as u64),
+            op_max.saturating_sub(constants::VSR_CHECKPOINT_OPS as u64 * 2),
+        ] {
+            if op > op_hook && op_hook >= op_min {
+                op = op_hook;
+                self.view_headers.push(self.journal_header_or_root(op));
+            }
+        }
+
+        // Ops run strictly descending (the checkpoint hooks may jump down).
+        let mut previous: Option<u64> = None;
+        for header in &self.view_headers {
+            if let Some(previous) = previous {
+                assert!(header.op < previous);
+            }
+            previous = Some(header.op);
+        }
     }
 
     /// Called every tick — advances all timeouts and the fault detector.
@@ -1688,7 +1846,16 @@ impl Replica {
     /// feed the fault detector; the sans-IO skeleton has no wall clock.
     ///
     /// Upstream: message receive path (`message_bus` → per-command handlers).
-    pub fn on_message(&mut self, header: &message_header::Header, now: u64) {
+    pub fn on_message(&mut self, message: &crate::message::Message, now: u64) {
+        // Parse the base header frame (no command-specific validation).
+        let some_frame: Option<&[u8; message_header::SIZE]> = message.frame().try_into().ok();
+        let Some(frame) = some_frame else {
+            return;
+        };
+        let Some(header) = message_header::Header::from_wire(frame) else {
+            return;
+        };
+
         // Validate cluster ID.
         if header.cluster != self.cluster {
             return; // Drop message from wrong cluster.
@@ -1697,18 +1864,18 @@ impl Replica {
         // Validate checksum (upstream verifies `header.valid_checksum()`).
 
         match header.command {
-            Command::Request => self.on_request(header),
-            Command::Prepare => self.on_prepare_message(header),
-            Command::Commit => self.on_commit(header, now),
-            Command::ExitView => self.on_exit_view(header),
+            Command::Request => self.on_request(&header),
+            Command::Prepare => self.on_prepare_message(&header),
+            Command::Commit => self.on_commit(&header, now),
+            Command::ExitView => self.on_exit_view(&header),
+            Command::JoinView => self.on_join_view(message),
             // TODO(port): remaining message handlers.
-            Command::PrepareOk
+            Command::View
+            | Command::PrepareOk
             | Command::Reply
             | Command::Ping
             | Command::Pong
             | Command::PingClient
-            | Command::JoinView
-            | Command::View
             | Command::Headers
             | Command::GetView
             | Command::GetHeaders
@@ -1723,6 +1890,233 @@ impl Replica {
             | Command::PongClient
             | Command::Eviction
             | Command::Block => {}
+        }
+    }
+
+    /// Handle a JoinView message — only meaningful for the primary of
+    /// `self.view` during a view change.
+    ///
+    /// Collects the JVs into [`Self::join_view_from_all_replicas`], runs the
+    /// `JVQuorum.quorum_headers` algorithm, and once it completes: installs the
+    /// canonical log, advances `log_view`, and broadcasts a View message.
+    ///
+    /// # Panics
+    ///
+    /// Panics on invariant violations (e.g. a broadcast JV from a replica
+    /// outside the cluster, or a JV for a view we have moved past).
+    ///
+    /// Upstream: `src/vsr/replica.zig:2608` (`on_join_view`),
+    /// `primary_receive_join_view` (:4045), and
+    /// `primary_set_log_from_join_view_messages` (:9705).
+    pub fn on_join_view(&mut self, message: &crate::message::Message) {
+        let Some(join_view) = message.header::<message_header::JoinView>() else {
+            return; // Command mismatch or malformed header.
+        };
+        // DEVIATION: upstream validates checksums at the message_bus receive
+        // path; sans-IO messages are constructed locally, so guard anyway.
+        if !join_view.valid_checksum() || !join_view.valid_checksum_body(message.body_used()) {
+            return;
+        }
+
+        // `ignore_view_change_message` (.join_view arm, `replica.zig:6805`):
+        if join_view.view < self.view {
+            return; // Older view.
+        }
+        if self.status == Status::Normal && join_view.view == self.view {
+            return; // View already started.
+        }
+        if self.join_view_quorum {
+            return; // Quorum already received.
+        }
+        if Self::primary_index_for_view(self.view, self.replica_count) != self.replica_index {
+            // A backup: it staged its own JV for broadcast in
+            // `transition_to_view_change_status` but does not process incoming
+            // JVs — it awaits a View from the new primary.
+            return;
+        }
+
+        assert!(self.replica_count > 1);
+        assert_eq!(self.status, Status::ViewChange);
+        assert_eq!(join_view.view, self.view);
+        assert!(!self.join_view_quorum);
+        assert!(u16::from(join_view.replica) < self.replica_count);
+
+        let body = message.body_used();
+        self.primary_receive_join_view(&join_view, body);
+
+        // The new primary's own slot is filled by the broadcast loopback:
+        assert!(self.join_view_from_all_replicas[usize::from(self.replica_index)].is_some());
+        crate::jv_quorum::verify(&self.join_view_from_all_replicas);
+
+        let quorum = self.quorum();
+        let result = crate::jv_quorum::quorum_headers(
+            &self.join_view_from_all_replicas,
+            crate::jv_quorum::QuorumOptions {
+                replica_count: self.replica_count,
+                quorum_view_change: quorum.view_change,
+                quorum_nack_prepare: quorum.nack_prepare,
+            },
+        );
+        let op_head = match result {
+            crate::jv_quorum::QuorumHeadersResult::AwaitingQuorum => return,
+            crate::jv_quorum::QuorumHeadersResult::AwaitingRepair
+            | crate::jv_quorum::QuorumHeadersResult::CompleteInvalid => {
+                // TODO(port): upstream logs these and starts `journal`-request
+                // repairs (`primary_log_join_view_quorum` + `repair()`); sans-IO
+                // journals have no faults to repair, so there is nothing to do.
+                return;
+            }
+            crate::jv_quorum::QuorumHeadersResult::CompleteValid { op_head, .. } => op_head,
+        };
+
+        // TODO(port): an op_checkpoint lagging more than `replica_count - 1`
+        // views forfeits the view change to let a checkpoint-ahead replica be
+        // primary (upstream `on_join_view`). Deferred: no superblock yet.
+
+        assert!(!self.join_view_quorum);
+        self.join_view_quorum = true;
+
+        self.primary_set_log_from_join_view_messages();
+
+        // Still ViewChange, but our prior log_view headers may have been
+        // replaced; disambiguate them for a subsequent JV if we never reach
+        // Normal (upstream `replica.zig:2732`).
+        self.log_view = self.view;
+
+        assert_eq!(self.op, op_head);
+        assert!(self.op >= self.commit_max);
+        assert!(
+            self.prepare_timestamp
+                >= match self.journal.header_with_op(self.op) {
+                    Some(h) => h.timestamp,
+                    None => panic!("journal missing head op {}", self.op),
+                }
+        );
+
+        // DEVIATION: upstream starts CTRL journal repairs (`repair()`) and
+        // broadcasts the View only once the journal is contiguously clean.
+        // Sans-IO journals are clean by construction, so the log is ready now.
+        self.send_view();
+    }
+
+    /// Decode the body of a JoinView message into prepare headers.
+    ///
+    /// Returns `None` if the body is empty or not a whole number of headers.
+    fn decode_join_view_headers(body: &[u8]) -> Option<Vec<message_header::Prepare>> {
+        if body.is_empty() || !body.len().is_multiple_of(message_header::SIZE) {
+            return None;
+        }
+        let mut headers = Vec::with_capacity(body.len() / message_header::SIZE);
+        for frame in body.as_chunks::<{ message_header::SIZE }>().0 {
+            headers.push(message_header::Prepare::from_wire(frame)?);
+        }
+        Some(headers)
+    }
+
+    /// Record a received JoinView in the quorum slot of its sender.
+    ///
+    /// A duplicate JV is kept only if it is strictly newer (higher checkpoint,
+    /// then commit) than the one already recorded — upstream
+    /// `replica.zig:4061`.
+    fn primary_receive_join_view(&mut self, join_view: &message_header::JoinView, body: &[u8]) {
+        let slot = usize::from(join_view.replica);
+        if let Some(existing) = &self.join_view_from_all_replicas[slot] {
+            let replace = existing.header.checkpoint_op < join_view.checkpoint_op
+                || (existing.header.checkpoint_op == join_view.checkpoint_op
+                    && existing.header.commit_min < join_view.commit_min);
+            if !replace {
+                return; // Keep the more up-to-date duplicate.
+            }
+        }
+        let Some(headers) = Self::decode_join_view_headers(body) else {
+            return; // Malformed body.
+        };
+        self.join_view_from_all_replicas[slot] =
+            Some(crate::jv_quorum::JoinedView { header: *join_view, headers });
+    }
+
+    /// Install the new view's log from the JV quorum (as the new primary).
+    ///
+    /// Sets the head op, truncates ops above it, installs the canonical headers
+    /// (high → low op), and preserves the highest possible `commit_max`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the JV quorum has not been collected, or if the quorum no
+    /// longer yields a complete valid result.
+    ///
+    /// Upstream: `src/vsr/replica.zig:9705`
+    /// (`primary_set_log_from_join_view_messages`).
+    fn primary_set_log_from_join_view_messages(&mut self) {
+        assert_eq!(self.status, Status::ViewChange);
+        assert!(self.view > self.log_view);
+        assert!(self.is_primary());
+        assert!(self.replica_count > 1);
+        assert!(self.join_view_quorum);
+        assert!(self.join_view_from_all_replicas[usize::from(self.replica_index)].is_some());
+        crate::jv_quorum::verify(&self.join_view_from_all_replicas);
+
+        // The `prepare_timestamp` prevents the primary's clock from running
+        // backwards; advance before discarding uncommitted timestamps.
+        let timestamp_max = crate::jv_quorum::timestamp_max(&self.join_view_from_all_replicas);
+        self.prepare_timestamp = self.prepare_timestamp.max(timestamp_max);
+
+        let quorum = self.quorum();
+        let result = crate::jv_quorum::quorum_headers(
+            &self.join_view_from_all_replicas,
+            crate::jv_quorum::QuorumOptions {
+                replica_count: self.replica_count,
+                quorum_view_change: quorum.view_change,
+                quorum_nack_prepare: quorum.nack_prepare,
+            },
+        );
+        let crate::jv_quorum::QuorumHeadersResult::CompleteValid { op_head, headers, .. } = result
+        else {
+            unreachable!("quorum_headers is CompleteValid once join_view_quorum is set");
+        };
+
+        // We must never rewind `commit_max`: `commit_min` represents what we
+        // have already applied to the state machine (upstream
+        // `set_op_and_commit_max`).
+        let commit_max_quorum = crate::jv_quorum::commit_max(&self.join_view_from_all_replicas);
+
+        // Uncommitted ops may not survive a view change; never truncate
+        // committed ops. Truncate the head first: ops above it are discarded.
+        self.journal.remove_entries_from(op_head + 1);
+        self.op = op_head;
+
+        self.commit_max = self.commit_max.max(commit_max_quorum);
+        assert!(self.commit_max <= op_head);
+        assert!(
+            self.commit_max
+                >= op_head.saturating_sub(u64::from(constants::PIPELINE_PREPARE_QUEUE_MAX))
+        );
+
+        // Install the canonical headers high → low (upstream `replace_header`).
+        // We must not set an op dirty if we already have it exactly: that would
+        // trigger a WAL repair and delay the view change (upstream `replica.zig:8524`).
+        for header in &headers {
+            assert!(header.op <= self.op);
+            if !self.journal.has_header(header) {
+                self.journal.set_header_as_dirty(header);
+            }
+        }
+        assert!(self.journal.header_with_op(self.commit_max).is_some());
+
+        // Uncanonical (older log_view) JVs may hold committed headers no
+        // canonical JV carries; install them. Uncommitted headers from these
+        // JVs would be verified and written by `repair_header` upstream —
+        // deferred to the I/O increment.
+        for jv in crate::jv_quorum::jvs_uncanonical(&self.join_view_from_all_replicas) {
+            for header in &jv.headers {
+                if crate::jv_quorum::jv_header_type(header) != crate::jv_quorum::JvHeaderType::Valid
+                {
+                    continue;
+                }
+                if header.op <= jv.header.commit_min && !self.journal.has_header(header) {
+                    self.journal.set_header_as_dirty(header);
+                }
+            }
         }
     }
 
@@ -1956,8 +2350,10 @@ mod tests {
         header.cluster = 0xBEEF;
         header.command = Command::Request;
         header.set_checksum();
+        let mut message = crate::message::Message::new();
+        message.frame_mut().copy_from_slice(&header.to_wire());
         // Should silently drop — no panic, no state change.
-        r.on_message(&header, 0);
+        r.on_message(&message, 0);
         assert_eq!(r.status, Status::Normal);
     }
 
@@ -2279,7 +2675,7 @@ mod tests {
         // Primary broadcasts a Commit; the backup receives it through the
         // sans-IO send_queue.
         primary.send_commit(1_000);
-        let commit = header_of(&primary.send_queue.pop().unwrap());
+        let commit = primary.send_queue.pop().unwrap();
 
         let mut backup = Replica::new(0, 1, 3);
         backup.status = Status::Normal;
@@ -2326,14 +2722,14 @@ mod tests {
         header
     }
 
-    /// Build a checksum-valid Commit message header from the primary.
+    /// Build a checksum-valid Commit message from the primary.
     fn make_commit_message(
         cluster: u128,
         view: u32,
         commit: u64,
         commit_checksum: u128,
         timestamp_monotonic: u64,
-    ) -> message_header::Header {
+    ) -> crate::message::Message {
         let mut c = message_header::Commit::default();
         c.cluster = cluster;
         c.view = view;
@@ -2343,13 +2739,9 @@ mod tests {
         c.timestamp_monotonic = timestamp_monotonic;
         c.set_checksum_body(&[]);
         c.set_checksum();
-        message_header::Header::from_wire(&c.to_wire()).unwrap()
-    }
-
-    /// The base `Header` frame of a queued message (for feeding `on_message`).
-    fn header_of(message: &crate::message::Message) -> message_header::Header {
-        let frame: &[u8; message_header::SIZE] = message.frame().try_into().unwrap();
-        message_header::Header::from_wire(frame).unwrap()
+        let mut message = crate::message::Message::new();
+        message.set_header(&c);
+        message
     }
 
     #[test]
@@ -2586,8 +2978,8 @@ mod tests {
         // Exchange the queued ExitViews. Each replica already has its own bit
         // set, so a second distinct bit reaches the quorum and triggers the
         // transition to view 1.
-        r1.on_message(&header_of(&r2.send_queue[0]), 10_001);
-        r2.on_message(&header_of(&r1.send_queue[0]), 10_001);
+        r1.on_message(&r2.send_queue[0], 10_001);
+        r2.on_message(&r1.send_queue[0], 10_001);
 
         // Each replica has now joined view 1; `log_view` keeps point at view 0,
         // the last view the log is known to be valid in (upstream semantics).
@@ -2622,7 +3014,7 @@ mod tests {
         peer.status = Status::Normal;
         peer.commit_fault.signal(0);
         peer.tick_normal_heartbeat_fault(10_000);
-        r.on_message(&header_of(&peer.send_queue[0]), 10_001);
+        r.on_message(&peer.send_queue[0], 10_001);
         assert_eq!(r.view, 1);
         assert_eq!(r.send_queue.len(), 2); // ExitView + JoinView
 
@@ -2650,6 +3042,174 @@ mod tests {
         // dirty, so it is nacked to give the new primary freedom to truncate.
         assert_eq!(join_view.present_bitset, 1 << 2);
         assert_eq!(join_view.nack_bitset, (1 << 0) | (1 << 1));
+    }
+
+    /// Prepare chained ops `1..=op_max` (view 0) and commit op `committed` on a
+    /// Normal replica, returning the prepared headers in ascending-op order.
+    #[allow(clippy::cast_possible_truncation, clippy::too_many_arguments)]
+    fn prepare_and_commit_suffix(
+        r: &mut Replica,
+        cluster: u128,
+        op_max: u64,
+        committed: u64,
+    ) -> Vec<message_header::Prepare> {
+        assert!(committed >= 1);
+        assert!(committed <= op_max);
+        let mut parent = 0;
+        let mut headers = Vec::new();
+        for op in 1..=op_max {
+            let header = make_prepare_for_replica(cluster, 0, op, parent, 0);
+            parent = header.checksum();
+            assert_eq!(r.on_prepare(&header), OnPrepareResult::Accepted);
+            headers.push(header);
+        }
+        r.on_message(
+            &make_commit_message(
+                cluster,
+                0,
+                committed,
+                headers[committed as usize - 1].checksum(),
+                100,
+            ),
+            100,
+        );
+        headers
+    }
+
+    #[test]
+    fn on_join_view_new_primary_installs_log_and_sends_view() {
+        // Replica 1 is the new primary (view 1). It and replica 2 both prepared
+        // ops 1..3 and committed op 1 before the old primary (0) failed. The
+        // uncommitted suffix (ops 2,3) is dirty on both, so the CTRL quorum
+        // nacks and truncates it: the new log is [1].
+        let mut r1 = Replica::new(0, 1, 3);
+        r1.status = Status::Normal;
+        let headers = prepare_and_commit_suffix(&mut r1, 0, 3, 1);
+        r1.transition_to_view_change_status(1);
+        assert_eq!(r1.send_queue.len(), 1); // JoinView
+        assert!(r1.join_view_from_all_replicas[1].is_some());
+
+        let mut r2 = Replica::new(0, 2, 3);
+        r2.status = Status::Normal;
+        prepare_and_commit_suffix(&mut r2, 0, 3, 1);
+        r2.transition_to_view_change_status(1);
+        let peer_jv = r2.send_queue.pop().unwrap();
+
+        r1.on_message(&peer_jv, 20_000);
+
+        // Quorum reached; log established; View broadcast.
+        assert!(r1.join_view_quorum);
+        assert_eq!(r1.log_view, 1);
+        assert_eq!(r1.view, 1);
+        assert_eq!(r1.op, 1); // nacked suffix truncated
+        assert_eq!(r1.commit_max, 1);
+        assert_eq!(r1.send_queue.len(), 2); // JoinView + View
+
+        let view = r1.send_queue[1].header::<message_header::View>().unwrap();
+        assert_eq!(view.view, 1);
+        assert_eq!(view.replica, 1);
+        assert_eq!(view.op, 1);
+        assert_eq!(view.commit_max, 1);
+
+        // Body: zeroed CheckpointState prefix + the surviving headers descending.
+        let body = r1.send_queue[1].body_used();
+        assert_eq!(body.len(), constants::CHECKPOINT_STATE_SIZE + 2 * message_header::SIZE);
+        assert_eq!(
+            &body[..constants::CHECKPOINT_STATE_SIZE],
+            &[0; constants::CHECKPOINT_STATE_SIZE]
+        );
+        let start = constants::CHECKPOINT_STATE_SIZE;
+        let head: &[u8; message_header::SIZE] =
+            body[start..start + message_header::SIZE].try_into().unwrap();
+        assert_eq!(message_header::Prepare::from_wire(head).unwrap(), headers[0]);
+        let root: &[u8; message_header::SIZE] = body
+            [start + message_header::SIZE..start + 2 * message_header::SIZE]
+            .try_into()
+            .unwrap();
+        assert_eq!(message_header::Prepare::from_wire(root).unwrap().op, 0);
+    }
+
+    #[test]
+    fn on_join_view_does_nothing_without_quorum() {
+        let mut r1 = Replica::new(0, 1, 3);
+        r1.status = Status::Normal;
+        prepare_and_commit_suffix(&mut r1, 0, 3, 1);
+        r1.transition_to_view_change_status(1);
+        assert_eq!(r1.send_queue.len(), 1); // only our own JoinView
+
+        // No second JV: quorum (2 of 3) not yet reached — no View, no log set.
+        assert!(!r1.join_view_quorum);
+        assert_eq!(r1.log_view, 0);
+        assert_eq!(r1.send_queue.len(), 1);
+    }
+
+    #[test]
+    fn on_join_view_ignored_by_backup() {
+        // Replica 2 is a backup for view 1; it stages its own JV broadcast but
+        // must not process incoming JVs.
+        let mut r2 = Replica::new(0, 2, 3);
+        r2.status = Status::Normal;
+        prepare_and_commit_suffix(&mut r2, 0, 3, 1);
+        r2.transition_to_view_change_status(1);
+        // Backups never fill their own JV slot (only the new primary does).
+        assert!(r2.join_view_from_all_replicas[2].is_none());
+
+        // A peer JV arrives — the backup ignores it.
+        let mut r1 = Replica::new(0, 1, 3);
+        r1.status = Status::Normal;
+        prepare_and_commit_suffix(&mut r1, 0, 3, 1);
+        r1.transition_to_view_change_status(1);
+        let peer_jv = r1.send_queue.pop().unwrap();
+        r2.on_message(&peer_jv, 20_000);
+
+        assert!(!r2.join_view_quorum);
+        assert_eq!(r2.log_view, 0);
+        // No View emitted: the queue still holds only r2's own staged JoinView.
+        assert_eq!(r2.send_queue.len(), 1);
+        assert_eq!(r2.send_queue[0].header::<message_header::JoinView>().unwrap().replica, 2);
+    }
+
+    #[test]
+    fn view_change_reaches_view_message() {
+        // End-to-end sans-IO view change: replicas 1 and 2 red-detect the dead
+        // primary 0, exchange ExitViews, transition to view 1, and the new
+        // primary (1) collects a JV quorum and broadcasts a View.
+        let mut r1 = Replica::new(0, 1, 3);
+        r1.status = Status::Normal;
+        prepare_and_commit_suffix(&mut r1, 0, 3, 1);
+        r1.commit_fault.signal(0);
+        r1.tick_normal_heartbeat_fault(10_000); // ExitView
+        assert_eq!(r1.send_queue.len(), 1);
+
+        let mut r2 = Replica::new(0, 2, 3);
+        r2.status = Status::Normal;
+        prepare_and_commit_suffix(&mut r2, 0, 3, 1);
+        r2.commit_fault.signal(0);
+        r2.tick_normal_heartbeat_fault(10_000); // ExitView
+
+        let ev1 = r1.send_queue[0].header::<message_header::ExitView>().unwrap();
+        let ev2 = r2.send_queue[0].header::<message_header::ExitView>().unwrap();
+        r1.on_message(&r2.send_queue[0], 10_001);
+        r2.on_message(&r1.send_queue[0], 10_001);
+        assert_eq!(r1.status, Status::ViewChange);
+        assert_eq!(r2.status, Status::ViewChange);
+        // The ExitViews advertised the old view (0), before the transition.
+        assert_eq!(ev1.view, 0);
+        assert_eq!(ev2.view, 0);
+
+        // r1 is the new primary. Deliver r2's JoinView to complete its quorum.
+        // Each replica's queue holds [ExitView, JoinView].
+        assert_eq!(r2.send_queue.len(), 2);
+        let jv = r2.send_queue.pop().unwrap();
+        assert_eq!(r1.send_queue.len(), 2);
+        r1.on_message(&jv, 10_002);
+        assert_eq!(r1.send_queue.len(), 3); // ExitView + JoinView + View
+        assert_eq!(r1.log_view, 1);
+
+        let view = r1.send_queue[2].header::<message_header::View>().unwrap();
+        assert_eq!(view.view, 1);
+        assert_eq!(view.op, 1);
+        assert_eq!(view.commit_max, 1);
     }
 
     #[test]
