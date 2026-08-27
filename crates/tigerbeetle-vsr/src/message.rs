@@ -81,6 +81,20 @@ impl Message {
         u32::from_le_bytes(bytes)
     }
 
+    /// Copy `bytes` into the body region (following the header frame).
+    ///
+    /// The caller is responsible for setting `header.size` and the body/header
+    /// checksums (upstream: `set_checksum_body` + `set_checksum`).
+    ///
+    /// # Panics
+    /// Panics if the body does not fit in the fixed-size buffer.
+    pub fn set_body(&mut self, bytes: &[u8]) {
+        let start = HEADER_SIZE;
+        let end = start + bytes.len();
+        assert!(end <= self.buffer.len());
+        self.buffer_mut()[start..end].copy_from_slice(bytes);
+    }
+
     /// The body covered by the size field (upstream `body_used`).
     ///
     /// # Panics
