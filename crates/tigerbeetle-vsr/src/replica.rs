@@ -17,6 +17,7 @@ use tigerbeetle_core::constants;
 
 use crate::command::Command;
 use crate::message_header;
+use crate::message_header::TypedHeader;
 
 // ---------------------------------------------------------------------------
 // Status
@@ -82,8 +83,10 @@ pub struct Replica {
     /// Whether commit_dispatch is currently executing (reentrancy guard).
     pub commit_dispatch_entered: bool,
 
-    // ── Subsystems (assigned after construction) ────────────────────────
-    // journal: Journal,
+    // ── Subsystems ───────────────────────────────────────────────────────
+    /// The write-ahead log (WAL): suspend slot geometry, header ring, dirty/
+    /// faulty recovery bits, and on-disk checksums.
+    pub journal: crate::journal::Journal,
     // grid: Grid,
     // state_machine: StateMachine,
     // clock: Clock,
@@ -354,6 +357,7 @@ impl Replica {
             heartbeat_timestamp: 0,
             exit_view_from_all_replicas: 0,
             primary_abdicating: false,
+            journal: crate::journal::Journal::new(cluster, replica_index),
         }
     }
 
@@ -425,6 +429,9 @@ impl Replica {
     /// Returns [`PrepareReject`] if the replica is not primary, not in normal
     /// status, behind on commits, or the pipeline is full.
     ///
+    /// # Panics
+    /// Panics if `operation` is `.reserved` or `.root`.
+    ///
     /// Upstream: `src/vsr/replica.zig:7283` (`primary_pipeline_prepare`).
     pub fn primary_pipeline_prepare(
         &mut self,
@@ -449,32 +456,56 @@ impl Replica {
             return Err(PrepareReject::PipelineFull);
         }
 
-        // Advance op.
-        self.op += 1;
-        let op = self.op;
+        // The incoming request is rewritten as a Prepare addressing `self.op + 1`;
+        // `self.op` is advanced below, exactly as upstream's `on_prepare` does for
+        // the primary's self-sent prepare message.
+        assert_ne!(operation, crate::Operation::RESERVED, "operation != .reserved");
+        assert_ne!(operation, crate::Operation::ROOT, "operation != .root");
+        let op = self.op + 1;
 
         // Timestamp: monotonic, at least prepare_timestamp + 1.
         self.prepare_timestamp = self.prepare_timestamp.max(self.commit_max) + 1;
         let timestamp = self.prepare_timestamp;
 
-        let checksum_parent = self.pipeline_queue.prepare_queue.last().map_or(0, |p| p.checksum);
+        // The hash-chain parent is the checksum of the journal's current head.
+        let parent =
+            self.journal.header_with_op(self.op).map_or(0, message_header::Prepare::checksum);
+
+        let mut header = message_header::Prepare {
+            cluster: self.cluster,
+            #[allow(clippy::cast_possible_truncation)] // replica_count ≤ u8::MAX
+            replica: self.replica_index as u8,
+            view: self.view,
+            op,
+            commit: self.commit_max,
+            timestamp,
+            parent,
+            operation,
+            ..message_header::Prepare::default()
+        };
+        header.set_checksum_body(&[]);
+        header.set_checksum();
+
+        // Advance op and record the prepare in the journal (upstream `on_prepare`):
+        self.op = op;
+        self.journal.set_header_as_dirty(&header);
 
         let prepare = PipelinePrepare {
             op,
-            checksum: 0, // Will be set when the message is serialized.
+            checksum: header.checksum(),
             acks_received: 0,
             ok_quorum_received: false,
         };
         self.pipeline_queue.prepare_queue.push(prepare);
         self.ok_from_all_replicas.push(0);
 
-        // Start timeouts if pipeline was previously empty.
+        // Start timeouts if the pipeline was previously empty.
         if self.pipeline_queue.prepare_queue.len() == 1 {
             self.prepare_timeout = Timeout::start(constants::PIPELINE_PREPARE_QUEUE_MAX);
         }
 
-        let _ = (client, request, operation, body_size, timestamp, checksum_parent);
-        // TODO(port): serialize the prepare message, write to journal, send to backups.
+        let _ = (client, request, body_size);
+        // TODO(port): serialize the prepare message, send to backups.
 
         Ok(op)
     }
@@ -545,6 +576,19 @@ impl Replica {
         self.advance_commit_max(op);
 
         // TODO(port): execute the operation on the state machine, build Reply.
+
+        // Simulate the async prepare write completing: the header is already in
+        // the journal (dirty); the on-disk copy accompanies commit.
+        // DEVIATION: upstream marks a prepare written when `write_prepare`'s
+        // callback fires (before commit, on equal disks). Without a message bus /
+        // I/O pool we complete the write synchronously at commit.
+        // TODO(port): remove when `write_prepare`/`write_prepare_callback` ports.
+        if let Some(header) = self.journal.header_with_op(op).copied() {
+            let slot = crate::journal::Journal::slot_for_op(op);
+            self.journal.dirty.clear(slot);
+            self.journal.prepare_inhabited[slot.index] = true;
+            self.journal.prepare_checksums[slot.index] = header.checksum();
+        }
     }
 
     /// Returns the number of prepares in the pipeline.
@@ -1624,13 +1668,14 @@ mod tests {
         let mut r = Replica::new(0, 0, 3); // primary, quorum=2
         r.status = Status::Normal;
         r.primary_pipeline_prepare(1, 100, crate::Operation(6), 64).unwrap();
+        let checksum = r.journal.header_with_op(1).unwrap().checksum();
 
         // Replica 1 acks.
-        let result = r.on_prepare_ok(1, 0xAB, 1);
+        let result = r.on_prepare_ok(1, checksum, 1);
         assert_eq!(result, PrepareOkResult::AckCounted);
 
         // Replica 2 acks → quorum reached.
-        let result = r.on_prepare_ok(1, 0xAB, 2);
+        let result = r.on_prepare_ok(1, checksum, 2);
         assert!(matches!(result, PrepareOkResult::QuorumReached { op: 1, .. }));
     }
 
@@ -1639,9 +1684,10 @@ mod tests {
         let mut r = Replica::new(0, 0, 3);
         r.status = Status::Normal;
         r.primary_pipeline_prepare(1, 100, crate::Operation(6), 64).unwrap();
+        let checksum = r.journal.header_with_op(1).unwrap().checksum();
 
-        let _ = r.on_prepare_ok(1, 0xAB, 1);
-        let result = r.on_prepare_ok(1, 0xAB, 1); // duplicate
+        let _ = r.on_prepare_ok(1, checksum, 1);
+        let result = r.on_prepare_ok(1, checksum, 1); // duplicate
         assert_eq!(result, PrepareOkResult::DuplicateAck);
     }
 
@@ -1656,6 +1702,65 @@ mod tests {
         r.commit_op(5);
         assert_eq!(r.commit_min, 5);
         assert_eq!(r.commit_max, 5);
+    }
+
+    // ── Journal wiring ───────────────────────────────────────────────────
+
+    #[test]
+    fn primary_pipeline_prepare_wires_journal_chain() {
+        let mut r = Replica::new(0, 0, 3);
+        r.status = Status::Normal;
+        r.primary_pipeline_prepare(1, 100, crate::Operation(6), 64).unwrap();
+        r.primary_pipeline_prepare(2, 101, crate::Operation(6), 64).unwrap();
+
+        // Op 0 was never prepared — the journal ring still holds a reserved header.
+        assert_eq!(r.journal.header_with_op(0), None);
+
+        let h1 = *r.journal.header_with_op(1).unwrap();
+        assert_eq!(h1.op, 1);
+        assert_eq!(h1.commit, 0);
+        assert_eq!(h1.parent, 0); // first entry — hash chain starts at 0
+        assert_eq!(h1.view, 0);
+        assert_eq!(r.pipeline_queue.prepare_queue[0].checksum, h1.checksum());
+
+        // Dirty until the prepare write "completes":
+        assert!(r.journal.dirty.bit(crate::journal::Journal::slot_for_op(1)));
+
+        let h2 = *r.journal.header_with_op(2).unwrap();
+        assert_eq!(h2.op, 2);
+        assert_eq!(h2.parent, h1.checksum()); // hash chain links op 2 → op 1
+        assert_eq!(h2.commit, 0); // nothing committed yet
+        assert_eq!(r.pipeline_queue.prepare_queue[1].checksum, h2.checksum());
+
+        assert_eq!(r.journal.op_maximum(), 2);
+    }
+
+    #[test]
+    fn commit_op_marks_journal_prepare_written() {
+        let mut r = Replica::new(0, 0, 3);
+        r.status = Status::Normal;
+        r.primary_pipeline_prepare(1, 100, crate::Operation(6), 64).unwrap();
+        let header = *r.journal.header_with_op(1).unwrap();
+        let slot = crate::journal::Journal::slot_for_op(1);
+
+        // Not yet written: dirty + uninhabited.
+        assert!(r.journal.dirty.bit(slot));
+        assert!(!r.journal.has_prepare(&header));
+
+        r.commit_op(1);
+
+        assert!(!r.journal.dirty.bit(slot));
+        assert!(r.journal.prepare_inhabited[slot.index]);
+        assert_eq!(r.journal.prepare_checksums[slot.index], header.checksum());
+        assert!(r.journal.has_prepare(&header));
+    }
+
+    #[test]
+    #[should_panic = "operation != .reserved"]
+    fn primary_pipeline_prepare_rejects_reserved_operation() {
+        let mut r = Replica::new(0, 0, 3);
+        r.status = Status::Normal;
+        let _ = r.primary_pipeline_prepare(1, 100, crate::Operation::RESERVED, 64);
     }
 
     #[test]
@@ -1982,8 +2087,9 @@ mod tests {
         let op = r.primary_pipeline_prepare(1, 1, crate::Operation::NOOP, 0).unwrap();
 
         // Quorum = 2 (replica_count 3). Self + one backup.
-        r.on_prepare_ok(op, 0, 0); // self
-        r.on_prepare_ok(op, 0, 1); // replica 1 → quorum
+        let checksum = r.journal.header_with_op(op).unwrap().checksum();
+        r.on_prepare_ok(op, checksum, 0); // self
+        r.on_prepare_ok(op, checksum, 1); // replica 1 → quorum
 
         assert!(r.pipeline_queue.prepare_queue[0].ok_quorum_received);
         assert_eq!(r.commit_min, 0);
@@ -2008,8 +2114,9 @@ mod tests {
 
         // Quorum all three.
         for op in [op1, op2, op3] {
-            r.on_prepare_ok(op, 0, 0);
-            r.on_prepare_ok(op, 0, 1);
+            let checksum = r.journal.header_with_op(op).unwrap().checksum();
+            r.on_prepare_ok(op, checksum, 0);
+            r.on_prepare_ok(op, checksum, 1);
         }
 
         r.commit_dispatch_enter();
@@ -2037,8 +2144,9 @@ mod tests {
         let mut r = Replica::new(0, 0, 3);
         r.status = Status::Normal;
         let op = r.primary_pipeline_prepare(1, 1, crate::Operation::NOOP, 0).unwrap();
-        r.on_prepare_ok(op, 0, 0);
-        r.on_prepare_ok(op, 0, 1);
+        let checksum = r.journal.header_with_op(op).unwrap().checksum();
+        r.on_prepare_ok(op, checksum, 0);
+        r.on_prepare_ok(op, checksum, 1);
 
         // Enter dispatch (sets commit_dispatch_entered via internal state).
         r.commit_dispatch_enter();
