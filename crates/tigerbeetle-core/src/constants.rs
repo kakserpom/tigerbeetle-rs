@@ -428,6 +428,8 @@ pub const CONNECTION_DELAY_MAX: Duration = CONFIG.process.connection_delay_max;
 
 /// How often the replica broadcasts a Ping (upstream: 1000ms).
 pub const PING_TIMEOUT: u32 = 1_000;
+/// How often the primary re-sends pending prepares (upstream: 250ms).
+pub const PREPARE_TIMEOUT: u32 = 250;
 /// How often the primary broadcasts a Commit heartbeat (upstream: 500ms).
 pub const COMMIT_MESSAGE_TIMEOUT: u32 = 500;
 /// How long the primary waits without a prepare_ok quorum before abdicating (upstream: 10s).

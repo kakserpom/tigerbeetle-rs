@@ -886,36 +886,63 @@ impl Replica {
 impl Replica {
     /// Called every tick to check the commit heartbeat fault detector.
     ///
-    /// - **Primary, yellow**: resets commit_message_timeout, sends extra Commit.
-    /// - **Backup, red**: sends ExitView to begin view change.
+    /// - **Primary, yellow/red**: resets commit_message_timeout, sends extra
+    ///   Commit to re-smooth the interval.
+    /// - **Backup, red**: sends ExitView to begin view change and re-signals
+    ///   the fault detector to avoid repeated ExitView.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `self.status` is not `Normal`.
     ///
     /// Upstream: `src/vsr/replica.zig:1591` (`tick_normal_heartbeat_fault`).
     pub fn tick_normal_heartbeat_fault(&mut self, now: u64) {
-        if self.status != Status::Normal {
+        assert_eq!(self.status, Status::Normal);
+
+        let tardy = self.commit_fault.tardy(now);
+        if tardy == Tardiness::Green {
+            return; // Everything is fine!
+        }
+
+        if self.is_primary() {
+            // See FaultDetector smoothing test for why resetting the timeout is
+            // critical here.
+            self.commit_message_timeout.reset(constants::COMMIT_MESSAGE_TIMEOUT);
+            self.send_commit(now);
+        } else if tardy == Tardiness::Yellow {
+            // A slight delay which could be caused by a natural drop in the
+            // load, so wait some more for a Commit message from the primary.
+        } else {
+            self.send_exit_view();
+            self.commit_fault.signal(now);
+        }
+        assert_ne!(self.commit_fault.tardy(now), Tardiness::Red);
+    }
+
+    /// Send a Commit heartbeat to all replicas (primary only).
+    ///
+    /// Signals the fault detector even while abdicating, to maintain the
+    /// invariant that a replica doesn't let commit_fault go red without action.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the replica is not a Normal primary or if
+    /// `commit_min != commit_max`.
+    ///
+    /// Upstream: `src/vsr/replica.zig:11342` (`send_commit`).
+    pub fn send_commit(&mut self, now: u64) {
+        assert_eq!(self.status, Status::Normal);
+        assert!(self.is_primary());
+        assert_eq!(self.commit_min, self.commit_max);
+
+        self.commit_fault.signal(now);
+        if self.primary_abdicating {
+            assert!(self.primary_abdicate_timeout.active);
             return;
         }
 
-        match self.commit_fault.tardy(now) {
-            Tardiness::Green => {}
-            Tardiness::Yellow => {
-                if self.is_primary() {
-                    // Primary: resend commit to re-smooth the interval.
-                    self.commit_message_timeout.reset(constants::COMMIT_MESSAGE_TIMEOUT);
-                    // TODO(port): send_commit to all replicas.
-                }
-                // Backup: wait — don't trigger view change yet.
-            }
-            Tardiness::Red => {
-                if self.is_primary() {
-                    // Primary: resend commit to re-smooth.
-                    self.commit_message_timeout.reset(constants::COMMIT_MESSAGE_TIMEOUT);
-                    // TODO(port): send_commit to all replicas.
-                } else {
-                    // Backup: primary is dead — begin view change.
-                    self.send_exit_view();
-                }
-            }
-        }
+        // TODO(port): broadcast Commit{commit_max, checkpoint_op, timestamp: now} to replicas.
+        let _ = now;
     }
 
     /// Handle a ping message — reply with a pong.
@@ -1024,24 +1051,146 @@ impl Replica {
         // TODO(port): send JoinView to all replicas.
     }
 
-    /// Called every tick — advances all timeouts.
-    pub fn tick(&mut self) {
+    /// Called every tick — advances all timeouts and the fault detector.
+    ///
+    /// Upstream: `src/vsr/replica.zig:1532` (`tick`).
+    pub fn tick(&mut self, now: u64) {
+        if self.status == Status::Normal {
+            self.tick_normal_heartbeat_fault(now);
+        }
+
         if self.ping_timeout.tick() {
-            // TODO(port): broadcast Ping.
+            self.on_ping_timeout();
+        }
+        if self.prepare_timeout.tick() {
+            self.on_prepare_timeout();
         }
         if self.commit_message_timeout.tick() {
-            // TODO(port): broadcast Commit heartbeat.
+            self.on_commit_message_timeout(now);
         }
         if self.exit_view_message_timeout.tick() {
-            // TODO(port): resend ExitView if own bit still set.
+            self.on_exit_view_message_timeout();
         }
         if self.exit_view_window_timeout.tick() {
-            // Reset exit_view_from_all_replicas, keeping only own bit.
-            self.exit_view_from_all_replicas = 1u64 << self.replica_index;
+            self.on_exit_view_window_timeout();
+        }
+        if self.view_change_status_timeout.tick() {
+            self.on_view_change_status_timeout();
         }
         if self.primary_abdicate_timeout.tick() {
-            self.primary_abdicating = true;
+            self.on_primary_abdicate_timeout();
         }
+    }
+
+    /// Timeout: broadcast a Ping to all replicas.
+    ///
+    /// Upstream: `src/vsr/replica.zig:3567` (`on_ping_timeout`).
+    fn on_ping_timeout(&mut self) {
+        self.ping_timeout.reset(constants::PING_TIMEOUT);
+        // TODO(port): broadcast Ping with view_durable(), checkpoint_id/op, release info.
+    }
+
+    /// Timeout: the primary re-sends pending prepares or issues a Commit
+    /// heartbeat.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the replica is not a Normal primary.
+    ///
+    /// Upstream: `src/vsr/replica.zig:3608` (`on_prepare_timeout`).
+    pub fn on_prepare_timeout(&mut self) {
+        assert_eq!(self.status, Status::Normal);
+        assert!(self.is_primary());
+        self.prepare_timeout.reset(constants::PREPARE_TIMEOUT);
+        if self.pipeline_queue.prepare_queue.is_empty() {
+            // Nothing pending — nothing to re-send.
+        } else {
+            // TODO(port): find pipeline slot without a full prepare_ok quorum and
+            // re-send the prepare (upstream: `primary_pipeline_pending` +
+            // `on_repair` for the journal-write case).
+        }
+    }
+
+    /// Timeout: the primary sends a Commit heartbeat at a fixed cadence.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the replica is not a Normal primary or if
+    /// `commit_min != commit_max`.
+    ///
+    /// Upstream: `src/vsr/replica.zig:3691` (`on_commit_message_timeout`).
+    pub fn on_commit_message_timeout(&mut self, now: u64) {
+        self.commit_message_timeout.reset(constants::COMMIT_MESSAGE_TIMEOUT);
+        assert_eq!(self.status, Status::Normal);
+        assert!(self.is_primary());
+        assert_eq!(self.commit_min, self.commit_max);
+        self.send_commit(now);
+    }
+
+    /// Timeout: reset the ExitView window, keeping only our own bit.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless the status is `Normal` or `ViewChange` and some replica
+    /// has been observed exiting the view.
+    ///
+    /// Upstream: `src/vsr/replica.zig:3701` (`on_exit_view_window_timeout`).
+    pub fn on_exit_view_window_timeout(&mut self) {
+        assert!(self.status == Status::Normal || self.status == Status::ViewChange);
+        assert_ne!(self.exit_view_from_all_replicas, 0);
+        self.exit_view_window_timeout.stop();
+
+        // Don't reset our own EV; it will be reset if/when we receive a heartbeat.
+        let exit_view = self.exit_view_from_all_replicas & (1u64 << self.replica_index) != 0;
+        self.exit_view_from_all_replicas = 0;
+        if exit_view {
+            self.exit_view_from_all_replicas = 1u64 << self.replica_index;
+        }
+    }
+
+    /// Timeout: re-send ExitView if our bit is still set after the window.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless the status is `Normal` or `ViewChange`.
+    ///
+    /// Upstream: `src/vsr/replica.zig:3715` (`on_exit_view_message_timeout`).
+    pub fn on_exit_view_message_timeout(&mut self) {
+        assert!(self.status == Status::Normal || self.status == Status::ViewChange);
+        self.exit_view_message_timeout.reset(constants::EXIT_VIEW_MESSAGE_TIMEOUT);
+
+        if self.exit_view_from_all_replicas & (1u64 << self.replica_index) != 0 {
+            self.send_exit_view();
+        }
+    }
+
+    /// Timeout: in view change, re-signal ExitView to keep the view-change
+    /// quorum alive.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless the status is `ViewChange`.
+    ///
+    /// Upstream: `src/vsr/replica.zig:3727` (`on_view_change_status_timeout`).
+    pub fn on_view_change_status_timeout(&mut self) {
+        assert_eq!(self.status, Status::ViewChange);
+        self.view_change_status_timeout.reset(constants::VIEW_CHANGE_STATUS_TIMEOUT);
+        self.send_exit_view();
+    }
+
+    /// Timeout: the primary starts abdicating after `PRIMARY_ABDICATE_TIMEOUT`
+    /// without a prepare_ok quorum.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the replica is not a Normal primary.
+    ///
+    /// Upstream: `src/vsr/replica.zig:3678` (`on_primary_abdicate_timeout`).
+    pub fn on_primary_abdicate_timeout(&mut self) {
+        assert_eq!(self.status, Status::Normal);
+        assert!(self.is_primary());
+        self.primary_abdicate_timeout.reset(constants::PRIMARY_ABDICATE_TIMEOUT);
+        self.primary_abdicating = true;
     }
 }
 
@@ -1687,6 +1836,115 @@ mod tests {
         r.commit_fault.signal(0);
         r.tick_normal_heartbeat_fault(10_000);
         assert_eq!(r.status, Status::ViewChange);
+    }
+
+    #[test]
+    fn tick_normal_heartbeat_fault_backup_red_resignals() {
+        // The backup must re-signal after ExitView, or it would be red again next tick.
+        let mut r = Replica::new(0, 1, 3);
+        r.status = Status::Normal;
+        r.commit_fault.signal(0);
+        r.tick_normal_heartbeat_fault(10_000);
+        assert_eq!(r.status, Status::ViewChange);
+        assert_ne!(r.commit_fault.tardy(10_000), Tardiness::Red);
+    }
+
+    #[test]
+    fn tick_normal_heartbeat_fault_primary_yellow_resends_commit() {
+        // Primary that stops receiving prepare_ok feed becomes yellow; it re-sends
+        // an extra Commit and resets commit_message_timeout to re-smooth.
+        let mut r = Replica::new(0, 0, 3);
+        r.status = Status::Normal;
+        // Two signals 500ms apart, then silence to reach yellow.
+        r.commit_fault.signal(0);
+        r.commit_fault.signal(500);
+        r.commit_message_timeout = Timeout::start(100);
+        r.tick_normal_heartbeat_fault(5_000); // yellow (elapsed 4500 > 1.5×ewma≈1425? )
+        // After send_commit, fault detector is re-signaled at now → green.
+        assert_eq!(r.commit_fault.tardy(5_000), Tardiness::Green);
+        assert!(r.commit_message_timeout.active);
+    }
+
+    #[test]
+    fn tick_dispatches_commit_message_timeout_to_send_commit() {
+        let mut r = Replica::new(0, 0, 3);
+        r.status = Status::Normal;
+        r.commit_message_timeout = Timeout::start(1);
+
+        r.tick(100);
+        assert_eq!(r.commit_message_timeout.ticks, constants::COMMIT_MESSAGE_TIMEOUT);
+        assert!(r.commit_message_timeout.active);
+        // send_commit signals the fault detector → green at the same timestamp.
+        assert_eq!(r.commit_fault.tardy(100), Tardiness::Green);
+    }
+
+    #[test]
+    fn tick_dispatches_primary_abdicate_timeout() {
+        let mut r = Replica::new(0, 0, 3);
+        r.status = Status::Normal;
+        r.primary_abdicate_timeout = Timeout::start(1);
+        assert!(!r.primary_abdicating);
+
+        r.tick(0);
+        assert!(r.primary_abdicating);
+        assert_eq!(r.primary_abdicate_timeout.ticks, constants::PRIMARY_ABDICATE_TIMEOUT);
+        assert!(r.primary_abdicate_timeout.active);
+    }
+
+    #[test]
+    fn tick_dispatches_ping_timeout() {
+        let mut r = Replica::new(0, 1, 3);
+        r.status = Status::Normal;
+        r.ping_timeout = Timeout::start(1);
+
+        r.tick(0);
+        assert_eq!(r.ping_timeout.ticks, constants::PING_TIMEOUT);
+    }
+
+    #[test]
+    fn on_exit_view_window_timeout_keeps_own_bit() {
+        let mut r = Replica::new(0, 0, 3);
+        r.status = Status::Normal;
+        r.exit_view_from_all_replicas = 0b111; // all three replicas saw ExitView
+        r.exit_view_window_timeout = Timeout::start(1);
+
+        r.tick(0);
+        assert_eq!(r.exit_view_from_all_replicas, 0b001);
+        assert!(!r.exit_view_window_timeout.active);
+    }
+
+    #[test]
+    fn on_exit_view_window_timeout_clears_if_own_bit_unset() {
+        let mut r = Replica::new(0, 0, 3);
+        r.status = Status::ViewChange;
+        r.exit_view_from_all_replicas = 0b110; // others only — own bit not set
+
+        r.on_exit_view_window_timeout();
+        assert_eq!(r.exit_view_from_all_replicas, 0);
+    }
+
+    #[test]
+    fn on_exit_view_message_timeout_resends_exit_view() {
+        let mut r = Replica::new(0, 1, 3);
+        r.status = Status::ViewChange;
+        r.exit_view_from_all_replicas = 1u64 << 1;
+
+        r.on_exit_view_message_timeout();
+        // send_exit_view reaffirms the ViewChange status and restarts the window.
+        assert_eq!(r.status, Status::ViewChange);
+        assert_ne!(r.exit_view_from_all_replicas & (1u64 << 1), 0);
+    }
+
+    #[test]
+    fn on_view_change_status_timeout_resignals_exit_view() {
+        let mut r = Replica::new(0, 1, 3);
+        r.status = Status::ViewChange;
+        r.exit_view_from_all_replicas = 0; // cleared after transition
+
+        r.on_view_change_status_timeout();
+        assert_eq!(r.view_change_status_timeout.ticks, constants::VIEW_CHANGE_STATUS_TIMEOUT);
+        assert_eq!(r.status, Status::ViewChange);
+        assert_ne!(r.exit_view_from_all_replicas & (1u64 << 1), 0);
     }
 
     // ── Commit pipeline tests ────────────────────────────────────────────
