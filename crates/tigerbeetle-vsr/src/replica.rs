@@ -664,6 +664,20 @@ impl Replica {
         Ok(op)
     }
 
+    /// The head of the prepare pipeline that has not yet reached a quorum of
+    /// prepare_oks, with its slot index.
+    ///
+    /// Upstream: `src/vsr/replica.zig:7502` (`primary_pipeline_pending`).
+    fn primary_pipeline_pending(&self) -> Option<(usize, &PipelinePrepare)> {
+        assert_eq!(self.status, Status::Normal);
+        assert!(self.is_primary());
+        self.pipeline_queue
+            .prepare_queue
+            .iter()
+            .enumerate()
+            .find(|(_, prepare)| !prepare.ok_quorum_received)
+    }
+
     /// Accept a Prepare replicated from the primary (or self-sent on the
     /// primary). Advances `op` by exactly one and records the header as dirty
     /// in the journal.
@@ -1952,21 +1966,52 @@ impl Replica {
     /// Timeout: the primary re-sends pending prepares or issues a Commit
     /// heartbeat.
     ///
+    /// Re-sends the first prepare without a full prepare_ok quorum to every
+    /// backup that has not yet acked it, walking the replicas in ring order
+    /// (a lost prepare or prepare_ok is thus retried at a fixed cadence).
+    ///
     /// # Panics
     ///
-    /// Panics if the replica is not a Normal primary.
+    /// Panics if the replica is not a Normal primary, or if a pending prepare
+    /// is missing from the primary's own journal.
     ///
     /// Upstream: `src/vsr/replica.zig:3608` (`on_prepare_timeout`).
     pub fn on_prepare_timeout(&mut self) {
         assert_eq!(self.status, Status::Normal);
         assert!(self.is_primary());
         self.prepare_timeout.reset(constants::PREPARE_TIMEOUT);
-        if self.pipeline_queue.prepare_queue.is_empty() {
-            // Nothing pending — nothing to re-send.
-        } else {
-            // TODO(port): find pipeline slot without a full prepare_ok quorum and
-            // re-send the prepare (upstream: `primary_pipeline_pending` +
-            // `on_repair` for the journal-write case).
+
+        let Some((slot, prepare)) = self.primary_pipeline_pending() else {
+            // Nothing unquorum'd is pending; stop ticking until the next prepare.
+            self.prepare_timeout.stop();
+            return;
+        };
+
+        // The peers that have not yet acked this prepare, in ring order
+        // (upstream builds `waiting` at replica.zig:3627-3639).
+        let mut waiting = Vec::new();
+        for ring in 1..self.replica_count {
+            let replica = (self.replica_index + ring) % self.replica_count;
+            if self.ok_from_all_replicas[slot] & (1 << replica) == 0 {
+                waiting.push(replica);
+            }
+        }
+        // The primary's own prepare_ok is always set (see
+        // `primary_pipeline_prepare`), so a pending prepare necessarily has
+        // some unacked backup.
+        assert!(!waiting.is_empty(), "pending prepare has a quorum already");
+
+        // DEVIATION: upstream re-sends `prepare.message`, which carries the
+        // request body; sans-IO bodies are deferred, so the header-only
+        // prepare is replayed (receivers dispatch on the header alone).
+        let prepare_op = prepare.op;
+        let Some(prepare_header) = self.journal.header_with_op(prepare_op) else {
+            panic!("primary's journal must hold its own pending prepare op {prepare_op}")
+        };
+        let mut message = crate::message::Message::new();
+        message.set_header(prepare_header);
+        for _ in 0..waiting.len() {
+            self.send_queue.push(message.clone());
         }
     }
 
@@ -3059,6 +3104,82 @@ mod tests {
         let _ = r.on_prepare_ok(1, checksum, 1);
         let result = r.on_prepare_ok(1, checksum, 1); // duplicate
         assert_eq!(result, PrepareOkResult::DuplicateAck);
+    }
+
+    #[test]
+    fn primary_pipeline_pending_tracks_unquorumed_head() {
+        let mut r = Replica::new(0, 0, 3);
+        r.status = Status::Normal;
+        r.primary_pipeline_prepare(1, 1, crate::Operation::NOOP, 0).unwrap();
+        r.primary_pipeline_prepare(2, 2, crate::Operation::NOOP, 0).unwrap();
+
+        // Both are pending (self-ack alone is not a quorum).
+        let (slot, pending) = r.primary_pipeline_pending().unwrap();
+        assert_eq!(slot, 0);
+        assert_eq!(pending.op, 1);
+        assert!(!pending.ok_quorum_received);
+
+        // Quorum op 1 (self + replica 1): the new head is op 2.
+        let checksum = r.journal.header_with_op(1).unwrap().checksum();
+        r.on_prepare_ok(1, checksum, 1);
+        let (slot, pending) = r.primary_pipeline_pending().unwrap();
+        assert_eq!(slot, 1);
+        assert_eq!(pending.op, 2);
+
+        // Quorum op 2 too: nothing left pending.
+        let checksum = r.journal.header_with_op(2).unwrap().checksum();
+        r.on_prepare_ok(2, checksum, 1);
+        assert!(r.primary_pipeline_pending().is_none());
+    }
+
+    #[test]
+    fn on_prepare_timeout_retransmits_to_unacked_backups() {
+        let mut r = Replica::new(0, 0, 3);
+        r.status = Status::Normal;
+        let op = r.primary_pipeline_prepare(1, 1, crate::Operation::NOOP, 0).unwrap();
+
+        // No backup has acked → both replicas 1 and 2 are waiting; the
+        // timeout re-sends the pending prepare to each.
+        r.on_prepare_timeout();
+        assert_eq!(r.send_queue.len(), 2);
+        let checksum = r.journal.header_with_op(op).unwrap().checksum();
+        for message in &r.send_queue {
+            let prepare = message.header::<message_header::Prepare>().unwrap();
+            assert_eq!(prepare.op, op);
+            assert_eq!(prepare.checksum(), checksum);
+        }
+        assert!(r.prepare_timeout.active); // reset, still ticking
+        r.send_queue.clear();
+
+        // Once a backup acks, retransmission stops.
+        r.on_prepare_ok(op, checksum, 1);
+        r.commit_dispatch_enter();
+        r.on_prepare_timeout();
+        assert!(r.send_queue.is_empty());
+        assert!(!r.prepare_timeout.active); // pending none → stopped
+    }
+
+    #[test]
+    fn prepare_timeout_retransmits_pending_head_only() {
+        let mut r = Replica::new(0, 0, 3);
+        r.status = Status::Normal;
+        r.primary_pipeline_prepare(1, 1, crate::Operation::NOOP, 0).unwrap();
+        r.primary_pipeline_prepare(2, 2, crate::Operation::NOOP, 0).unwrap();
+
+        // Quorum op 1 and commit it; op 2 remains pending.
+        let checksum = r.journal.header_with_op(1).unwrap().checksum();
+        r.on_prepare_ok(1, checksum, 1);
+        r.commit_dispatch_enter();
+        assert_eq!(r.commit_min, 1);
+        assert_eq!(r.pipeline_queue.prepare_queue.len(), 1);
+
+        // The timeout re-sends op 2 (still unacked by both backups), not op 1.
+        r.on_prepare_timeout();
+        assert_eq!(r.send_queue.len(), 2);
+        for message in &r.send_queue {
+            let prepare = message.header::<message_header::Prepare>().unwrap();
+            assert_eq!(prepare.op, 2);
+        }
     }
 
     #[test]
