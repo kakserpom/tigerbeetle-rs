@@ -76,6 +76,12 @@ pub struct Replica {
     /// The prepare currently being committed (primary).
     pub commit_prepare: Option<u64>, // op of the prepare being committed
 
+    // ── Commit pipeline ──────────────────────────────────────────────────
+    /// Current stage of the commit pipeline state machine.
+    pub commit_stage: CommitStage,
+    /// Whether commit_dispatch is currently executing (reentrancy guard).
+    pub commit_dispatch_entered: bool,
+
     // ── Subsystems (assigned after construction) ────────────────────────
     // journal: Journal,
     // grid: Grid,
@@ -229,6 +235,43 @@ impl FaultDetector {
 }
 
 // ---------------------------------------------------------------------------
+// CommitStage — async commit pipeline state machine
+// ---------------------------------------------------------------------------
+
+/// Progress through the commit pipeline for one prepare.
+///
+/// Each variant represents a stage in the pipeline. Stages that need async
+/// I/O (prefetch, stall, compact, checkpoint_*) return `.pending` from the
+/// dispatch; `.ready` means synchronous completion.
+///
+/// Upstream: `src/vsr/replica.zig:83` (`CommitStage`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommitStage {
+    /// Not committing.
+    Idle,
+    /// Get the next prepare to commit from the pipeline.
+    Start,
+    /// Break out of the commit loop if there is nothing to commit.
+    CheckPrepare,
+    /// Load required data from LSM tree on disk into memory.
+    Prefetch,
+    /// Primary delays committing as backpressure to let backups catch up.
+    Stall,
+    /// Ensure that ClientReplies has at least one Write available.
+    ReplySetup,
+    /// Execute state machine logic.
+    Execute,
+    /// Every `VSR_CHECKPOINT_OPS`, mark the current checkpoint as durable.
+    CheckpointDurable,
+    /// Run one beat of LSM compaction.
+    Compact,
+    /// Every `VSR_CHECKPOINT_OPS`, persist the current state to disk.
+    CheckpointData,
+    /// Update the superblock.
+    CheckpointSuperblock,
+}
+
+// ---------------------------------------------------------------------------
 // Quorum computation
 // ---------------------------------------------------------------------------
 
@@ -298,6 +341,8 @@ impl Replica {
             ok_from_all_replicas: Vec::new(),
             prepare_timestamp: 0,
             commit_prepare: None,
+            commit_stage: CommitStage::Idle,
+            commit_dispatch_entered: false,
             ping_timeout: Timeout::default(),
             prepare_timeout: Timeout::default(),
             commit_message_timeout: Timeout::default(),
@@ -418,6 +463,7 @@ impl Replica {
             op,
             checksum: 0, // Will be set when the message is serialized.
             acks_received: 0,
+            ok_quorum_received: false,
         };
         self.pipeline_queue.prepare_queue.push(prepare);
         self.ok_from_all_replicas.push(0);
@@ -473,6 +519,7 @@ impl Replica {
         let quorum = u64::from(quorums(self.replica_count).replication);
         if self.ok_from_all_replicas[slot] >= (1u64 << quorum) - 1 {
             // Quorum reached! Stop prepare timeout if pipeline is drained.
+            prepare.ok_quorum_received = true;
             if self.pipeline_queue.prepare_queue.len() <= 1 {
                 self.prepare_timeout.stop();
             }
@@ -522,6 +569,313 @@ impl Replica {
         let prepare = self.pipeline_queue.prepare_queue.remove(0);
         self.ok_from_all_replicas.remove(0);
         Some(prepare)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Commit pipeline — async state machine for committing prepares
+// ---------------------------------------------------------------------------
+
+impl Replica {
+    /// Enter the commit pipeline. Called when commit_min < commit_max and
+    /// there is at least one prepare ready to commit.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `commit_dispatch_entered` is already `true` or if
+    /// `commit_stage` is not `Idle`.
+    ///
+    /// Upstream: `src/vsr/replica.zig:4541` (`commit_dispatch_enter`).
+    pub fn commit_dispatch_enter(&mut self) {
+        assert!(!self.commit_dispatch_entered);
+        assert_eq!(self.commit_stage, CommitStage::Idle);
+        self.commit_dispatch();
+    }
+
+    /// Resume the commit pipeline after an async I/O completes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `commit_stage` is `Idle` or if `commit_dispatch_entered`
+    /// is `false`.
+    ///
+    /// Upstream: `src/vsr/replica.zig:4546` (`commit_dispatch_resume`).
+    pub fn commit_dispatch_resume(&mut self) {
+        assert_ne!(self.commit_stage, CommitStage::Idle);
+        assert!(self.commit_dispatch_entered);
+        self.commit_dispatch_entered = false;
+        self.commit_dispatch();
+    }
+
+    /// Cancel the commit pipeline (e.g. on state sync).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `commit_stage` is `Idle` or if `commit_dispatch_entered`
+    /// is `false`.
+    ///
+    /// Upstream: `src/vsr/replica.zig:4553` (`commit_dispatch_cancel`).
+    pub fn commit_dispatch_cancel(&mut self) {
+        assert_ne!(self.commit_stage, CommitStage::Idle);
+        assert!(self.commit_dispatch_entered);
+        self.commit_prepare = None;
+        self.commit_stage = CommitStage::Idle;
+        self.commit_dispatch_entered = false;
+    }
+
+    /// The main commit loop. Processes up to `VSR_CHECKPOINT_OPS` prepares
+    /// per call, then returns.
+    ///
+    /// Upstream: `src/vsr/replica.zig:4374` (`commit_dispatch`).
+    fn commit_dispatch(&mut self) {
+        assert!(!self.commit_dispatch_entered);
+        self.commit_dispatch_entered = true;
+
+        loop {
+            if self.commit_stage == CommitStage::Idle {
+                self.commit_stage = CommitStage::Start;
+                assert!(self.commit_prepare.is_none());
+                let ready = self.commit_start();
+                if !ready {
+                    return; // async: pending
+                }
+            }
+
+            if self.commit_stage == CommitStage::Start {
+                self.commit_stage = CommitStage::CheckPrepare;
+                if self.commit_prepare.is_none() {
+                    break; // nothing to commit
+                }
+            }
+
+            assert!(self.commit_prepare.is_some());
+
+            if self.commit_stage == CommitStage::CheckPrepare {
+                self.commit_stage = CommitStage::Prefetch;
+                let ready = self.commit_prefetch();
+                if !ready {
+                    return;
+                }
+            }
+
+            if self.commit_stage == CommitStage::Prefetch {
+                self.commit_stage = CommitStage::Stall;
+                let ready = self.commit_stall();
+                if !ready {
+                    return;
+                }
+            }
+
+            if self.commit_stage == CommitStage::Stall {
+                self.commit_stage = CommitStage::ReplySetup;
+                let ready = self.commit_reply_setup();
+                if !ready {
+                    return;
+                }
+            }
+
+            if self.commit_stage == CommitStage::ReplySetup {
+                self.commit_stage = CommitStage::Execute;
+                self.commit_execute();
+            }
+
+            if self.commit_stage == CommitStage::Execute {
+                self.commit_stage = CommitStage::CheckpointDurable;
+                let ready = self.commit_checkpoint_durable();
+                if !ready {
+                    return;
+                }
+            }
+
+            if self.commit_stage == CommitStage::CheckpointDurable {
+                self.commit_stage = CommitStage::Compact;
+                let ready = self.commit_compact();
+                if !ready {
+                    return;
+                }
+            }
+
+            if self.commit_stage == CommitStage::Compact {
+                self.commit_stage = CommitStage::CheckpointData;
+                let ready = self.commit_checkpoint_data();
+                if !ready {
+                    return;
+                }
+            }
+
+            if self.commit_stage == CommitStage::CheckpointData {
+                self.commit_stage = CommitStage::CheckpointSuperblock;
+                let ready = self.commit_checkpoint_superblock();
+                if !ready {
+                    return;
+                }
+            }
+
+            if self.commit_stage == CommitStage::CheckpointSuperblock {
+                self.commit_stage = CommitStage::Idle;
+                self.commit_finish();
+            }
+
+            assert!(self.commit_prepare.is_none());
+            assert_eq!(self.commit_stage, CommitStage::Idle);
+        }
+
+        assert_eq!(self.commit_stage, CommitStage::CheckPrepare);
+        assert!(self.commit_prepare.is_none());
+        self.commit_stage = CommitStage::Idle;
+        self.commit_dispatch_entered = false;
+    }
+
+    /// Stage: Start — get the next prepare to commit.
+    ///
+    /// On the primary in Normal status, pops from the pipeline.
+    /// On backups, reads from journal (async — deferred to Phase 3).
+    ///
+    /// Upstream: `src/vsr/replica.zig:4565` (`commit_start`).
+    fn commit_start(&mut self) -> bool {
+        assert_eq!(self.commit_stage, CommitStage::Start);
+        assert!(self.commit_prepare.is_none());
+
+        if self.status == Status::Normal && self.is_primary() {
+            self.commit_start_pipeline();
+            true
+        } else {
+            // TODO(port): commit_start_journal — read from journal (async).
+            // For now, return ready (nothing to commit from journal).
+            true
+        }
+    }
+
+    /// Primary: take the head of the pipeline as the prepare to commit.
+    ///
+    /// Upstream: `src/vsr/replica.zig:4578` (`commit_start_pipeline`).
+    fn commit_start_pipeline(&mut self) {
+        assert_eq!(self.commit_stage, CommitStage::Start);
+        assert!(self.commit_prepare.is_none());
+        assert_eq!(self.status, Status::Normal);
+        assert!(self.is_primary());
+
+        let Some(head) = self.pipeline_queue.prepare_queue.first() else {
+            return; // nothing in the pipeline
+        };
+
+        if !head.ok_quorum_received {
+            // TODO(port): handle via on_prepare_timeout.
+            return;
+        }
+
+        let count = self.ok_from_all_replicas.first().map_or(0, |bits| bits.count_ones() as usize);
+        assert!(u64::from(self.quorum().replication) <= count as u64);
+        assert!(count <= self.replica_count as usize);
+
+        self.commit_prepare = Some(head.op);
+    }
+
+    /// Stage: Prefetch — load required data from LSM tree into memory.
+    ///
+    /// Upstream: `src/vsr/replica.zig:4715` (`commit_prefetch`).
+    fn commit_prefetch(&self) -> bool {
+        assert_eq!(self.commit_stage, CommitStage::Prefetch);
+        assert!(self.commit_prepare.is_some());
+        // TODO(port): state_machine.prefetch — async I/O. For now, ready.
+        true
+    }
+
+    /// Stage: Stall — primary backpressure to let backups catch up.
+    ///
+    /// Upstream: `src/vsr/replica.zig:4777` (`commit_stall`).
+    fn commit_stall(&self) -> bool {
+        assert_eq!(self.commit_stage, CommitStage::Stall);
+        // TODO(port): commit_stall_timeout — async backpressure. For now, ready.
+        true
+    }
+
+    /// Stage: ReplySetup — ensure ClientReplies has a Write slot.
+    ///
+    /// Upstream: `src/vsr/replica.zig:4877` (`commit_reply_setup`).
+    fn commit_reply_setup(&self) -> bool {
+        assert_eq!(self.commit_stage, CommitStage::ReplySetup);
+        // TODO(port): client_replies.ready() — async. For now, ready.
+        true
+    }
+
+    /// Stage: Execute — run state machine logic on the committed prepare.
+    ///
+    /// After execution on the primary, pops the committed prepare from the
+    /// pipeline and the next request from the request queue.
+    ///
+    /// Upstream: `src/vsr/replica.zig:4893` (`commit_execute`),
+    /// `src/vsr/replica.zig:5344` (`execute_op`).
+    fn commit_execute(&mut self) {
+        assert_eq!(self.commit_stage, CommitStage::Execute);
+        let Some(op) = self.commit_prepare else {
+            panic!("commit_execute requires commit_prepare");
+        };
+        assert_eq!(self.commit_min + 1, op);
+
+        // Execute on state machine.
+        // TODO(port): state_machine.execute(commit_prepare.body_used())
+        self.commit_min = op;
+        self.advance_commit_max(op);
+        assert!(self.commit_min <= self.commit_max);
+
+        if self.status == Status::Normal && self.is_primary() {
+            assert_eq!(self.commit_min, self.commit_max);
+
+            // Pop the committed prepare from the pipeline (primary only).
+            let popped = self.pop_committed();
+            assert!(popped.is_some_and(|p| p.op == op));
+
+            // Pop the next request to prepare (if any).
+            // TODO(port): pass full request message to primary_pipeline_prepare.
+            self.pipeline_queue.request_queue.pop();
+        }
+    }
+
+    /// Stage: CheckpointDurable — mark the checkpoint as durable.
+    ///
+    /// Upstream: `src/vsr/replica.zig:4967` (`commit_checkpoint_durable`).
+    fn commit_checkpoint_durable(&self) -> bool {
+        assert_eq!(self.commit_stage, CommitStage::CheckpointDurable);
+        // TODO(port): grid.checkpoint_durable — async. For now, ready.
+        true
+    }
+
+    /// Stage: Compact — run one beat of LSM compaction.
+    ///
+    /// Upstream: `src/vsr/replica.zig:4943` (`commit_compact`).
+    fn commit_compact(&self) -> bool {
+        assert_eq!(self.commit_stage, CommitStage::Compact);
+        // TODO(port): state_machine.compact — async. For now, ready.
+        true
+    }
+
+    /// Stage: CheckpointData — persist the current state to disk.
+    ///
+    /// Upstream: `src/vsr/replica.zig:4989` (`commit_checkpoint_data`).
+    fn commit_checkpoint_data(&self) -> bool {
+        assert_eq!(self.commit_stage, CommitStage::CheckpointData);
+        // TODO(port): checkpoint_data — async. For now, ready.
+        true
+    }
+
+    /// Stage: CheckpointSuperblock — update the superblock.
+    ///
+    /// Upstream: `src/vsr/replica.zig` (`commit_checkpoint_superblock`).
+    fn commit_checkpoint_superblock(&self) -> bool {
+        assert_eq!(self.commit_stage, CommitStage::CheckpointSuperblock);
+        // TODO(port): superblock.checkpoint — async. For now, ready.
+        true
+    }
+
+    /// Stage: Finish — cleanup after committing one prepare.
+    ///
+    /// Upstream: `src/vsr/replica.zig:5278` (`commit_finish`).
+    fn commit_finish(&mut self) {
+        assert_eq!(self.commit_stage, CommitStage::Idle);
+        assert!(self.commit_prepare.is_some());
+        // TODO(port): message_bus.unref(commit_prepare.message), commit_started = null.
+        self.commit_prepare = None;
     }
 }
 
@@ -753,6 +1107,8 @@ pub struct PipelinePrepare {
     pub checksum: u128,
     /// Number of prepare_ok responses received.
     pub acks_received: u16,
+    /// Whether a quorum of prepare_ok messages has been received.
+    pub ok_quorum_received: bool,
 }
 
 /// A client request queued on the primary.
@@ -1021,7 +1377,8 @@ mod tests {
     #[test]
     fn pipeline_cache_insert_and_find() {
         let mut cache = PipelineCache::new(4);
-        let p = PipelinePrepare { op: 10, checksum: 0xAB, acks_received: 0 };
+        let p =
+            PipelinePrepare { op: 10, checksum: 0xAB, acks_received: 0, ok_quorum_received: false };
         assert!(cache.insert(p).is_none());
         assert!(cache.find(10, 0xAB).is_some());
         assert!(cache.find(10, 0xCD).is_none());
@@ -1031,8 +1388,10 @@ mod tests {
     #[test]
     fn pipeline_cache_eviction() {
         let mut cache = PipelineCache::new(2);
-        let p1 = PipelinePrepare { op: 0, checksum: 1, acks_received: 0 };
-        let p2 = PipelinePrepare { op: 2, checksum: 2, acks_received: 0 };
+        let p1 =
+            PipelinePrepare { op: 0, checksum: 1, acks_received: 0, ok_quorum_received: false };
+        let p2 =
+            PipelinePrepare { op: 2, checksum: 2, acks_received: 0, ok_quorum_received: false };
         // op=0 maps to index 0, op=2 maps to index 0 (2 % 2 == 0).
         assert!(cache.insert(p1).is_none());
         let evicted = cache.insert(p2);
@@ -1328,5 +1687,112 @@ mod tests {
         r.commit_fault.signal(0);
         r.tick_normal_heartbeat_fault(10_000);
         assert_eq!(r.status, Status::ViewChange);
+    }
+
+    // ── Commit pipeline tests ────────────────────────────────────────────
+
+    #[test]
+    fn commit_dispatch_empty_pipeline_noop() {
+        // Primary with nothing to commit: pipeline empty, no-op.
+        let mut r = Replica::new(0, 0, 3);
+        r.status = Status::Normal;
+
+        r.commit_dispatch_enter();
+        assert_eq!(r.commit_stage, CommitStage::Idle);
+        assert!(!r.commit_dispatch_entered);
+        assert!(r.commit_prepare.is_none());
+        assert_eq!(r.commit_min, 0);
+    }
+
+    #[test]
+    fn commit_dispatch_pipeline_without_quorum_noop() {
+        // Prepare in pipeline but no quorum yet: no-op.
+        let mut r = Replica::new(0, 0, 3);
+        r.status = Status::Normal;
+        r.primary_pipeline_prepare(1, 1, crate::Operation::NOOP, 0).unwrap();
+
+        r.commit_dispatch_enter();
+        assert_eq!(r.commit_stage, CommitStage::Idle);
+        assert_eq!(r.commit_min, 0);
+    }
+
+    #[test]
+    fn commit_dispatch_pipeline_with_quorum_executes() {
+        // Primary with a quorum'd prepare: commit executes fully.
+        let mut r = Replica::new(0, 0, 3);
+        r.status = Status::Normal;
+        let op = r.primary_pipeline_prepare(1, 1, crate::Operation::NOOP, 0).unwrap();
+
+        // Quorum = 2 (replica_count 3). Self + one backup.
+        r.on_prepare_ok(op, 0, 0); // self
+        r.on_prepare_ok(op, 0, 1); // replica 1 → quorum
+
+        assert!(r.pipeline_queue.prepare_queue[0].ok_quorum_received);
+        assert_eq!(r.commit_min, 0);
+        assert_eq!(r.commit_max, 0);
+
+        r.commit_dispatch_enter();
+        assert_eq!(r.commit_stage, CommitStage::Idle);
+        assert_eq!(r.commit_min, op);
+        assert_eq!(r.commit_max, op);
+        assert!(r.commit_prepare.is_none());
+        assert!(r.pipeline_queue.prepare_queue.is_empty());
+    }
+
+    #[test]
+    fn commit_dispatch_commits_multiple_prepares() {
+        let mut r = Replica::new(0, 0, 3);
+        r.status = Status::Normal;
+
+        let op1 = r.primary_pipeline_prepare(1, 1, crate::Operation::NOOP, 0).unwrap();
+        let op2 = r.primary_pipeline_prepare(2, 2, crate::Operation::NOOP, 0).unwrap();
+        let op3 = r.primary_pipeline_prepare(3, 3, crate::Operation::NOOP, 0).unwrap();
+
+        // Quorum all three.
+        for op in [op1, op2, op3] {
+            r.on_prepare_ok(op, 0, 0);
+            r.on_prepare_ok(op, 0, 1);
+        }
+
+        r.commit_dispatch_enter();
+        assert_eq!(r.commit_stage, CommitStage::Idle);
+        assert_eq!(r.commit_min, op3);
+        assert!(r.pipeline_queue.prepare_queue.is_empty());
+    }
+
+    #[test]
+    fn commit_dispatch_backup_does_not_commit() {
+        // Backup in Normal status: no pipeline, nothing to commit.
+        let mut r = Replica::new(0, 1, 3);
+        r.status = Status::Normal;
+        r.commit_min = 0;
+        r.commit_max = 1; // knows about a commit but has no prepare
+
+        // commit_start_journal stub: no prepare available → ready, nothing to commit.
+        r.commit_dispatch_enter();
+        assert_eq!(r.commit_stage, CommitStage::Idle);
+        assert_eq!(r.commit_min, 0);
+    }
+
+    #[test]
+    fn commit_dispatch_cancel_resets_state() {
+        let mut r = Replica::new(0, 0, 3);
+        r.status = Status::Normal;
+        let op = r.primary_pipeline_prepare(1, 1, crate::Operation::NOOP, 0).unwrap();
+        r.on_prepare_ok(op, 0, 0);
+        r.on_prepare_ok(op, 0, 1);
+
+        // Enter dispatch (sets commit_dispatch_entered via internal state).
+        r.commit_dispatch_enter();
+        // After the loop, state is reset already.
+
+        // Manually simulate being mid-commit to test cancel.
+        r.commit_stage = CommitStage::Execute;
+        r.commit_prepare = Some(op);
+        r.commit_dispatch_entered = true;
+        r.commit_dispatch_cancel();
+        assert_eq!(r.commit_stage, CommitStage::Idle);
+        assert!(!r.commit_dispatch_entered);
+        assert!(r.commit_prepare.is_none());
     }
 }
