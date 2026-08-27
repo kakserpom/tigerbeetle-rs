@@ -569,7 +569,7 @@ impl Replica {
     pub fn primary_pipeline_prepare(
         &mut self,
         client: u128,
-        request: u64,
+        request: u32,
         operation: crate::Operation,
         body_size: u32,
     ) -> Result<u64, PrepareReject> {
@@ -608,10 +608,18 @@ impl Replica {
             cluster: self.cluster,
             replica: self.replica_u8(),
             view: self.view,
+            // DEVIATION: sans-IO has no client Request message to inherit
+            // `release`/`request_checksum` from (upstream: replica.zig:7386/7391),
+            // so the replica's minimum supported release is used and the request
+            // checksum is left unset (it is not required by any consumer here).
+            release: crate::multiversion::Release::MINIMUM,
+            parent,
+            client,
+            request_checksum: 0,
             op,
             commit: self.commit_max,
             timestamp,
-            parent,
+            request,
             operation,
             ..message_header::Prepare::default()
         };
@@ -633,12 +641,24 @@ impl Replica {
         self.pipeline_queue.prepare_queue.push(prepare);
         self.ok_from_all_replicas.push(0);
 
+        // Upstream counts the primary's own prepare_ok toward a quorum of
+        // prepare_oks ("including ourself", replica.zig:2293): the primary's
+        // journal write completes on the loopback as `write_prepare_callback`
+        // → `send_prepare_ok`. Contribute that self-ack here.
+        let result = self.on_prepare_ok(op, header.checksum(), self.replica_index);
+        assert!(matches!(
+            result,
+            PrepareOkResult::AckCounted
+                | PrepareOkResult::QuorumReached { .. }
+                | PrepareOkResult::DuplicateAck
+        ));
+
         // Start timeouts if the pipeline was previously empty.
         if self.pipeline_queue.prepare_queue.len() == 1 {
             self.prepare_timeout = Timeout::start(constants::PIPELINE_PREPARE_QUEUE_MAX);
         }
 
-        let _ = (client, request, body_size);
+        let _ = body_size;
         // TODO(port): serialize the prepare message, send to backups.
 
         Ok(op)
@@ -755,6 +775,11 @@ impl Replica {
             return;
         }
         assert!(u16::from(prepare_ok.replica) < self.replica_count);
+        // Upstream `ignore_prepare_ok` only counts acks in normal status for the
+        // current view (older/newer-view acks are dropped; replica.zig:6076-6096).
+        if self.status != Status::Normal || prepare_ok.view != self.view {
+            return;
+        }
 
         match self.on_prepare_ok(
             prepare_ok.op,
@@ -1466,10 +1491,7 @@ impl Replica {
             // `pipeline == .queue` (with the survivors asserted contiguous and
             // clean). Sans-IO the journal is already verified, and the pipeline
             // was rebuilt by `primary_start_view_as_the_new_primary`.
-            assert_eq!(
-                self.commit_max + self.pipeline_queue.prepare_queue.len() as u64,
-                self.op
-            );
+            assert_eq!(self.commit_max + self.pipeline_queue.prepare_queue.len() as u64, self.op);
 
             self.ping_timeout = Timeout::start(constants::PING_TIMEOUT);
             // DEVIATION: upstream additionally stops join_view_message_timeout
@@ -2719,14 +2741,28 @@ impl Replica {
     }
 
     /// Handle a Prepare message from the primary — decode and forward to
-    /// [`Self::on_prepare`].
+    /// [`Self::on_prepare`], then ack the accepted prepare on the backup.
     ///
-    /// Upstream: `src/vsr/replica.zig:2021` (`on_prepare`).
+    /// Upstream: `src/vsr/replica.zig:2021` (`on_prepare`); the ack is sent
+    /// from `write_prepare_callback` → `send_prepare_ok` (replica.zig:11225).
     pub fn on_prepare_message(&mut self, header: &message_header::Header) {
         let Some(prepare) = header.into_typed::<message_header::Prepare>() else {
             return; // Command mismatch or invalid header.
         };
-        self.on_prepare(&prepare);
+        // Upstream ignores prepares sent outside our normal current-view state
+        // (older/newer view, view-change status); raw `on_prepare` asserts a
+        // matching view, so filter first (upstream: replica.zig:2066-2086).
+        if self.status != Status::Normal || prepare.view != self.view {
+            return;
+        }
+        if self.on_prepare(&prepare) != OnPrepareResult::Accepted {
+            return;
+        }
+        // A backup acks the accepted prepare; the primary contributes its own
+        // prepare_ok on the pipeline path instead (we do not self-ack here).
+        if !self.is_primary() {
+            self.send_prepare_ok(&prepare);
+        }
     }
 
     /// Handle a Commit message from the primary (backup only, normal status).
@@ -3001,13 +3037,16 @@ mod tests {
         r.primary_pipeline_prepare(1, 100, crate::Operation(6), 64).unwrap();
         let checksum = r.journal.header_with_op(1).unwrap().checksum();
 
-        // Replica 1 acks.
-        let result = r.on_prepare_ok(1, checksum, 1);
-        assert_eq!(result, PrepareOkResult::AckCounted);
+        // The primary contributed its own prepare_ok on prepare.
+        assert!(r.pipeline_queue.prepare_queue[0].acks_received >= 1);
 
-        // Replica 2 acks → quorum reached.
-        let result = r.on_prepare_ok(1, checksum, 2);
+        // Replica 1 acks → quorum reached (primary + one backup).
+        let result = r.on_prepare_ok(1, checksum, 1);
         assert!(matches!(result, PrepareOkResult::QuorumReached { op: 1, .. }));
+
+        // A repeated ack is not re-counted.
+        let result = r.on_prepare_ok(1, checksum, 1);
+        assert_eq!(result, PrepareOkResult::DuplicateAck);
     }
 
     #[test]
@@ -3020,6 +3059,40 @@ mod tests {
         let _ = r.on_prepare_ok(1, checksum, 1);
         let result = r.on_prepare_ok(1, checksum, 1); // duplicate
         assert_eq!(result, PrepareOkResult::DuplicateAck);
+    }
+
+    #[test]
+    fn backup_acks_prepare_on_the_wire_and_primary_commits() {
+        // The primary prepares op 1 through its pipeline; the backup receives
+        // the Prepare on the wire, accepts it, and acks; the primary counts the
+        // ack toward quorum and commits through its commit dispatch.
+        let mut r1 = Replica::new(0, 0, 3); // primary, view 0
+        r1.status = Status::Normal;
+        r1.primary_pipeline_prepare(1, 100, crate::Operation(6), 64).unwrap();
+        assert_eq!(r1.pipeline_queue.prepare_queue.len(), 1);
+
+        let mut r2 = Replica::new(0, 2, 3); // backup
+        r2.status = Status::Normal;
+        let prepare = *r1.journal.header_with_op(1).unwrap();
+        assert_eq!(prepare.command, Command::Prepare);
+        let mut prepare_msg = crate::message::Message::new();
+        prepare_msg.set_header(&prepare);
+        r2.on_message(&prepare_msg, 20_000);
+        assert_eq!(r2.op, 1);
+        assert_eq!(r2.send_queue.len(), 1); // exactly one PrepareOk
+        let ok = r2.send_queue[0].header::<message_header::PrepareOk>().unwrap();
+        assert_eq!(ok.op, 1);
+        assert_eq!(u16::from(ok.replica), 2);
+        assert_eq!(ok.prepare_checksum, prepare.checksum());
+        assert_eq!(ok.view, 0);
+        assert_eq!(ok.cluster, 0);
+
+        // The primary processes the ack → quorum → commits op 1.
+        r1.on_message(&r2.send_queue[0], 20_001);
+        assert_eq!(r1.commit_min, 1);
+        assert_eq!(r1.commit_max, 1);
+        assert!(r1.pipeline_queue.prepare_queue.is_empty());
+        assert_eq!(r2.commit_min, 0); // the backup has not committed yet
     }
 
     #[test]
@@ -4147,9 +4220,9 @@ mod tests {
         r.status = Status::Normal;
         let op = r.primary_pipeline_prepare(1, 1, crate::Operation::NOOP, 0).unwrap();
 
-        // Quorum = 2 (replica_count 3). Self + one backup.
+        // Quorum = 2 (replica_count 3): the primary's own prepare_ok was
+        // contributed on prepare, so one backup ack completes the quorum.
         let checksum = r.journal.header_with_op(op).unwrap().checksum();
-        r.on_prepare_ok(op, checksum, 0); // self
         r.on_prepare_ok(op, checksum, 1); // replica 1 → quorum
 
         assert!(r.pipeline_queue.prepare_queue[0].ok_quorum_received);
@@ -4173,10 +4246,10 @@ mod tests {
         let op2 = r.primary_pipeline_prepare(2, 2, crate::Operation::NOOP, 0).unwrap();
         let op3 = r.primary_pipeline_prepare(3, 3, crate::Operation::NOOP, 0).unwrap();
 
-        // Quorum all three.
+        // Quorum all three; the primary's own prepare_ok brings each to
+        // quorum with a single backup ack.
         for op in [op1, op2, op3] {
             let checksum = r.journal.header_with_op(op).unwrap().checksum();
-            r.on_prepare_ok(op, checksum, 0);
             r.on_prepare_ok(op, checksum, 1);
         }
 
@@ -4206,8 +4279,7 @@ mod tests {
         r.status = Status::Normal;
         let op = r.primary_pipeline_prepare(1, 1, crate::Operation::NOOP, 0).unwrap();
         let checksum = r.journal.header_with_op(op).unwrap().checksum();
-        r.on_prepare_ok(op, checksum, 0);
-        r.on_prepare_ok(op, checksum, 1);
+        r.on_prepare_ok(op, checksum, 1); // replica 1 → quorum (with the self-ack)
 
         // Enter dispatch (sets commit_dispatch_entered via internal state).
         r.commit_dispatch_enter();
