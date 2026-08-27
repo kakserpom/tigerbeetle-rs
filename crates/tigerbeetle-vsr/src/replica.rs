@@ -308,14 +308,38 @@ pub struct Quorum {
 /// Compute VSR quorums for a given replica count.
 ///
 /// Upstream: `src/vsr.zig` — `quorums` function.
+///
+/// Flexible Paxos: `quorum_replication_max` caps the replication quorum below a
+/// majority; the view-change quorum is then raised to compensate
+/// (`quorum_replication + quorum_view_change > replica_count`), optimizing the
+/// common (replication) case at the expense of the rarer (view-change) case.
+///
+/// # Panics
+/// Panics if `replica_count == 0`.
 #[must_use]
 pub const fn quorums(replica_count: u16) -> Quorum {
-    // From upstream:
-    // quorum_replication = @divFloor(replica_count, 2) + 1
-    // quorum_view_change = @divFloor(replica_count, 2) + 1
-    // quorum_nack_prepare = @divFloor(replica_count, 2)
-    let half = replica_count / 2;
-    Quorum { replication: half + 1, view_change: half + 1, nack_prepare: half, majority: half + 1 }
+    assert!(replica_count > 0);
+    // For replica_count=2, quorum_replication=2 even though 1 would intersect.
+    // This improves durability of small clusters and avoids special-casing a
+    // single-replica view change.
+    let replication = if replica_count == 2 {
+        2
+    } else {
+        // div_ceil(replica_count, 2), capped at quorum_replication_max.
+        let div_ceil = replica_count.div_ceil(2);
+        let cap = constants::QUORUM_REPLICATION_MAX as u16;
+        if cap < div_ceil { cap } else { div_ceil }
+    };
+    // The view-change quorum may be more expensive to make the replication
+    // quorum cheaper (see constants.rs:QUORUM_REPLICATION_MAX).
+    let view_change = if replica_count == 2 { 2 } else { replica_count - replication + 1 };
+    // How many nack_prepare messages (about a given op) to NACK; this is enough
+    // to guarantee that the replication quorum was not reached (i.e. the op was
+    // not committed), because `nack_prepare + quorum_replication > replica_count`.
+    let nack_prepare = replica_count - replication + 1;
+    // Simple majority. Upstream: div_ceil(n, 2) + (is_even(n)).
+    let majority = replica_count.div_ceil(2) + if replica_count.is_multiple_of(2) { 1 } else { 0 };
+    Quorum { replication, view_change, nack_prepare, majority }
 }
 
 // ---------------------------------------------------------------------------
@@ -1796,7 +1820,7 @@ mod tests {
         let q = quorums(1);
         assert_eq!(q.replication, 1);
         assert_eq!(q.view_change, 1);
-        assert_eq!(q.nack_prepare, 0);
+        assert_eq!(q.nack_prepare, 1);
         assert_eq!(q.majority, 1);
     }
 
@@ -1805,8 +1829,17 @@ mod tests {
         let q = quorums(3);
         assert_eq!(q.replication, 2);
         assert_eq!(q.view_change, 2);
-        assert_eq!(q.nack_prepare, 1);
+        assert_eq!(q.nack_prepare, 2);
         assert_eq!(q.majority, 2);
+    }
+
+    #[test]
+    fn quorums_4_replicas() {
+        let q = quorums(4);
+        assert_eq!(q.replication, 2);
+        assert_eq!(q.view_change, 3);
+        assert_eq!(q.nack_prepare, 3);
+        assert_eq!(q.majority, 3);
     }
 
     #[test]
@@ -1814,16 +1847,16 @@ mod tests {
         let q = quorums(5);
         assert_eq!(q.replication, 3);
         assert_eq!(q.view_change, 3);
-        assert_eq!(q.nack_prepare, 2);
+        assert_eq!(q.nack_prepare, 3);
         assert_eq!(q.majority, 3);
     }
 
     #[test]
     fn quorums_6_replicas() {
         let q = quorums(6);
-        assert_eq!(q.replication, 4);
+        assert_eq!(q.replication, 3);
         assert_eq!(q.view_change, 4);
-        assert_eq!(q.nack_prepare, 3);
+        assert_eq!(q.nack_prepare, 4);
         assert_eq!(q.majority, 4);
     }
 

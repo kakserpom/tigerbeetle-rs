@@ -20,6 +20,7 @@ pub mod grid;
 pub mod groove;
 pub mod io;
 pub mod journal;
+pub mod jv_quorum;
 pub mod manifest_log;
 pub mod marzullo;
 pub mod message;
