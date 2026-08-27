@@ -833,8 +833,30 @@ impl Replica {
         }
     }
 
-    /// Backup (or recovering) replica: take the next committed op from the
-    /// journal.
+    /// Enter the commit pipeline to commit committed ops from the journal
+    /// (backup only).
+    ///
+    /// Upstream: `src/vsr/replica.zig:4310` (`commit_journal`).
+    fn commit_journal(&mut self) {
+        assert!(self.status == Status::Normal || self.status == Status::ViewChange);
+        assert!(!self.is_primary());
+        assert!(self.commit_min <= self.commit_max);
+        assert!(self.commit_min <= self.op);
+
+        // We have already committed this far:
+        if self.commit_max == self.commit_min {
+            return;
+        }
+
+        // Guard against multiple concurrent invocations:
+        if self.commit_stage != CommitStage::Idle {
+            return;
+        }
+
+        self.commit_dispatch_enter();
+    }
+
+    /// Backup: take the next committed op from the journal.
     ///
     /// Commits forward while `commit_min < commit_max`, as long as the next op
     /// is already journaled. The prepare *body* read is async and deferred with
@@ -1442,7 +1464,13 @@ impl Replica {
     /// based on the command type.
     ///
     /// Upstream: `src/vsr/replica.zig:1729` (`on_message`).
-    pub fn on_message(&mut self, header: &message_header::Header) {
+    /// Dispatches an incoming message to the appropriate handler.
+    ///
+    /// `now` is the monotonic clock time (milliseconds) used by handlers that
+    /// feed the fault detector; the sans-IO skeleton has no wall clock.
+    ///
+    /// Upstream: message receive path (`message_bus` → per-command handlers).
+    pub fn on_message(&mut self, header: &message_header::Header, now: u64) {
         // Validate cluster ID.
         if header.cluster != self.cluster {
             return; // Drop message from wrong cluster.
@@ -1453,7 +1481,7 @@ impl Replica {
         match header.command {
             Command::Request => self.on_request(header),
             Command::Prepare => self.on_prepare_message(header),
-            Command::Commit => self.on_commit(header),
+            Command::Commit => self.on_commit(header, now),
             // TODO(port): remaining message handlers.
             Command::PrepareOk
             | Command::Reply
@@ -1508,23 +1536,50 @@ impl Replica {
         self.on_prepare(&prepare);
     }
 
-    /// Handle a commit message from the primary (backup only).
+    /// Handle a Commit message from the primary (backup only, normal status).
+    ///
+    /// Feeds the fault detector, verifies the committed checksum against the
+    /// journal (when present), advances `commit_max`, and enters the commit
+    /// pipeline to execute the op from the journal.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a known committed entry's checksum disagrees with the Commit
+    /// message (upstream: `commit checksum verification failed`).
     ///
     /// Upstream: `src/vsr/replica.zig:2396` (`on_commit`).
-    pub fn on_commit(&mut self, header: &message_header::Header) {
+    pub fn on_commit(&mut self, header: &message_header::Header, now: u64) {
+        let Some(commit) = header.into_typed::<message_header::Commit>() else {
+            return; // Command mismatch or invalid header.
+        };
         if self.is_primary() {
-            return; // Primary doesn't receive commit messages.
+            return; // Primary does not receive Commit messages.
         }
         if self.status != Status::Normal {
             return;
         }
-        if header.view != self.view {
-            return; // Stale commit.
+        if commit.view != self.view {
+            return; // Stale or future Commit.
+        }
+        assert_eq!(
+            u64::from(commit.replica),
+            u64::from(Self::primary_index_for_view(commit.view, self.replica_count))
+        );
+
+        self.on_commit_heartbeat(commit.view, commit.timestamp_monotonic, commit.commit, now);
+
+        // We may not always have the latest commit entry, but if we do, our
+        // checksum must match:
+        if let Some(entry) = self.journal.header_with_op(commit.commit)
+            && entry.checksum() != commit.commit_checksum
+        {
+            // DEVIATION: upstream panics only when the hash chain between
+            // `commit` and `self.op` is valid (`valid_hash_chain_between`);
+            // that verification is deferred.
+            panic!("commit checksum verification failed");
         }
 
-        // Upstream: advance commit_max, update heartbeat timestamp, commit journal.
-        // TODO(port): advance_commit_max and commit_journal.
-        let _ = header;
+        self.commit_journal();
     }
 
     /// Returns `true` if we should ignore this request message.
@@ -1675,7 +1730,7 @@ mod tests {
         header.command = Command::Request;
         header.set_checksum();
         // Should silently drop — no panic, no state change.
-        r.on_message(&header);
+        r.on_message(&header, 0);
         assert_eq!(r.status, Status::Normal);
     }
 
@@ -1918,6 +1973,69 @@ mod tests {
         assert_eq!(r.commit_stage, CommitStage::Idle);
     }
 
+    #[test]
+    fn on_commit_drives_backup_journal_commit() {
+        let mut r = Replica::new(0, 1, 3); // backup, primary is replica 0
+        r.status = Status::Normal;
+
+        let h1 = make_prepare_for_replica(0, 0, 1, 0, 0);
+        assert_eq!(r.on_prepare(&h1), OnPrepareResult::Accepted);
+        let h2 = make_prepare_for_replica(0, 0, 2, h1.checksum(), 0);
+        assert_eq!(r.on_prepare(&h2), OnPrepareResult::Accepted);
+        let h3 = make_prepare_for_replica(0, 0, 3, h2.checksum(), 0);
+        assert_eq!(r.on_prepare(&h3), OnPrepareResult::Accepted);
+
+        // Primary commits ops 1..3 and broadcasts a Commit message:
+        let commit = make_commit_message(0, 0, 3, h3.checksum(), 100);
+        r.on_message(&commit, 1_000);
+
+        assert_eq!(r.heartbeat_timestamp, 100);
+        assert_eq!(r.commit_min, 3);
+        assert_eq!(r.commit_max, 3);
+        assert_eq!(r.commit_stage, CommitStage::Idle);
+        assert!(r.journal.has_prepare(&h3));
+    }
+
+    #[test]
+    fn on_commit_stale_timestamp_skips_heartbeat() {
+        let mut r = Replica::new(0, 1, 3);
+        r.status = Status::Normal;
+        let h1 = make_prepare_for_replica(0, 0, 1, 0, 0);
+        r.on_prepare(&h1);
+
+        r.on_commit_heartbeat(0, 50, 1, 100); // sets heartbeat_timestamp = 50
+
+        // An older Commit (timestamp 40) must not move the heartbeat backward,
+        // and commit_max still advances, so op 1 commits:
+        let commit = make_commit_message(0, 0, 1, h1.checksum(), 40);
+        r.on_message(&commit, 200);
+        assert_eq!(r.heartbeat_timestamp, 50);
+        assert_eq!(r.commit_min, 1);
+    }
+
+    #[test]
+    fn on_commit_ignored_on_primary() {
+        let mut r = Replica::new(0, 0, 3); // primary
+        r.status = Status::Normal;
+        let commit = make_commit_message(0, 0, 1, 0, 100);
+        r.on_message(&commit, 200);
+        assert_eq!(r.commit_max, 0);
+        assert_eq!(r.commit_min, 0);
+    }
+
+    #[test]
+    #[should_panic = "commit checksum verification failed"]
+    fn on_commit_panics_on_checksum_mismatch() {
+        let mut r = Replica::new(0, 1, 3);
+        r.status = Status::Normal;
+        let h1 = make_prepare_for_replica(0, 0, 1, 0, 0);
+        r.on_prepare(&h1);
+
+        // Commit claims op 1 but with the wrong checksum:
+        let commit = make_commit_message(0, 0, 1, 0xDEAD, 100);
+        r.on_message(&commit, 200);
+    }
+
     /// Build a checksum-valid Prepare header as a primary would, for feeding
     /// `on_prepare` from the primary's point of view.
     fn make_prepare_for_replica(
@@ -1939,6 +2057,26 @@ mod tests {
         header.set_checksum_body(&[]);
         header.set_checksum();
         header
+    }
+
+    /// Build a checksum-valid Commit message header from the primary.
+    fn make_commit_message(
+        cluster: u128,
+        view: u32,
+        commit: u64,
+        commit_checksum: u128,
+        timestamp_monotonic: u64,
+    ) -> message_header::Header {
+        let mut c = message_header::Commit::default();
+        c.cluster = cluster;
+        c.view = view;
+        c.replica = 0; // primary replica index for view 0
+        c.commit = commit;
+        c.commit_checksum = commit_checksum;
+        c.timestamp_monotonic = timestamp_monotonic;
+        c.set_checksum_body(&[]);
+        c.set_checksum();
+        message_header::Header::from_wire(&c.to_wire()).unwrap()
     }
 
     #[test]
