@@ -2274,14 +2274,14 @@ impl Replica {
             Command::View => self.on_view(message, now),
             Command::PrepareOk => self.on_prepare_ok_message(message),
             Command::GetPrepare => self.on_get_prepare(&header),
+            Command::GetHeaders => self.on_get_headers(&header),
+            Command::Headers => self.on_headers(message),
             // TODO(port): remaining message handlers.
             Command::Reply
             | Command::Ping
             | Command::Pong
             | Command::PingClient
-            | Command::Headers
             | Command::GetView
-            | Command::GetHeaders
             | Command::GetReply
             | Command::GetBlocks
             | Command::Deprecated12
@@ -2772,14 +2772,28 @@ impl Replica {
     /// if the suffix is empty or not a whole number of headers.
     fn decode_view_headers(body: &[u8]) -> Option<Vec<message_header::Prepare>> {
         let headers = body.get(constants::CHECKPOINT_STATE_SIZE..)?;
-        if headers.is_empty() || !headers.len().is_multiple_of(message_header::SIZE) {
+        Self::decode_headers_bytes(headers)
+    }
+
+    /// Decode a message body as a sequence of whole prepare-header frames.
+    ///
+    /// Returns `None` if the body is empty or not a whole number of headers.
+    fn decode_headers_bytes(body: &[u8]) -> Option<Vec<message_header::Prepare>> {
+        if body.is_empty() || !body.len().is_multiple_of(message_header::SIZE) {
             return None;
         }
-        let mut out = Vec::with_capacity(headers.len() / message_header::SIZE);
-        for frame in headers.as_chunks::<{ message_header::SIZE }>().0 {
+        let mut out = Vec::with_capacity(body.len() / message_header::SIZE);
+        for frame in body.as_chunks::<{ message_header::SIZE }>().0 {
             out.push(message_header::Prepare::from_wire(frame)?);
         }
         Some(out)
+    }
+
+    /// Decode the body of a `Headers` message into prepare headers.
+    fn decode_headers_body(
+        message: &crate::message::Message,
+    ) -> Option<Vec<message_header::Prepare>> {
+        Self::decode_headers_bytes(message.body_used())
     }
 
     /// Handle a client request (primary only, normal status).
@@ -2911,6 +2925,195 @@ impl Replica {
             return;
         };
         self.enqueue_header(&prepare.clone());
+    }
+
+    /// Request a peer to re-serve the headers for `[op_min, op_max]` (both
+    /// inclusive), up to `GET_HEADERS_MAX` of them, as a `Headers` message.
+    ///
+    /// DEVIATION: upstream (`repair`, replica.zig:7666-7678) chooses the peer
+    /// and requests pessimistically beyond the known break; sans-IO has no
+    /// `repair()` orchestration yet, so the caller supplies the range and the
+    /// destination. As with the other repair requests, the flat `send_queue`
+    /// carries no routing metadata: the single queued `GetHeaders` must be
+    /// delivered to `to`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `to` is not a valid replica index, if `to` is this replica,
+    /// or if `op_min > op_max`.
+    ///
+    /// Upstream: `src/vsr/replica.zig:7666-7678` (the `GetHeaders` sender).
+    pub fn send_get_headers(&mut self, to: u8, op_min: u64, op_max: u64) {
+        assert!(u16::from(to) < self.replica_count);
+        assert_ne!(to, self.replica_u8());
+        assert!(op_min <= op_max);
+        // `GetHeaders` requires `view == 0` (message_header.rs):
+        let mut get_headers = message_header::GetHeaders {
+            cluster: self.cluster,
+            view: 0,
+            replica: self.replica_u8(),
+            op_min,
+            op_max,
+            ..message_header::GetHeaders::default()
+        };
+        get_headers.set_checksum_body(&[]);
+        get_headers.set_checksum();
+        self.enqueue_header(&get_headers);
+    }
+
+    /// Serve the prepare headers in `[op_min, op_max]` (both inclusive) that we
+    /// hold in the journal, as a `Headers` message to the requester.
+    ///
+    /// Serves at most `GET_HEADERS_MAX` headers. If the range yields nothing we
+    /// stay silent so the requester does not mistake an empty body for a valid
+    /// response.
+    ///
+    /// DEVIATION: upstream (replica.zig:3184-3191) copies into a message
+    /// buffer; sans-IO builds a `Vec`/`Message`. The flat `send_queue` carries
+    /// no routing metadata, so the single queued `Headers` must be delivered to
+    /// `get_headers.replica`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `replica_count <= 1` or if the request claims to originate
+    /// from this replica.
+    ///
+    /// Upstream: `src/vsr/replica.zig:3159` (`on_get_headers`).
+    #[allow(clippy::cast_possible_truncation)] // body length is bounded by GET_HEADERS_MAX frames
+    pub fn on_get_headers(&mut self, header: &message_header::Header) {
+        let Some(get_headers) = header.into_typed::<message_header::GetHeaders>() else {
+            return; // Command mismatch or invalid header.
+        };
+        assert!(self.replica_count > 1);
+        assert_ne!(get_headers.replica, self.replica_u8());
+
+        // `op_min`/`op_max` are both inclusive; the journal never copies more
+        // than `GET_HEADERS_MAX` headers into `dest` (upstream 3181-3191).
+        let mut dest = vec![message_header::Prepare::default(); constants::GET_HEADERS_MAX];
+        let copied = self.journal.copy_latest_headers_between(
+            get_headers.op_min,
+            get_headers.op_max,
+            &mut dest,
+        );
+        if copied == 0 {
+            return; // Nothing in range; stay silent (upstream 3194-3201).
+        }
+
+        let mut headers = message_header::Headers {
+            cluster: self.cluster,
+            view: self.view,
+            replica: self.replica_u8(),
+            ..message_header::Headers::default()
+        };
+        let frames: Vec<u8> =
+            dest[..copied].iter().flat_map(message_header::Prepare::to_wire).collect();
+
+        let size = message_header::SIZE + frames.len();
+        headers.size = size as u32;
+        headers.set_checksum_body(&frames);
+        headers.set_checksum();
+
+        let mut response = crate::message::Message::new();
+        response.set_header(&headers);
+        response.set_body(&frames);
+        self.send_queue.push(response);
+    }
+
+    /// Handle a `Headers` message: try to repair every prepare header it
+    /// carries, then re-run repair of the anything outstanding.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a valid `Headers` message carries an undersized body (never
+    /// happens: `Headers::invalid` already requires a body; the assert mirrors
+    /// upstream replica.zig:3309).
+    ///
+    /// Upstream: `src/vsr/replica.zig:3300` (`on_headers`).
+    #[allow(clippy::cast_possible_truncation)] // SIZE is a const that fits in u32
+    pub fn on_headers(&mut self, message: &crate::message::Message) {
+        let Some(headers) = message.header::<message_header::Headers>() else {
+            return; // Invalid header or wrong command.
+        };
+        let Some(received) = Self::decode_headers_body(message) else {
+            return; // Body is not a whole number of headers.
+        };
+        assert!(headers.size > message_header::SIZE as u32);
+
+        for header in &received {
+            self.repair_header(header);
+        }
+        // TODO(port): `repair()` orchestration (GetView/GetHeaders re-requests,
+        // prepare repairs, budgets) is deferred; `on_prepare`/`on_commit` drive
+        // forward progress directly for now.
+    }
+
+    /// Decide whether to insert or update a prepare header received via
+    /// repair (from a `Headers` message or a late-prepare).
+    ///
+    /// A repair may never advance or replace `self.op`; it only backfills
+    /// behind the head. The hash-chain-connection check protects the
+    /// prepare_ok promise we made to the primary: confusing a broken entry with
+    /// a valid one would let a divergent op leak into a view change.
+    ///
+    /// DEVIATION: upstream also rejects headers preceding `op_repair_min()`
+    /// only when a checkpoint could still reference them; sans-IO has
+    /// `op_checkpoint == 0`, so the guard is against slot-wrapping garbage
+    /// only. The `checkpoint_id`-for-op assertion is likewise skipped.
+    ///
+    /// Returns whether the header was (re-)installed as dirty.
+    ///
+    /// Upstream: `src/vsr/replica.zig:7799` (`repair_header`).
+    fn repair_header(&mut self, header: &message_header::Prepare) -> bool {
+        assert!(self.status == Status::Normal || self.status == Status::ViewChange);
+
+        if header.view > self.view {
+            return false; // From a view we have not joined.
+        }
+        if header.op > self.op {
+            return false; // Would advance the hash chain head.
+        }
+        if header.op == self.op && !self.journal.has_header(header) {
+            return false; // Would replace the hash chain head.
+        }
+        if header.op < self.op_repair_min() {
+            return false; // Precedes the (ring) wrap this op belongs to.
+        }
+
+        if self.journal.has_header(header) && self.journal.has_prepare(header) {
+            return false; // Already clean.
+        }
+
+        // Replacing an entry whose view differs from the head's requires
+        // proving the replacement connects the chain up to the head:
+        let head_view_departed = match self.journal.header_with_op(self.op) {
+            Some(head) => head.view != header.view,
+            None => true,
+        };
+        if head_view_departed && !self.repair_header_would_connect_hash_chain(header) {
+            return false; // Would break the chain; divergent or stale.
+        }
+
+        self.journal.set_header_as_dirty(header);
+        true
+    }
+
+    /// Whether replacing our entry at `header.op` (which may be a stale or
+    /// diverged op) with `header` would allow the hash chain to connect through
+    /// to `self.op`.
+    ///
+    /// Upstream: `src/vsr/replica.zig:7945` (`repair_header_would_connect_hash_chain`).
+    fn repair_header_would_connect_hash_chain(&self, header: &message_header::Prepare) -> bool {
+        let mut entry = *header;
+        while entry.op < self.op {
+            let Some(next) = self.journal.next_entry(&entry) else {
+                return false;
+            };
+            if entry.checksum != next.parent {
+                return false;
+            }
+            entry = *next;
+        }
+        entry.op == self.op
     }
 
     /// Handle a Commit message from the primary (backup only, normal status).
@@ -3727,6 +3930,186 @@ mod tests {
         assert_eq!(backup.commit_max, 2);
         // The commit marks the repaired prepare's slot clean:
         assert!(backup.journal.has_prepare(&h2));
+    }
+
+    #[test]
+    fn on_get_headers_serves_contiguous_range_descending() {
+        let mut r = Replica::new(0, 0, 3); // primary
+        r.status = Status::Normal;
+        let h1 = make_prepare_for_replica(0, 0, 1, 0, 0);
+        let h2 = make_prepare_for_replica(0, 0, 2, h1.checksum(), 0);
+        let h3 = make_prepare_for_replica(0, 0, 3, h2.checksum(), 0);
+        r.on_prepare(&h1);
+        r.on_prepare(&h2);
+        r.on_prepare(&h3);
+
+        // Replica 2 asks for headers 1..=5:
+        let mut get_headers = message_header::GetHeaders {
+            cluster: 0,
+            replica: 2,
+            op_min: 1,
+            op_max: 5,
+            ..message_header::GetHeaders::default()
+        };
+        get_headers.set_checksum_body(&[]);
+        get_headers.set_checksum();
+        let mut request = crate::message::Message::new();
+        request.set_header(&get_headers);
+        r.on_message(&request, 100);
+        assert_eq!(r.send_queue.len(), 1);
+        let response = r.send_queue.pop().unwrap();
+        let headers = response.header::<message_header::Headers>().unwrap();
+        assert_eq!(headers.size as usize, message_header::SIZE * 4); // header + 3
+        let decoded = Replica::decode_headers_body(&response).unwrap();
+        let ops: Vec<u64> = decoded.iter().map(|h| h.op).collect();
+        // copy_latest_headers_between copies newest first:
+        assert_eq!(ops, [3, 2, 1]);
+        for (served, expected) in decoded.iter().zip([&h3, &h2, &h1]) {
+            assert_eq!(served.checksum(), expected.checksum());
+        }
+        assert_eq!(headers.view, r.view);
+        assert_eq!(headers.replica, 0);
+    }
+
+    #[test]
+    fn on_get_headers_is_silent_without_headers_in_range() {
+        let mut r = Replica::new(0, 0, 3);
+        r.status = Status::Normal;
+        let h1 = make_prepare_for_replica(0, 0, 1, 0, 0);
+        let h2 = make_prepare_for_replica(0, 0, 2, h1.checksum(), 0);
+        r.on_prepare(&h1);
+        r.on_prepare(&h2);
+
+        // Replica 2 asks for an op-range the journal does not hold:
+        let mut get_headers = message_header::GetHeaders {
+            cluster: 0,
+            replica: 2,
+            op_min: 4,
+            op_max: 6,
+            ..message_header::GetHeaders::default()
+        };
+        get_headers.set_checksum_body(&[]);
+        get_headers.set_checksum();
+        let mut request = crate::message::Message::new();
+        request.set_header(&get_headers);
+        r.on_message(&request, 100);
+        assert!(r.send_queue.is_empty());
+    }
+
+    #[test]
+    fn on_get_headers_bounded_by_index_get_max() {
+        let mut r = Replica::new(0, 0, 3);
+        r.status = Status::Normal;
+        let mut parent = 0;
+        for op in 1..=30 {
+            let h = make_prepare_for_replica(0, 0, op, parent, 0);
+            parent = h.checksum();
+            r.on_prepare(&h);
+        }
+        assert_eq!(r.op, 30);
+
+        let mut get_headers = message_header::GetHeaders {
+            cluster: 0,
+            replica: 2,
+            op_min: 1,
+            op_max: 30,
+            ..message_header::GetHeaders::default()
+        };
+        get_headers.set_checksum_body(&[]);
+        get_headers.set_checksum();
+        let mut request = crate::message::Message::new();
+        request.set_header(&get_headers);
+        r.on_message(&request, 100);
+        let response = r.send_queue.pop().unwrap();
+        let decoded = Replica::decode_headers_body(&response).unwrap();
+        assert_eq!(decoded.len(), constants::GET_HEADERS_MAX);
+    }
+
+    #[test]
+    fn on_headers_refreshes_dirty_headers_and_skips_clean() {
+        let mut r = Replica::new(0, 1, 3); // backup
+        r.status = Status::Normal;
+        let h1 = make_prepare_for_replica(0, 0, 1, 0, 0);
+        let h2 = make_prepare_for_replica(0, 0, 2, h1.checksum(), 0);
+        assert_eq!(r.on_prepare(&h1), OnPrepareResult::Accepted);
+        assert_eq!(r.on_prepare(&h2), OnPrepareResult::Accepted);
+
+        // A repair of a dirty (writes pending) prepare refreshes the slot:
+        assert!(r.repair_header(&h1));
+        assert!(r.repair_header(&h2));
+        assert!(r.journal.has_header(&h1));
+        assert!(r.journal.has_header(&h2));
+
+        // Once committed (clean), the identical headers are no-ops:
+        r.commit_max = 2;
+        r.commit_dispatch_enter();
+        assert_eq!(r.commit_min, 2);
+        assert!(!r.repair_header(&h1));
+        assert!(!r.repair_header(&h2));
+    }
+
+    #[test]
+    fn repair_header_refuses_to_move_or_break_the_head() {
+        let mut r = Replica::new(0, 1, 3); // backup
+        r.status = Status::Normal;
+        let h1 = make_prepare_for_replica(0, 0, 1, 0, 0);
+        let h2 = make_prepare_for_replica(0, 0, 2, h1.checksum(), 0);
+        assert_eq!(r.on_prepare(&h1), OnPrepareResult::Accepted);
+        assert_eq!(r.on_prepare(&h2), OnPrepareResult::Accepted);
+        assert_eq!(r.op, 2);
+
+        // A newer view is never installed:
+        let newer_view = make_prepare_for_replica(0, 1, 1, 0, 0);
+        assert!(!r.repair_header(&newer_view));
+
+        // An op ahead of the head may not be repaired in:
+        let h3 = make_prepare_for_replica(0, 0, 3, h2.checksum(), 0);
+        assert!(!r.repair_header(&h3));
+
+        // A different prepare for the head op would change the hash chain head:
+        let divergent = make_prepare_for_replica(0, 0, 2, 0xDEAD, 0);
+        assert!(!r.repair_header(&divergent));
+        // The original head (and journal) is untouched:
+        assert_eq!(r.journal.header_with_op(2).unwrap().checksum(), h2.checksum());
+    }
+
+    #[test]
+    fn get_headers_round_trip_refreshes_backup_range() {
+        // Primary r0 committed ops 1..=3:
+        let mut primary = Replica::new(0, 0, 3);
+        primary.status = Status::Normal;
+        let h1 = make_prepare_for_replica(0, 0, 1, 0, 0);
+        let h2 = make_prepare_for_replica(0, 0, 2, h1.checksum(), 0);
+        let h3 = make_prepare_for_replica(0, 0, 3, h2.checksum(), 0);
+        primary.on_prepare(&h1);
+        primary.on_prepare(&h2);
+        primary.on_prepare(&h3);
+        primary.commit_op(1);
+        primary.commit_op(2);
+        primary.commit_op(3);
+
+        // Backup r2 received 1..=3 but wants to confirm the chain (its slots
+        // are still dirty — writes pending):
+        let mut backup = Replica::new(0, 2, 3);
+        backup.status = Status::Normal;
+        backup.on_prepare(&h1);
+        backup.on_prepare(&h2);
+        backup.on_prepare(&h3);
+
+        // The exchange: backup asks for the range, primary serves it, backup
+        // repairs its dirty copies. Op range is served newest-first.
+        backup.send_get_headers(0, 1, 5);
+        primary.on_message(&backup.send_queue.pop().unwrap(), 50);
+        assert_eq!(primary.send_queue.len(), 1);
+        let headers = primary.send_queue.pop().unwrap();
+        backup.on_message(&headers, 100);
+
+        assert_eq!(backup.op, 3);
+        // The dirty slots were refreshed, and the chain head never moved:
+        assert_eq!(backup.journal.header_with_op(1).unwrap().checksum(), h1.checksum());
+        assert_eq!(backup.journal.header_with_op(2).unwrap().checksum(), h2.checksum());
+        assert_eq!(backup.journal.header_with_op(3).unwrap().checksum(), h3.checksum());
+        assert!(backup.send_queue.is_empty());
     }
 
     #[test]
