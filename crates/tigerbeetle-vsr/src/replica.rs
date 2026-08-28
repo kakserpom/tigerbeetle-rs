@@ -1837,9 +1837,69 @@ impl Replica {
     /// Panics unless the replica is the primary with `view == log_view`.
     ///
     /// Upstream: `src/vsr/replica.zig:9499` (`primary_send_view`).
-    fn send_view(&mut self) {
+    fn primary_send_view(&mut self) {
+        assert!(self.status == Status::Normal || self.status == Status::ViewChange);
+        assert!(self.is_primary());
+        assert!(self.primary_journal_headers_repaired());
+
         let message = self.make_view_message(0);
         self.send_queue.push(message);
+    }
+
+    /// Whether this (primary) replica's log is a valid hash chain from
+    /// `op_repair_min` up to the head — the CTRL precondition for sending Views
+    /// and starting the view (`primary_send_view` must not advertise a broken
+    /// log).
+    ///
+    /// # Panics
+    ///
+    /// Panics unless the replica is the primary with `view == log_view`, or a
+    /// view-changing primary without a collected JoinView quorum.
+    ///
+    /// Upstream: `src/vsr/replica.zig:7999` (`primary_journal_headers_repaired`).
+    fn primary_journal_headers_repaired(&self) -> bool {
+        assert!(self.status == Status::Normal || self.status == Status::ViewChange);
+        assert!(self.is_primary());
+        assert_eq!(self.view, self.log_view);
+        if self.status == Status::ViewChange {
+            assert!(self.join_view_quorum);
+        }
+        self.valid_hash_chain_between(self.op_repair_min(), self.op)
+    }
+
+    /// Whether the journal holds a contiguous, connected hash chain over
+    /// `op_min..=op_max` (each op's `parent` matching its predecessor's
+    /// checksum; `op_min` is the verified anchor).
+    ///
+    /// # Panics
+    ///
+    /// Panics unless `op_max == self.op` (checking a sub-head range would risk
+    /// committing a forked chain that a new primary reordered).
+    ///
+    /// Upstream: `src/vsr/replica.zig:11004` (`valid_hash_chain_between`).
+    fn valid_hash_chain_between(&self, op_min: u64, op_max: u64) -> bool {
+        assert!(op_min <= op_max);
+        assert_eq!(op_max, self.op);
+        // DEVIATION: upstream asserts `op_max >= op_checkpoint()` and that the
+        // op after the checkpoint connects to the superblock checkpoint header;
+        // sans-IO `op_checkpoint()` is 0 with no superblock to connect to.
+        let Some(head) = self.journal.header_with_op(op_max).copied() else {
+            return false;
+        };
+        let mut b = head;
+        let mut op = op_max;
+        while op > op_min {
+            op -= 1;
+            let Some(a) = self.journal.header_with_op(op).copied() else {
+                return false;
+            };
+            assert_eq!(a.op + 1, b.op); // guaranteed by the slot arithmetic
+            if a.checksum() != b.parent {
+                return false;
+            }
+            b = a;
+        }
+        true
     }
 
     /// Send a PrepareOk for every op in `commit_max+1..=op` that we have
@@ -2492,11 +2552,13 @@ impl Replica {
                 }
         );
 
-        // DEVIATION: upstream starts CTRL journal repairs (`repair()`) and
-        // broadcasts the View only once the journal is contiguously clean, then
-        // transitions to Normal via `primary_start_view_as_the_new_primary`.
-        // Sans-IO journals are clean by construction, so the log is ready now.
-        self.send_view();
+        // DEVIATION: upstream keeps the replica in `view_change` and drives the
+        // CTRL loop from `repair()` (waiting for the journal's prepares, then
+        // `primary_repair_pipeline` → `primary_start_view_as_the_new_primary`).
+        // Sans-IO journals are clean by construction and the pipeline rebuild is
+        // synchronous, so we broadcast the View (only once the log's hash chain
+        // is verified, via `primary_send_view`) and transition immediately.
+        self.primary_send_view();
         self.primary_start_view_as_the_new_primary(now);
     }
 
@@ -3112,8 +3174,10 @@ impl Replica {
     /// ([`Self::on_prepare_message`]) and after every `Headers` response
     /// ([`Self::on_headers`]).
     ///
-    /// DEVIATION (deferred): the grid `GetBlocks` repair and the view-change
-    /// primary's `primary_send_view` step are not ported yet.
+    /// DEVIATION (deferred): only the grid `GetBlocks` repair step is not
+    /// ported yet. The view-change primary's `primary_send_view` step is folded
+    /// into [`Self::on_join_view`], which transitions to Normal synchronously
+    /// once the quorum log is installed.
     ///
     /// # Panics
     ///
@@ -5562,6 +5626,34 @@ mod tests {
             .try_into()
             .unwrap();
         assert_eq!(message_header::Prepare::from_wire(root).unwrap().op, 0);
+    }
+
+    #[test]
+    fn primary_journal_headers_repaired_requires_contiguous_hash_chain() {
+        // Replica 0 is the view-0 primary. Ops 1..3 prepared, op 1 committed.
+        let mut r = Replica::new(0, 0, 1);
+        r.status = Status::Normal;
+        let headers = prepare_and_commit_suffix(&mut r, 0, 3, 1);
+        assert!(r.primary_journal_headers_repaired());
+
+        // Punch a hole: lose op 2's header+prepare but keep the head (op 3).
+        r.journal.remove_entry(crate::journal::Journal::slot_for_op(2));
+        assert!(!r.primary_journal_headers_repaired());
+
+        // Recovering the header from a peer reconnects the chain.
+        assert!(r.repair_header(&headers[1]));
+        assert_eq!(r.journal.header_with_op(2), Some(&headers[1]));
+        assert!(r.primary_journal_headers_repaired());
+    }
+
+    #[test]
+    #[should_panic(expected = "primary_journal_headers_repaired")]
+    fn primary_send_view_panics_when_journal_headers_unrepaired() {
+        let mut r = Replica::new(0, 0, 1);
+        r.status = Status::Normal;
+        prepare_and_commit_suffix(&mut r, 0, 3, 1);
+        r.journal.remove_entry(crate::journal::Journal::slot_for_op(2));
+        r.primary_send_view();
     }
 
     #[test]
