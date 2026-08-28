@@ -6391,6 +6391,57 @@ mod tests {
     }
 
     #[test]
+    fn execute_op_reply_routing_exactly_one_backup_per_op() {
+        // The primary always replies; among the backups exactly one, selected
+        // deterministically by the op (upstream `execute_op_reply_to_client`,
+        // replica.zig:5328), so a client retrying against another replica never
+        // races with the primary's own reply.
+        let primary = Replica::new(CLUSTER, 0, 3);
+        let backup1 = Replica::new(CLUSTER, 1, 3);
+        let backup2 = Replica::new(CLUSTER, 2, 3);
+
+        let mut selected_by_one = 0;
+        let mut selected_by_two = 0;
+        for op in 1..=256 {
+            assert!(primary.execute_op_reply_to_client(op), "primary always replies");
+
+            let one = backup1.execute_op_reply_to_client(op);
+            let two = backup2.execute_op_reply_to_client(op);
+            assert_ne!(one, two, "op {op}: exactly one backup replies");
+            assert_eq!(one, backup1.execute_op_reply_to_client(op), "op {op}: deterministic");
+            assert_eq!(two, backup2.execute_op_reply_to_client(op), "op {op}: deterministic");
+            selected_by_one += usize::from(one);
+            selected_by_two += usize::from(two);
+        }
+
+        assert_eq!(selected_by_one + selected_by_two, 256);
+        assert!(selected_by_one > 0 && selected_by_two > 0, "both backups serve some ops");
+    }
+
+    #[test]
+    fn backup_commit_execute_replies_only_when_selected() {
+        let mut backup1 = Replica::new(CLUSTER, 1, 3);
+        backup1.status = Status::Normal;
+        let mut backup2 = Replica::new(CLUSTER, 2, 3);
+        backup2.status = Status::Normal;
+
+        // The same committed op lands on both backups through the shared
+        // prepare path.
+        let h1 = make_prepare_for_replica(CLUSTER, 0, 1, 0, 0);
+        for r in [&mut backup1, &mut backup2] {
+            deliver_prepare(r, &h1);
+            r.commit_max = 1;
+            r.commit_journal();
+            assert_eq!(r.commit_min, 1);
+        }
+
+        // Exactly one of the two backups turns `execute_op_reply_to_client`
+        // into a reply delivered to the client.
+        let replies = backup1.client_send_queue.len() + backup2.client_send_queue.len();
+        assert_eq!(replies, 1, "exactly one backup replies to the client");
+    }
+
+    #[test]
     fn on_request_repeat_reply_register_serves_ram_reply() {
         let mut r = Replica::new(CLUSTER, 0, 3);
         r.status = Status::Normal;
