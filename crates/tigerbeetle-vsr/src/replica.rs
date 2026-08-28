@@ -124,9 +124,11 @@ pub struct Replica {
     pub grid_storage: Option<MemoryStorage>,
     // state_machine: StateMachine,
     // clock: Clock,
-    // client_sessions: ClientSessions,
     // client_replies: ClientReplies,
     // message_bus: MessageBus,
+    /// The client sessions table: the latest committed reply header per active
+    /// client (upstream `client_sessions`).
+    pub client_sessions: crate::client_sessions::ClientSessions,
 
     // ── Timeouts (tick counts) ──────────────────────────────────────────
     pub ping_timeout: Timeout,
@@ -201,6 +203,12 @@ pub struct Replica {
     /// sans-IO skeleton instead queues outbound messages here; the integration
     /// layer drains the queue.
     pub send_queue: Vec<crate::message::Message>,
+    /// Client-directed outbound messages (PongClient/Eviction) awaiting delivery.
+    ///
+    /// DEVIATION: upstream routes client-directed messages to each client's
+    /// address via `message_bus`; the sans-IO skeleton owns no client transport,
+    /// so these are queued separately for the integration layer.
+    pub client_send_queue: Vec<crate::message::Message>,
 }
 
 // ---------------------------------------------------------------------------
@@ -505,6 +513,8 @@ impl Replica {
             grid_storage: None,
             grid_serve_reads: Vec::new(),
             send_queue: Vec::new(),
+            client_send_queue: Vec::new(),
+            client_sessions: crate::client_sessions::ClientSessions::new(),
             // Upstream boots from a superblock whose checkpoint holds the root
             // prepare at op 0; a fresh replica's JV always includes it.
             join_view_headers: vec![message_header::Prepare::root(cluster)],
@@ -1532,6 +1542,152 @@ impl Replica {
             // pong_timestamp_wall, monotonic_now)` and `prepare_timeout.set_rtt_ns`
             // from the measured round-trip time (needs the clock/io infrastructure).
         }
+    }
+
+    /// Handle a client's PingClient — reply with a PongClient (time sync), or
+    /// evict the client if it is unknown or unsupported.
+    ///
+    /// Upstream: `src/vsr/replica.zig:1919` (`on_ping_client`).
+    pub fn on_ping_client(&mut self, message: &crate::message::Message) {
+        let Some(ping_client) = message.header::<message_header::PingClient>() else {
+            return;
+        };
+        if !ping_client.valid_checksum() || !ping_client.valid_checksum_body(message.body_used()) {
+            return;
+        }
+        if ping_client.invalid_header().is_some() {
+            return;
+        }
+        // `PingClient::invalid_header` guarantees `client != 0` (upstream also
+        // asserts it).
+
+        if self.ignore_ping_client(&ping_client) {
+            return;
+        }
+
+        let mut reply = message_header::PongClient {
+            cluster: self.cluster,
+            // DEVIATION: upstream reports `log_view_durable()`; sans-IO has no
+            // superblock, so the in-memory log view stands in.
+            view: self.log_view,
+            replica: self.replica_u8(),
+            release: crate::multiversion::Release::MINIMUM,
+            // Echo the client's monotonic timestamp back for clock synchronization.
+            ping_timestamp_monotonic: ping_client.ping_timestamp_monotonic,
+            size: u32::try_from(message_header::SIZE)
+                .unwrap_or_else(|_| unreachable!("SIZE fits u32")),
+            ..message_header::PongClient::default()
+        };
+        reply.set_checksum_body(&[]);
+        reply.set_checksum();
+        self.send_header_to_client(ping_client.client, &reply);
+    }
+
+    /// Whether a PingClient must be dropped (or its client evicted) rather than
+    /// answered with a PongClient.
+    ///
+    /// Upstream: `src/vsr/replica.zig:6003` (`ignore_ping_client`).
+    fn ignore_ping_client(&mut self, ping_client: &message_header::PingClient) -> bool {
+        assert_eq!(ping_client.command, crate::command::Command::PingClient);
+        assert_ne!(ping_client.client, 0);
+
+        // DEVIATION: upstream drops PingClient from standbys; the sans-IO replica
+        // does not support standby configuration, so that branch never applies.
+
+        // If the client is not in the sessions table, a nonzero session means its
+        // register hasn't landed yet. An up-to-date primary that has already
+        // committed the register evicts the client, forcing a fresh register
+        // (upstream replica.zig:6014-6025).
+        if self.client_sessions.get(ping_client.client).is_none()
+            && ping_client.session != 0
+            && self.status == Status::Normal
+            && self.is_primary()
+            && self.commit_min >= ping_client.session
+        {
+            self.send_eviction_message_to_client(
+                ping_client.client,
+                message_header::Reason::NoSession,
+            );
+            return true;
+        }
+
+        // DEVIATION: upstream bounds-checks the client's release against
+        // `release_client_min` and `self.release` (multiversion); sans-IO
+        // supports only the minimum release, so clients must speak exactly it.
+        if ping_client.release.value < crate::multiversion::Release::MINIMUM.value {
+            if self.status == Status::Normal && self.is_primary() {
+                self.send_eviction_message_to_client(
+                    ping_client.client,
+                    message_header::Reason::ClientReleaseTooLow,
+                );
+            }
+            return true;
+        }
+        if ping_client.release.value > crate::multiversion::Release::MINIMUM.value {
+            if self.status == Status::Normal && self.is_primary() {
+                self.send_eviction_message_to_client(
+                    ping_client.client,
+                    message_header::Reason::ClientReleaseTooHigh,
+                );
+            }
+            return true;
+        }
+
+        false
+    }
+
+    /// Send an Eviction message to a client (primary only).
+    ///
+    /// # Panics
+    /// Panics unless the replica is `Normal` and primary (upstream asserts).
+    ///
+    /// Upstream: `src/vsr/replica.zig:8921`
+    /// (`send_eviction_message_to_client`).
+    fn send_eviction_message_to_client(&mut self, client: u128, reason: message_header::Reason) {
+        assert_eq!(self.status, Status::Normal);
+        assert!(self.is_primary());
+
+        let mut eviction = message_header::Eviction {
+            cluster: self.cluster,
+            // DEVIATION: upstream reports `log_view_durable()`; sans-IO uses the
+            // in-memory log view.
+            view: self.log_view,
+            replica: self.replica_u8(),
+            release: crate::multiversion::Release::MINIMUM,
+            client,
+            reason_ordinal: reason as u8,
+            size: u32::try_from(message_header::SIZE)
+                .unwrap_or_else(|_| unreachable!("SIZE fits u32")),
+            ..message_header::Eviction::default()
+        };
+        eviction.set_checksum_body(&[]);
+        eviction.set_checksum();
+        self.send_header_to_client(client, &eviction);
+    }
+
+    /// Send a client-directed header (PongClient or Eviction) to `client`.
+    ///
+    /// # Panics
+    /// Panics if the header's cluster differs, if the header is not
+    /// client-directed, or if the header's view is newer than `log_view`
+    /// (upstream asserts all three; `view <= log_view_durable()`).
+    ///
+    /// Upstream: `src/vsr/replica.zig:8988` (`send_header_to_client`).
+    fn send_header_to_client<T: TypedHeader>(&mut self, _client: u128, header: &T) {
+        // `_client` documents the routing intent; the message carries no client
+        // address (the PongClient header has no `client` field), so the
+        // integration layer must pair it with the triggering PingClient.
+        let frame = header.frame();
+        assert_eq!(frame.cluster, self.cluster);
+        assert!(frame.view <= self.log_view);
+        assert!(
+            frame.command == crate::command::Command::PongClient
+                || frame.command == crate::command::Command::Eviction
+        );
+
+        let mut message = crate::message::Message::new();
+        message.set_header(header);
+        self.client_send_queue.push(message);
     }
 
     /// `self.replica_index` as the wire `u8` replica field.
@@ -2642,17 +2798,19 @@ impl Replica {
             Command::Block => self.on_block(message),
             Command::Ping => self.on_ping(message),
             Command::Pong => self.on_pong(message),
-            // TODO(port): remaining message handlers.
-            Command::Reply
-            | Command::PingClient
+            Command::PingClient => self.on_ping_client(message),
+            // PongClient/Eviction are client-directed and misdirected here
+            // (upstream replica.zig:1822 warns and drops); the remaining
+            // commands are still unported. Drop all of them.
+            Command::PongClient
+            | Command::Eviction
+            | Command::Reply
             | Command::GetReply
             | Command::Deprecated12
             | Command::Deprecated21
             | Command::Deprecated22
             | Command::Deprecated23
-            | Command::Reserved
-            | Command::PongClient
-            | Command::Eviction => {}
+            | Command::Reserved => {}
         }
     }
 
@@ -4424,6 +4582,23 @@ mod tests {
         header.release = crate::multiversion::Release::MINIMUM;
         header.ping_timestamp_monotonic = 7;
         header.pong_timestamp_wall = 9;
+        header.size = message_header::SIZE as u32;
+        header.set_checksum_body(&[]);
+        header.set_checksum();
+
+        let mut message = Message::new();
+        message.set_header(&header);
+        message
+    }
+
+    /// Builds a valid `PingClient` message from `client`.
+    fn ping_client_message(client: u128, session: u64, ping_timestamp: u64) -> Message {
+        let mut header = message_header::PingClient::default();
+        header.cluster = CLUSTER;
+        header.client = client;
+        header.release = crate::multiversion::Release::MINIMUM;
+        header.ping_timestamp_monotonic = ping_timestamp;
+        header.session = session;
         header.size = message_header::SIZE as u32;
         header.set_checksum_body(&[]);
         header.set_checksum();
@@ -7216,6 +7391,100 @@ mod tests {
             assert_eq!(ping.ping_timestamp_monotonic, 5);
             assert_eq!(message.body_used().len(), body_len);
         }
+    }
+
+    #[test]
+    fn on_ping_client_replies_with_pong_client() {
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        assert_eq!(r.client_sessions.count(), 0);
+        // session == 0: the client may not be registered yet, but time sync is
+        // always answered (upstream only evicts a registered-but-unknown client).
+        let ping_msg = ping_client_message(42, 0, 123_456_789);
+        r.on_message(&ping_msg, 9);
+        assert_eq!(r.send_queue.len(), 0);
+        assert_eq!(r.client_send_queue.len(), 1);
+
+        let reply = r.client_send_queue.remove(0);
+        let pong_client = reply.header::<message_header::PongClient>().expect("pong_client");
+        assert!(pong_client.valid_checksum());
+        assert!(pong_client.valid_checksum_body(&[]));
+        assert_eq!(pong_client.invalid_header(), None);
+        assert_eq!(pong_client.cluster, CLUSTER);
+        assert_eq!(pong_client.replica, 0);
+        assert_eq!(pong_client.view, r.log_view);
+        assert_eq!(pong_client.release, crate::multiversion::Release::MINIMUM);
+        assert_eq!(pong_client.ping_timestamp_monotonic, 123_456_789);
+    }
+
+    #[test]
+    fn on_ping_client_evicts_committed_but_unregistered_client() {
+        // The primary has already committed the client's register (commit_min),
+        // yet the client is not in the sessions table — it must re-register.
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        r.status = Status::Normal;
+        assert!(r.is_primary());
+        r.commit_min = 100;
+
+        let ping_client = ping_client_message(42, 50, 11);
+        r.on_message(&ping_client, 0);
+        assert!(r.client_send_queue.len() == 1, "an eviction replaces the pong");
+        let message = r.client_send_queue.remove(0);
+        let eviction = message.header::<message_header::Eviction>().expect("eviction");
+        assert!(eviction.valid_checksum());
+        assert_eq!(eviction.invalid_header(), None);
+        assert_eq!(eviction.client, 42);
+        assert_eq!(eviction.reason(), Some(message_header::Reason::NoSession));
+    }
+
+    #[test]
+    fn on_ping_client_answers_pong_for_register_in_flight() {
+        // The register is still uncommitted (session > commit_min), so the
+        // primary cannot evict yet and answers the ping.
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        r.status = Status::Normal;
+        r.commit_min = 30;
+
+        let ping_client = ping_client_message(42, 50, 11);
+        r.on_message(&ping_client, 0);
+        assert_eq!(r.client_send_queue.len(), 1);
+        let reply = r.client_send_queue.remove(0);
+        assert!(reply.header::<message_header::PongClient>().is_some());
+    }
+
+    #[test]
+    fn on_ping_client_evicts_unsupported_release() {
+        // A release above the supported minimum (sans-IO is single-versioned)
+        // gets an eviction when the replica is an up-to-date primary.
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        r.status = Status::Normal;
+        let mut ping_client = ping_client_message(42, 0, 11);
+        let mut header = ping_client.header::<message_header::PingClient>().expect("ping_client");
+        header.release = crate::multiversion::Release { value: 2 };
+        header.set_checksum();
+        ping_client.set_header(&header);
+
+        r.on_message(&ping_client, 0);
+        assert_eq!(r.client_send_queue.len(), 1);
+        let message = r.client_send_queue.remove(0);
+        let eviction = message.header::<message_header::Eviction>().expect("eviction");
+        assert_eq!(eviction.reason(), Some(message_header::Reason::ClientReleaseTooHigh));
+    }
+
+    #[test]
+    fn on_ping_client_from_non_primary_is_answered_not_evicted() {
+        // Backups answer PongClient but never evict; the uncommitted/unknown
+        // session path is a no-op for them.
+        let mut r = Replica::new(CLUSTER, 1, 3);
+        r.status = Status::Normal;
+        assert!(!r.is_primary());
+        r.commit_min = 100;
+
+        let ping_client = ping_client_message(42, 50, 11);
+        r.on_message(&ping_client, 0);
+        assert_eq!(r.client_send_queue.len(), 1);
+        let reply = r.client_send_queue.remove(0);
+        assert!(reply.header::<message_header::PongClient>().is_some());
+        assert_eq!(r.client_send_queue.len(), 0);
     }
 
     #[test]
