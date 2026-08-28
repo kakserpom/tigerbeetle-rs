@@ -693,8 +693,9 @@ impl Replica {
     /// in the journal.
     ///
     /// Out-of-order prepares (a gap of more than one op) are rejected with
-    /// [`OnPrepareResult::FutureOp`] — upstream recovers via
-    /// `jump_to_newer_op_in_normal_status`, which needs the message bus.
+    /// [`OnPrepareResult::FutureOp`]; the caller recovers via
+    /// `jump_to_newer_op_in_normal_status`. Only the concurrent `repair()` gap
+    /// filling is deferred.
     ///
     /// # Panics
     /// Panics if the replica is not `.normal`, if the header's cluster/view/
@@ -2844,10 +2845,44 @@ impl Replica {
                 self.on_repair(&prepare);
             }
             OnPrepareResult::FutureOp => {
-                // TODO(port): `jump_to_newer_op_in_normal_status` — repair the
-                // range behind the future op instead of dropping it.
+                // The primary has moved more than one op past our head: advance
+                // `op` so the skipped prepares slot in as they are repaired
+                // (upstream repairs the gap concurrently via `repair()`).
+                self.jump_to_newer_op_in_normal_status(prepare.op);
             }
         }
+    }
+
+    /// Advance `op` to `op - 1`, skipping a contiguous range of missing ops.
+    ///
+    /// When a backup receives a prepare more than one op ahead of its head,
+    /// the missing ops in between are unknown, but the head can still be moved
+    /// forward so that the intervening prepares repair in one by one (they are
+    /// repaired on demand — upstream via `repair()`).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the replica is not `.normal`, is the primary, is asked to jump
+    /// by one op or fewer, would restore an already-committed op, or would
+    /// overwrite an op the WAL cannot hold (all replicated from upstream's
+    /// asserts; the caller routes only current-view headers here).
+    ///
+    /// Upstream: `src/vsr/replica.zig:6933`
+    /// (`jump_to_newer_op_in_normal_status`).
+    pub fn jump_to_newer_op_in_normal_status(&mut self, op: u64) {
+        assert_eq!(self.status, Status::Normal);
+        assert!(!self.is_primary());
+        assert!(op > self.op + 1);
+        // We may have learned of a higher `commit_max` through a commit message
+        // before jumping to a newer op: still reject coming at/below `commit_min`.
+        assert!(op > self.commit_min);
+        // Never overwrite an op that still needs to be checkpointed.
+        // DEVIATION: sans-IO the checkpoint is always durable at 0.
+        assert!(op <= self.op_prepare_max_sync());
+
+        self.op = op - 1;
+        assert!(self.op >= self.commit_min);
+        assert_eq!(self.op + 1, op);
     }
 
     /// Handle a repair Prepare: one we already hold, or one that may replace a
@@ -3846,6 +3881,36 @@ mod tests {
         r.on_repair(&h3);
         assert!(r.send_queue.is_empty());
         assert!(r.journal.header_with_op(3).is_none());
+    }
+
+    #[test]
+    fn future_prepare_jumps_head_then_gap_repairs_in() {
+        // Primary is at op 3; backup r1 misses op 2. The op-3 prepare arrives
+        // first: the head jumps to op 2, the re-sent op 3 is accepted across
+        // the empty slot, and op 2 then repairs in below the head.
+        let mut r = Replica::new(0, 1, 3); // backup
+        r.status = Status::Normal;
+        let h1 = make_prepare_for_replica(0, 0, 1, 0, 0);
+        let h2 = make_prepare_for_replica(0, 0, 2, h1.checksum(), 0);
+        let h3 = make_prepare_for_replica(0, 0, 3, h2.checksum(), 0);
+        deliver_prepare(&mut r, &h1);
+        assert_eq!(r.op, 1);
+
+        deliver_prepare(&mut r, &h3); // FutureOp -> jump to op 2
+        assert_eq!(r.op, 2);
+
+        // The (re-sent) op 3 is now exactly one ahead: it is accepted across
+        // the gap, since the parent-link check is skipped for a slot that was
+        // never written (upstream replica.zig:2211-2215).
+        deliver_prepare(&mut r, &h3);
+        assert_eq!(r.op, 3);
+        assert_eq!(r.journal.header_with_op(3).unwrap().checksum(), h3.checksum());
+
+        // The missing op 2 repairs in below the head (as a GetPrepare response:
+        // a Prepare with op < self.op goes through on_repair):
+        deliver_prepare(&mut r, &h2);
+        assert_eq!(r.op, 3); // repairs never advance the head
+        assert_eq!(r.journal.header_with_op(2).unwrap().checksum(), h2.checksum());
     }
 
     #[test]
