@@ -28,6 +28,9 @@ use crate::multiversion::Release;
 
 pub const SIZE: usize = 256;
 
+/// [`SIZE`] as the wire `size` field's type (upstream `@sizeOf(Header)`).
+pub const SIZE_U32: u32 = SIZE as u32;
+
 /// The vsr checksum of an empty body (upstream: `vsr.checksum(&.{})`).
 #[must_use]
 pub fn checksum_body_empty() -> u128 {

@@ -1313,9 +1313,17 @@ impl Replica {
             let popped = self.pop_committed();
             assert!(popped.is_some_and(|p| p.op == op));
 
-            // Pop the next request to prepare (if any).
-            // TODO(port): pass full request message to primary_pipeline_prepare.
-            self.pipeline_queue.request_queue.pop();
+            // Pop the next request to prepare (if any) and prepare it now that
+            // the pipeline has room (upstream: replica.zig:4901-4904).
+            if let Some(request) = self.pipeline_queue.request_queue.pop() {
+                let result = self.primary_pipeline_prepare(
+                    request.client,
+                    request.request,
+                    request.operation,
+                    0, // DEVIATION: sans-IO bodies are deferred; unused.
+                );
+                assert!(result.is_ok(), "popped request must be preparable");
+            }
         }
     }
 
@@ -2694,6 +2702,15 @@ pub struct PipelineQueue {
     pub request_queue: Vec<PipelineRequest>,
 }
 
+impl PipelineQueue {
+    /// Whether the prepare queue has reached capacity (upstream
+    /// `prepare_queue.full()`).
+    #[must_use]
+    pub fn prepare_queue_full(&self) -> bool {
+        self.prepare_queue.len() >= constants::PIPELINE_PREPARE_QUEUE_MAX as usize
+    }
+}
+
 /// A prepare in the pipeline.
 #[derive(Clone, Copy, Debug)]
 pub struct PipelinePrepare {
@@ -2709,7 +2726,8 @@ pub struct PipelinePrepare {
 #[derive(Clone, Copy, Debug)]
 pub struct PipelineRequest {
     pub client: u128,
-    pub request: u64,
+    pub request: u32,
+    pub operation: crate::Operation,
 }
 
 /// Pipeline cache used by backups and during view changes.
@@ -3609,19 +3627,50 @@ impl Replica {
 
     /// Handle a client request (primary only, normal status).
     ///
+    /// A validated request is prepared immediately when the pipeline is not
+    /// full, else it is queued on the request queue and prepared once earlier
+    /// commits execute (upstream `commit_execute`).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the primary has an uncommitted prepare (upstream asserts
+    /// `commit_min == commit_max`, replica.zig:1950).
+    ///
     /// Upstream: `src/vsr/replica.zig:1944` (`on_request`).
     pub fn on_request(&mut self, header: &message_header::Header) {
-        if !self.is_primary() {
-            return; // Only primary handles requests.
+        if !self.is_primary() || self.status != Status::Normal {
+            return;
         }
-        if self.status != Status::Normal {
+        let Some(request) = header.into_typed::<message_header::Request>() else {
+            return; // Command mismatch or invalid header.
+        };
+        if !request.valid_checksum() || request.invalid_header().is_some() {
+            return;
+        }
+        if self.ignore_request_message(&request) {
             return;
         }
 
-        // Upstream: if the prepare queue is full, queue the request for later.
-        // For now, log that we received the request.
-        let _ = header;
-        // TODO(port): primary_pipeline_prepare — begin preparing the request.
+        // The primary must be fully caught up to accept a request
+        // (upstream: replica.zig:1950).
+        assert_eq!(self.commit_min, self.commit_max);
+
+        if self.pipeline_queue.prepare_queue_full() {
+            self.pipeline_queue.request_queue.push(PipelineRequest {
+                client: request.client,
+                request: request.request,
+                operation: request.operation,
+            });
+        } else {
+            let body_size = request.size - message_header::SIZE_U32;
+            let result = self.primary_pipeline_prepare(
+                request.client,
+                request.request,
+                request.operation,
+                body_size,
+            );
+            assert!(result.is_ok(), "valid primary-visible request must prepare");
+        }
     }
 
     /// Handle a Prepare message from the primary — decode and forward to
@@ -4441,13 +4490,68 @@ impl Replica {
         self.commit_journal();
     }
 
-    /// Returns `true` if we should ignore this request message.
+    /// Returns `true` if a client request should be ignored: dropped, or
+    /// answered with an eviction.
     ///
-    /// Upstream: `src/vsr/replica.zig:1930` (`ignore_request_message`).
-    #[must_use]
-    pub fn ignore_request_message(&self, header: &message_header::Header) -> bool {
-        // Ignore if not from the primary's current view.
-        header.view != self.view || !self.is_primary() || self.status != Status::Normal
+    /// Subset of upstream's checks that are meaningful sans-IO — standby
+    /// discrimination, backup forwarding (`ignore_request_message_backup`), the
+    /// request body / operation / register-body safeguards, and the
+    /// upgrade/duplicate/preparing checks are all deferred (the port has no
+    /// standby mode, backup forwarding, `request_size_limit`, or mounted state
+    /// machine / session table yet). `Request::invalid_header` already rejects
+    /// malformed requests, so the evictions below are the ones a valid header
+    /// can still trigger.
+    ///
+    /// Upstream: `src/vsr/replica.zig:6242` (`ignore_request_message`).
+    fn ignore_request_message(&mut self, request: &message_header::Request) -> bool {
+        assert_eq!(request.command, crate::command::Command::Request);
+        assert!(self.is_primary());
+        assert_eq!(self.status, Status::Normal);
+
+        // A buggy client may send a view higher than one the cluster has seen.
+        // Err on the side of safety and drop such requests (upstream 6256-6265).
+        if request.view > self.view {
+            return true;
+        }
+
+        // Unsupported client release versions are evicted (upstream 6276-6304).
+        // DEVIATION: sans-IO the replica runs exactly `Release::MINIMUM`, and
+        // `Request::invalid_header` rejects `release == 0`, so — MINIMUM being
+        // `(0,0,1)` — the too-low branch is unreachable on a valid header; it
+        // is kept for symmetry with upstream. The replica's own `release` field
+        // is likewise pinned to `MINIMUM`.
+        if request.release.value < crate::multiversion::Release::MINIMUM.value {
+            self.send_eviction_message_to_client(
+                request.client,
+                message_header::Reason::ClientReleaseTooLow,
+            );
+            return true;
+        }
+        if request.release.value > crate::multiversion::Release::MINIMUM.value {
+            self.send_eviction_message_to_client(
+                request.client,
+                message_header::Reason::ClientReleaseTooHigh,
+            );
+            return true;
+        }
+
+        // Compatibility safeguard (upstream 6357-6379): `Request::invalid_header`
+        // accepts a `.register` without a body (legacy clients), so such a
+        // request must be evicted rather than silently dropped. The only sizes
+        // invalid_header admits for a register are `SIZE` and
+        // `SIZE + @sizeOf(RegisterRequest)`, so a header-only request is
+        // precisely the legacy no-body one.
+        if request.operation == crate::Operation::REGISTER
+            && request.size == message_header::SIZE_U32
+        {
+            self.send_eviction_message_to_client(
+                request.client,
+                message_header::Reason::InvalidRequestBodySize,
+            );
+            return true;
+        }
+
+        false
     }
 }
 
@@ -4599,6 +4703,25 @@ mod tests {
         header.release = crate::multiversion::Release::MINIMUM;
         header.ping_timestamp_monotonic = ping_timestamp;
         header.session = session;
+        header.size = message_header::SIZE as u32;
+        header.set_checksum_body(&[]);
+        header.set_checksum();
+
+        let mut message = Message::new();
+        message.set_header(&header);
+        message
+    }
+
+    /// Builds a valid (minimum size, no body) `Request` message from `client`.
+    fn request_message(client: u128, request: u32, operation: crate::Operation) -> Message {
+        let mut header = message_header::Request::default();
+        header.cluster = CLUSTER;
+        header.client = client;
+        header.session = 42;
+        header.request = request;
+        header.operation = operation;
+        header.release = crate::multiversion::Release::MINIMUM;
+        header.view = 0;
         header.size = message_header::SIZE as u32;
         header.set_checksum_body(&[]);
         header.set_checksum();
@@ -5156,6 +5279,152 @@ mod tests {
         header.set_checksum();
         r.on_request(&header);
         // No state change — backup ignores request.
+    }
+
+    #[test]
+    fn on_request_primary_prepares_immediately() {
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        r.status = Status::Normal;
+        assert!(r.is_primary());
+
+        let request = request_message(1, 7, crate::Operation::NOOP);
+        r.on_message(&request, 0);
+
+        assert_eq!(r.op, 1);
+        assert_eq!(r.pipeline_queue.prepare_queue.len(), 1);
+        assert_eq!(r.pipeline_queue.request_queue.len(), 0);
+        assert_eq!(r.pipeline_queue.prepare_queue[0].op, 1);
+        // The primary contributes its own prepare_ok.
+        assert_eq!(r.pipeline_queue.prepare_queue[0].acks_received, 1);
+        // And the prepare is broadcast to both backups (2).
+        assert_eq!(r.send_queue.len(), 2);
+
+        let header = r.journal.header_with_op(1).expect("journal head");
+        assert_eq!(header.client, 1);
+        assert_eq!(header.request, 7);
+        assert_eq!(header.operation, crate::Operation::NOOP);
+    }
+
+    #[test]
+    fn on_request_queues_when_pipeline_full() {
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        r.status = Status::Normal;
+        for _ in 0..constants::PIPELINE_PREPARE_QUEUE_MAX {
+            let op = r.primary_pipeline_prepare(1, 1, crate::Operation::NOOP, 0).unwrap();
+            assert!(op > 0);
+        }
+        let prepare_count = constants::PIPELINE_PREPARE_QUEUE_MAX as usize;
+        assert_eq!(r.pipeline_queue.prepare_queue.len(), prepare_count);
+
+        let request = request_message(2, 9, crate::Operation::NOOP);
+        r.on_message(&request, 0);
+
+        assert_eq!(r.pipeline_queue.prepare_queue.len(), prepare_count);
+        assert_eq!(r.pipeline_queue.request_queue.len(), 1);
+        assert_eq!(r.pipeline_queue.request_queue[0].client, 2);
+        assert_eq!(r.pipeline_queue.request_queue[0].request, 9);
+        // No broadcast for a queued request.
+        assert_eq!(r.send_queue.len(), prepare_count * 2);
+    }
+
+    #[test]
+    fn on_request_commit_execute_drains_request_queue() {
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        r.status = Status::Normal;
+        assert!(r.is_primary());
+        assert!(r.commit_min == 0 && r.commit_max == 0);
+
+        // Pipeline a first op and queue a second client request behind it.
+        let op = r.primary_pipeline_prepare(1, 1, crate::Operation::NOOP, 0).unwrap();
+        assert_eq!(op, 1);
+        r.advance_commit_max(1);
+        r.pipeline_queue.request_queue.push(PipelineRequest {
+            client: 7,
+            request: 9,
+            operation: crate::Operation::NOOP,
+        });
+
+        // Drive the execute stage manually: commit_prepare = op 1.
+        r.commit_max = 1;
+        r.commit_prepare = Some(1);
+        r.commit_stage = CommitStage::Execute;
+        r.commit_execute();
+
+        // The queued request was prepared as op 2.
+        assert_eq!(r.op, 2);
+        assert_eq!(r.pipeline_queue.request_queue.len(), 0);
+        assert_eq!(r.pipeline_queue.prepare_queue.len(), 1);
+        assert_eq!(r.pipeline_queue.prepare_queue[0].op, 2);
+        let header = r.journal.header_with_op(2).expect("journal op 2");
+        assert_eq!(header.client, 7);
+        assert_eq!(header.request, 9);
+        assert_eq!(header.operation, crate::Operation::NOOP);
+    }
+
+    #[test]
+    fn on_request_evicts_unsupported_release() {
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        r.status = Status::Normal;
+        assert!(r.is_primary());
+
+        let mut request = request_message(1, 1, crate::Operation::NOOP);
+        let mut header = request.header::<message_header::Request>().expect("request");
+        header.release = crate::multiversion::Release { value: 2 };
+        header.set_checksum();
+        request.set_header(&header);
+        r.on_message(&request, 0);
+
+        assert_eq!(r.pipeline_queue.prepare_queue.len(), 0);
+        assert_eq!(r.client_send_queue.len(), 1);
+        let eviction =
+            r.client_send_queue[0].header::<message_header::Eviction>().expect("eviction");
+        assert_eq!(eviction.reason(), Some(message_header::Reason::ClientReleaseTooHigh));
+    }
+
+    #[test]
+    fn on_request_evicts_register_without_body() {
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        r.status = Status::Normal;
+        assert!(r.is_primary());
+
+        let mut header = message_header::Request::default();
+        header.cluster = CLUSTER;
+        header.client = 5;
+        header.session = 0;
+        header.request = 0;
+        header.operation = crate::Operation::REGISTER;
+        header.release = crate::multiversion::Release::MINIMUM;
+        header.size = message_header::SIZE as u32;
+        header.set_checksum_body(&[]);
+        header.set_checksum();
+        let mut message = Message::new();
+        message.set_header(&header);
+        r.on_message(&message, 0);
+
+        assert_eq!(r.pipeline_queue.prepare_queue.len(), 0);
+        assert_eq!(r.client_send_queue.len(), 1);
+        let eviction =
+            r.client_send_queue[0].header::<message_header::Eviction>().expect("eviction");
+        assert_eq!(eviction.reason(), Some(message_header::Reason::InvalidRequestBodySize));
+    }
+
+    #[test]
+    fn on_request_drops_future_view() {
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        r.status = Status::Normal;
+        assert!(r.is_primary());
+
+        let mut request = request_message(1, 1, crate::Operation::NOOP);
+        let mut header = request.header::<message_header::Request>().expect("request");
+        header.view = 1; // Newer than r.view == 0.
+        header.set_checksum();
+        request.set_header(&header);
+        r.on_message(&request, 0);
+
+        assert_eq!(r.pipeline_queue.prepare_queue.len(), 0);
+        assert_eq!(r.pipeline_queue.request_queue.len(), 0);
+        assert_eq!(r.client_send_queue.len(), 0, "dropped, not evicted");
+        assert_eq!(r.send_queue.len(), 0);
     }
 
     #[test]
