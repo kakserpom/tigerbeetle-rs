@@ -2828,13 +2828,74 @@ impl Replica {
         if self.status != Status::Normal || prepare.view != self.view {
             return;
         }
-        if self.on_prepare(&prepare) != OnPrepareResult::Accepted {
+        match self.on_prepare(&prepare) {
+            OnPrepareResult::Accepted => {
+                // A backup acks the accepted prepare; the primary contributes
+                // its own prepare_ok on the pipeline path instead (we do not
+                // self-ack here).
+                if !self.is_primary() {
+                    self.send_prepare_ok(&prepare);
+                }
+            }
+            OnPrepareResult::Stale => {
+                // We already hold the op: it may be a re-broadcast of a prepare
+                // whose ack was lost — refresh the journal and republish the
+                // ack if we have it clean (upstream `on_repair`).
+                self.on_repair(&prepare);
+            }
+            OnPrepareResult::FutureOp => {
+                // TODO(port): `jump_to_newer_op_in_normal_status` — repair the
+                // range behind the future op instead of dropping it.
+            }
+        }
+    }
+
+    /// Handle a repair Prepare: one we already hold, or one that may replace a
+    /// faulty/dirty entry. Repairs may never advance `self.op`.
+    ///
+    /// Upstream `on_repair` is reached from `on_prepare` for prepares that are
+    /// older (`view < self.view`) or that we already hold (`op <= self.op`,
+    /// current view). The sans-IO port reaches it only from
+    /// [`Self::on_prepare_message`] via [`OnPrepareResult::Stale`] (view
+    /// matches, `op <= self.op`).
+    ///
+    /// If the prepare is already journaled and clean, we resend our prepare_ok:
+    /// the primary's copy of that ack may have been lost, and republishing it
+    /// lets the quorum make progress. Otherwise the prepare is (re-)installed
+    /// as dirty and, on a backup, a commit pass is attempted.
+    ///
+    /// DEVIATION: upstream also consults the pipeline-cache and the
+    /// repair-message budget, and writes the repaired prepare through
+    /// `write_prepare`; sans-IO installs the header via `repair_header` only.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `self.status` is not `Status::Normal` (the repair path only
+    /// runs in a normal-op context, matching the lone caller in the port).
+    ///
+    /// Upstream: `src/vsr/replica.zig:2455` (`on_repair`).
+    pub fn on_repair(&mut self, header: &message_header::Prepare) {
+        assert_eq!(self.status, Status::Normal);
+        if header.view > self.view {
+            return; // From a view we have not joined.
+        }
+        if header.op > self.op {
+            return; // Repairs may never advance `self.op`.
+        }
+
+        if self.journal.has_prepare(header) {
+            // Duplicate and clean: republish the lost prepare_ok (upstream
+            // 2510-2515).
+            self.send_prepare_ok(header);
             return;
         }
-        // A backup acks the accepted prepare; the primary contributes its own
-        // prepare_ok on the pipeline path instead (we do not self-ack here).
-        if !self.is_primary() {
-            self.send_prepare_ok(&prepare);
+
+        if self.repair_header(header) {
+            // Optimistically try to commit now that the prepare is (re-)staged
+            // (upstream 2539-2541); primaries wait for the pipeline instead.
+            if !self.is_primary() {
+                self.commit_journal();
+            }
         }
     }
 
@@ -3716,6 +3777,76 @@ mod tests {
         assert_eq!(r.commit_stage, CommitStage::Idle);
         assert!(r.journal.has_prepare(&h3));
     }
+    #[test]
+    fn on_repair_resends_prepare_ok_for_clean_duplicate() {
+        // Backup r1 accepted h1 and committed it (slot clean). The primary
+        // re-sends h1 (its copy of our ack may be lost): on_repair republishes
+        // the prepare_ok instead of dropping the duplicate.
+        let mut r = Replica::new(0, 1, 3);
+        r.status = Status::Normal;
+        let h1 = make_prepare_for_replica(0, 0, 1, 0, 0);
+        deliver_prepare(&mut r, &h1); // Accepted -> acks h1
+        assert_eq!(r.send_queue.len(), 1);
+
+        r.commit_max = 1;
+        r.commit_journal();
+        assert_eq!(r.commit_min, 1);
+        assert!(r.journal.has_prepare(&h1));
+
+        // The identical re-send goes through the Stale -> on_repair path:
+        deliver_prepare(&mut r, &h1);
+        assert_eq!(r.send_queue.len(), 2);
+        let ack = r.send_queue.pop().unwrap().header::<message_header::PrepareOk>().unwrap();
+        assert_eq!(ack.prepare_checksum, h1.checksum);
+        assert_eq!(ack.op, 1);
+        assert_eq!(ack.replica, 1);
+    }
+
+    #[test]
+    fn on_repair_refreshes_dirty_copy_and_commits() {
+        // A dirty copy is not a duplicate: on_repair re-stages the header and
+        // (as a backup) attempts the commit pass, which finishes the op here.
+        let mut r = Replica::new(0, 1, 3); // backup
+        r.status = Status::Normal;
+        let h1 = make_prepare_for_replica(0, 0, 1, 0, 0);
+        deliver_prepare(&mut r, &h1); // Accepted -> acks h1
+        assert_eq!(r.send_queue.len(), 1);
+
+        // The primary committed op 1 but its Commit broadcast has not arrived
+        // yet. It re-sends h1; our slot is still dirty (write pending):
+        r.commit_max = 1;
+        deliver_prepare(&mut r, &h1); // Stale -> on_repair -> stale copy
+        assert_eq!(r.send_queue.len(), 1); // no re-ack for a dirty copy
+        assert_eq!(r.commit_min, 1); // commit_journal finished the op
+        assert!(r.journal.has_prepare(&h1)); // now clean
+
+        // With the slot clean, a third re-send republishes the ack:
+        deliver_prepare(&mut r, &h1);
+        assert_eq!(r.send_queue.len(), 2);
+    }
+
+    #[test]
+    fn on_repair_ignores_newer_view_and_future_ops() {
+        let mut r = Replica::new(0, 1, 3); // backup
+        r.status = Status::Normal;
+        let h1 = make_prepare_for_replica(0, 0, 1, 0, 0);
+        let h2 = make_prepare_for_replica(0, 0, 2, h1.checksum(), 0);
+        assert_eq!(r.on_prepare(&h1), OnPrepareResult::Accepted);
+        assert_eq!(r.on_prepare(&h2), OnPrepareResult::Accepted);
+        assert_eq!(r.op, 2);
+
+        // A newer view is refused (we have not joined it):
+        let newer_view = make_prepare_for_replica(0, 1, 1, 0, 0);
+        r.on_repair(&newer_view);
+        assert!(r.send_queue.is_empty());
+        assert_eq!(r.journal.header_with_op(1).unwrap().checksum(), h1.checksum());
+
+        // An op beyond the head may not be repaired in:
+        let h3 = make_prepare_for_replica(0, 0, 3, h2.checksum(), 0);
+        r.on_repair(&h3);
+        assert!(r.send_queue.is_empty());
+        assert!(r.journal.header_with_op(3).is_none());
+    }
 
     #[test]
     fn on_commit_stale_timestamp_skips_heartbeat() {
@@ -4151,6 +4282,13 @@ mod tests {
         header.set_checksum_body(&[]);
         header.set_checksum();
         header
+    }
+
+    /// Deliver a Prepare through the full dispatch path (`on_message`).
+    fn deliver_prepare(r: &mut Replica, prepare: &message_header::Prepare) {
+        let mut message = crate::message::Message::new();
+        message.set_header(prepare);
+        r.on_message(&message, 100);
     }
 
     /// Build a checksum-valid Commit message from the primary.
