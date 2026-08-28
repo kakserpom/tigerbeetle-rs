@@ -305,6 +305,19 @@ impl ClientReplies {
         self.faulty.unset(slot.index);
     }
 
+    /// Whether the reply at the slot is known to be corrupt or missing
+    /// (upstream: reading `client_replies.faulty`, replica.zig:2381).
+    #[must_use]
+    pub fn reply_is_faulty(&self, slot: client_sessions::ReplySlot) -> bool {
+        self.faulty.get(slot.index)
+    }
+
+    /// Mark the reply at the slot as corrupt or missing (upstream: setting
+    /// `client_replies.faulty`, replica.zig:3284).
+    pub fn mark_faulty(&mut self, slot: client_sessions::ReplySlot) {
+        self.faulty.set(slot.index);
+    }
+
     /// Queues a reply write. Coalesces with any queued (not yet started) write to the same
     /// slot, keeping only the newest reply.
     ///

@@ -3010,13 +3010,13 @@ impl Replica {
             Command::Ping => self.on_ping(message),
             Command::Pong => self.on_pong(message),
             Command::PingClient => self.on_ping_client(message),
+            Command::Reply => self.on_reply(message),
+            Command::GetReply => self.on_get_reply(message),
             // PongClient/Eviction are client-directed and misdirected here
             // (upstream replica.zig:1822 warns and drops); the remaining
             // commands are still unported. Drop all of them.
             Command::PongClient
             | Command::Eviction
-            | Command::Reply
-            | Command::GetReply
             | Command::Deprecated12
             | Command::Deprecated21
             | Command::Deprecated22
@@ -3114,27 +3114,55 @@ impl Replica {
         }
     }
 
-    /// Drive pending client-reply writes to completion (upstream: the storage
-    /// callback halves of `client_replies`, settled in the IO event loop).
+    /// Drive pending client-reply writes and reads to completion (upstream:
+    /// the storage callback halves of `client_replies`, settled in the IO
+    /// event loop).
     ///
-    /// The written replies stay unread — the GetReply handler is deferred — so
-    /// the only events produced are write completions, which are consumed here.
+    /// Completed reply-repair reads are dispatched here: a found reply is sent
+    /// to the requesting replica; a corrupt or unexpected reply marks the slot
+    /// faulty so it can be repaired via [`Self::on_reply`].
     ///
     /// DEVIATION: the sans-IO replica has no storage until one is mounted via
     /// `grid_storage` (see that field's DEVIATION note); without it there is
     /// nothing to poll.
     ///
     /// # Panics
-    /// Panics if a client-reply event requires a handler that is not ported yet.
+    /// Panics if a reply-repair read's destination replica is missing.
     pub fn poll_client_replies(&mut self) {
         let Some(storage) = self.grid_storage.as_mut() else {
             return;
         };
         self.client_replies.poll(storage);
-        assert!(
-            self.client_replies.take_events().is_empty(),
-            "client-reply events imply handlers that are not ported yet"
-        );
+        for event in self.client_replies.take_events() {
+            match event {
+                crate::client_replies::Event::ReadReply {
+                    slot,
+                    outcome,
+                    destination_replica,
+                    ..
+                } => {
+                    match outcome {
+                        crate::client_replies::ReadOutcome::Found(reply)
+                        | crate::client_replies::ReadOutcome::ResolvedByWrite(reply) => {
+                            let Some(destination) = destination_replica else {
+                                continue; // unreachable: get_reply reads carry a destination
+                            };
+                            assert!(u16::from(destination) < self.replica_count);
+                            self.send_reply_to_replica(&reply);
+                        }
+                        crate::client_replies::ReadOutcome::Corrupt
+                        | crate::client_replies::ReadOutcome::Unexpected => {
+                            self.client_replies.mark_faulty(slot);
+                        }
+                    }
+                }
+                crate::client_replies::Event::Ready
+                | crate::client_replies::Event::CheckpointDone => {
+                    // These fire only when `ready()`/`checkpoint()` waiters are
+                    // registered, which the sans-IO replica does not do yet.
+                }
+            }
+        }
     }
 
     fn on_grid_event(&mut self, event: Event) {
@@ -3185,6 +3213,143 @@ impl Replica {
         let mut reply = crate::message::Message::new();
         reply.buffer_mut()[..constants::BLOCK_SIZE].copy_from_slice(&block_bytes);
         self.send_queue.push(reply);
+    }
+
+    /// Send a stored client reply to a replica that requested it.
+    ///
+    /// DEVIATION: upstream `send_message_to_replica` (replica.zig:8972) opens
+    /// a connection to the destination. The sans-IO port has no message bus,
+    /// so the reply is pushed to the shared outbox (`send_queue`) and the
+    /// integration layer must pair it with the `GetReply`'s `replica` field.
+    fn send_reply_to_replica(&mut self, reply: &crate::message::Message) {
+        assert_eq!(
+            reply.header::<message_header::Reply>().map(|header| header.command),
+            Some(crate::command::Command::Reply),
+        );
+        self.send_queue.push(reply.clone());
+    }
+
+    /// Serve a `GetReply` for a client's committed reply (reply repair).
+    ///
+    /// Responds with the stored `command=reply` message when the reply is
+    /// available and valid; otherwise stays silent (upstream docs:
+    /// "Protocol: Repair Client Replies").
+    ///
+    /// The reply is served from RAM when a write to its slot is still in
+    /// flight; otherwise it is read from the client-replies zone, and the
+    /// read's outcome (`Event::ReadReply`) is dispatched by
+    /// [`Self::poll_client_replies`].
+    ///
+    /// Upstream: `src/vsr/replica.zig:3213` (`on_get_reply`).
+    ///
+    /// # Panics
+    /// Panics if the session entry's client does not match the `GetReply`, the
+    /// session holds a body-less reply, or the reply op does not match the
+    /// `GetReply`'s (all asserted invariants of the session table, upstream
+    /// replica.zig:3225-3238).
+    pub fn on_get_reply(&mut self, message: &crate::message::Message) {
+        let Some(get_reply) = message.header::<message_header::GetReply>() else {
+            return;
+        };
+        if !get_reply.valid_checksum() || !get_reply.valid_checksum_body(message.body_used()) {
+            return;
+        }
+        if get_reply.invalid_header().is_some() {
+            return;
+        }
+        // `GetReply::invalid_header` guarantees `reply_client != 0`.
+
+        // `ignore_repair_message` (replica.zig:6106): reply repair runs from
+        // normal/view-change status, and `GetReply`'s `view` is always 0 so
+        // the view gates do not apply.
+        if !matches!(self.status, Status::Normal | Status::ViewChange) {
+            return;
+        }
+        if get_reply.replica == self.replica_u8() {
+            return; // Misdirected (upstream warns and drops).
+        }
+
+        let Some(entry) = self.client_sessions.get(get_reply.reply_client) else {
+            return; // Client not in the sessions table.
+        };
+        assert_eq!(entry.header.client, get_reply.reply_client);
+
+        if entry.header.checksum != get_reply.reply_checksum {
+            return; // The session has advanced past (or never held) this reply.
+        }
+        // Body-less replies live only in the sessions trailer, never in the
+        // client-replies zone, and are requested by checksum alone:
+        assert_ne!(entry.header.size, message_header::SIZE_U32);
+        assert_eq!(entry.header.op, get_reply.reply_op);
+
+        let Some(slot) = self.client_sessions.get_slot_for_client(get_reply.reply_client) else {
+            unreachable!("session entry exists (fetched above)");
+        };
+
+        // Serve from RAM if a write to the slot is still in flight
+        // (upstream `read_reply_sync`, replica.zig:6665).
+        if let Some(in_flight) = self.client_replies.write_in_flight_latest(slot, entry).cloned() {
+            self.send_reply_to_replica(&in_flight);
+            return;
+        }
+
+        // Otherwise queue an async read; the reply is sent once the read
+        // completes (upstream `read_reply`, replica.zig:3251).
+        let Some(storage) = self.grid_storage.as_mut() else {
+            // DEVIATION: the sans-IO replica has no storage until one is
+            // mounted via `grid_storage` (see that field's DEVIATION note).
+            return;
+        };
+        if let Err(crate::client_replies::ReadError::Busy) =
+            self.client_replies.read_reply(storage, slot, entry, Some(get_reply.replica))
+        {
+            // Upstream: ignore the GetReply when client_replies is busy.
+        }
+    }
+
+    /// Handle a reply sent by another replica (reply repair, the receiving
+    /// half of `on_get_reply`): rewrite a corrupt/missing reply into the
+    /// client-replies zone (upstream `src/vsr/replica.zig:2342` `on_reply`).
+    pub fn on_reply(&mut self, message: &crate::message::Message) {
+        let Some(reply) = message.header::<message_header::Reply>() else {
+            return;
+        };
+        if !reply.valid_checksum() || !reply.valid_checksum_body(message.body_used()) {
+            return;
+        }
+        if reply.invalid_header().is_some() {
+            return;
+        }
+
+        // The reply is only useful if it matches the session table's expected
+        // reply *and* the slot is known to be corrupt/missing:
+        let Some(entry) = self.client_sessions.get(reply.client) else {
+            return; // Client not in the sessions table.
+        };
+        if entry.header.checksum != reply.checksum {
+            return; // The session has a different (newer/older) reply in mind.
+        }
+        let Some(slot) = self.client_sessions.get_slot_for_header(&reply) else {
+            unreachable!("session entry exists (fetched above)");
+        };
+        if !self.client_replies.reply_is_faulty(slot) {
+            return; // Nothing to repair.
+        }
+        if !self.client_replies.ready_sync() {
+            return; // Upstream: ignore while busy.
+        }
+
+        let Some(storage) = self.grid_storage.as_mut() else {
+            // DEVIATION: see `grid_storage`'s DEVIATION note.
+            return;
+        };
+        let reply_message = message.clone();
+        self.client_replies.write_reply(
+            storage,
+            slot,
+            reply_message,
+            crate::client_replies::WriteTrigger::Repair,
+        );
     }
 
     /// Request missing blocks from `destination` (upstream
@@ -5746,6 +5911,194 @@ mod tests {
         r.poll_client_replies();
         let mut storage = r.grid_storage.take().expect("mounted storage");
         assert!(storage.next_completion().is_none(), "noop produced no write");
+    }
+
+    fn get_reply_message(
+        from: u8,
+        client: u128,
+        checksum: u128,
+        op: u64,
+    ) -> crate::message::Message {
+        let mut header = message_header::GetReply::default();
+        header.cluster = CLUSTER;
+        header.replica = from;
+        header.size = message_header::SIZE_U32;
+        header.reply_client = client;
+        header.reply_checksum = checksum;
+        header.reply_op = op;
+        // `GetReply::invalid_header` requires a zero view/release, which the
+        // defaults already satisfy.
+        header.set_checksum_body(&[]);
+        header.set_checksum();
+        let mut message = crate::message::Message::new();
+        message.set_header(&header);
+        message
+    }
+
+    fn register_and_persist(r: &mut Replica, client: u128) -> u64 {
+        let op = r.primary_pipeline_prepare(client, 0, crate::Operation::REGISTER, 0).unwrap();
+        assert_eq!(op, 1);
+        r.commit_max = 1;
+        r.commit_prepare = Some(1);
+        r.commit_stage = CommitStage::Execute;
+        r.commit_execute();
+        r.poll_client_replies();
+        op
+    }
+
+    #[test]
+    fn on_get_reply_serves_stored_reply() {
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        r.status = Status::Normal;
+        r.grid_storage = Some(MemoryStorage::new(
+            Zone::ClientReplies.start() + 4 * crate::message::MESSAGE_SIZE_MAX as u64,
+        ));
+
+        register_and_persist(&mut r, 7);
+        r.send_queue.clear(); // Clear the primary's prepare-broadcast noise.
+        let entry = r.client_sessions.get(7).expect("registered client");
+        let expected_client = entry.header.client;
+        let expected_checksum = entry.header.checksum;
+        let expected_op = entry.header.op;
+
+        // Replica 1 asks for client 7's committed reply.
+        let get_reply = get_reply_message(1, expected_client, expected_checksum, expected_op);
+        r.on_message(&get_reply, 0);
+        // The reply is on disk (not a RAM write), so a reply-repair read is
+        // issued and settles on the next poll.
+        assert_eq!(r.send_queue.len(), 0);
+        r.poll_client_replies();
+
+        assert_eq!(r.send_queue.len(), 1);
+        let reply = &r.send_queue[0];
+        let header = reply.header::<message_header::Reply>().expect("a reply message");
+        assert_eq!(header.client, expected_client);
+        assert_eq!(header.checksum, expected_checksum);
+        assert_eq!(header.op, expected_op);
+        assert_eq!(header.replica, r.replica_u8());
+        assert!(header.valid_checksum());
+    }
+
+    #[test]
+    fn on_get_reply_serves_in_flight_ram_write() {
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        r.status = Status::Normal;
+        r.grid_storage = Some(MemoryStorage::new(
+            Zone::ClientReplies.start() + 4 * crate::message::MESSAGE_SIZE_MAX as u64,
+        ));
+
+        // Commit the register but leave the reply write in flight.
+        let op = r.primary_pipeline_prepare(7, 0, crate::Operation::REGISTER, 0).unwrap();
+        r.commit_max = op;
+        r.commit_prepare = Some(op);
+        r.commit_stage = CommitStage::Execute;
+        r.commit_execute();
+        let slot = r.client_sessions.get_slot_for_client(7).expect("client 7 session");
+        assert!(!r.client_replies.reply_durable(slot), "register write in flight");
+        r.send_queue.clear(); // Clear the primary's prepare-broadcast noise.
+
+        let entry = r.client_sessions.get(7).expect("registered client");
+        let expected_checksum = entry.header.checksum;
+        let expected_op = entry.header.op;
+        let get_reply = get_reply_message(1, entry.header.client, expected_checksum, expected_op);
+        r.on_message(&get_reply, 0);
+
+        // Served from RAM: no read, no poll needed.
+        assert_eq!(r.send_queue.len(), 1);
+        let header = r.send_queue[0].header::<message_header::Reply>().expect("a reply message");
+        assert_eq!(header.checksum, expected_checksum);
+    }
+
+    #[test]
+    fn on_get_reply_ignores_unknown_client_and_bad_checksum() {
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        r.status = Status::Normal;
+        r.grid_storage = Some(MemoryStorage::new(
+            Zone::ClientReplies.start() + 4 * crate::message::MESSAGE_SIZE_MAX as u64,
+        ));
+
+        register_and_persist(&mut r, 7);
+        r.send_queue.clear(); // Clear the primary's prepare-broadcast noise.
+
+        // Unknown client.
+        r.on_message(&get_reply_message(1, 99, 0xDEAD_BEEF, 1), 0);
+        assert_eq!(r.send_queue.len(), 0, "unknown client: no reply");
+
+        // Known client, wrong reply checksum.
+        let entry = r.client_sessions.get(7).expect("registered client");
+        let expected_op = entry.header.op;
+        r.on_message(&get_reply_message(1, 7, 0xDEAD_BEEF, expected_op), 0);
+        assert_eq!(r.send_queue.len(), 0, "checksum mismatch: no reply");
+        r.poll_client_replies();
+        assert_eq!(r.send_queue.len(), 0);
+    }
+
+    #[test]
+    fn on_reply_repairs_faulty_reply() {
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        r.status = Status::Normal;
+        r.grid_storage = Some(MemoryStorage::new(
+            Zone::ClientReplies.start() + 4 * crate::message::MESSAGE_SIZE_MAX as u64,
+        ));
+
+        register_and_persist(&mut r, 7);
+        let slot = r.client_sessions.get_slot_for_client(7).expect("client 7 session");
+        assert!(r.client_replies.reply_durable(slot));
+        r.send_queue.clear(); // Clear the primary's prepare-broadcast noise.
+
+        // A clean slot is not rewritten (upstream replica.zig:2377).
+        let entry = r.client_sessions.get(7).expect("registered client");
+        let reply_header = entry.header;
+        let mut reply = crate::message::Message::new();
+        reply.set_header(&reply_header);
+        r.on_message(&reply, 0);
+        assert!(r.client_replies.reply_durable(slot), "clean slot untouched");
+        let _repaired_storage = r.grid_storage.take().expect("mounted storage");
+
+        // Simulate a corrupt on-disk reply and repair it from replica 1.
+        r.grid_storage = Some(MemoryStorage::new(
+            Zone::ClientReplies.start() + 4 * crate::message::MESSAGE_SIZE_MAX as u64,
+        ));
+        r.client_replies.mark_faulty(slot);
+        assert!(r.client_replies.reply_is_faulty(slot));
+
+        let mut reply = crate::message::Message::new();
+        reply.set_header(&reply_header);
+        r.on_message(&reply, 0);
+        assert!(!r.client_replies.reply_durable(slot), "repair write in flight");
+        r.poll_client_replies();
+        assert!(r.client_replies.reply_durable(slot), "reply repaired");
+        assert!(!r.client_replies.reply_is_faulty(slot));
+    }
+
+    #[test]
+    fn on_get_reply_ignores_misdirected_or_wrong_status() {
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        r.status = Status::Normal;
+        r.grid_storage = Some(MemoryStorage::new(
+            Zone::ClientReplies.start() + 4 * crate::message::MESSAGE_SIZE_MAX as u64,
+        ));
+
+        register_and_persist(&mut r, 7);
+        r.send_queue.clear(); // Clear the primary's prepare-broadcast noise.
+        let entry = r.client_sessions.get(7).expect("registered client");
+        let expected_client = entry.header.client;
+        let expected_checksum = entry.header.checksum;
+        let expected_op = entry.header.op;
+
+        // A GetReply addressed to self is dropped.
+        r.on_message(
+            &get_reply_message(r.replica_u8(), expected_client, expected_checksum, expected_op),
+            0,
+        );
+        assert_eq!(r.send_queue.len(), 0, "misdirected: no reply");
+        r.poll_client_replies();
+        assert_eq!(r.send_queue.len(), 0, "no reads were queued");
+
+        // A GetReply arriving while not in normal/view-change status is dropped.
+        r.status = Status::Recovering;
+        r.on_message(&get_reply_message(1, expected_client, expected_checksum, expected_op), 0);
+        assert_eq!(r.send_queue.len(), 0, "recovering: no reply");
     }
 
     #[test]
