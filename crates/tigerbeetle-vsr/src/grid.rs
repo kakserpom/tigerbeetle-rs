@@ -706,6 +706,26 @@ impl Grid {
         self.free_set.is_free(address)
     }
 
+    /// Number of coherent reads parked awaiting a block from a remote replica
+    /// (upstream `grid.read_global_queue.count()`).
+    #[must_use]
+    pub fn read_global_queue_len(&self) -> usize {
+        self.read_global_queue.len()
+    }
+
+    /// The `(address, checksum)` pairs parked in the global repair queue, in
+    /// FIFO order (upstream iterating `grid.read_global_queue`).
+    #[must_use]
+    pub fn global_reads(&self) -> Vec<(u64, u128)> {
+        self.read_global_queue
+            .iter()
+            .map(|&id| {
+                let read = self.reads[id].as_ref().unwrap_or_else(|| unreachable!("live read"));
+                (read.address, read.checksum)
+            })
+            .collect()
+    }
+
     /// Contents of a block (read-only view for tests and upcoming slices).
     #[must_use]
     pub fn block(&self, location: u32) -> &[u8] {

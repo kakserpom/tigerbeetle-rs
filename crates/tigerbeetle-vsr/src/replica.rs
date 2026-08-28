@@ -14,6 +14,7 @@
 // computation, and construction logic so that other modules can reference it.
 
 use tigerbeetle_core::constants;
+use tigerbeetle_core::stdx::Instant;
 use tigerbeetle_core::stdx::prng::Prng;
 
 use crate::command::Command;
@@ -146,6 +147,12 @@ pub struct Replica {
     pub grid_repair_message_budget: RepairBudgetGrid,
     /// Deterministic PRNG for repair-selection shuffles (upstream `prng`).
     pub prng: Prng,
+    /// The most recent monotonic clock value, in nanoseconds, used to stamp
+    /// grid repair budget requests.
+    ///
+    /// DEVIATION: upstream reads `self.clock.monotonic()` on demand; the
+    /// sans-IO replica has no clock, so the owner's tick provides it.
+    pub monotonic_now: u64,
     /// In-flight `GetBlocks` serve reads, keyed by grid read token, indexed
     /// before every request so a block is only ever fetched once per remote
     /// replica (upstream `replica.grid_reads`).
@@ -488,6 +495,7 @@ impl Replica {
                 replica_count: replica_count as u8,
             }),
             prng: Prng::from_seed(u64::from(replica_index)),
+            monotonic_now: 0,
             commit_fault: FaultDetector::new(0, 100, 2_000),
             heartbeat_timestamp: 0,
             exit_view_from_all_replicas: 0,
@@ -1592,6 +1600,7 @@ impl Replica {
         // Stop driving repairs while the journal may be inconsistent with the
         // new view (upstream `replica.zig:10231`).
         self.journal_repair_timeout.stop();
+        self.grid_repair_timeout.stop();
         self.send_join_view();
     }
 
@@ -1670,13 +1679,13 @@ impl Replica {
             assert!(self.pipeline_queue.prepare_queue.is_empty());
         }
 
-        // DEVIATION: upstream additionally starts get_view_message_timeout,
-        // repair_sync_timeout, grid_repair/scrub timeouts (none exist sans-IO
-        // yet) and resets `commit_mins` / `head_ops` EWMA history.
-        //
-        // The grid repair timeout field lives on `Replica` but is armed only
-        // from the grid-repair integration (see `on_grid_repair_timeout`).
+        // DEVIATION: upstream additionally starts get_view_message_timeout and
+        // repair_sync_timeout, and resets `commit_mins` / `head_ops` EWMA history.
         self.journal_repair_timeout = Timeout::start(constants::JOURNAL_REPAIR_TIMEOUT);
+        // Upstream starts the grid repair timeout with `100 / tick_ms` ticks
+        // (replica.zig:9921); sans-IO ticks are unitless, so it uses the same
+        // fixed cadence as the journal repair timeout.
+        self.grid_repair_timeout = Timeout::start(constants::GRID_REPAIR_TIMEOUT);
 
         self.heartbeat_timestamp = 0;
         // A replica reports its own ExitView only while it thinks the primary
@@ -2200,6 +2209,7 @@ impl Replica {
     ///
     /// Upstream: `src/vsr/replica.zig:1532` (`tick`).
     pub fn tick(&mut self, now: u64) {
+        self.monotonic_now = now;
         if self.status == Status::Normal {
             self.tick_normal_heartbeat_fault(now);
         }
@@ -2227,6 +2237,9 @@ impl Replica {
         }
         if self.journal_repair_timeout.tick() {
             self.on_journal_repair_timeout();
+        }
+        if self.grid_repair_timeout.tick() {
+            self.on_grid_repair_timeout();
         }
     }
 
@@ -2510,6 +2523,7 @@ impl Replica {
     ///
     /// Upstream: message receive path (`message_bus` → per-command handlers).
     pub fn on_message(&mut self, message: &crate::message::Message, now: u64) {
+        self.monotonic_now = now;
         // Parse the base header frame (no command-specific validation).
         let some_frame: Option<&[u8; message_header::SIZE]> = message.frame().try_into().ok();
         let Some(frame) = some_frame else {
@@ -2539,6 +2553,7 @@ impl Replica {
             Command::Headers => self.on_headers(message),
             Command::GetView => self.on_get_view(message),
             Command::GetBlocks => self.on_get_blocks(message),
+            Command::Block => self.on_block(message),
             // TODO(port): remaining message handlers.
             Command::Reply
             | Command::Ping
@@ -2551,8 +2566,7 @@ impl Replica {
             | Command::Deprecated23
             | Command::Reserved
             | Command::PongClient
-            | Command::Eviction
-            | Command::Block => {}
+            | Command::Eviction => {}
         }
     }
 
@@ -2693,6 +2707,157 @@ impl Replica {
         let mut reply = crate::message::Message::new();
         reply.buffer_mut()[..constants::BLOCK_SIZE].copy_from_slice(&block_bytes);
         self.send_queue.push(reply);
+    }
+
+    /// Request missing blocks from `destination` (upstream
+    /// `src/vsr/replica.zig:11229` `send_get_blocks`).
+    ///
+    /// # Panics
+    /// Panics if the destination is self, the grid is not mounted, or (in a
+    /// multi-replica cluster) the destination's repair budget is exhausted.
+    #[allow(clippy::field_reassign_with_default)] // typed header: reserved fields private
+    pub fn send_get_blocks(&mut self, destination: u8) {
+        assert!(self.grid_repair_timeout.active);
+        assert!(self.grid.is_some()); // Upstream `grid.callback != .cancel`.
+        assert_ne!(destination, self.replica_u8());
+
+        if self.replica_count > 1 {
+            assert!(
+                self.grid_repair_message_budget.budget_available(destination)
+                    >= u32::from(constants::GRID_REPAIR_REQUEST_MAX)
+            );
+        }
+
+        // The slot split in upstream trades requests between
+        // `blocks_missing.faulty_blocks` and `read_global_queue`. This port has
+        // no BlockMissing bookkeeping (DEVIATION), so only parked coherent
+        // reads are requested, and the whole buffer goes to `read_global_queue`.
+        let now = Instant { ns: self.monotonic_now };
+        let mut requested = Vec::new();
+        {
+            let grid = self
+                .grid
+                .as_ref()
+                .unwrap_or_else(|| unreachable!("grid is mounted (asserted above)"));
+            for (address, checksum) in grid
+                .global_reads()
+                .into_iter()
+                .take(usize::from(constants::GRID_REPAIR_REQUEST_MAX))
+            {
+                assert!(!grid.free_set_is_free(address)); // Upstream replica.zig:11321.
+                if self.grid_repair_message_budget.decrement(
+                    crate::BlockReference { checksum, address },
+                    destination,
+                    now,
+                ) {
+                    requested.push((address, checksum));
+                }
+            }
+        }
+
+        if requested.is_empty() {
+            return;
+        }
+
+        let body: Vec<u8> = requested
+            .iter()
+            .flat_map(|(address, checksum)| {
+                let mut request = vec![0_u8; size_of::<crate::BlockRequest>()];
+                request[0..16].copy_from_slice(&checksum.to_le_bytes());
+                request[16..24].copy_from_slice(&address.to_le_bytes());
+                request
+            })
+            .collect();
+
+        let mut header = message_header::GetBlocks::default();
+        header.cluster = self.cluster;
+        header.replica = self.replica_u8();
+        header.size = u32::try_from(message_header::SIZE + body.len())
+            .unwrap_or_else(|_| unreachable!("get_blocks size is far below u32::MAX"));
+        header.set_checksum_body(&body);
+        header.set_checksum();
+
+        let mut message = crate::message::Message::new();
+        message.set_header(&header);
+        message.set_body(&body);
+        self.send_queue.push(message);
+    }
+
+    /// Handle a repair Block from a remote replica: fulfill parked coherent
+    /// reads and persist the block (upstream `src/vsr/replica.zig:3453`
+    /// `on_block`).
+    pub fn on_block(&mut self, message: &crate::message::Message) {
+        let Some(block) = message.header::<message_header::Block>() else {
+            return;
+        };
+        if !block.valid_checksum() || !block.valid_checksum_body(message.body_used()) {
+            return;
+        }
+        if block.invalid_header().is_some() {
+            return;
+        }
+
+        if self.grid.is_none() {
+            return; // Upstream `grid.callback == .cancel`.
+        }
+
+        // The block may be shorter than `block_size`; pad with zeros so the
+        // grid can store a full block (upstream copies into a full `BlockPtr`).
+        let size = block.size as usize;
+        let mut full_block = vec![0_u8; constants::BLOCK_SIZE];
+        full_block[..size].copy_from_slice(&message.buffer()[..size]);
+        let address = block.address;
+        let checksum = block.checksum;
+
+        let fulfilled = {
+            let (Some(grid), Some(storage)) = (&mut self.grid, &mut self.grid_storage) else {
+                unreachable!("grid is mounted above");
+            };
+            let fulfilled = grid.fulfill_block(&full_block);
+            if fulfilled {
+                // Persist the repair so the block survives restarts.
+                // DEVIATION: upstream writes only when the block was in
+                // `blocks_missing.faulty_blocks` (`repair_block_waiting`);
+                // this port has no BlockMissing tracking, so every fulfilled
+                // repair block is durably written.
+                let location = grid.get_block();
+                grid.block_mut(location).copy_from_slice(&full_block);
+                let _ = grid.repair_block(storage, location);
+            }
+            fulfilled
+        };
+
+        if fulfilled {
+            self.grid_repair_message_budget.increment(crate::BlockReference { checksum, address });
+            if let Some(destination) =
+                self.grid_repair_message_budget.next_destination(&mut self.prng)
+            {
+                self.send_get_blocks(destination);
+            }
+        }
+    }
+
+    /// Periodic grid-repair driver: re-arm the cadence, reap expired budget
+    /// requests, and request blocks from a random replica with budget left.
+    ///
+    /// Upstream: `src/vsr/replica.zig:3815` (`on_grid_repair_timeout`).
+    ///
+    /// # Panics
+    /// Panics if the grid repair timeout is not active (the replica must be
+    /// in `Normal` status with the timeout armed).
+    pub fn on_grid_repair_timeout(&mut self) {
+        assert!(self.grid_repair_timeout.active);
+        // Upstream uses `reset_with_jitter`; sans-IO is deterministic, so we
+        // re-arm with a fixed cadence (DEVIATION).
+        self.grid_repair_timeout.reset(constants::GRID_REPAIR_TIMEOUT);
+        self.grid_repair_message_budget.reap_expired_requests(Instant { ns: self.monotonic_now });
+
+        if self.grid.is_some()
+            && let Some(destination) =
+                self.grid_repair_message_budget.next_destination(&mut self.prng)
+        {
+            self.send_get_blocks(destination);
+        }
     }
 
     /// Whether a JoinView/View message should be dropped before processing.
@@ -3503,6 +3668,17 @@ impl Replica {
             return;
         }
 
+        // Grid repair step (upstream replica.zig:7552): request remote blocks
+        // for parked coherent reads. Unlike the journal steps below this runs
+        // before the status asserts, matching upstream, where it precedes
+        // `state_machine_opened`.
+        if self.grid.is_some()
+            && let Some(destination) =
+                self.grid_repair_message_budget.next_destination(&mut self.prng)
+        {
+            self.send_get_blocks(destination);
+        }
+
         assert!(self.status == Status::Normal || self.status == Status::ViewChange);
         assert!(self.repairs_allowed());
 
@@ -4249,6 +4425,91 @@ mod tests {
         r.on_message(&request, 0);
         assert!(r.send_queue.is_empty());
         assert!(r.grid_serve_reads.is_empty());
+    }
+
+    #[test]
+    fn on_block_repairs_parked_reads_and_persists() {
+        // Two replicas in one cluster: r0 holds the block, r1's coherent read
+        // for it is parked in the grid read-global queue (nothing stored
+        // locally), so the grid repair timeout requests it over the
+        // GetBlocks/Block protocol.
+        let mut r0 = Replica::new(CLUSTER, 0, 2);
+        mount_test_grid(&mut r0);
+        let (address, checksum, expected) = {
+            let (grid, storage) = r0.grid_mut();
+            write_block(grid, storage)
+        };
+
+        let mut r1 = Replica::new(CLUSTER, 1, 2);
+        mount_test_grid(&mut r1);
+        // r1's free set must also consider the address allocated for its
+        // coherent read to be legal (`read_block` asserts non-free).
+        {
+            let (grid, _storage) = r1.grid_mut();
+            let reservation = grid.reserve(1);
+            assert_eq!(grid.acquire(reservation), address);
+        }
+        r1.status = Status::Normal;
+        r1.grid_repair_timeout = Timeout::start(constants::GRID_REPAIR_TIMEOUT);
+
+        // Park the coherent read: storage holds no block at `address`.
+        {
+            let (grid, storage) = r1.grid_mut();
+            grid.read_block(
+                storage,
+                address,
+                checksum,
+                true,
+                ReadOptions { cache_read: true, cache_write: false },
+            );
+            grid.poll(storage);
+            assert_eq!(grid.read_global_queue_len(), 1);
+        }
+
+        // The grid repair timeout picks a peer with budget left and requests.
+        r1.on_grid_repair_timeout();
+        assert_eq!(r1.send_queue.len(), 1);
+        let get_blocks = r1.send_queue.remove(0);
+        let request = get_blocks.header::<message_header::GetBlocks>().expect("get_blocks");
+        assert!(request.valid_checksum());
+        assert!(request.valid_checksum_body(get_blocks.body_used()));
+        assert_eq!(request.replica, 1);
+        assert_eq!(request.cluster, CLUSTER);
+
+        // r0 serves it: the reply message *is* the block.
+        r0.on_message(&get_blocks, 0);
+        r0.poll_grid();
+        assert_eq!(r0.send_queue.len(), 1);
+        let reply = r0.send_queue.remove(0);
+        assert_eq!(reply.buffer(), expected.as_slice());
+
+        // r1 receives the repair block: the parked read is fulfilled, the
+        // budget is replenished, and nothing further needs requesting.
+        r1.on_message(&reply, 0);
+        assert_eq!(r1.send_queue.len(), 0);
+        assert_eq!(r1.grid_mut().0.read_global_queue_len(), 0, "parked read fulfilled");
+        // Complete the durable repair-block write to storage.
+        r1.poll_grid();
+
+        // A fresh coherent read now resolves from storage (the block persisted).
+        let (grid, storage) = r1.grid_mut();
+        let token = grid.read_block(
+            storage,
+            address,
+            checksum,
+            true,
+            ReadOptions { cache_read: true, cache_write: false },
+        );
+        grid.poll(storage);
+        let events = grid.take_events();
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                Event::ReadDone { token: done_token, result: ReadBlockResult::Valid, .. }
+                    if *done_token == token
+            )),
+            "fresh read of the repaired block succeeds"
+        );
     }
 
     #[test]
