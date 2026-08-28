@@ -5360,6 +5360,20 @@ mod tests {
         message
     }
 
+    /// Commits a register for `client` at the next op, returning that op
+    /// (its commit number becomes the client's session number).
+    fn register_client(r: &mut Replica, client: u128) -> u64 {
+        let op = r.primary_pipeline_prepare(client, 0, crate::Operation::REGISTER, 0, 0).unwrap();
+        r.commit_max = op;
+        r.commit_prepare = Some(op);
+        r.commit_stage = CommitStage::Execute;
+        r.commit_execute();
+        assert_eq!(r.client_sessions.get(client).expect("registered session").session, op,);
+        r.send_queue.clear();
+        r.client_send_queue.clear();
+        op
+    }
+
     #[test]
     fn grid_mount_and_repair_budget_construction() {
         let mut r = Replica::new(CLUSTER, 1, 3);
@@ -6573,6 +6587,72 @@ mod tests {
         r.on_message(&request_message(9, 1, crate::Operation::NOOP), 0);
         assert_eq!(r.op, 2, "waiting for the in-pipeline register: nothing prepared");
         assert!(r.client_send_queue.is_empty(), "no eviction while the register is pending");
+    }
+
+    #[test]
+    fn on_request_evicts_oldest_registration_at_capacity() {
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        r.status = Status::Normal;
+
+        // Fill the client table (test_min: 7 slots) with clients 1..=7.
+        for client in 1..=constants::CLIENTS_MAX {
+            register_client(&mut r, u128::from(client));
+        }
+        assert_eq!(r.client_sessions.count(), constants::CLIENTS_MAX as usize);
+
+        // The next registration evicts the oldest entry (commit 1): client 1.
+        register_client(&mut r, 8);
+        assert_eq!(r.client_sessions.count(), constants::CLIENTS_MAX as usize);
+        assert_eq!(r.client_sessions.get(1), None, "the oldest registration is evicted",);
+        assert_eq!(r.client_sessions.get(8).expect("newest session").session, 8);
+
+        // The evicted client is now unknown: its next request is evicted with
+        // `no_session`.
+        r.on_message(&request_message(1, 1, crate::Operation::NOOP), 0);
+        let evicted = r
+            .client_send_queue
+            .last()
+            .expect("eviction")
+            .header::<message_header::Eviction>()
+            .expect("eviction header");
+        assert_eq!(evicted.reason(), Some(message_header::Reason::NoSession));
+        assert_eq!(evicted.client, 1);
+        assert_eq!(r.op, 8, "no request may prepare");
+    }
+
+    #[test]
+    fn on_request_evicts_session_too_low_after_slot_reuse() {
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        r.status = Status::Normal;
+
+        // Client 1 registers first (session 1), then the table fills around it,
+        // and client 8's registration evicts it.
+        for client in 1..=constants::CLIENTS_MAX {
+            register_client(&mut r, u128::from(client));
+        }
+        register_client(&mut r, 8);
+        assert_eq!(r.client_sessions.get(1), None);
+
+        // Client 1 re-registers: its new session (9) exceeds the old one.
+        register_client(&mut r, 1);
+        assert_eq!(r.client_sessions.get(1).expect("re-registered session").session, 9);
+
+        // A stale request still carrying the client's pre-eviction session is
+        // evicted with `session_too_low`: that session number now belongs to a
+        // newer registration of the same client.
+        r.on_message(
+            &request_message_full(1, 1, crate::Operation::NOOP, 1, 0, message_header::SIZE as u32),
+            0,
+        );
+        let evicted = r
+            .client_send_queue
+            .last()
+            .expect("eviction")
+            .header::<message_header::Eviction>()
+            .expect("eviction header");
+        assert_eq!(evicted.reason(), Some(message_header::Reason::SessionTooLow));
+        assert_eq!(evicted.client, 1);
+        assert_eq!(r.op, 9, "no request may prepare");
     }
 
     fn get_reply_message(
