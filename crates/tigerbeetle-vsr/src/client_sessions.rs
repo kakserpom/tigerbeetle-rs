@@ -282,6 +282,18 @@ impl ClientSessions {
         Some(entry)
     }
 
+    /// # Panics
+    /// Panics if the entry is absent or internally inconsistent (upstream asserts).
+    #[must_use]
+    pub fn get_mut(&mut self, client: u128) -> Option<&mut Entry> {
+        let entry_index = *self.entries_by_client.get(&client)?;
+        let entry = &mut self.entries[entry_index];
+        assert_ne!(entry.session, 0);
+        assert_eq!(entry.header.command, crate::command::Command::Reply);
+        assert_eq!(entry.header.client, client);
+        Some(entry)
+    }
+
     #[must_use]
     pub fn get_slot_for_client(&self, client: u128) -> Option<ReplySlot> {
         let index = *self.entries_by_client.get(&client)?;

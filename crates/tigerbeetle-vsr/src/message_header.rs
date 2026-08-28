@@ -31,6 +31,10 @@ pub const SIZE: usize = 256;
 /// [`SIZE`] as the wire `size` field's type (upstream `@sizeOf(Header)`).
 pub const SIZE_U32: u32 = SIZE as u32;
 
+/// [`size_of::<crate::RegisterResult>()`] as the wire `size` field's type
+/// (upstream `@sizeOf(vsr.RegisterResult)`).
+pub const REGISTER_RESULT_SIZE_U32: u32 = size_of::<crate::RegisterResult>() as u32;
+
 /// The vsr checksum of an empty body (upstream: `vsr.checksum(&.{})`).
 #[must_use]
 pub fn checksum_body_empty() -> u128 {

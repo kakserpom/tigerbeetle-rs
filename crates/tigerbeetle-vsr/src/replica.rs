@@ -1303,6 +1303,23 @@ impl Replica {
 
         // Execute on state machine.
         // TODO(port): state_machine.execute(commit_prepare.body_used())
+
+        // Construct the client reply from the committed prepare and update the
+        // client sessions table (upstream `execute_op`: replica.zig:5391-5523).
+        // Runs on the primary and backups alike: any replica can answer a
+        // client's GetReply.
+        if let Some(prepare) = self.journal.header_with_op(op).copied() {
+            let reply = Self::build_reply(&prepare);
+
+            match reply.operation {
+                crate::Operation::REGISTER => self.client_table_entry_create(&reply),
+                crate::Operation::PULSE | crate::Operation::UPGRADE => {
+                    assert_eq!(reply.client, 0);
+                }
+                _ => self.client_table_entry_update(&reply),
+            }
+        }
+
         self.commit_op(op);
         assert!(self.commit_min <= self.commit_max);
 
@@ -1325,6 +1342,124 @@ impl Replica {
                 assert!(result.is_ok(), "popped request must be preparable");
             }
         }
+    }
+
+    /// Construct a client `Reply` for a committed prepare.
+    ///
+    /// The reply's `operation`, `client`, `request` and `request_checksum`
+    /// echo the prepare; `commit` is the prepare's op; `context` is the reply's
+    /// stable-with-view checksum so a retransmitted reply stays valid
+    /// (upstream replica.zig:5466-5486).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the prepare's operation is `.root` or `.reserved`.
+    ///
+    /// DEVIATION: upstream sizes the reply according to the state machine's
+    /// result (`.register` bodies carry a `RegisterResult`; state-machine
+    /// operations carry a `StateMachine.Result`). sans-IO the state machine
+    /// execute and the request/result bodies are deferred, so only the reply
+    /// header is built: empty-bodied except for `.register`, whose
+    /// `RegisterResult` size is preserved (the `batch_size_limit` contents are
+    /// zeroed — upstream copies them from the register request body).
+    fn build_reply(prepare: &message_header::Prepare) -> message_header::Reply {
+        assert_ne!(prepare.operation, crate::Operation::ROOT);
+        assert_ne!(prepare.operation, crate::Operation::RESERVED);
+
+        let mut reply = message_header::Reply {
+            cluster: prepare.cluster,
+            replica: prepare.replica,
+            view: prepare.view,
+            release: prepare.release,
+            op: prepare.op,
+            commit: prepare.op,
+            timestamp: prepare.timestamp,
+            client: prepare.client,
+            request: prepare.request,
+            operation: prepare.operation,
+            request_checksum: prepare.request_checksum,
+            size: message_header::SIZE_U32,
+            ..message_header::Reply::default()
+        };
+        // DEVIATION: the reply body is deferred (see above), so the checksum
+        // covers an empty body even for operations that carry one upstream.
+        reply.set_checksum_body(&[]);
+        if reply.operation == crate::Operation::REGISTER {
+            // Inflate the size to carry a `RegisterResult` alongside a
+            // checksum computed over the empty (deferred) body.
+            reply.size += message_header::REGISTER_RESULT_SIZE_U32;
+        }
+        // `context` is the reply's checksum computed with a fixed view,
+        // allowing the reply to be retransmitted in a newer view
+        // (upstream replica.zig:5484-5485).
+        reply.context = reply.calculate_checksum();
+        reply.set_checksum();
+        reply
+    }
+
+    /// Record a newly registered client's session on commit.
+    ///
+    /// The register op's commit number becomes the client's session number.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless the reply is a valid register reply, or when the session
+    /// table is already full and has no eviction candidate (upstream asserts).
+    ///
+    /// Upstream: `src/vsr/replica.zig:5692` (`client_table_entry_create`).
+    fn client_table_entry_create(&mut self, reply: &message_header::Reply) {
+        assert_eq!(reply.command, crate::command::Command::Reply);
+        assert_eq!(reply.operation, crate::Operation::REGISTER);
+        assert_ne!(reply.client, 0);
+        assert_eq!(reply.op, reply.commit);
+        assert_eq!(reply.size, message_header::SIZE_U32 + message_header::REGISTER_RESULT_SIZE_U32);
+
+        let session = reply.commit; // The commit number becomes the session number.
+        let request = reply.request;
+        // The `0` commit number is reserved for the cluster `.root` operation.
+        assert_ne!(session, 0);
+        assert_eq!(request, 0);
+
+        let clients_max = constants::CLIENTS_MAX as usize;
+        let clients = self.client_sessions.count();
+        assert!(clients <= clients_max);
+        if clients == clients_max {
+            let evictee = self.client_sessions.evictee();
+            self.client_sessions.remove(evictee);
+            assert_eq!(self.client_sessions.count(), clients_max - 1);
+        }
+
+        let _ = self.client_sessions.put(session, reply);
+        assert!(self.client_sessions.count() <= clients_max);
+    }
+
+    /// Update a registered client's latest reply on commit.
+    ///
+    /// If the client's session was evicted while preparing, there is nothing to
+    /// update (the next request will receive an eviction from the primary).
+    ///
+    /// Upstream: `src/vsr/replica.zig:5750` (`client_table_entry_update`).
+    fn client_table_entry_update(&mut self, reply: &message_header::Reply) {
+        assert_eq!(reply.command, crate::command::Command::Reply);
+        assert_ne!(reply.operation, crate::Operation::REGISTER);
+        assert_ne!(reply.client, 0);
+        assert_eq!(reply.op, reply.commit);
+        assert_ne!(reply.commit, 0);
+        assert_ne!(reply.request, 0);
+
+        if let Some(entry) = self.client_sessions.get_mut(reply.client) {
+            assert_eq!(entry.header.command, crate::command::Command::Reply);
+            assert_eq!(entry.header.op, entry.header.commit);
+            assert!(entry.header.commit >= entry.session);
+            assert_eq!(entry.header.client, reply.client);
+            assert_eq!(entry.header.request + 1, reply.request);
+            assert!(entry.header.op < reply.op);
+            assert!(entry.header.commit < reply.commit);
+            assert_eq!(entry.header.release.value, reply.release.value);
+
+            entry.header = *reply;
+        }
+        // Else: the session was evicted while preparing; nothing to update.
     }
 
     /// Stage: CheckpointDurable — mark the checkpoint as durable.
@@ -5359,6 +5494,96 @@ mod tests {
         assert_eq!(header.client, 7);
         assert_eq!(header.request, 9);
         assert_eq!(header.operation, crate::Operation::NOOP);
+    }
+
+    #[test]
+    fn commit_execute_register_creates_session() {
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        r.status = Status::Normal;
+
+        // A register op (request 0, per Request::invalid_header) at commit 1.
+        let op = r.primary_pipeline_prepare(7, 0, crate::Operation::REGISTER, 0).unwrap();
+        assert_eq!(op, 1);
+        r.commit_max = 1;
+        r.commit_prepare = Some(1);
+        r.commit_stage = CommitStage::Execute;
+        r.commit_execute();
+
+        assert_eq!(r.client_sessions.count(), 1);
+        let entry = r.client_sessions.get(7).expect("registered client");
+        // The register op's commit number becomes the session number.
+        assert_eq!(entry.session, 1);
+        assert_eq!(entry.header.operation, crate::Operation::REGISTER);
+        assert_eq!(entry.header.client, 7);
+        assert_eq!(entry.header.op, 1);
+        assert_eq!(entry.header.commit, 1);
+        assert_eq!(entry.header.request, 0);
+        assert_eq!(
+            entry.header.size,
+            message_header::SIZE_U32 + message_header::REGISTER_RESULT_SIZE_U32
+        );
+        assert_ne!(entry.header.context, 0, "stable-with-view reply checksum");
+        assert!(entry.header.valid_checksum());
+    }
+
+    #[test]
+    fn commit_execute_noop_updates_registered_session() {
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        r.status = Status::Normal;
+
+        // Register client 7 (commit 1).
+        let op = r.primary_pipeline_prepare(7, 0, crate::Operation::REGISTER, 0).unwrap();
+        assert_eq!(op, 1);
+        r.commit_max = 1;
+        r.commit_prepare = Some(1);
+        r.commit_stage = CommitStage::Execute;
+        r.commit_execute();
+
+        let entry = r.client_sessions.get(7).expect("registered client");
+        assert_eq!(entry.session, 1);
+        assert_eq!(entry.header.request, 0);
+
+        // Client 7's next request (request 1, noop) commits as op 2.
+        let op = r.primary_pipeline_prepare(7, 1, crate::Operation::NOOP, 0).unwrap();
+        assert_eq!(op, 2);
+        r.commit_max = 2;
+        r.commit_prepare = Some(2);
+        r.commit_stage = CommitStage::Execute;
+        r.commit_execute();
+
+        let entry = r.client_sessions.get(7).expect("registered client");
+        assert_eq!(r.client_sessions.count(), 1);
+        // The session number stays the register's commit; the header is the
+        // client's latest committed reply.
+        assert_eq!(entry.session, 1);
+        assert_eq!(entry.header.operation, crate::Operation::NOOP);
+        assert_eq!(entry.header.request, 1);
+        assert_eq!(entry.header.op, 2);
+        assert_eq!(entry.header.commit, 2);
+    }
+
+    #[test]
+    fn commit_execute_skips_unregistered_client() {
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        r.status = Status::Normal;
+
+        // Register client 7 (commit 1), then commit a noop for client 8.
+        let op = r.primary_pipeline_prepare(7, 0, crate::Operation::REGISTER, 0).unwrap();
+        assert_eq!(op, 1);
+        r.commit_max = 1;
+        r.commit_prepare = Some(1);
+        r.commit_stage = CommitStage::Execute;
+        r.commit_execute();
+
+        let op = r.primary_pipeline_prepare(8, 1, crate::Operation::NOOP, 0).unwrap();
+        assert_eq!(op, 2);
+        r.commit_max = 2;
+        r.commit_prepare = Some(2);
+        r.commit_stage = CommitStage::Execute;
+        r.commit_execute();
+
+        assert_eq!(r.client_sessions.count(), 1, "unregistered client creates no entry");
+        assert!(r.client_sessions.get(8).is_none());
     }
 
     #[test]
