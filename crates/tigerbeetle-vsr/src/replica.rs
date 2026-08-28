@@ -2836,6 +2836,9 @@ impl Replica {
                 // self-ack here).
                 if !self.is_primary() {
                     self.send_prepare_ok(&prepare);
+                    // Opportunistically repair any gaps this prepare exposed
+                    // (upstream defer: replica.zig:2111-2116).
+                    self.repair();
                 }
             }
             OnPrepareResult::Stale => {
@@ -2883,6 +2886,205 @@ impl Replica {
         self.op = op - 1;
         assert!(self.op >= self.commit_min);
         assert_eq!(self.op + 1, op);
+    }
+
+    /// Whether this replica may currently repair (request or serve repairs).
+    ///
+    /// # Panics
+    ///
+    /// Panics if in `.view_change` with a quorum but not the would-be primary
+    /// (an invariant of the transition, upstream replica.zig:8444).
+    ///
+    /// Upstream: `src/vsr/replica.zig:8440` (`repairs_allowed`).
+    #[must_use]
+    pub fn repairs_allowed(&self) -> bool {
+        match self.status {
+            Status::ViewChange => {
+                // Becoming primary requires a repair of the journal first; a
+                // backup mid-transition must stay quiet (upstream 8442-8447).
+                if self.join_view_quorum {
+                    assert_eq!(
+                        Replica::primary_index_for_view(self.view, self.replica_count),
+                        u16::from(self.replica_u8())
+                    );
+                    true
+                } else {
+                    false
+                }
+            }
+            Status::Normal => true,
+            _ => false,
+        }
+    }
+
+    /// The largest op that may be requested during repair.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the head has moved beyond what the WAL can hold (an invariant
+    /// that the checkpoint/commit machinery enforces).
+    ///
+    /// Upstream: `src/vsr/replica.zig:7243` (`op_repair_max`).
+    #[must_use]
+    pub fn op_repair_max(&self) -> u64 {
+        assert!(self.op >= self.op_checkpoint());
+        assert!(self.op <= self.op_prepare_max_sync());
+        assert!(self.op <= self.commit_max + u64::from(constants::PIPELINE_PREPARE_QUEUE_MAX));
+        self.commit_max.min(self.op_prepare_max_sync().max(self.op))
+    }
+
+    /// Choose a peer to send repair requests to.
+    ///
+    /// DEVIATION: upstream rotates through peers with a PRNG to spread load;
+    /// sans-IO we deterministically pick the next replica index.
+    ///
+    /// # Panics
+    ///
+    /// Panics if this is a solo replica (nothing to repair from) or the cluster
+    /// is larger than `u8::MAX` replicas.
+    ///
+    /// Upstream: `src/vsr/replica.zig:4268` (`choose_any_other_replica`).
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)] // replica_count <= u8::MAX asserted above
+    pub fn choose_any_other_replica(&self) -> u8 {
+        assert!(self.replica_count > 1);
+        assert!(self.replica_count <= u16::from(u8::MAX) + 1);
+        let other = (u16::from(self.replica_u8()) + 1) % self.replica_count;
+        assert_ne!(other, u16::from(self.replica_u8()));
+        other as u8
+    }
+
+    /// Request the prepare for `op` (whose header we hold, dirty) from a peer.
+    ///
+    /// Upstream: `src/vsr/replica.zig:8311` (`repair_prepare`).
+    ///
+    /// DEVIATION: no write budget, pipeline cache, or `journal.writing`
+    /// consultation; upstream further has a mode that requests an
+    /// *unknown*-checksum prepare with `view` + checksum 0, which the view-0
+    /// explicit-checksum `GetPrepare` form of this port cannot express —
+    /// unknown-checksum ops are covered by the `GetHeaders` break path instead
+    /// (they repair in as a header first, then get their body here).
+    ///
+    /// # Panics
+    ///
+    /// Panics if not `.normal`/`.view_change` or if repairs are not allowed.
+    ///
+    /// Upstream: `src/vsr/replica.zig:8311` (`repair_prepare`).
+    fn repair_prepare(&mut self, op: u64) {
+        assert!(self.status == Status::Normal || self.status == Status::ViewChange);
+        assert!(self.repairs_allowed());
+        let Some(header) = self.journal.header_with_op(op).copied() else {
+            return;
+        };
+        let to = self.choose_any_other_replica();
+        self.send_get_prepare(to, op, header.checksum());
+    }
+
+    /// Repair every op in `op_min..=op_max` that lacks a clean prepare.
+    ///
+    /// # Panics
+    ///
+    /// Panics if repairs are not allowed, if the range strays outside
+    /// `[op_repair_min, op]`, or if `op_min > op_max`.
+    ///
+    /// Upstream: `src/vsr/replica.zig:8220` (`repair_prepares_between`).
+    fn repair_prepares_between(&mut self, op_min: u64, op_max: u64) {
+        assert!(self.status == Status::Normal || self.status == Status::ViewChange);
+        assert!(self.repairs_allowed());
+        assert!(op_min >= self.op_repair_min());
+        assert!(op_min <= op_max);
+        assert!(op_max <= self.op);
+
+        // DEVIATION: no IOP/write budget to schedule against — request every op
+        // whose slot is absent or dirty (the repair-message budget is deferred).
+        for op in op_min..=op_max {
+            let missing_or_dirty =
+                self.journal.slot_with_op(op).is_none_or(|slot| self.journal.dirty.bit(slot));
+            if missing_or_dirty {
+                self.repair_prepare(op);
+            }
+        }
+    }
+
+    /// Detect missing/divergent headers and prepares in the journal and repair
+    /// them from peers.
+    ///
+    /// In normal operation this runs opportunistically after a prepare is
+    /// accepted ([`Self::on_prepare_message`]) and after every `Headers`
+    /// response ([`Self::on_headers`]).
+    ///
+    /// DEVIATION (deferred): the `journal_repair_timeout` gate, `GetView` /
+    /// `view_headers` head advancement, grid `GetBlocks` repair,
+    /// `repair_clean_out_of_bound_prepares`, and the view-change primary's
+    /// `primary_send_view` steps are not ported yet — `repair()` is a manual
+    /// trigger that the harness calls when it wants a pass.
+    ///
+    /// # Panics
+    ///
+    /// Panics if not `.normal`/`.view_change`, if the journal head advances
+    /// further than a pipeline beyond the commit frontier, or if the journal
+    /// head op is absent.
+    ///
+    /// Upstream: `src/vsr/replica.zig:7544` (`repair`).
+    pub fn repair(&mut self) {
+        assert!(self.status == Status::Normal || self.status == Status::ViewChange);
+        assert!(self.repairs_allowed());
+
+        assert!(self.op_checkpoint() <= self.op);
+        assert!(self.op_checkpoint() <= self.commit_min);
+        assert!(self.commit_min <= self.op);
+        assert!(self.commit_min <= self.commit_max);
+        assert!(
+            self.commit_max
+                >= self.op.saturating_sub(u64::from(constants::PIPELINE_PREPARE_QUEUE_MAX))
+        );
+        assert!(self.journal.header_with_op(self.op).is_some());
+
+        // The op is from the current view; anything that hash-chains to it is
+        // worth repairing (upstream 7608-7619). Wait for view-change primaries.
+
+        let repair_op_max: u64 = if self.status == Status::ViewChange {
+            // View-changing replicas repair unconditionally.
+            self.op
+        } else {
+            // Missing prepares within a pipeline of ops from the head may arrive
+            // via normal replication; wait for them (upstream 7635).
+            self.op.saturating_sub(u64::from(constants::PIPELINE_PREPARE_QUEUE_MAX))
+        };
+
+        // Request any missing or disconnected headers:
+        let header_break =
+            self.journal.find_latest_headers_break_between(self.op_repair_min(), self.op);
+        if let Some(range) = header_break {
+            assert!(self.replica_count > 1);
+            assert!(range.op_min >= self.op_repair_min());
+            assert!(range.op_max < self.op);
+
+            if range.op_min <= repair_op_max {
+                let op_max = range.op_max.min(repair_op_max);
+                assert!(range.op_min <= op_max);
+                // Pessimistically request extra headers: sends are inexpensive
+                // and it may save extra round-trips (upstream 7672-7676).
+                let to = self.choose_any_other_replica();
+                self.send_get_headers(to, range.op_min, op_max);
+            }
+        }
+
+        // First priority is committing further; only then repairing committed
+        // prepares at risk of eviction (upstream 7682-7686):
+        if self.commit_min < repair_op_max {
+            self.repair_prepares_between(self.commit_min + 1, repair_op_max);
+        }
+        if self.op_repair_min() <= self.commit_min {
+            self.repair_prepares_between(self.op_repair_min(), self.commit_min);
+        }
+
+        if self.commit_min < self.commit_max {
+            // Commit what we can even eagerly — discovering missing prepares
+            // drives further repairs (upstream 7697-7705).
+            assert!(self.replica_count > 1);
+            self.commit_journal();
+        }
     }
 
     /// Handle a repair Prepare: one we already hold, or one that may replace a
@@ -3138,9 +3340,10 @@ impl Replica {
         for header in &received {
             self.repair_header(header);
         }
-        // TODO(port): `repair()` orchestration (GetView/GetHeaders re-requests,
-        // prepare repairs, budgets) is deferred; `on_prepare`/`on_commit` drive
-        // forward progress directly for now.
+        // Repair whatever the newly-installed headers left outstanding: dirty
+        // prepares above commit_min still need their bodies, and earlier breaks
+        // can be discovered by re-scanning (upstream 3321).
+        self.repair();
     }
 
     /// Decide whether to insert or update a prepare header received via
@@ -3911,6 +4114,150 @@ mod tests {
         deliver_prepare(&mut r, &h2);
         assert_eq!(r.op, 3); // repairs never advance the head
         assert_eq!(r.journal.header_with_op(2).unwrap().checksum(), h2.checksum());
+    }
+
+    #[test]
+    fn repair_requests_headers_across_a_journal_break() {
+        // Backup r1 committed ops 1..=5; Commit messages for 6..=11 were
+        // processed, but those prepares were then lost from the journal. The
+        // head jumps past them to op 15. With pipeline=4 the repair window is
+        // [1..=11]: the 6..=14 break yields a GetHeaders request for 6..=11.
+        let mut r = Replica::new(0, 1, 3); // backup
+        r.status = Status::Normal;
+        let mut parent = 0;
+        for op in 1..=5 {
+            let h = make_prepare_for_replica(0, 0, op, parent, 0);
+            parent = h.checksum();
+            r.on_prepare(&h);
+        }
+        for op in 1..=5 {
+            r.commit_op(op);
+        }
+        // Commit messages advanced the frontier past the (still missing)
+        // prepares 6..=11:
+        r.commit_min = 11;
+        r.commit_max = 11;
+
+        let h15 = make_prepare_for_replica(0, 0, 15, parent, 0);
+        deliver_prepare(&mut r, &h15); // FutureOp -> jump to op 14
+        assert_eq!(r.op, 14);
+        deliver_prepare(&mut r, &h15); // op 15 == op+1: accepted across the gap
+        assert_eq!(r.op, 15);
+
+        // The accept already ran a repair pass; drain and drive a fresh one to
+        // assert on its output in isolation.
+        r.send_queue.clear();
+        r.repair();
+        assert_eq!(r.send_queue.len(), 1);
+        let get_headers =
+            r.send_queue.pop().unwrap().header::<message_header::GetHeaders>().unwrap();
+        assert_eq!(get_headers.replica, 1);
+        assert_eq!(get_headers.view, 0);
+        assert_eq!(get_headers.op_min, 6);
+        assert_eq!(get_headers.op_max, 11);
+    }
+
+    #[test]
+    fn repair_heals_gap_through_headers_then_prepare() {
+        // The full loop: r1 detects the break, GetHeaders from r0 installs the
+        // missing headers, and the follow-up repair pass turns each dirty
+        // recovered header into a GetPrepare for its body.
+        let mut primary = Replica::new(0, 0, 3);
+        primary.status = Status::Normal;
+        let mut parent = 0;
+        let mut h_by_op = std::collections::HashMap::new();
+        for op in 1..=15 {
+            let h = make_prepare_for_replica(0, 0, op, parent, 0);
+            parent = h.checksum();
+            primary.on_prepare(&h);
+            h_by_op.insert(op, h);
+        }
+
+        let mut r = Replica::new(0, 1, 3); // backup
+        r.status = Status::Normal;
+        let mut parent = 0;
+        for op in 1..=5 {
+            let h = make_prepare_for_replica(0, 0, op, parent, 0);
+            parent = h.checksum();
+            r.on_prepare(&h);
+        }
+        for op in 1..=5 {
+            r.commit_op(op);
+        }
+        // Committed 6..=11, then lost (see the gap test above):
+        r.commit_min = 11;
+        r.commit_max = 11;
+        let h15 = h_by_op[&15];
+        deliver_prepare(&mut r, &h15); // jump to 14
+        deliver_prepare(&mut r, &h15); // accept across the gap
+        assert_eq!(r.op, 15);
+        r.send_queue.clear();
+
+        // Pass 1: GetHeaders(6..=11).
+        r.repair();
+        let get_headers =
+            r.send_queue.pop().unwrap().header::<message_header::GetHeaders>().unwrap();
+        assert_eq!(get_headers.op_min, 6);
+        assert_eq!(get_headers.op_max, 11);
+
+        // Primary serves headers 6..=11 (newest first); backup installs them.
+        let mut request = crate::message::Message::new();
+        request.set_header(&get_headers);
+        primary.on_message(&request, 100);
+        let response = primary.send_queue.pop().unwrap();
+        r.on_message(&response, 100);
+
+        assert_eq!(r.send_queue.len(), 6); // one GetPrepare per recovered op
+        let mut repair_ops: Vec<u64> = r
+            .send_queue
+            .iter()
+            .map(|m| m.header::<message_header::GetPrepare>().unwrap().prepare_op)
+            .collect();
+        repair_ops.sort_unstable();
+        assert_eq!(repair_ops, [6, 7, 8, 9, 10, 11]);
+        for m in &r.send_queue {
+            let request = m.header::<message_header::GetPrepare>().unwrap();
+            assert_eq!(request.replica, 1);
+            let expected = &h_by_op[&request.prepare_op];
+            assert_eq!(request.prepare_checksum, expected.checksum);
+        }
+
+        // Pass 2: serve the op-6 body; the backup's journal now holds the
+        // repaired header+prepare for op 6.
+        let index = r
+            .send_queue
+            .iter()
+            .position(|m| m.header::<message_header::GetPrepare>().unwrap().prepare_op == 6)
+            .unwrap();
+        let get_prepare =
+            r.send_queue.remove(index).header::<message_header::GetPrepare>().unwrap();
+        assert_eq!(get_prepare.prepare_op, 6);
+        let mut request = crate::message::Message::new();
+        request.set_header(&get_prepare);
+        primary.on_message(&request, 100);
+        let prepare = primary.send_queue.pop().unwrap();
+        assert_eq!(prepare.header::<message_header::Prepare>().unwrap().op, 6);
+        r.on_message(&prepare, 100);
+        assert_eq!(r.journal.header_with_op(6).unwrap().checksum(), h_by_op[&6].checksum);
+    }
+
+    #[test]
+    fn repair_is_quiet_when_journal_intact() {
+        let mut r = Replica::new(0, 1, 3); // backup
+        r.status = Status::Normal;
+        let mut parent = 0;
+        for op in 1..=15 {
+            let h = make_prepare_for_replica(0, 0, op, parent, 0);
+            parent = h.checksum();
+            r.on_prepare(&h);
+        }
+        for op in 1..=11 {
+            r.commit_op(op);
+        }
+        assert_eq!(r.commit_min, 11);
+
+        r.repair(); // contiguous and clean where it matters: nothing asked for
+        assert!(r.send_queue.is_empty());
     }
 
     #[test]
