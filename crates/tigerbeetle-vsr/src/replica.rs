@@ -130,6 +130,11 @@ pub struct Replica {
     /// Whether the primary has started abdicating.
     pub primary_abdicating: bool,
 
+    // ── Repair: head advancement ─────────────────────────────────────────
+    /// Correlation nonce echoed in `GetView`/`View` exchanges so a backup can
+    /// match the primary's reply to its request (upstream `self.nonce`).
+    pub nonce: u128,
+
     // ── Outbound messages (sans-IO) ──────────────────────────────────────
     /// Outbound messages awaiting delivery.
     ///
@@ -428,6 +433,9 @@ impl Replica {
             join_view_from_all_replicas: vec![None; constants::REPLICAS_MAX],
             join_view_quorum: false,
             view_headers: Vec::new(),
+            // Sans-IO deterministic nonce (upstream uses a random u128);
+            // nonzero so `GetView` messages validate.
+            nonce: u128::from(replica_index) + 1,
         }
     }
 
@@ -1762,20 +1770,16 @@ impl Replica {
         }
     }
 
-    /// Build and enqueue the View message announcing the new log to the other
-    /// replicas (the new primary's first broadcast of the view).
-    ///
-    /// The body carries a `CheckpointState` prefix (zeroed — no superblock yet)
-    /// followed by the `view_headers` frames.
+    /// The replica's `view_headers` must be primed first
+    /// ([`Self::primary_update_view_headers`]).
     ///
     /// # Panics
     ///
     /// Panics unless the replica is the primary with `view == log_view`.
     ///
-    /// Upstream: `src/vsr/replica.zig:9499` (`primary_send_view`) and :5795
-    /// (`create_view_message`).
+    /// Upstream: `src/vsr/replica.zig:5795` (`create_view_message`).
     #[allow(clippy::cast_possible_truncation)] // body length is bounded by the fixed buffer
-    fn send_view(&mut self) {
+    fn make_view_message(&mut self, nonce: u128) -> crate::message::Message {
         assert!(self.status == Status::Normal || self.status == Status::ViewChange);
         assert!(self.is_primary());
         assert_eq!(self.view, self.log_view);
@@ -1796,7 +1800,7 @@ impl Replica {
             checkpoint_op: 0, // TODO(port): op_checkpoint from the superblock.
             op: self.op,
             commit_max: self.commit_max,
-            nonce: 0,
+            nonce,
             size: (message_header::SIZE + body_len) as u32,
             ..message_header::View::default()
         };
@@ -1812,6 +1816,19 @@ impl Replica {
         let mut message = crate::message::Message::new();
         message.set_body(&body);
         message.set_header(&view);
+        message
+    }
+
+    /// Build and enqueue the View message announcing the new log to the other
+    /// replicas (the new primary's first broadcast of the view).
+    ///
+    /// # Panics
+    ///
+    /// Panics unless the replica is the primary with `view == log_view`.
+    ///
+    /// Upstream: `src/vsr/replica.zig:9499` (`primary_send_view`).
+    fn send_view(&mut self) {
+        let message = self.make_view_message(0);
         self.send_queue.push(message);
     }
 
@@ -2277,12 +2294,12 @@ impl Replica {
             Command::GetPrepare => self.on_get_prepare(&header),
             Command::GetHeaders => self.on_get_headers(&header),
             Command::Headers => self.on_headers(message),
+            Command::GetView => self.on_get_view(message),
             // TODO(port): remaining message handlers.
             Command::Reply
             | Command::Ping
             | Command::Pong
             | Command::PingClient
-            | Command::GetView
             | Command::GetReply
             | Command::GetBlocks
             | Command::Deprecated12
@@ -2761,9 +2778,11 @@ impl Replica {
         assert_eq!(view.view, self.view);
         assert!(!self.is_primary());
 
-        // DEVIATION: upstream then optionally starves the verification pipeline
-        // and runs `repair()` (`syncing == .idle`); sans-IO journals are clean
-        // by construction and the CTRL repair machinery is deferred.
+        // DEVIATION: upstream optionally starves the verification pipeline when
+        // state syncing; sans-IO journals are clean by construction. When idle
+        // it re-runs `repair()`, which we do too: a jumped head leaves a gap
+        // below it that the repair pass now fills via GetHeaders/GetPrepare.
+        self.repair();
     }
 
     /// Decode the body of a View message into prepare headers.
@@ -3060,11 +3079,10 @@ impl Replica {
     /// accepted ([`Self::on_prepare_message`]) and after every `Headers`
     /// response ([`Self::on_headers`]).
     ///
-    /// DEVIATION (deferred): the `journal_repair_timeout` gate, `GetView` /
-    /// `view_headers` head advancement, grid `GetBlocks` repair, and the
-    /// view-change primary's `primary_send_view` steps are not ported yet —
-    /// `repair()` is a manual trigger that the harness calls when it wants a
-    /// pass.
+    /// DEVIATION (deferred): the `journal_repair_timeout` gate, grid `GetBlocks`
+    /// repair, and the view-change primary's `primary_send_view` steps are not
+    /// ported yet — `repair()` is a manual trigger that the harness calls when
+    /// it wants a pass.
     ///
     /// # Panics
     ///
@@ -3086,6 +3104,18 @@ impl Replica {
                 >= self.op.saturating_sub(u64::from(constants::PIPELINE_PREPARE_QUEUE_MAX))
         );
         assert!(self.journal.header_with_op(self.op).is_some());
+
+        // Request outstanding possibly committed headers to advance our op
+        // number. This handles the case of an idle cluster, where a backup
+        // will not otherwise advance (upstream 7598-7616).
+        if self.op < self.op_repair_max()
+            || (self.status == Status::Normal
+                && self.view_headers.first().is_some_and(|header| self.op < header.op))
+        {
+            assert!(self.replica_count > 1);
+            assert!(!self.is_primary());
+            self.send_get_view();
+        }
 
         // The op is from the current view; anything that hash-chains to it is
         // worth repairing (upstream 7608-7619). Wait for view-change primaries.
@@ -3364,6 +3394,65 @@ impl Replica {
         response.set_header(&headers);
         response.set_body(&frames);
         self.send_queue.push(response);
+    }
+
+    /// Request the primary of the current view to serve us a fresh `View`, so we
+    /// can advance our head op when we are too far behind to GetPrepare.
+    ///
+    /// DEVIATION: upstream (`repair`, replica.zig:7598-7616) sends `GetView`
+    /// through the message bus to `primary_index(view)`. The flat `send_queue`
+    /// carries no routing metadata: the single queued `GetView` must be
+    /// delivered to the primary.
+    ///
+    /// # Panics
+    ///
+    /// Panics if this is a solo replica or this replica is the primary.
+    ///
+    /// Upstream: the `GetView` sender behind `src/vsr/replica.zig:7598`.
+    pub fn send_get_view(&mut self) {
+        assert!(self.replica_count > 1);
+        assert!(!self.is_primary());
+
+        let mut get_view = message_header::GetView {
+            cluster: self.cluster,
+            view: self.view,
+            replica: self.replica_u8(),
+            nonce: self.nonce,
+            ..message_header::GetView::default()
+        };
+        get_view.set_checksum_body(&[]);
+        get_view.set_checksum();
+        self.enqueue_header(&get_view);
+    }
+
+    /// Serve a `GetView` request: reply to the requester with a fresh `View`
+    /// carrying our op/commit_max and echoing `get_view.nonce`.
+    ///
+    /// DEVIATION: the flat `send_queue` carries no routing metadata, so the
+    /// single queued `View` must be delivered to `get_view.replica`.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless this replica is a normal-status primary whose
+    /// `view == log_view`, and the request matches our view and did not
+    /// originate from this replica.
+    ///
+    /// Upstream: `src/vsr/replica.zig:3022` (`on_get_view`).
+    pub fn on_get_view(&mut self, message: &crate::message::Message) {
+        let Some(get_view) = message.header::<message_header::GetView>() else {
+            return; // Command mismatch or malformed header.
+        };
+        if !get_view.valid_checksum() || !get_view.valid_checksum_body(message.body_used()) {
+            return;
+        }
+        assert_eq!(self.status, Status::Normal);
+        assert_eq!(self.view, self.log_view);
+        assert_eq!(get_view.view, self.view);
+        assert_ne!(get_view.replica, self.replica_u8());
+        assert!(self.is_primary());
+
+        let view = self.make_view_message(get_view.nonce);
+        self.send_queue.push(view);
     }
 
     /// Handle a `Headers` message: try to repair every prepare header it
@@ -4348,6 +4437,101 @@ mod tests {
             .map(|m| m.header::<message_header::GetPrepare>().unwrap().prepare_op)
             .collect();
         assert_eq!(get_prepares, [6]);
+    }
+
+    #[test]
+    fn repair_requests_get_view_from_primary_when_op_behind() {
+        // A backup whose head trails its commit frontier (`op < op_repair_max`)
+        // asks the primary for a fresh View, so it can advance the head even in
+        // an idle cluster (upstream replica.zig:7598).
+        let mut r = Replica::new(0, 1, 3); // backup
+        r.status = Status::Normal;
+        prepare_and_commit_suffix(&mut r, 0, 8, 8);
+        // Commit messages advanced the frontier ahead of the head:
+        r.commit_max = 16;
+        assert_eq!(r.op, 8);
+        assert!(r.op < r.op_repair_max());
+
+        r.repair();
+        assert_eq!(r.send_queue.len(), 1);
+        let get_view = r.send_queue.pop().unwrap().header::<message_header::GetView>().unwrap();
+        assert_eq!(get_view.replica, 1);
+        assert_eq!(get_view.view, 0);
+        assert_eq!(get_view.nonce, r.nonce);
+    }
+
+    #[test]
+    fn get_view_advances_head_and_triggers_gap_repair() {
+        // Full loop: a backup behind the primary's head requests a View, the
+        // primary replies with its op/commit_max (echoing the nonce), the backup
+        // jumps its head (bounded by op_prepare_max_sync), and the repair pass
+        // then targets the gap below.
+        let mut primary = Replica::new(0, 0, 3);
+        primary.status = Status::Normal;
+        let mut parent = 0;
+        let mut h_by_op = std::collections::HashMap::new();
+        for op in 1..=18 {
+            let h = make_prepare_for_replica(0, 0, op, parent, 0);
+            parent = h.checksum();
+            primary.on_prepare(&h);
+            h_by_op.insert(op, h);
+        }
+        for op in 1..=15 {
+            primary.commit_op(op);
+        }
+        assert_eq!(primary.op, 18);
+        assert_eq!(primary.commit_max, 15);
+
+        let mut r = Replica::new(0, 1, 3); // backup
+        r.status = Status::Normal;
+        prepare_and_commit_suffix(&mut r, 0, 6, 6);
+        r.commit_max = 15; // knows of commits beyond its head
+        assert_eq!(r.op, 6);
+
+        // Step 1: backup requests the view.
+        r.repair();
+        let get_view = r.send_queue.pop().unwrap();
+        assert_eq!(get_view.header::<message_header::GetView>().unwrap().nonce, r.nonce);
+
+        // Step 2: the primary replies with a View echoing our nonce.
+        primary.on_message(&get_view, 100);
+        let view = primary.send_queue.pop().unwrap();
+        assert_eq!(primary.send_queue.len(), 0);
+        let view_header = view.header::<message_header::View>().unwrap();
+        assert_eq!(view_header.view, 0);
+        assert_eq!(view_header.replica, 0);
+        assert_eq!(view_header.nonce, r.nonce);
+        assert_eq!(view_header.op, 18);
+        assert_eq!(view_header.commit_max, 15);
+
+        // Step 3: the backup jumps its head and stages the new log suffix.
+        r.on_message(&view, 100);
+        assert_eq!(r.op, 18);
+        assert_eq!(r.commit_max, 15);
+        assert_eq!(r.status, Status::Normal);
+        // The staged suffix (descending from the new head) plus the checkpoint
+        // hook at op 0 (with no real checkpoints, saturating to the root).
+        assert_eq!(r.view_headers.first().unwrap().op, 18);
+        assert_eq!(r.view_headers[constants::VIEW_CHANGE_HEADERS_SUFFIX_MAX as usize - 1].op, 14);
+        assert!(r.view_headers.len() <= constants::VIEW_HEADERS_MAX as usize);
+        // The jumped-op suffix headers replaced the journal's (absent) slots:
+        for op in 14..=18 {
+            let slot = crate::journal::Journal::slot_for_op(op);
+            assert!(r.journal.header_with_op(op).is_some());
+            assert!(r.journal.dirty.bit(slot));
+            assert_eq!(r.journal.header_with_op(op).unwrap().checksum(), h_by_op[&op].checksum());
+        }
+
+        // Step 4: the repair pass (run at the end of on_view) targets the hole
+        // the jump left below it, and the committed-but-only-headered op 14.
+        assert_eq!(r.send_queue.len(), 2);
+        let get_headers = r.send_queue.remove(0).header::<message_header::GetHeaders>().unwrap();
+        assert_eq!(get_headers.replica, 1);
+        assert_eq!(get_headers.op_min, 7);
+        assert_eq!(get_headers.op_max, 13);
+        let get_prepare =
+            r.send_queue.pop().unwrap().header::<message_header::GetPrepare>().unwrap();
+        assert_eq!(get_prepare.prepare_op, 14);
     }
 
     #[test]
