@@ -89,6 +89,10 @@ pub struct Replica {
     pub ok_from_all_replicas: Vec<u64>,
     /// Monotonically increasing timestamp for prepares.
     pub prepare_timestamp: u64,
+    /// The timestamp of the most recently executed prepare (upstream
+    /// `state_machine.commit_timestamp`; kept on the replica until the state
+    /// machine is wired into `commit_execute`).
+    pub commit_timestamp: u64,
     /// The prepare currently being committed (primary).
     pub commit_prepare: Option<u64>, // op of the prepare being committed
 
@@ -493,6 +497,7 @@ impl Replica {
             pipeline_queue: PipelineQueue::default(),
             ok_from_all_replicas: Vec::new(),
             prepare_timestamp: 0,
+            commit_timestamp: 0,
             commit_prepare: None,
             commit_stage: CommitStage::Idle,
             commit_dispatch_entered: false,
@@ -1338,31 +1343,41 @@ impl Replica {
         };
         assert_eq!(self.commit_min + 1, op);
 
+        let Some(prepare) = self.journal.header_with_op(op).copied() else {
+            unreachable!("the op being committed is journaled");
+        };
+
         // Execute on state machine.
         // TODO(port): state_machine.execute(commit_prepare.body_used())
+
+        // Track what the state machine has executed: every prepare's timestamp
+        // must strictly advance the previous one, which `<` therefore pins the
+        // primary's `prepare_timestamp` (upstream `execute_op` asserts
+        // `state_machine.commit_timestamp < prepare.header.timestamp`, and the
+        // AOF-recovery exception is moot sans-IO — replica.zig:5441-5445).
+        assert!(self.commit_timestamp < prepare.timestamp);
+        self.commit_timestamp = prepare.timestamp;
 
         // Construct the client reply from the committed prepare and update the
         // client sessions table (upstream `execute_op`: replica.zig:5391-5523).
         // Runs on the primary and backups alike: any replica can answer a
         // client's GetReply.
-        if let Some(prepare) = self.journal.header_with_op(op).copied() {
-            let reply = Self::build_reply(&prepare);
+        let reply = Self::build_reply(&prepare);
 
-            match reply.operation {
-                crate::Operation::REGISTER => self.client_table_entry_create(&reply),
-                crate::Operation::PULSE | crate::Operation::UPGRADE => {
-                    assert_eq!(reply.client, 0);
-                }
-                _ => self.client_table_entry_update(&reply),
+        match reply.operation {
+            crate::Operation::REGISTER => self.client_table_entry_create(&reply),
+            crate::Operation::PULSE | crate::Operation::UPGRADE => {
+                assert_eq!(reply.client, 0);
             }
+            _ => self.client_table_entry_update(&reply),
+        }
 
-            // Reply to the client: the primary always; exactly one backup per
-            // op (selected deterministically). Pulse/upgrade have no client.
-            if reply.client != 0 && self.execute_op_reply_to_client(reply.op) {
-                let mut message = crate::message::Message::new();
-                message.set_header(&reply);
-                self.send_reply_message_to_client(&message);
-            }
+        // Reply to the client: the primary always; exactly one backup per op
+        // (selected deterministically). Pulse/upgrade have no client.
+        if reply.client != 0 && self.execute_op_reply_to_client(reply.op) {
+            let mut message = crate::message::Message::new();
+            message.set_header(&reply);
+            self.send_reply_message_to_client(&message);
         }
 
         self.commit_op(op);
@@ -6336,6 +6351,46 @@ mod tests {
     }
 
     #[test]
+    fn commit_execute_tracks_monotonic_commit_timestamp() {
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        r.status = Status::Normal;
+
+        let op1 = r.primary_pipeline_prepare(7, 0, crate::Operation::REGISTER, 0, 0).unwrap();
+        let timestamp1 = r.journal.header_with_op(op1).expect("prepare").timestamp;
+        r.commit_max = op1;
+        r.commit_prepare = Some(op1);
+        r.commit_stage = CommitStage::Execute;
+        r.commit_execute();
+        assert_eq!(r.commit_timestamp, timestamp1);
+
+        // A later op is stamped strictly later, so execution advances too
+        // (upstream `state_machine.commit_timestamp < prepare.header.timestamp`).
+        let op2 = r.primary_pipeline_prepare(7, 1, crate::Operation::NOOP, 0, 0).unwrap();
+        let timestamp2 = r.journal.header_with_op(op2).expect("prepare").timestamp;
+        assert!(timestamp2 > timestamp1);
+        r.commit_max = op2;
+        r.commit_prepare = Some(op2);
+        r.commit_stage = CommitStage::Execute;
+        r.commit_execute();
+        assert_eq!(r.commit_timestamp, timestamp2);
+    }
+
+    #[test]
+    #[should_panic(expected = "commit_timestamp < prepare.timestamp")]
+    fn commit_execute_panics_on_stale_prepare_timestamp() {
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        r.status = Status::Normal;
+        assert_eq!(r.primary_pipeline_prepare(7, 0, crate::Operation::NOOP, 0, 0).unwrap(), 1);
+        r.commit_max = 1;
+        r.commit_prepare = Some(1);
+        r.commit_stage = CommitStage::Execute;
+        // The committed prepare's timestamp must advance the previous one; a
+        // backwards (or stalled) state machine clock is a bug.
+        r.commit_timestamp = u64::MAX;
+        r.commit_execute();
+    }
+
+    #[test]
     fn on_request_repeat_reply_register_serves_ram_reply() {
         let mut r = Replica::new(CLUSTER, 0, 3);
         r.status = Status::Normal;
@@ -6603,7 +6658,7 @@ mod tests {
         // The next registration evicts the oldest entry (commit 1): client 1.
         register_client(&mut r, 8);
         assert_eq!(r.client_sessions.count(), constants::CLIENTS_MAX as usize);
-        assert_eq!(r.client_sessions.get(1), None, "the oldest registration is evicted",);
+        assert_eq!(r.client_sessions.get(1), None, "the oldest registration is evicted");
         assert_eq!(r.client_sessions.get(8).expect("newest session").session, 8);
 
         // The evicted client is now unknown: its next request is evicted with
