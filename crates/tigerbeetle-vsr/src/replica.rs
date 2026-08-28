@@ -3006,6 +3006,53 @@ impl Replica {
         }
     }
 
+    /// Drop dirty WAL entries that fall outside the `[op_repair_min, op]`
+    /// repair window, so that `repair()` can eventually finish.
+    ///
+    /// An out-of-bounds dirty slot is either:
+    /// - an op `<= op_checkpoint` that was committed before checkpointing, but
+    ///   whose WAL entry was found corrupt after recovering from a crash, or
+    /// - (indistinguishably) an op `> self.op` that was truncated, and is now
+    ///   corrupt.
+    ///
+    /// In-bounds slots are left alone: the `repair_prepares_between` invocations
+    /// that run before this function either already repaired them, or are
+    /// waiting for a `GetPrepare` reply.
+    ///
+    /// # Panics
+    ///
+    /// Panics if repairs are not allowed, or if the journal head is more than a
+    /// full slot count ahead of the commit frontier.
+    ///
+    /// Upstream: `src/vsr/replica.zig:8257` (`repair_clean_out_of_bound_prepares`).
+    fn repair_clean_out_of_bound_prepares(&mut self) {
+        assert!(self.status == Status::Normal || self.status == Status::ViewChange);
+        assert!(self.repairs_allowed());
+        assert!(self.op >= self.commit_min);
+        assert!(self.op - self.commit_min <= u64::from(constants::JOURNAL_SLOT_COUNT));
+
+        // The repair window's slots, inclusive:
+        let slots_repaired = crate::journal::SlotRange {
+            head: crate::journal::Slot::for_op(self.op_repair_min()),
+            tail: self
+                .journal
+                .slot_with_op(self.op)
+                .unwrap_or_else(|| panic!("slot_with_op({}) failed", self.op)),
+        };
+
+        for slot_index in 0..u64::from(constants::JOURNAL_SLOT_COUNT) {
+            let slot = crate::journal::Slot::for_op(slot_index);
+            if slots_repaired.head == slots_repaired.tail || slots_repaired.contains(slot) {
+                // In-bounds: handled by the repair_prepares_between invocations
+                // before this function is invoked.
+            } else if self.journal.dirty.bit(slot) {
+                // Out-of-bounds dirty slots cannot be repaired (there is no
+                // valid sibling to hash-chain to); drop the entry.
+                self.journal.remove_entry(slot);
+            }
+        }
+    }
+
     /// Detect missing/divergent headers and prepares in the journal and repair
     /// them from peers.
     ///
@@ -3014,10 +3061,10 @@ impl Replica {
     /// response ([`Self::on_headers`]).
     ///
     /// DEVIATION (deferred): the `journal_repair_timeout` gate, `GetView` /
-    /// `view_headers` head advancement, grid `GetBlocks` repair,
-    /// `repair_clean_out_of_bound_prepares`, and the view-change primary's
-    /// `primary_send_view` steps are not ported yet — `repair()` is a manual
-    /// trigger that the harness calls when it wants a pass.
+    /// `view_headers` head advancement, grid `GetBlocks` repair, and the
+    /// view-change primary's `primary_send_view` steps are not ported yet —
+    /// `repair()` is a manual trigger that the harness calls when it wants a
+    /// pass.
     ///
     /// # Panics
     ///
@@ -3078,6 +3125,8 @@ impl Replica {
         if self.op_repair_min() <= self.commit_min {
             self.repair_prepares_between(self.op_repair_min(), self.commit_min);
         }
+
+        self.repair_clean_out_of_bound_prepares();
 
         if self.commit_min < self.commit_max {
             // Commit what we can even eagerly — discovering missing prepares
@@ -4258,6 +4307,47 @@ mod tests {
 
         r.repair(); // contiguous and clean where it matters: nothing asked for
         assert!(r.send_queue.is_empty());
+    }
+
+    #[test]
+    fn repair_cleans_dirty_slots_out_of_bounds() {
+        // A crash-recovered replica may hold a dirty WAL entry that is out of
+        // bounds of the `[op_repair_min, op]` window (op <= op_checkpoint, or an
+        // op beyond self.op that was truncated). Such entries cannot be
+        // repaired — `repair()` must drop them, while leaving in-bounds dirty
+        // slots alone.
+        let mut r = Replica::new(0, 1, 3); // backup
+        r.status = Status::Normal;
+        let mut parent = 0;
+        for op in 1..=15 {
+            let h = make_prepare_for_replica(0, 0, op, parent, 0);
+            parent = h.checksum();
+            r.on_prepare(&h);
+        }
+        for op in 1..=11 {
+            r.commit_op(op);
+        }
+
+        // In-bounds dirty slot: repaired via GetPrepare.
+        let in_bounds = crate::journal::Slot::for_op(6);
+        r.journal.dirty.set(in_bounds);
+        // Out-of-bounds dirty slot: a stray corrupt entry far from the window
+        // (op 25 > self.op; slot 25 in the 32-slot test journal).
+        let out_of_bounds = crate::journal::Slot::for_op(25);
+        r.journal.dirty.set(out_of_bounds);
+        assert!(r.journal.dirty.bit(in_bounds));
+        assert!(r.journal.dirty.bit(out_of_bounds));
+
+        r.repair();
+
+        assert!(!r.journal.dirty.bit(out_of_bounds));
+        assert!(r.journal.dirty.bit(in_bounds)); // still waiting for a GetPrepare
+        let get_prepares: Vec<u64> = r
+            .send_queue
+            .iter()
+            .map(|m| m.header::<message_header::GetPrepare>().unwrap().prepare_op)
+            .collect();
+        assert_eq!(get_prepares, [6]);
     }
 
     #[test]
