@@ -3670,8 +3670,10 @@ impl Replica {
     ///
     /// # Panics
     ///
-    /// Panics if a known committed entry's checksum disagrees with the Commit
-    /// message (upstream: `commit checksum verification failed`).
+    /// Panics if a present committed entry's checksum disagrees with the Commit
+    /// message while our hash chain up to the head is intact (upstream:
+    /// `commit checksum verification failed`). A mismatch with a broken chain is
+    /// tolerated while the journal is still repairing.
     ///
     /// Upstream: `src/vsr/replica.zig:2396` (`on_commit`).
     pub fn on_commit(&mut self, header: &message_header::Header, now: u64) {
@@ -3695,14 +3697,18 @@ impl Replica {
         self.on_commit_heartbeat(commit.view, commit.timestamp_monotonic, commit.commit, now);
 
         // We may not always have the latest commit entry, but if we do, our
-        // checksum must match:
-        if let Some(entry) = self.journal.header_with_op(commit.commit)
-            && entry.checksum() != commit.commit_checksum
-        {
-            // DEVIATION: upstream panics only when the hash chain between
-            // `commit` and `self.op` is valid (`valid_hash_chain_between`);
-            // that verification is deferred.
-            panic!("commit checksum verification failed");
+        // checksum must match (upstream `replica.zig:2436-2449`):
+        if let Some(entry) = self.journal.header_with_op(commit.commit) {
+            if entry.checksum() == commit.commit_checksum {
+                // Verified.
+            } else if self.valid_hash_chain_between(commit.commit, self.op) {
+                // Our own chain from `commit` to the head is intact, so the
+                // primary's checksum is simply wrong.
+                panic!("commit checksum verification failed");
+            } else {
+                // We may still be repairing after receiving the View message;
+                // skip verification until the chain reconnects.
+            }
         }
 
         self.commit_journal();
@@ -5166,6 +5172,35 @@ mod tests {
         // Commit claims op 1 but with the wrong checksum:
         let commit = make_commit_message(0, 0, 1, 0xDEAD, 100);
         r.on_message(&commit, 200);
+    }
+
+    #[test]
+    fn on_commit_skips_checksum_verification_while_repairing() {
+        let mut r = Replica::new(0, 1, 3);
+        r.status = Status::Normal;
+        let h1 = make_prepare_for_replica(0, 0, 1, 0, 0);
+        r.on_prepare(&h1);
+        let h2 = make_prepare_for_replica(0, 0, 2, h1.checksum(), 0);
+        r.on_prepare(&h2);
+        let h3 = make_prepare_for_replica(0, 0, 3, h2.checksum(), 0);
+        r.on_prepare(&h3);
+        assert_eq!(r.op, 3);
+
+        // Lose op 2's header while still holding the head (op 3), so our chain
+        // from op 1 up to the head is broken — exactly the mid-repair state
+        // where a mismatched commit checksum must be tolerated.
+        r.journal.remove_entry(crate::journal::Journal::slot_for_op(2));
+        assert!(!r.valid_hash_chain_between(1, r.op));
+
+        // Commit claims op 1 (whose entry we hold) with a bogus checksum:
+        let commit = make_commit_message(0, 0, 1, 0xDEAD, 100);
+        r.on_message(&commit, 200);
+
+        // No panic: commit_max advanced (op 1 applies; op 2 is still absent).
+        assert_eq!(r.heartbeat_timestamp, 100);
+        assert_eq!(r.commit_max, 1);
+        assert_eq!(r.commit_min, 1);
+        assert!(r.journal.header_with_op(2).is_none());
     }
 
     /// Build a checksum-valid Prepare header as a primary would, for feeding
