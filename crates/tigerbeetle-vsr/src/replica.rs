@@ -17,9 +17,9 @@ use tigerbeetle_core::constants;
 use tigerbeetle_core::stdx::prng::Prng;
 
 use crate::command::Command;
-use crate::grid::Grid;
+use crate::grid::{Event, Grid, ReadBlockResult, ReadOptions};
 use crate::message_header;
-use crate::message_header::TypedHeader;
+use crate::message_header::{GetBlocks, TypedHeader};
 use crate::repair_budget::{RepairBudgetGrid, RepairBudgetOptions};
 use crate::storage::MemoryStorage;
 
@@ -46,6 +46,16 @@ pub enum Status {
 // ---------------------------------------------------------------------------
 // Replica
 // ---------------------------------------------------------------------------
+
+/// One in-flight `GetBlocks` serve read on behalf of a remote replica
+/// (upstream `replica.grid_reads[i]`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GridServeRead {
+    pub token: u32,
+    pub destination: u16,
+    pub address: u64,
+    pub checksum: u128,
+}
 
 /// The VSR Replica — owns all consensus state and subsystems.
 ///
@@ -136,6 +146,14 @@ pub struct Replica {
     pub grid_repair_message_budget: RepairBudgetGrid,
     /// Deterministic PRNG for repair-selection shuffles (upstream `prng`).
     pub prng: Prng,
+    /// In-flight `GetBlocks` serve reads, keyed by grid read token, indexed
+    /// before every request so a block is only ever fetched once per remote
+    /// replica (upstream `replica.grid_reads`).
+    ///
+    /// DEVIATION: upstream preallocates a fixed pool of
+    /// `constants.grid_repair_reads_max` read slots. This port keeps a plain
+    /// `Vec` bounded by the same limit.
+    pub grid_serve_reads: Vec<GridServeRead>,
 
     // ── Fault detection ──────────────────────────────────────────────────
     /// EWMA fault detector for commit heartbeats from the primary.
@@ -477,6 +495,7 @@ impl Replica {
             journal: crate::journal::Journal::new(cluster, replica_index),
             grid: None,
             grid_storage: None,
+            grid_serve_reads: Vec::new(),
             send_queue: Vec::new(),
             // Upstream boots from a superblock whose checkpoint holds the root
             // prepare at op 0; a fresh replica's JV always includes it.
@@ -506,6 +525,27 @@ impl Replica {
     pub fn mount_grid(&mut self, grid: Grid, storage: MemoryStorage) {
         self.grid = Some(grid);
         self.grid_storage = Some(storage);
+    }
+
+    /// The mounted grid and its storage, as a mutable pair.
+    ///
+    /// # Panics
+    /// Panics if the grid is not mounted (upstream asserts the grid exists).
+    pub fn grid_mut(&mut self) -> (&mut Grid, &mut MemoryStorage) {
+        let grid = self
+            .grid
+            .as_mut()
+            .unwrap_or_else(|| unreachable!("grid is mounted before grid repair paths run"));
+        let storage = self.grid_storage.as_mut().unwrap_or_else(|| {
+            unreachable!("grid storage is mounted before grid repair paths run")
+        });
+        (grid, storage)
+    }
+
+    /// The grid and its storage, as an immutable pair.
+    #[must_use]
+    pub fn grid_pair(&self) -> Option<(&Grid, &MemoryStorage)> {
+        Some((self.grid.as_ref()?, self.grid_storage.as_ref()?))
     }
 
     /// Returns `true` if this replica is the current primary for its view.
@@ -2498,13 +2538,13 @@ impl Replica {
             Command::GetHeaders => self.on_get_headers(&header),
             Command::Headers => self.on_headers(message),
             Command::GetView => self.on_get_view(message),
+            Command::GetBlocks => self.on_get_blocks(message),
             // TODO(port): remaining message handlers.
             Command::Reply
             | Command::Ping
             | Command::Pong
             | Command::PingClient
             | Command::GetReply
-            | Command::GetBlocks
             | Command::Deprecated12
             | Command::Deprecated21
             | Command::Deprecated22
@@ -2514,6 +2554,145 @@ impl Replica {
             | Command::Eviction
             | Command::Block => {}
         }
+    }
+
+    /// Handle a `GetBlocks` request from a remote replica: read each requested
+    /// block and reply with a `Block` message when each read completes.
+    ///
+    /// # Panics
+    /// Panics if the request body is empty or not aligned to `BlockRequest`
+    /// (callers validate `GetBlocks::invalid_header` before dispatching).
+    ///
+    /// Upstream: `src/vsr/replica.zig:3324` (`on_get_blocks`).
+    pub fn on_get_blocks(&mut self, message: &crate::message::Message) {
+        let Some(get_blocks) = message.header::<GetBlocks>() else {
+            return;
+        };
+        if !get_blocks.valid_checksum() || !get_blocks.valid_checksum_body(message.body_used()) {
+            return;
+        }
+        if get_blocks.invalid_header().is_some() {
+            return;
+        }
+
+        if get_blocks.replica == self.replica_u8() {
+            return; // Misdirected message (self).
+        }
+
+        // Upstream also drops for `standby()`; the sans-IO port has no standby flag.
+        if self.grid.is_none() {
+            return; // Upstream `grid.callback == .cancel`.
+        }
+
+        let destination = u16::from(get_blocks.replica);
+        let request_bytes = message.body_used();
+        assert!(!request_bytes.is_empty()); // Guaranteed by `invalid_header`.
+
+        // Disjoint field borrows: the grid and its storage are separate from the
+        // serve-read ledger.
+        let (Some(grid), Some(storage)) = (&mut self.grid, &mut self.grid_storage) else {
+            return;
+        };
+        for request in request_bytes.as_chunks::<{ size_of::<crate::BlockRequest>() }>().0 {
+            let mut checksum_bytes = [0_u8; 16];
+            checksum_bytes.copy_from_slice(&request[0..16]);
+            let mut address_bytes = [0_u8; 8];
+            address_bytes.copy_from_slice(&request[16..24]);
+            let block_checksum = u128::from_le_bytes(checksum_bytes);
+            let block_address = u64::from_le_bytes(address_bytes);
+
+            if self.grid_serve_reads.iter().any(|read| {
+                read.destination == destination
+                    && read.address == block_address
+                    && read.checksum == block_checksum
+            }) {
+                continue; // Already reading this block for this replica.
+            }
+            if self.grid_serve_reads.len() >= usize::from(constants::GRID_REPAIR_READS_MAX) {
+                return; // Upstream: ignore the remaining requests.
+            }
+
+            let token = grid.read_block(
+                storage,
+                block_address,
+                block_checksum,
+                true, // Coherent read (local storage only).
+                ReadOptions { cache_read: true, cache_write: false },
+            );
+            self.grid_serve_reads.push(GridServeRead {
+                token,
+                destination,
+                address: block_address,
+                checksum: block_checksum,
+            });
+        }
+    }
+
+    /// Drive the mounted grid forward and handle its completion events.
+    ///
+    /// # Panics
+    /// Panics if the grid is not mounted (no-op: nothing to poll).
+    pub fn poll_grid(&mut self) {
+        let events = {
+            let (Some(grid), Some(storage)) = (&mut self.grid, &mut self.grid_storage) else {
+                return;
+            };
+            grid.poll(storage);
+            grid.take_events()
+        };
+        for event in events {
+            self.on_grid_event(event);
+        }
+    }
+
+    fn on_grid_event(&mut self, event: Event) {
+        if let Event::ReadDone { token, address, checksum, result, valid_location } = event {
+            self.on_grid_read_done(token, address, checksum, result, valid_location);
+        }
+        // Other completions are drained by the owner directly.
+    }
+
+    /// Reply to a `GetBlocks` read with the block contents.
+    ///
+    /// Upstream: `src/vsr/replica.zig:3410` (`on_get_blocks_read_block`).
+    fn on_grid_read_done(
+        &mut self,
+        token: u32,
+        address: u64,
+        checksum: u128,
+        result: ReadBlockResult,
+        valid_location: Option<u32>,
+    ) {
+        let Some(index) = self.grid_serve_reads.iter().position(|read| read.token == token) else {
+            return;
+        };
+        let read = self.grid_serve_reads.remove(index);
+
+        if result != ReadBlockResult::Valid {
+            return;
+        }
+        let Some(location) = valid_location else {
+            return;
+        };
+
+        // Upstream asserts `read.message.header.checksum == grid_read.checksum`
+        // — the reply *is* the block, so that is the block's own content checksum.
+        assert_eq!(read.checksum, checksum);
+        assert_eq!(read.address, address);
+
+        let block_bytes = {
+            let grid =
+                self.grid.as_mut().unwrap_or_else(|| unreachable!("grid mounted for a serve read"));
+            assert_eq!(grid.block(location).len(), constants::BLOCK_SIZE);
+            grid.block(location).to_vec()
+        };
+
+        // The reply *is* the block: the block's own header (command=block,
+        // cluster, address, checksum) occupies the message header slot.
+        assert_eq!(block_bytes.len(), constants::BLOCK_SIZE);
+        let mut reply = crate::message::Message::new();
+        reply.buffer_mut()[..constants::BLOCK_SIZE].copy_from_slice(&block_bytes);
+        self.send_queue.push(reply);
     }
 
     /// Whether a JoinView/View message should be dropped before processing.
@@ -3855,25 +4034,27 @@ impl Replica {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used, // mirrors grid.rs's test module
+        clippy::field_reassign_with_default, // typed headers keep reserved fields private
+        clippy::cast_possible_truncation // test helpers build wire sizes that fit u32
+    )]
+
     use super::*;
     use crate::Zone;
     use crate::grid::GridOptions;
+    use crate::message::Message;
+    use crate::message_header::BlockType;
+    use crate::multiversion::Release;
+    use tigerbeetle_core::constants::BLOCK_SIZE;
     use tigerbeetle_lsm::free_set::SHARD_BITS;
 
-    #[test]
-    fn grid_mount_and_repair_budget_construction() {
-        let mut r = Replica::new(0xDEAD, 1, 3);
-        assert!(r.grid.is_none());
-        assert!(r.grid_storage.is_none());
+    const CLUSTER: u128 = 0xDEAD;
 
-        // The grid repair budget covers every remote replica (`replica_count - 1`)
-        // with a full `GetBlocks` worth of budget each.
-        assert_eq!(r.grid_repair_message_budget.budget_available(0), 5);
-        assert_eq!(r.grid_repair_message_budget.budget_available(2), 5);
-
-        let grid = Grid::new(GridOptions {
+    fn test_grid() -> Grid {
+        Grid::new(GridOptions {
             cache_blocks_count: 64,
             stash_blocks_count: 12,
             read_iops_max: 2,
@@ -3882,12 +4063,192 @@ mod tests {
             // multiple of `SHARD_BITS`; grid.rs uses the same sizing).
             free_set_blocks_count: Some(2 * SHARD_BITS),
             free_set_blocks_capacity: None,
-        });
-        let storage = MemoryStorage::new(Zone::Grid.start() + 64 * constants::BLOCK_SIZE as u64);
-        r.mount_grid(grid, storage);
+        })
+    }
+
+    fn test_storage() -> MemoryStorage {
+        MemoryStorage::new(Zone::Grid.start() + 64 * BLOCK_SIZE as u64)
+    }
+
+    fn mount_test_grid(r: &mut Replica) {
+        r.mount_grid(test_grid(), test_storage());
+    }
+
+    fn write_block_header(buffer: &mut [u8], address: u64, body_len: usize) -> u128 {
+        let mut header = message_header::Block::default();
+        header.cluster = CLUSTER;
+        header.size = (message_header::SIZE + body_len) as u32;
+        header.release = Release { value: 1 };
+        header.address = address;
+        header.block_type_ordinal = BlockType::FreeSet as u8;
+
+        let body = vec![0xAB_u8; body_len];
+        header.checksum_body = header.calculate_checksum_body(&body);
+        header.set_checksum();
+        buffer[..message_header::SIZE].copy_from_slice(&header.to_wire());
+        buffer[message_header::SIZE..message_header::SIZE + body.len()].copy_from_slice(&body);
+        header.checksum
+    }
+
+    /// Creates a full-size block for a freshly acquired address, returns the
+    /// `(address, checksum, bytes)` — the write completed and the block is cached.
+    fn write_block(grid: &mut Grid, storage: &mut MemoryStorage) -> (u64, u128, Vec<u8>) {
+        let reservation = grid.reserve(1);
+        let address = grid.acquire(reservation);
+
+        let mut bytes = vec![0u8; BLOCK_SIZE];
+        let checksum = write_block_header(&mut bytes, address, BLOCK_SIZE - message_header::SIZE);
+
+        let location = grid.get_block();
+        grid.block_mut(location).copy_from_slice(&bytes);
+        grid.create_block(storage, address, location);
+        grid.poll(storage);
+        let _ = grid.take_events();
+        assert!(grid.cached_location(address).is_some());
+        (address, checksum, bytes)
+    }
+
+    /// Builds a `GetBlocks` message from `source` requesting `requests` (address, checksum).
+    fn get_blocks_message(source: u8, requests: &[(u64, u128)]) -> Message {
+        let mut header = message_header::GetBlocks::default();
+        header.cluster = CLUSTER;
+        header.replica = source;
+
+        let mut body = Vec::with_capacity(requests.len() * size_of::<crate::BlockRequest>());
+        for (address, checksum) in requests {
+            body.extend_from_slice(&checksum.to_le_bytes());
+            body.extend_from_slice(&address.to_le_bytes());
+            body.extend_from_slice(&[0_u8; 8]);
+        }
+        header.size = (message_header::SIZE + body.len()) as u32;
+        header.set_checksum_body(&body);
+        header.set_checksum();
+
+        let mut message = Message::new();
+        message.set_header(&header);
+        message.set_body(&body);
+        message
+    }
+
+    #[test]
+    fn grid_mount_and_repair_budget_construction() {
+        let mut r = Replica::new(CLUSTER, 1, 3);
+        assert!(r.grid.is_none());
+        assert!(r.grid_storage.is_none());
+
+        // The grid repair budget covers every remote replica (`replica_count - 1`)
+        // with a full `GetBlocks` worth of budget each.
+        assert_eq!(r.grid_repair_message_budget.budget_available(0), 5);
+        assert_eq!(r.grid_repair_message_budget.budget_available(2), 5);
+
+        mount_test_grid(&mut r);
 
         assert!(r.grid.is_some());
         assert!(r.grid_storage.is_some());
+    }
+
+    #[test]
+    fn on_get_blocks_serves_a_requested_block() {
+        let mut r = Replica::new(CLUSTER, 0, 2);
+        mount_test_grid(&mut r);
+        let (address, checksum, expected) = {
+            let (grid, storage) = r.grid_mut();
+            write_block(grid, storage)
+        };
+
+        let request = get_blocks_message(1, &[(address, checksum)]);
+        r.on_message(&request, 0);
+
+        // The read is in flight until pumped:
+        assert_eq!(r.grid_serve_reads.len(), 1);
+
+        r.poll_grid();
+
+        // No grid reads left; exactly one Block reply was sent.
+        assert!(r.grid_serve_reads.is_empty());
+        assert_eq!(r.send_queue.len(), 1);
+
+        let reply = &r.send_queue[0];
+        // The reply *is* the block: buffer[0..block_size], its own header parsed
+        // as the message header (upstream `on_get_blocks_read_block`).
+        assert_eq!(reply.buffer(), expected.as_slice());
+        assert_eq!(reply.size_raw(), BLOCK_SIZE as u32);
+        let header = reply.header::<message_header::Block>().expect("reply is a block");
+        assert!(header.valid_checksum());
+        assert!(header.valid_checksum_body(reply.body_used()));
+        assert_eq!(header.cluster, CLUSTER);
+        assert_eq!(header.address, address);
+        assert_eq!(header.release, Release { value: 1 });
+        assert_eq!(header.block_type_ordinal, BlockType::FreeSet as u8);
+        assert_eq!(header.size, BLOCK_SIZE as u32);
+        assert_eq!(reply.body_used().len(), BLOCK_SIZE - message_header::SIZE);
+    }
+
+    #[test]
+    fn on_get_blocks_dedupes_inflight_and_within_message() {
+        let mut r = Replica::new(CLUSTER, 0, 2);
+        mount_test_grid(&mut r);
+        let (address, checksum, expected) = {
+            let (grid, storage) = r.grid_mut();
+            write_block(grid, storage)
+        };
+
+        // The same block twice in one message, then again in a second message.
+        let request = get_blocks_message(1, &[(address, checksum), (address, checksum)]);
+        let request_again = get_blocks_message(1, &[(address, checksum)]);
+        r.on_message(&request, 0);
+        r.on_message(&request_again, 0);
+
+        assert_eq!(r.grid_serve_reads.len(), 1, "one outstanding read, deduped twice");
+
+        r.poll_grid();
+
+        assert!(r.grid_serve_reads.is_empty());
+        assert_eq!(r.send_queue.len(), 1, "one reply, not three");
+        assert_eq!(r.send_queue[0].buffer(), expected.as_slice());
+    }
+
+    #[test]
+    fn on_get_blocks_ignores_bad_cluster() {
+        let mut r = Replica::new(CLUSTER, 0, 2);
+        mount_test_grid(&mut r);
+
+        // Wrong cluster: dropped in `on_message` before any handler runs.
+        let mut header = message_header::GetBlocks::default();
+        header.cluster = CLUSTER + 1;
+        header.replica = 1;
+        header.size = (message_header::SIZE + size_of::<crate::BlockRequest>()) as u32;
+        let mut body = Vec::with_capacity(size_of::<crate::BlockRequest>());
+        body.extend_from_slice(&0xAB_u128.to_le_bytes());
+        body.extend_from_slice(&1_u64.to_le_bytes());
+        body.extend_from_slice(&[0_u8; 8]);
+        header.set_checksum_body(&body);
+        header.set_checksum();
+        let mut request = Message::new();
+        request.set_header(&header);
+        request.set_body(&body);
+
+        r.on_message(&request, 0);
+        assert!(r.send_queue.is_empty());
+        assert!(r.grid_serve_reads.is_empty());
+    }
+
+    #[test]
+    fn on_get_blocks_ignores_misdirected_self() {
+        let mut r = Replica::new(CLUSTER, 0, 2);
+        assert!(r.grid.is_none());
+        // Not mounted: ignored (upstream `grid.callback == .cancel`) regardless of direction.
+        let request = get_blocks_message(1, &[(1, 0xAB)]);
+        r.on_message(&request, 0);
+        assert!(r.send_queue.is_empty());
+        assert!(r.grid_serve_reads.is_empty());
+
+        // Misdirected (to self): ignored even with a mounted grid.
+        mount_test_grid(&mut r);
+        let request = get_blocks_message(0, &[(1, 0xAB)]);
+        r.on_message(&request, 0);
+        assert!(r.send_queue.is_empty());
+        assert!(r.grid_serve_reads.is_empty());
     }
 
     #[test]
