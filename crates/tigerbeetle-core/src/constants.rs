@@ -440,6 +440,8 @@ pub const EXIT_VIEW_WINDOW_TIMEOUT: u32 = 5_000;
 pub const EXIT_VIEW_MESSAGE_TIMEOUT: u32 = 500;
 /// How long to wait in view change before timing out (upstream: 5s).
 pub const VIEW_CHANGE_STATUS_TIMEOUT: u32 = 5_000;
+/// How often the repair timeout fires to drive `repair()` passes (upstream: 100ms).
+pub const JOURNAL_REPAIR_TIMEOUT: u32 = 100;
 
 /// The maximum number of outgoing messages that may be queued on a replica connection.
 pub const CONNECTION_SEND_QUEUE_MAX_REPLICA: usize = umax(umin(CLIENTS_MAX as usize, 4), 2);

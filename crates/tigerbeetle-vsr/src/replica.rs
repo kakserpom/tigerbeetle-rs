@@ -102,6 +102,7 @@ pub struct Replica {
     pub exit_view_message_timeout: Timeout,
     pub exit_view_window_timeout: Timeout,
     pub primary_abdicate_timeout: Timeout,
+    pub journal_repair_timeout: Timeout,
 
     // ── Fault detection ──────────────────────────────────────────────────
     /// EWMA fault detector for commit heartbeats from the primary.
@@ -157,12 +158,16 @@ pub struct Timeout {
     pub ticks: u32,
     /// Whether the timeout is currently active.
     pub active: bool,
+    /// Number of times the timeout has fired. Upstream's `attempts` (used to
+    /// trigger an unconditional repair every 50 fires). Never reset; wraps for
+    /// decoys only.
+    pub attempts: u64,
 }
 
 impl Timeout {
     #[must_use]
     pub const fn start(ticks: u32) -> Self {
-        Self { ticks, active: true }
+        Self { ticks, active: true, attempts: 0 }
     }
 
     /// Advance by one tick. Returns `true` if the timeout has fired.
@@ -173,6 +178,7 @@ impl Timeout {
         self.ticks = self.ticks.saturating_sub(1);
         if self.ticks == 0 {
             self.active = false;
+            self.attempts += 1;
             true
         } else {
             false
@@ -421,6 +427,7 @@ impl Replica {
             exit_view_message_timeout: Timeout::default(),
             exit_view_window_timeout: Timeout::default(),
             primary_abdicate_timeout: Timeout::default(),
+            journal_repair_timeout: Timeout::default(),
             commit_fault: FaultDetector::new(0, 100, 2_000),
             heartbeat_timestamp: 0,
             exit_view_from_all_replicas: 0,
@@ -1486,6 +1493,9 @@ impl Replica {
         self.pipeline_queue = PipelineQueue::default();
         self.ok_from_all_replicas.clear();
         self.view_change_status_timeout = Timeout::start(constants::VIEW_CHANGE_STATUS_TIMEOUT);
+        // Stop driving repairs while the journal may be inconsistent with the
+        // new view (upstream `replica.zig:10231`).
+        self.journal_repair_timeout.stop();
         self.send_join_view();
     }
 
@@ -1565,9 +1575,9 @@ impl Replica {
         }
 
         // DEVIATION: upstream additionally starts get_view_message_timeout,
-        // repair_sync_timeout, journal_repair_timeout, grid_repair/scrub
-        // timeouts (none exist sans-IO yet) and resets `commit_mins` /
-        // `head_ops` EWMA history.
+        // repair_sync_timeout, grid_repair/scrub timeouts (none exist sans-IO
+        // yet) and resets `commit_mins` / `head_ops` EWMA history.
+        self.journal_repair_timeout = Timeout::start(constants::JOURNAL_REPAIR_TIMEOUT);
 
         self.heartbeat_timestamp = 0;
         // A replica reports its own ExitView only while it thinks the primary
@@ -1984,6 +1994,9 @@ impl Replica {
         }
         if self.primary_abdicate_timeout.tick() {
             self.on_primary_abdicate_timeout();
+        }
+        if self.journal_repair_timeout.tick() {
+            self.on_journal_repair_timeout();
         }
     }
 
@@ -3072,17 +3085,35 @@ impl Replica {
         }
     }
 
+    /// Periodic repair driver: re-arm our repair cadence and run a pass.
+    ///
+    /// Upstream also reaps expired `journal_repair_message_budget` requests;
+    /// the sans-IO port has no message budgets.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the replica is not `.normal`/`.view_change`.
+    ///
+    /// Upstream: `src/vsr/replica.zig:3771` (`on_journal_repair_timeout`).
+    pub fn on_journal_repair_timeout(&mut self) {
+        assert!(self.status == Status::Normal || self.status == Status::ViewChange);
+        // Upstream uses `reset_with_jitter`; sans-IO is deterministic, so we
+        // re-arm with a fixed cadence (DEVIATION).
+        self.journal_repair_timeout.reset(constants::JOURNAL_REPAIR_TIMEOUT);
+        self.repair();
+    }
+
     /// Detect missing/divergent headers and prepares in the journal and repair
     /// them from peers.
     ///
-    /// In normal operation this runs opportunistically after a prepare is
-    /// accepted ([`Self::on_prepare_message`]) and after every `Headers`
-    /// response ([`Self::on_headers`]).
+    /// Runs only while [`Self::journal_repair_timeout`] is active: in normal
+    /// operation it fires every `JOURNAL_REPAIR_TIMEOUT` ticks, and
+    /// opportunistically after a prepare is accepted
+    /// ([`Self::on_prepare_message`]) and after every `Headers` response
+    /// ([`Self::on_headers`]).
     ///
-    /// DEVIATION (deferred): the `journal_repair_timeout` gate, grid `GetBlocks`
-    /// repair, and the view-change primary's `primary_send_view` steps are not
-    /// ported yet — `repair()` is a manual trigger that the harness calls when
-    /// it wants a pass.
+    /// DEVIATION (deferred): the grid `GetBlocks` repair and the view-change
+    /// primary's `primary_send_view` step are not ported yet.
     ///
     /// # Panics
     ///
@@ -3092,6 +3123,13 @@ impl Replica {
     ///
     /// Upstream: `src/vsr/replica.zig:7544` (`repair`).
     pub fn repair(&mut self) {
+        if !self.journal_repair_timeout.active {
+            // Upstream: `if (!self.journal_repair_timeout.ticking) return;`
+            // (replica.zig:7545). Guards against repair traffic before the
+            // replica has completed its status transition.
+            return;
+        }
+
         assert!(self.status == Status::Normal || self.status == Status::ViewChange);
         assert!(self.repairs_allowed());
 
@@ -3120,12 +3158,19 @@ impl Replica {
         // The op is from the current view; anything that hash-chains to it is
         // worth repairing (upstream 7608-7619). Wait for view-change primaries.
 
-        let repair_op_max: u64 = if self.status == Status::ViewChange {
+        let repair_op_max: u64 = if self.journal_repair_timeout.attempts != 0
+            && self.journal_repair_timeout.attempts.is_multiple_of(50)
+        {
+            // Every 50 timeouts, unconditionally repair — allows backups to
+            // repair journal faults in an idle cluster where the head op
+            // does not progress (replica.zig:7625).
+            self.op
+        } else if self.status == Status::ViewChange {
             // View-changing replicas repair unconditionally.
             self.op
         } else {
-            // Missing prepares within a pipeline of ops from the head may arrive
-            // via normal replication; wait for them (upstream 7635).
+            // Missing prepares within a pipeline of ops from the head may
+            // arrive via normal replication; wait for them (upstream 7635).
             self.op.saturating_sub(u64::from(constants::PIPELINE_PREPARE_QUEUE_MAX))
         };
 
@@ -4262,6 +4307,9 @@ mod tests {
         // [1..=11]: the 6..=14 break yields a GetHeaders request for 6..=11.
         let mut r = Replica::new(0, 1, 3); // backup
         r.status = Status::Normal;
+        // repair() is gated on the journal-repair timeout being active (the
+        // upstream `journal_repair_timeout` gate); arm it to run passes.
+        r.journal_repair_timeout = Timeout::start(constants::JOURNAL_REPAIR_TIMEOUT);
         let mut parent = 0;
         for op in 1..=5 {
             let h = make_prepare_for_replica(0, 0, op, parent, 0);
@@ -4313,6 +4361,9 @@ mod tests {
 
         let mut r = Replica::new(0, 1, 3); // backup
         r.status = Status::Normal;
+        // Arm the repair timeout so the internal repair passes after accepts
+        // and after Headers run (see the gap test above).
+        r.journal_repair_timeout = Timeout::start(constants::JOURNAL_REPAIR_TIMEOUT);
         let mut parent = 0;
         for op in 1..=5 {
             let h = make_prepare_for_replica(0, 0, op, parent, 0);
@@ -4394,6 +4445,8 @@ mod tests {
         }
         assert_eq!(r.commit_min, 11);
 
+        // Arm the repair timeout (repair() is gated on it being active).
+        r.journal_repair_timeout = Timeout::start(constants::JOURNAL_REPAIR_TIMEOUT);
         r.repair(); // contiguous and clean where it matters: nothing asked for
         assert!(r.send_queue.is_empty());
     }
@@ -4427,6 +4480,8 @@ mod tests {
         assert!(r.journal.dirty.bit(in_bounds));
         assert!(r.journal.dirty.bit(out_of_bounds));
 
+        // Arm the repair timeout (repair() is gated on it being active).
+        r.journal_repair_timeout = Timeout::start(constants::JOURNAL_REPAIR_TIMEOUT);
         r.repair();
 
         assert!(!r.journal.dirty.bit(out_of_bounds));
@@ -4452,6 +4507,8 @@ mod tests {
         assert_eq!(r.op, 8);
         assert!(r.op < r.op_repair_max());
 
+        // Arm the repair timeout (repair() is gated on it being active).
+        r.journal_repair_timeout = Timeout::start(constants::JOURNAL_REPAIR_TIMEOUT);
         r.repair();
         assert_eq!(r.send_queue.len(), 1);
         let get_view = r.send_queue.pop().unwrap().header::<message_header::GetView>().unwrap();
@@ -4484,6 +4541,10 @@ mod tests {
 
         let mut r = Replica::new(0, 1, 3); // backup
         r.status = Status::Normal;
+        // Arm the repair timeout before the View lands: the tail of `on_view`
+        // re-runs the (gated) repair pass to fill the gap below the jumped
+        // head.
+        r.journal_repair_timeout = Timeout::start(constants::JOURNAL_REPAIR_TIMEOUT);
         prepare_and_commit_suffix(&mut r, 0, 6, 6);
         r.commit_max = 15; // knows of commits beyond its head
         assert_eq!(r.op, 6);
@@ -4532,6 +4593,107 @@ mod tests {
         let get_prepare =
             r.send_queue.pop().unwrap().header::<message_header::GetPrepare>().unwrap();
         assert_eq!(get_prepare.prepare_op, 14);
+    }
+
+    #[test]
+    fn repair_is_gated_until_the_journal_repair_timeout_is_active() {
+        // `repair()` is only reached when the repair timeout is ticking
+        // (upstream `replica.zig:7545`); without it the pass emits nothing.
+        let mut r = Replica::new(0, 1, 3); // backup
+        r.status = Status::Normal;
+        prepare_and_commit_suffix(&mut r, 0, 5, 5);
+        r.commit_max = 16; // knows of commits beyond its head
+        assert_eq!(r.op, 5);
+        assert!(r.op < r.op_repair_max());
+
+        // Gate closed: no timeout armed.
+        r.repair();
+        assert!(r.send_queue.is_empty());
+        assert!(!r.journal_repair_timeout.active);
+
+        // Gate open: arming the timeout lets the pass run.
+        r.journal_repair_timeout = Timeout::start(constants::JOURNAL_REPAIR_TIMEOUT);
+        r.repair();
+        assert_eq!(r.send_queue.len(), 1);
+        let get_view = r.send_queue.pop().unwrap().header::<message_header::GetView>().unwrap();
+        assert_eq!(get_view.nonce, r.nonce);
+    }
+
+    #[test]
+    fn journal_repair_timeout_drives_repair_from_tick() {
+        // The tick loop fires the repair timeout, which re-arms itself and
+        // runs a repair pass — no manual `repair()` call needed.
+        let mut r = Replica::new(0, 1, 3); // backup
+        r.status = Status::Normal;
+        prepare_and_commit_suffix(&mut r, 0, 8, 8);
+        r.commit_max = 12; // knows of commits beyond its head
+
+        r.journal_repair_timeout = Timeout::start(constants::JOURNAL_REPAIR_TIMEOUT);
+        for _ in 0..constants::JOURNAL_REPAIR_TIMEOUT - 1 {
+            r.tick(100);
+        }
+        assert!(r.journal_repair_timeout.active); // not fired yet
+        assert_eq!(r.send_queue.len(), 0);
+
+        r.tick(100); // the timeout fires: re-arms and repairs
+        assert!(r.journal_repair_timeout.active); // re-armed
+        assert_eq!(r.journal_repair_timeout.attempts, 1);
+        assert_eq!(r.send_queue.len(), 1);
+        let get_view = r.send_queue.pop().unwrap().header::<message_header::GetView>().unwrap();
+        assert_eq!(get_view.replica, 1);
+        assert_eq!(get_view.nonce, r.nonce);
+    }
+
+    #[test]
+    fn every_fiftieth_repair_pass_is_unconditional() {
+        // In normal status the repair window is [commit_min+1, op - pipeline];
+        // a gap outside that window goes unrequested until the 50th timeout
+        // fire, which repairs unconditionally (upstream `replica.zig:7625`).
+        let mut r = Replica::new(0, 1, 3); // backup
+        r.status = Status::Normal;
+        let mut parent = 0;
+        for op in 1..=5 {
+            let h = make_prepare_for_replica(0, 0, op, parent, 0);
+            parent = h.checksum();
+            r.on_prepare(&h);
+        }
+        for op in 1..=5 {
+            r.commit_op(op);
+        }
+        // Committed 6..=7, then lost; the head jumps across the hole to op 8
+        // (see the committed-loss pattern above).
+        let h8 = make_prepare_for_replica(0, 0, 8, parent, 0);
+        deliver_prepare(&mut r, &h8); // jump to op 7
+        deliver_prepare(&mut r, &h8); // accept at op 8
+        assert_eq!(r.op, 8);
+        assert_eq!(r.commit_min, 5);
+        r.send_queue.clear();
+
+        r.journal_repair_timeout = Timeout::start(constants::JOURNAL_REPAIR_TIMEOUT);
+        // With pipeline=4 the bounded window is `op - 4 = 4`, so the 6..=7
+        // break's range is not requested, and the dirty head op 8 is out of
+        // `[commit_min+1, repair_op_max]`:
+        for _fire in 1..=49 {
+            for _ in 0..constants::JOURNAL_REPAIR_TIMEOUT {
+                r.tick(100);
+            }
+            assert_eq!(r.send_queue.len(), 0);
+        }
+        assert_eq!(r.journal_repair_timeout.attempts, 49);
+
+        // The 50th fire repairs unconditionally: GetHeaders for the 6..=7 gap
+        // and a GetPrepare for the dirty head op 8.
+        for _ in 0..constants::JOURNAL_REPAIR_TIMEOUT {
+            r.tick(100);
+        }
+        assert_eq!(r.journal_repair_timeout.attempts, 50);
+        assert_eq!(r.send_queue.len(), 2);
+        let get_headers = r.send_queue.remove(0).header::<message_header::GetHeaders>().unwrap();
+        assert_eq!(get_headers.op_min, 6);
+        assert_eq!(get_headers.op_max, 7);
+        let get_prepare =
+            r.send_queue.pop().unwrap().header::<message_header::GetPrepare>().unwrap();
+        assert_eq!(get_prepare.prepare_op, 8);
     }
 
     #[test]
