@@ -14,10 +14,14 @@
 // computation, and construction logic so that other modules can reference it.
 
 use tigerbeetle_core::constants;
+use tigerbeetle_core::stdx::prng::Prng;
 
 use crate::command::Command;
+use crate::grid::Grid;
 use crate::message_header;
 use crate::message_header::TypedHeader;
+use crate::repair_budget::{RepairBudgetGrid, RepairBudgetOptions};
+use crate::storage::MemoryStorage;
 
 // ---------------------------------------------------------------------------
 // Status
@@ -87,7 +91,26 @@ pub struct Replica {
     /// The write-ahead log (WAL): suspend slot geometry, header ring, dirty/
     /// faulty recovery bits, and on-disk checksums.
     pub journal: crate::journal::Journal,
-    // grid: Grid,
+    /// The grid (block storage): cache, stash, free set, read/write IOPS.
+    ///
+    /// `None` until [`Self::mount_grid`] attaches an opened grid — upstream owns
+    /// the grid from construction and runs it once the superblock is open.
+    ///
+    /// DEVIATION: upstream constructs the grid over a real data file and opens it
+    /// from the superblock. The sans-IO replica carries no superblock, so the
+    /// owner mounts an externally-opened grid (with an attached
+    /// [`crate::grid::SuperBlockView`]) before grid repairs can run.
+    ///
+    /// Just like upstream's `grid.callback == .cancel` gate, `None` short-circuits
+    /// all grid repair paths (`on_get_blocks`, `on_block`, `send_get_blocks`).
+    pub grid: Option<Grid>,
+    /// The storage backing [`Self::grid`].
+    ///
+    /// DEVIATION: upstream owns one `Storage` (`superblock.storage`) shared by
+    /// WAL and grid I/O. The sans-IO replica owns a concrete in-memory storage
+    /// for the grid; the grid's APIs take `&mut dyn Storage`, so both are handed
+    /// out together via [`Self::grid_mut`].
+    pub grid_storage: Option<MemoryStorage>,
     // state_machine: StateMachine,
     // clock: Clock,
     // client_sessions: ClientSessions,
@@ -103,6 +126,16 @@ pub struct Replica {
     pub exit_view_window_timeout: Timeout,
     pub primary_abdicate_timeout: Timeout,
     pub journal_repair_timeout: Timeout,
+    /// Drives periodic `GetBlocks` grid-repair requests (upstream
+    /// `grid_repair_timeout`).
+    pub grid_repair_timeout: Timeout,
+
+    // ── Grid repair bookkeeping ──────────────────────────────────────────
+    /// Per-replica budget of inflight block requests (upstream
+    /// `grid_repair_message_budget`).
+    pub grid_repair_message_budget: RepairBudgetGrid,
+    /// Deterministic PRNG for repair-selection shuffles (upstream `prng`).
+    pub prng: Prng,
 
     // ── Fault detection ──────────────────────────────────────────────────
     /// EWMA fault detector for commit heartbeats from the primary.
@@ -396,6 +429,9 @@ impl Replica {
     ///
     /// Panics if `replica_index >= replica_count` or `replica_count == 0`.
     #[must_use]
+    // `replica_index`/`replica_count` cast to the `u8` repair-budget indices;
+    // `replica_count ≤ u8::MAX` (constrained by cluster tuples in `constants`).
+    #[allow(clippy::cast_possible_truncation)]
     pub fn new(cluster: u128, replica_index: u16, replica_count: u16) -> Self {
         assert!(replica_index < replica_count);
         assert!(replica_count > 0);
@@ -428,11 +464,19 @@ impl Replica {
             exit_view_window_timeout: Timeout::default(),
             primary_abdicate_timeout: Timeout::default(),
             journal_repair_timeout: Timeout::default(),
+            grid_repair_timeout: Timeout::default(),
+            grid_repair_message_budget: RepairBudgetGrid::new(RepairBudgetOptions {
+                replica_index: replica_index as u8,
+                replica_count: replica_count as u8,
+            }),
+            prng: Prng::from_seed(u64::from(replica_index)),
             commit_fault: FaultDetector::new(0, 100, 2_000),
             heartbeat_timestamp: 0,
             exit_view_from_all_replicas: 0,
             primary_abdicating: false,
             journal: crate::journal::Journal::new(cluster, replica_index),
+            grid: None,
+            grid_storage: None,
             send_queue: Vec::new(),
             // Upstream boots from a superblock whose checkpoint holds the root
             // prepare at op 0; a fresh replica's JV always includes it.
@@ -450,6 +494,18 @@ impl Replica {
     #[must_use]
     pub fn quorum(&self) -> Quorum {
         quorums(self.replica_count)
+    }
+
+    /// Attach an opened grid and its backing storage (upstream constructs both
+    /// at `Replica` creation from the superblock).
+    ///
+    /// DEVIATION: the sans-IO replica starts without a grid; [`Self::grid`] is
+    /// `None` until the owner mounts one via this method (upstream always has a
+    /// grid, whose `grid.callback == .cancel` gates the same code paths until it
+    /// is open).
+    pub fn mount_grid(&mut self, grid: Grid, storage: MemoryStorage) {
+        self.grid = Some(grid);
+        self.grid_storage = Some(storage);
     }
 
     /// Returns `true` if this replica is the current primary for its view.
@@ -1577,6 +1633,9 @@ impl Replica {
         // DEVIATION: upstream additionally starts get_view_message_timeout,
         // repair_sync_timeout, grid_repair/scrub timeouts (none exist sans-IO
         // yet) and resets `commit_mins` / `head_ops` EWMA history.
+        //
+        // The grid repair timeout field lives on `Replica` but is armed only
+        // from the grid-repair integration (see `on_grid_repair_timeout`).
         self.journal_repair_timeout = Timeout::start(constants::JOURNAL_REPAIR_TIMEOUT);
 
         self.heartbeat_timestamp = 0;
@@ -3799,6 +3858,37 @@ impl Replica {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::Zone;
+    use crate::grid::GridOptions;
+    use tigerbeetle_lsm::free_set::SHARD_BITS;
+
+    #[test]
+    fn grid_mount_and_repair_budget_construction() {
+        let mut r = Replica::new(0xDEAD, 1, 3);
+        assert!(r.grid.is_none());
+        assert!(r.grid_storage.is_none());
+
+        // The grid repair budget covers every remote replica (`replica_count - 1`)
+        // with a full `GetBlocks` worth of budget each.
+        assert_eq!(r.grid_repair_message_budget.budget_available(0), 5);
+        assert_eq!(r.grid_repair_message_budget.budget_available(2), 5);
+
+        let grid = Grid::new(GridOptions {
+            cache_blocks_count: 64,
+            stash_blocks_count: 12,
+            read_iops_max: 2,
+            write_iops_max: 2,
+            // Free-set bootstrap: two shards worth of addresses (must be a
+            // multiple of `SHARD_BITS`; grid.rs uses the same sizing).
+            free_set_blocks_count: Some(2 * SHARD_BITS),
+            free_set_blocks_capacity: None,
+        });
+        let storage = MemoryStorage::new(Zone::Grid.start() + 64 * constants::BLOCK_SIZE as u64);
+        r.mount_grid(grid, storage);
+
+        assert!(r.grid.is_some());
+        assert!(r.grid_storage.is_some());
+    }
 
     #[test]
     fn quorums_1_replica() {

@@ -443,6 +443,12 @@ pub const VIEW_CHANGE_STATUS_TIMEOUT: u32 = 5_000;
 /// How often the repair timeout fires to drive `repair()` passes (upstream: 100ms).
 pub const JOURNAL_REPAIR_TIMEOUT: u32 = 100;
 
+/// How often the grid repair timeout fires to drive `send_get_blocks` passes.
+///
+/// Upstream: `timeout_grid_repair_message_ticks` defaults to `100 / tick_ms`
+/// (replica.zig:1427), i.e. the same cadence as the journal repair timeout.
+pub const GRID_REPAIR_TIMEOUT: u32 = 100;
+
 /// The maximum number of outgoing messages that may be queued on a replica connection.
 pub const CONNECTION_SEND_QUEUE_MAX_REPLICA: usize = umax(umin(CLIENTS_MAX as usize, 4), 2);
 
