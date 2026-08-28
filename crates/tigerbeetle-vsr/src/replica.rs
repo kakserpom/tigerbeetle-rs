@@ -1462,24 +1462,76 @@ impl Replica {
 
     /// Handle a ping message — reply with a pong.
     ///
-    /// Upstream: `src/vsr/replica.zig:1849` (`on_ping`).
+    /// Pings let replicas synchronize cluster time and probe for connectivity.
+    /// Only replicas in `Normal`/`ViewChange` status reply, and misdirected
+    /// pings (from ourselves) are dropped.
     ///
-    /// DEVIATION: upstream extracts `ping_timestamp_monotonic` from the typed
-    /// Ping header.  This stub accepts the raw Header; typed field access is
-    /// deferred until the typed-header integration is complete.
-    #[allow(clippy::unused_self)]
-    #[must_use]
-    pub fn on_ping(&self, _header: &message_header::Header) -> PingReply {
-        // TODO(port): extract ping_timestamp_monotonic from typed Ping header.
-        PingReply { ping_timestamp_monotonic: 0, pong_timestamp_wall: 0 }
+    /// Upstream: `src/vsr/replica.zig:1849` (`on_ping`).
+    pub fn on_ping(&mut self, message: &crate::message::Message) {
+        let Some(ping) = message.header::<message_header::Ping>() else {
+            return;
+        };
+        if !ping.valid_checksum() || !ping.valid_checksum_body(message.body_used()) {
+            return;
+        }
+        if ping.invalid_header().is_some() {
+            return;
+        }
+        if self.status != Status::Normal && self.status != Status::ViewChange {
+            return;
+        }
+        if ping.replica == self.replica_u8() {
+            return; // Misdirected message (self).
+        }
+        // TODO(port): multiversion `upgrade_targets` tracking from the ping's
+        // view/checkpoint/release list (upstream replica.zig:1871).
+
+        // DEVIATION: upstream uses `view_durable()` (the on-disk view) so that
+        // pongs aren't dropped while the view is being updated, and `self.release`
+        // for the multiversion version; the sans-IO replica has neither superblock
+        // nor multiversion support, so the in-memory view and the minimum release
+        // stand in (matching the Prepare header construction).
+        let mut reply = message_header::Pong {
+            cluster: self.cluster,
+            replica: self.replica_u8(),
+            view: self.view,
+            release: crate::multiversion::Release::MINIMUM,
+            // Copy the ping's monotonic timestamp and add our own wall-clock sample.
+            ping_timestamp_monotonic: ping.ping_timestamp_monotonic,
+            // DEVIATION: upstream samples `clock.realtime()` here; sans-IO has no
+            // wall clock, so the owner's latest monotonic `now` stands in.
+            pong_timestamp_wall: self.monotonic_now,
+            size: u32::try_from(message_header::SIZE)
+                .unwrap_or_else(|_| unreachable!("SIZE fits u32")),
+            ..message_header::Pong::default()
+        };
+        reply.set_checksum_body(&[]);
+        reply.set_checksum();
+        self.enqueue_header(&reply);
     }
 
     /// Handle a pong message — feed clock learning.
     ///
     /// Upstream: `src/vsr/replica.zig:1898` (`on_pong`).
-    #[allow(clippy::unused_self)]
-    pub fn on_pong(&mut self, _header: &message_header::Header) {
-        // TODO(port): clock.learn(m0, t1, m2) with the three-clock exchange.
+    pub fn on_pong(&mut self, message: &crate::message::Message) {
+        let Some(pong) = message.header::<message_header::Pong>() else {
+            return;
+        };
+        if !pong.valid_checksum() || !pong.valid_checksum_body(message.body_used()) {
+            return;
+        }
+        if pong.invalid_header().is_some() {
+            return;
+        }
+        if pong.replica == self.replica_u8() {
+            return; // Misdirected message (self).
+        }
+        // Ignore clocks of standbys.
+        if u16::from(pong.replica) < self.replica_count {
+            // TODO(port): `clock.learn(replica, ping_timestamp_monotonic,
+            // pong_timestamp_wall, monotonic_now)` and `prepare_timeout.set_rtt_ns`
+            // from the measured round-trip time (needs the clock/io infrastructure).
+        }
     }
 
     /// `self.replica_index` as the wire `u8` replica field.
@@ -2248,7 +2300,48 @@ impl Replica {
     /// Upstream: `src/vsr/replica.zig:3567` (`on_ping_timeout`).
     fn on_ping_timeout(&mut self) {
         self.ping_timeout.reset(constants::PING_TIMEOUT);
-        // TODO(port): broadcast Ping with view_durable(), checkpoint_id/op, release info.
+
+        // DEVIATION: upstream uses `view_durable()` (replica.zig:3574) and
+        // `self.release`, and `checkpoint_id` comes from the superblock's
+        // checkpoint; the sans-IO replica has no superblock or multiversion
+        // support (matching the Prepare header construction). `checkpoint_id = 0`
+        // is not validated by `Ping::invalid_header`.
+        let mut ping = message_header::Ping {
+            cluster: self.cluster,
+            replica: self.replica_u8(),
+            view: self.view,
+            release: crate::multiversion::Release::MINIMUM,
+            checkpoint_id: 0,
+            checkpoint_op: self.op_checkpoint(),
+            // Upstream samples `clock.monotonic()`; the owner's tick provides it.
+            ping_timestamp_monotonic: self.monotonic_now,
+            // DEVIATION: upstream bundles the multiversion release list (up to
+            // `vsr_releases_max`); sans-IO builds with the single minimum release.
+            release_count: 1,
+            ..message_header::Ping::default()
+        };
+
+        // Body: up to `vsr_releases_max` Release entries, the bundled minimum
+        // first and the rest zeroed (upstream `ping_message_release_list`).
+        let body_len = size_of::<crate::multiversion::Release>()
+            * usize::try_from(constants::VSR_RELEASES_MAX)
+                .unwrap_or_else(|_| unreachable!("vsr_releases_max fits usize"));
+        let mut body = vec![0_u8; body_len];
+        body[..size_of::<crate::multiversion::Release>()]
+            .copy_from_slice(&crate::multiversion::Release::MINIMUM.value.to_le_bytes());
+        ping.size = u32::try_from(message_header::SIZE + body.len())
+            .unwrap_or_else(|_| unreachable!("ping size is far below u32::MAX"));
+        ping.set_checksum_body(&body);
+        ping.set_checksum();
+
+        // Broadcast to every other replica (upstream
+        // `send_message_to_other_replicas_and_standbys`, replica.zig:3605).
+        for _ in 1..self.replica_count {
+            let mut message = crate::message::Message::new();
+            message.set_header(&ping);
+            message.set_body(&body);
+            self.send_queue.push(message);
+        }
     }
 
     /// Timeout: the primary re-sends pending prepares or issues a Commit
@@ -2384,13 +2477,6 @@ impl Replica {
         self.primary_abdicate_timeout.reset(constants::PRIMARY_ABDICATE_TIMEOUT);
         self.primary_abdicating = true;
     }
-}
-
-/// Reply to a ping message.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PingReply {
-    pub ping_timestamp_monotonic: u64,
-    pub pong_timestamp_wall: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -2554,10 +2640,10 @@ impl Replica {
             Command::GetView => self.on_get_view(message),
             Command::GetBlocks => self.on_get_blocks(message),
             Command::Block => self.on_block(message),
+            Command::Ping => self.on_ping(message),
+            Command::Pong => self.on_pong(message),
             // TODO(port): remaining message handlers.
             Command::Reply
-            | Command::Ping
-            | Command::Pong
             | Command::PingClient
             | Command::GetReply
             | Command::Deprecated12
@@ -4304,6 +4390,49 @@ mod tests {
         message
     }
 
+    /// Builds a valid `Ping` message from `source`, echoing the minimum release
+    /// (upstream `ping_message_release_list`).
+    fn ping_message(source: u8, ping_timestamp_monotonic: u64) -> Message {
+        let mut header = message_header::Ping::default();
+        header.cluster = CLUSTER;
+        header.replica = source;
+        header.release = crate::multiversion::Release::MINIMUM;
+        header.checkpoint_op = 0;
+        header.ping_timestamp_monotonic = ping_timestamp_monotonic;
+        header.release_count = 1;
+
+        let body_len =
+            size_of::<crate::multiversion::Release>() * constants::VSR_RELEASES_MAX as usize;
+        let mut body = vec![0_u8; body_len];
+        body[..size_of::<crate::multiversion::Release>()]
+            .copy_from_slice(&crate::multiversion::Release::MINIMUM.value.to_le_bytes());
+        header.size = (message_header::SIZE + body.len()) as u32;
+        header.set_checksum_body(&body);
+        header.set_checksum();
+
+        let mut message = Message::new();
+        message.set_header(&header);
+        message.set_body(&body);
+        message
+    }
+
+    /// Builds a valid `Pong` message from `source`.
+    fn pong_message(source: u8) -> Message {
+        let mut header = message_header::Pong::default();
+        header.cluster = CLUSTER;
+        header.replica = source;
+        header.release = crate::multiversion::Release::MINIMUM;
+        header.ping_timestamp_monotonic = 7;
+        header.pong_timestamp_wall = 9;
+        header.size = message_header::SIZE as u32;
+        header.set_checksum_body(&[]);
+        header.set_checksum();
+
+        let mut message = Message::new();
+        message.set_header(&header);
+        message
+    }
+
     #[test]
     fn grid_mount_and_repair_budget_construction() {
         let mut r = Replica::new(CLUSTER, 1, 3);
@@ -4633,6 +4762,64 @@ mod tests {
         // four of the five blocks are requested, leaving one request of budget.
         assert_eq!(r.grid_mut().0.read_global_queue_len(), 5, "still parked until fulfilled");
         assert_eq!(r.grid_repair_message_budget.budget_available(0), 1);
+    }
+
+    #[test]
+    fn grid_repair_expiry_restores_budget_and_resends() {
+        // Same five-parked-read topology as the cap test. Once the four
+        // outstanding requests expire (GRID_REPAIR_EXPIRY later), the budget is
+        // restored and the grid repair timeout re-requests the blocks.
+        let mut r = Replica::new(CLUSTER, 1, 2);
+        mount_test_grid(&mut r);
+        let requests: Vec<(u64, u128)> =
+            (1_u64..=5).map(|address| (address, 0x1000_u128 + u128::from(address))).collect();
+        {
+            let (grid, storage) = r.grid_mut();
+            let reservation = grid.reserve(requests.len());
+            for (address, _) in &requests {
+                assert_eq!(grid.acquire(reservation), *address);
+            }
+            for (address, checksum) in &requests {
+                grid.read_block(
+                    storage,
+                    *address,
+                    *checksum,
+                    true,
+                    ReadOptions { cache_read: true, cache_write: false },
+                );
+            }
+            grid.poll(storage);
+            assert_eq!(grid.read_global_queue_len(), 5);
+        }
+        r.status = Status::Normal;
+        r.grid_repair_timeout = Timeout::start(constants::GRID_REPAIR_TIMEOUT);
+
+        // First round (t=0): four blocks requested, one request of budget left.
+        r.on_grid_repair_timeout();
+        assert_eq!(r.send_queue.len(), 1);
+        assert_eq!(r.grid_repair_message_budget.budget_available(0), 1);
+
+        // A round before expiry (t=0): the requests are still outstanding and
+        // the budget is below GRID_REPAIR_REQUEST_MAX, so nothing is re-sent.
+        r.send_queue.clear();
+        r.on_grid_repair_timeout();
+        assert!(r.send_queue.is_empty(), "budget exhausted until the requests expire");
+
+        // After expiry (t = GRID_REPAIR_EXPIRY + 1ms): the budget is restored
+        // and the blocks are re-requested from the parked reads.
+        r.monotonic_now = 251_000_000;
+        r.on_grid_repair_timeout();
+        assert_eq!(r.send_queue.len(), 1, "expired requests are re-issued");
+        assert_eq!(r.grid_repair_message_budget.budget_available(0), 1);
+        let get_blocks = r.send_queue.remove(0);
+        let request = get_blocks.header::<message_header::GetBlocks>().expect("get_blocks");
+        assert!(request.valid_checksum());
+        assert_eq!(
+            request.size as usize,
+            message_header::SIZE
+                + usize::from(constants::GRID_REPAIR_REQUEST_MAX)
+                    * size_of::<crate::BlockRequest>()
+        );
     }
 
     #[test]
@@ -6953,6 +7140,82 @@ mod tests {
 
         r.tick(0);
         assert_eq!(r.ping_timeout.ticks, constants::PING_TIMEOUT);
+    }
+
+    #[test]
+    fn on_ping_replies_with_pong() {
+        let mut r = Replica::new(CLUSTER, 0, 2);
+        r.status = Status::Normal;
+        // The pong echoes the pinger's monotonic timestamp and carries this
+        // replica's wall-clock sample (`monotonic_now` sans-IO).
+        r.monotonic_now = 5;
+
+        let ping_msg = ping_message(1, 123_456_789);
+        r.on_message(&ping_msg, 5);
+        assert_eq!(r.send_queue.len(), 1);
+        let reply = r.send_queue.remove(0);
+
+        let pong = reply.header::<message_header::Pong>().expect("pong replied");
+        assert!(pong.valid_checksum());
+        assert!(pong.valid_checksum_body(&[]));
+        assert_eq!(pong.invalid_header(), None);
+        assert_eq!(pong.cluster, CLUSTER);
+        assert_eq!(pong.replica, 0);
+        assert_eq!(pong.release, crate::multiversion::Release::MINIMUM);
+        assert_eq!(pong.ping_timestamp_monotonic, 123_456_789);
+        assert_eq!(pong.pong_timestamp_wall, 5);
+    }
+
+    #[test]
+    fn on_ping_ignored_when_not_normal_or_misdirected() {
+        // A recovering replica does not reply (upstream replica.zig:1851).
+        let mut r = Replica::new(CLUSTER, 0, 2);
+        let ping = ping_message(1, 11);
+        r.on_message(&ping, 0);
+        assert!(r.send_queue.is_empty());
+
+        // Misdirected (from self): dropped even when Normal.
+        r.status = Status::Normal;
+        let self_ping = ping_message(0, 11);
+        r.on_message(&self_ping, 0);
+        assert!(r.send_queue.is_empty());
+    }
+
+    #[test]
+    fn on_pong_ignores_misdirected_and_standby() {
+        let mut r = Replica::new(CLUSTER, 0, 2);
+        // Misdirected (self): dropped.
+        let self_pong = pong_message(0);
+        r.on_message(&self_pong, 0);
+        assert!(r.send_queue.is_empty());
+        // A standby's clock is ignored (replica >= replica_count).
+        let standby_pong = pong_message(2);
+        r.on_message(&standby_pong, 0);
+        assert!(r.send_queue.is_empty());
+    }
+
+    #[test]
+    fn on_ping_timeout_broadcasts_pings() {
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        r.status = Status::Normal;
+        r.ping_timeout = Timeout::start(1);
+
+        r.tick(5);
+        assert_eq!(r.send_queue.len(), 2, "one ping to each other replica");
+        let body_len =
+            size_of::<crate::multiversion::Release>() * constants::VSR_RELEASES_MAX as usize;
+        for message in &r.send_queue {
+            let ping = message.header::<message_header::Ping>().expect("broadcast ping");
+            assert!(ping.valid_checksum());
+            assert!(ping.valid_checksum_body(message.body_used()));
+            assert_eq!(ping.invalid_header(), None);
+            assert_eq!(ping.cluster, CLUSTER);
+            assert_eq!(ping.replica, 0);
+            assert_eq!(ping.release, crate::multiversion::Release::MINIMUM);
+            assert_eq!(ping.checkpoint_op, 0);
+            assert_eq!(ping.ping_timestamp_monotonic, 5);
+            assert_eq!(message.body_used().len(), body_len);
+        }
     }
 
     #[test]
