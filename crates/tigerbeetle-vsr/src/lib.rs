@@ -118,10 +118,10 @@ const _: () = assert!(size_of::<RegisterRequest>() == 256);
 #[repr(C)]
 pub struct RegisterResult {
     pub batch_size_limit: u32,
-    pub reserved: [u8; 60],
+    pub reserved: [u8; 252],
 }
 
-const _: () = assert!(size_of::<RegisterResult>() == 64);
+const _: () = assert!(size_of::<RegisterResult>() == 256);
 
 /// Port of `vsr.UpgradeRequest`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

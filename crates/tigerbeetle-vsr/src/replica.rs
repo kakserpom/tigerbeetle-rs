@@ -129,6 +129,13 @@ pub struct Replica {
     /// The client sessions table: the latest committed reply header per active
     /// client (upstream `client_sessions`).
     pub client_sessions: crate::client_sessions::ClientSessions,
+    /// The committed client replies, persisted to the client-replies zone of
+    /// the data file (upstream `client_replies`).
+    ///
+    /// Writes are only possible once a storage is mounted via
+    /// [`Self::grid_storage`] (see the field's DEVIATION note); reads are
+    /// deferred until the GetReply handler is ported.
+    pub client_replies: crate::client_replies::ClientReplies,
 
     // ── Timeouts (tick counts) ──────────────────────────────────────────
     pub ping_timeout: Timeout,
@@ -515,6 +522,7 @@ impl Replica {
             send_queue: Vec::new(),
             client_send_queue: Vec::new(),
             client_sessions: crate::client_sessions::ClientSessions::new(),
+            client_replies: crate::client_replies::ClientReplies::new(replica_index as u8),
             // Upstream boots from a superblock whose checkpoint holds the root
             // prepare at op 0; a fresh replica's JV always includes it.
             join_view_headers: vec![message_header::Prepare::root(cluster)],
@@ -1381,13 +1389,15 @@ impl Replica {
             size: message_header::SIZE_U32,
             ..message_header::Reply::default()
         };
-        // DEVIATION: the reply body is deferred (see above), so the checksum
-        // covers an empty body even for operations that carry one upstream.
-        reply.set_checksum_body(&[]);
+        // DEVIATION: the reply body is deferred (see above), so its checksum
+        // covers the zeroed `RegisterResult` that this build produces (the
+        // `batch_size_limit` contents are zeroed — upstream copies them from
+        // the register request body).
         if reply.operation == crate::Operation::REGISTER {
-            // Inflate the size to carry a `RegisterResult` alongside a
-            // checksum computed over the empty (deferred) body.
             reply.size += message_header::REGISTER_RESULT_SIZE_U32;
+            reply.set_checksum_body(&[0_u8; message_header::REGISTER_RESULT_SIZE_U32 as usize]);
+        } else {
+            reply.set_checksum_body(&[]);
         }
         // `context` is the reply's checksum computed with a fixed view,
         // allowing the reply to be retransmitted in a newer view
@@ -1429,8 +1439,28 @@ impl Replica {
             assert_eq!(self.client_sessions.count(), clients_max - 1);
         }
 
-        let _ = self.client_sessions.put(session, reply);
+        let slot = self.client_sessions.put(session, reply);
         assert!(self.client_sessions.count() <= clients_max);
+
+        // Persist the reply body to the client-replies zone (a register reply
+        // is the only body-ful reply our operations produce).
+        //
+        // DEVIATION: upstream writes unconditionally. The sans-IO replica has
+        // no storage until the owner mounts one via `grid_storage` (see its
+        // DEVIATION note); without it the reply lives only in the in-memory
+        // sessions trailer.
+        if let Some(storage) = self.grid_storage.as_mut() {
+            let mut message = crate::message::Message::new();
+            // The body is already zeroed by `Message::new` (the zeroed
+            // `RegisterResult` that `build_reply`'s checksum covers).
+            message.set_header(reply);
+            self.client_replies.write_reply(
+                storage,
+                slot,
+                message,
+                crate::client_replies::WriteTrigger::Commit,
+            );
+        }
     }
 
     /// Update a registered client's latest reply on commit.
@@ -1459,7 +1489,35 @@ impl Replica {
 
             entry.header = *reply;
         }
-        // Else: the session was evicted while preparing; nothing to update.
+
+        // The session was evicted while preparing; nothing to do. The next
+        // request will receive an eviction from the primary.
+        let Some(slot) = self.client_sessions.get_slot_for_header(reply) else {
+            return;
+        };
+
+        // A body-less reply needs no storage: the header lives safely in the
+        // `client_sessions` trailer, so the slot's reply is removed
+        // (upstream replica.zig:5773-5776).
+        if reply.size == message_header::SIZE_U32 {
+            self.client_replies.remove_reply(slot);
+            return;
+        }
+
+        // DEVIATION: upstream writes unconditionally; the sans-IO replica
+        // persists only when a storage is mounted (see `grid_storage`'s
+        // DEVIATION note).
+        let Some(storage) = self.grid_storage.as_mut() else {
+            return;
+        };
+        let mut message = crate::message::Message::new();
+        message.set_header(reply);
+        self.client_replies.write_reply(
+            storage,
+            slot,
+            message,
+            crate::client_replies::WriteTrigger::Commit,
+        );
     }
 
     /// Stage: CheckpointDurable — mark the checkpoint as durable.
@@ -3054,6 +3112,29 @@ impl Replica {
         for event in events {
             self.on_grid_event(event);
         }
+    }
+
+    /// Drive pending client-reply writes to completion (upstream: the storage
+    /// callback halves of `client_replies`, settled in the IO event loop).
+    ///
+    /// The written replies stay unread — the GetReply handler is deferred — so
+    /// the only events produced are write completions, which are consumed here.
+    ///
+    /// DEVIATION: the sans-IO replica has no storage until one is mounted via
+    /// `grid_storage` (see that field's DEVIATION note); without it there is
+    /// nothing to poll.
+    ///
+    /// # Panics
+    /// Panics if a client-reply event requires a handler that is not ported yet.
+    pub fn poll_client_replies(&mut self) {
+        let Some(storage) = self.grid_storage.as_mut() else {
+            return;
+        };
+        self.client_replies.poll(storage);
+        assert!(
+            self.client_replies.take_events().is_empty(),
+            "client-reply events imply handlers that are not ported yet"
+        );
     }
 
     fn on_grid_event(&mut self, event: Event) {
@@ -5584,6 +5665,87 @@ mod tests {
 
         assert_eq!(r.client_sessions.count(), 1, "unregistered client creates no entry");
         assert!(r.client_sessions.get(8).is_none());
+    }
+
+    #[test]
+    fn commit_execute_register_writes_reply_to_storage() {
+        use crate::storage::{ReadRequest, Storage, zeroed_buffer};
+
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        r.status = Status::Normal;
+        r.grid_storage = Some(MemoryStorage::new(
+            Zone::ClientReplies.start() + 4 * crate::message::MESSAGE_SIZE_MAX as u64,
+        ));
+
+        // Register client 7 (commit 1): commits a body-ful reply.
+        let op = r.primary_pipeline_prepare(7, 0, crate::Operation::REGISTER, 0).unwrap();
+        assert_eq!(op, 1);
+        r.commit_max = 1;
+        r.commit_prepare = Some(1);
+        r.commit_stage = CommitStage::Execute;
+        r.commit_execute();
+
+        let slot = r.client_sessions.get_slot_for_client(7).expect("client 7 session");
+        assert!(!r.client_replies.reply_durable(slot), "reply not yet written");
+        r.poll_client_replies();
+        assert!(r.client_replies.reply_durable(slot), "reply durably written");
+
+        // Read the reply back from the client-replies zone and verify it is the
+        // registered client's zeroed-`RegisterResult` reply.
+        let mut storage = r.grid_storage.take().expect("mounted storage");
+        storage.read_sectors(ReadRequest {
+            zone: Zone::ClientReplies,
+            offset_in_zone: 0,
+            buffer: zeroed_buffer(crate::message::MESSAGE_SIZE_MAX),
+        });
+        let written = match storage.next_completion().expect("read completion") {
+            crate::storage::Completion::Read(request) => request.buffer,
+            crate::storage::Completion::Write(_) => unreachable!("expected a read"),
+        };
+
+        let entry = r.client_sessions.get(7).expect("registered client");
+        let written_header = message_header::Reply::from_wire(
+            written[..message_header::SIZE].try_into().expect("frame length"),
+        )
+        .expect("reply frame parses");
+        assert_eq!(written_header.checksum, entry.header.checksum);
+        assert_eq!(written_header.size, 512, "size was {}", written_header.size);
+        assert_eq!(&written[message_header::SIZE..512], &[0_u8; 256]);
+    }
+
+    #[test]
+    fn commit_execute_noop_does_not_write_reply() {
+        use crate::storage::Storage;
+
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        r.status = Status::Normal;
+        r.grid_storage = Some(MemoryStorage::new(
+            Zone::ClientReplies.start() + 4 * crate::message::MESSAGE_SIZE_MAX as u64,
+        ));
+
+        // Register client 7 (commit 1) then commit its body-less noop (op 2).
+        let op = r.primary_pipeline_prepare(7, 0, crate::Operation::REGISTER, 0).unwrap();
+        assert_eq!(op, 1);
+        r.commit_max = 1;
+        r.commit_prepare = Some(1);
+        r.commit_stage = CommitStage::Execute;
+        r.commit_execute();
+        r.poll_client_replies();
+
+        let op = r.primary_pipeline_prepare(7, 1, crate::Operation::NOOP, 0).unwrap();
+        assert_eq!(op, 2);
+        r.commit_max = 2;
+        r.commit_prepare = Some(2);
+        r.commit_stage = CommitStage::Execute;
+        r.commit_execute();
+
+        // A body-less reply is not written: remove_reply only clears the slot's
+        // faulty bit, so the storage stays quiet.
+        let slot = r.client_sessions.get_slot_for_client(7).expect("client 7 session");
+        assert!(r.client_replies.reply_durable(slot));
+        r.poll_client_replies();
+        let mut storage = r.grid_storage.take().expect("mounted storage");
+        assert!(storage.next_completion().is_none(), "noop produced no write");
     }
 
     #[test]
