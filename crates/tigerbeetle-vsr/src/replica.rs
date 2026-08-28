@@ -1603,13 +1603,24 @@ impl Replica {
     /// # Panics
     ///
     /// Panics if the replica is not the newly-elected primary in `ViewChange`
-    /// status, or if the journal is missing a survivor header (cannot happen by
-    /// construction — the log was just installed from the quorum).
+    /// status, if its journal is not fully repaired, or if the journal is
+    /// missing a survivor header. The journal-repaired panic is defensive
+    /// (matching upstream `primary_start_view_as_the_new_primary`): dirty ops
+    /// are nacked and truncated by the CTRL quorum before this runs, so it is
+    /// unreachable through [`Self::on_join_view`] by construction.
     fn primary_start_view_as_the_new_primary(&mut self, now: u64) {
         assert_eq!(self.status, Status::ViewChange);
         assert!(self.is_primary());
         assert_eq!(self.view, self.log_view);
         assert!(self.join_view_quorum);
+        // Upstream: `assert(self.primary_repair_pipeline() == .done)` and
+        // `assert(self.primary_journal_repaired())`.
+        // DEVIATION: the CTRL pipeline-repair phase (`primary_repair_pipeline`,
+        // its read callbacks and timeout) collapses in sans-IO — the journal
+        // holds only headers with no WAL read/completion model, so the rebuild
+        // below is the synchronous `primary_repair_pipeline_done` and the
+        // `.done` branch is taken unconditionally.
+        assert!(self.primary_journal_repaired());
         assert_eq!(self.commit_min, self.commit_max);
         assert!(self.commit_max <= self.op);
 
@@ -1617,18 +1628,31 @@ impl Replica {
         // `primary_repair_pipeline_done`, sans-IO: nothing to verify).
         self.pipeline_queue = PipelineQueue::default();
         self.ok_from_all_replicas.clear();
+        // A surviving op's header must string together with its predecessor
+        // (upstream asserts `journal_header.parent == parent` for each op):
+        let mut parent = match self.journal.header_with_op(self.commit_max) {
+            Some(header) => header.checksum(),
+            // DEVIATION: sans-IO journals hold no op-0 root (no superblock), so
+            // a chain anchored at commit_max == 0 starts from a zero parent.
+            None if self.commit_max == 0 => 0,
+            None => panic!("missing committed anchor {}", self.commit_max),
+        };
         for op in self.commit_max + 1..=self.op {
             let Some(header) = self.journal.header_with_op(op).copied() else {
                 panic!("new primary journal must hold survivor op {op}");
             };
+            assert_eq!(header.parent, parent);
+            assert_eq!(self.commit_max + self.pipeline_queue.prepare_queue.len() as u64, op - 1);
             self.pipeline_queue.prepare_queue.push(PipelinePrepare {
                 op,
                 checksum: header.checksum(),
                 acks_received: 0,
                 ok_quorum_received: false,
             });
+            parent = header.checksum();
             self.ok_from_all_replicas.push(0);
         }
+        assert_eq!(self.commit_max + self.pipeline_queue.prepare_queue.len() as u64, self.op);
 
         self.transition_to_normal_from_view_change_status(self.view, now);
 
@@ -1865,6 +1889,53 @@ impl Replica {
             assert!(self.join_view_quorum);
         }
         self.valid_hash_chain_between(self.op_repair_min(), self.op)
+    }
+
+    /// Whether every op the journal holds in `op_repair_min()..=op` has had its
+    /// prepare written to the WAL (no dirty slots) — the companion half of
+    /// [`Self::primary_journal_headers_repaired`]: the new primary may only
+    /// advertise and start a view once its own uncommitted prepares are durable,
+    /// so a subsequent crash cannot truncate them.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless the replica is the primary with `view == log_view`, a
+    /// view-changing primary without a collected JoinView quorum, or holds an
+    /// entry in `op_repair_min()..=op` whose header is absent.
+    ///
+    /// Upstream: `src/vsr/replica.zig:7983` (`primary_journal_prepares_repaired`).
+    fn primary_journal_prepares_repaired(&self) -> bool {
+        assert!(self.status == Status::Normal || self.status == Status::ViewChange);
+        assert!(self.is_primary());
+        assert_eq!(self.view, self.log_view);
+        if self.status == Status::ViewChange {
+            assert!(self.join_view_quorum);
+        }
+        for op in self.op_repair_min()..=self.op {
+            let Some(header) = self.journal.header_with_op(op) else {
+                panic!("primary journal missing header {op}");
+            };
+            let slot = self.journal.slot_for_header(header);
+            if self.journal.dirty.bit(slot) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Whether the primary's journal is fully repaired: headers hash-chain
+    /// connected up to the head *and* every prepare written. Without both, the
+    /// primary must not send Views or start the view as the new primary.
+    ///
+    /// Upstream: `src/vsr/replica.zig:7973` (`primary_journal_repaired`).
+    fn primary_journal_repaired(&self) -> bool {
+        assert!(self.status == Status::Normal || self.status == Status::ViewChange);
+        assert!(self.is_primary());
+        assert_eq!(self.view, self.log_view);
+        if self.status == Status::ViewChange {
+            assert!(self.join_view_quorum);
+        }
+        self.primary_journal_headers_repaired() && self.primary_journal_prepares_repaired()
     }
 
     /// Whether the journal holds a contiguous, connected hash chain over
@@ -5689,6 +5760,30 @@ mod tests {
         prepare_and_commit_suffix(&mut r, 0, 3, 1);
         r.journal.remove_entry(crate::journal::Journal::slot_for_op(2));
         r.primary_send_view();
+    }
+
+    #[test]
+    fn primary_journal_prepares_repaired_requires_written_prepares() {
+        let mut r = Replica::new(0, 0, 1);
+        r.status = Status::Normal;
+        let h1 = make_prepare_for_replica(0, 0, 1, 0, 0);
+        r.on_prepare(&h1);
+        let h2 = make_prepare_for_replica(0, 0, 2, h1.checksum(), 0);
+        r.on_prepare(&h2);
+        let h3 = make_prepare_for_replica(0, 0, 3, h2.checksum(), 0);
+        r.on_prepare(&h3);
+        // A single-replica primary commits through `commit_op`, not the Commit
+        // message (which on_commit ignores for the primary).
+        r.commit_op(1);
+
+        // Ops 2,3 were prepared but never written to the WAL — still dirty.
+        assert!(!r.primary_journal_prepares_repaired());
+        assert!(!r.primary_journal_repaired());
+
+        // Model the WAL write completions; the journal is now fully repaired.
+        mark_suffix_durable(&mut r, 1, 3);
+        assert!(r.primary_journal_prepares_repaired());
+        assert!(r.primary_journal_repaired());
     }
 
     #[test]
