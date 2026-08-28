@@ -2841,15 +2841,13 @@ impl Replica {
     /// requests, and request blocks from a random replica with budget left.
     ///
     /// Upstream: `src/vsr/replica.zig:3815` (`on_grid_repair_timeout`).
-    ///
-    /// # Panics
-    /// Panics if the grid repair timeout is not active (the replica must be
-    /// in `Normal` status with the timeout armed).
     pub fn on_grid_repair_timeout(&mut self) {
-        assert!(self.grid_repair_timeout.active);
+        // Re-arm *before* requesting: `Timeout::tick` clears `active` when it
+        // fires (mirroring `on_journal_repair_timeout`, which resets before
+        // calling `repair()`).
+        self.grid_repair_timeout.reset(constants::GRID_REPAIR_TIMEOUT);
         // Upstream uses `reset_with_jitter`; sans-IO is deterministic, so we
         // re-arm with a fixed cadence (DEVIATION).
-        self.grid_repair_timeout.reset(constants::GRID_REPAIR_TIMEOUT);
         self.grid_repair_message_budget.reap_expired_requests(Instant { ns: self.monotonic_now });
 
         if self.grid.is_some()
@@ -4427,6 +4425,21 @@ mod tests {
         assert!(r.grid_serve_reads.is_empty());
     }
 
+    /// Issue a coherent read for `(address, checksum)` and pump the grid until
+    /// the read parks in the read-global queue (i.e. repairable-from-remote).
+    fn park_read(r: &mut Replica, address: u64, checksum: u128) {
+        let (grid, storage) = r.grid_mut();
+        grid.read_block(
+            storage,
+            address,
+            checksum,
+            true,
+            ReadOptions { cache_read: true, cache_write: false },
+        );
+        grid.poll(storage);
+        assert_eq!(grid.read_global_queue_len(), 1);
+    }
+
     #[test]
     fn on_block_repairs_parked_reads_and_persists() {
         // Two replicas in one cluster: r0 holds the block, r1's coherent read
@@ -4453,18 +4466,7 @@ mod tests {
         r1.grid_repair_timeout = Timeout::start(constants::GRID_REPAIR_TIMEOUT);
 
         // Park the coherent read: storage holds no block at `address`.
-        {
-            let (grid, storage) = r1.grid_mut();
-            grid.read_block(
-                storage,
-                address,
-                checksum,
-                true,
-                ReadOptions { cache_read: true, cache_write: false },
-            );
-            grid.poll(storage);
-            assert_eq!(grid.read_global_queue_len(), 1);
-        }
+        park_read(&mut r1, address, checksum);
 
         // The grid repair timeout picks a peer with budget left and requests.
         r1.on_grid_repair_timeout();
@@ -4510,6 +4512,127 @@ mod tests {
             )),
             "fresh read of the repaired block succeeds"
         );
+    }
+
+    #[test]
+    fn on_grid_repair_timeout_fires_repair_roundtrip_over_ticks() {
+        // Same topology as `on_block_repairs_parked_reads_and_persists`, but the
+        // requester drives the repair through the real timeout path (`tick()`
+        // firing `grid_repair_timeout`), not by calling the handler directly.
+        let mut r0 = Replica::new(CLUSTER, 0, 2);
+        mount_test_grid(&mut r0);
+        let (address, checksum, expected) = {
+            let (grid, storage) = r0.grid_mut();
+            write_block(grid, storage)
+        };
+
+        let mut r1 = Replica::new(CLUSTER, 1, 2);
+        mount_test_grid(&mut r1);
+        {
+            let (grid, _storage) = r1.grid_mut();
+            let reservation = grid.reserve(1);
+            assert_eq!(grid.acquire(reservation), address);
+        }
+        r1.status = Status::Normal;
+        r1.grid_repair_timeout = Timeout::start(constants::GRID_REPAIR_TIMEOUT);
+        park_read(&mut r1, address, checksum);
+
+        // Reactor loop: the grid repair timeout fires after `GRID_REPAIR_TIMEOUT`
+        // ticks and r1 requests the parked block. The cluster clock stands still
+        // for the grid path, so both replicas tick with `now = 0`.
+        for _ in 0..constants::GRID_REPAIR_TIMEOUT {
+            r0.tick(0);
+            r1.tick(0);
+        }
+        assert_eq!(r1.send_queue.len(), 1, "grid repair timeout fired");
+        let get_blocks = r1.send_queue.remove(0);
+
+        // r0 serves the reply.
+        r0.on_message(&get_blocks, 0);
+        r0.poll_grid();
+        assert_eq!(r0.send_queue.len(), 1);
+        let reply = r0.send_queue.remove(0);
+        assert_eq!(reply.buffer(), expected.as_slice());
+
+        // r1 consumes it: the parked read is fulfilled, nothing further is
+        // requested, and the block is durably written.
+        r1.on_message(&reply, 0);
+        assert_eq!(r1.send_queue.len(), 0, "no further blocks to request");
+        assert_eq!(r1.grid_mut().0.read_global_queue_len(), 0, "parked read fulfilled");
+        r1.poll_grid();
+
+        let (grid, storage) = r1.grid_mut();
+        let token = grid.read_block(
+            storage,
+            address,
+            checksum,
+            true,
+            ReadOptions { cache_read: true, cache_write: false },
+        );
+        grid.poll(storage);
+        let events = grid.take_events();
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                Event::ReadDone { token: done_token, result: ReadBlockResult::Valid, .. }
+                    if *done_token == token
+            )),
+            "fresh read of the repaired block succeeds"
+        );
+    }
+
+    #[test]
+    fn send_get_blocks_requests_at_most_grid_repair_request_max_blocks() {
+        // Five parked reads but a per-destination budget of four requests per
+        // `GetBlocks` message: only `GRID_REPAIR_REQUEST_MAX` are requested, the
+        // fifth stays parked for a later round.
+        let mut r = Replica::new(CLUSTER, 1, 2);
+        mount_test_grid(&mut r);
+        let requests: Vec<(u64, u128)> =
+            (1_u64..=5).map(|address| (address, 0x1000_u128 + u128::from(address))).collect();
+        {
+            let (grid, storage) = r.grid_mut();
+            let reservation = grid.reserve(requests.len());
+            for (address, _) in &requests {
+                assert_eq!(grid.acquire(reservation), *address);
+            }
+            for (address, checksum) in &requests {
+                grid.read_block(
+                    storage,
+                    *address,
+                    *checksum,
+                    true,
+                    ReadOptions { cache_read: true, cache_write: false },
+                );
+            }
+            grid.poll(storage);
+            assert_eq!(grid.read_global_queue_len(), 5);
+        }
+        r.status = Status::Normal;
+        r.grid_repair_timeout = Timeout::start(constants::GRID_REPAIR_TIMEOUT);
+
+        r.on_grid_repair_timeout();
+        assert_eq!(r.send_queue.len(), 1);
+        let get_blocks = r.send_queue.remove(0);
+        let request = get_blocks.header::<message_header::GetBlocks>().expect("get_blocks");
+        assert!(request.valid_checksum());
+        assert!(
+            request.valid_checksum_body(get_blocks.body_used()),
+            "request body carries exactly the requested blocks"
+        );
+        assert_eq!(
+            request.size as usize,
+            message_header::SIZE
+                + usize::from(constants::GRID_REPAIR_REQUEST_MAX)
+                    * size_of::<crate::BlockRequest>()
+        );
+
+        // Requests do not drain the global queue — parked reads are removed only
+        // by a fulfilling `Block` (see `on_block_repairs_parked_reads_and_persists`).
+        // Here the cap shows as the message size and the budget drawdown:
+        // four of the five blocks are requested, leaving one request of budget.
+        assert_eq!(r.grid_mut().0.read_global_queue_len(), 5, "still parked until fulfilled");
+        assert_eq!(r.grid_repair_message_budget.budget_available(0), 1);
     }
 
     #[test]
