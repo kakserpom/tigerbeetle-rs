@@ -1295,6 +1295,31 @@ impl Replica {
         true
     }
 
+    /// Whether this replica is responsible for replying to the client whose op
+    /// is being executed: the primary always replies; among the backups exactly
+    /// one, selected deterministically by the op, so that a client retrying
+    /// against another replica does not get a duplicate-request race
+    /// (upstream `execute_op_reply_to_client`, replica.zig:5328).
+    ///
+    /// # Panics
+    /// Panics if the replica count exceeds 256 (upstream `replica_count` is a
+    /// `u8`; the `u16` in this port only widens the domain).
+    #[allow(clippy::cast_possible_truncation)] // replica_count ≤ 256 (asserted)
+    fn execute_op_reply_to_client(&self, op: u64) -> bool {
+        if self.is_primary() {
+            return true;
+        }
+        if self.replica_count == 1 {
+            return false;
+        }
+        assert!(self.replica_count <= u16::from(u8::MAX) + 1);
+        let mut prng = tigerbeetle_core::stdx::prng::Prng::from_seed(op);
+        // Upstream: `range_inclusive(u8, 1, replica_count - 1)`.
+        let offset = 1_u8 + prng.gen_int_inclusive_u8(self.replica_count as u8 - 2);
+        let backup = (self.primary_index() + u16::from(offset)) % self.replica_count;
+        backup == self.replica_index
+    }
+
     /// Stage: Execute — run state machine logic on the committed prepare.
     ///
     /// After execution on the primary, pops the committed prepare from the
@@ -1325,6 +1350,14 @@ impl Replica {
                     assert_eq!(reply.client, 0);
                 }
                 _ => self.client_table_entry_update(&reply),
+            }
+
+            // Reply to the client: the primary always; exactly one backup per
+            // op (selected deterministically). Pulse/upgrade have no client.
+            if reply.client != 0 && self.execute_op_reply_to_client(reply.op) {
+                let mut message = crate::message::Message::new();
+                message.set_header(&reply);
+                self.send_reply_message_to_client(&message);
             }
         }
 
@@ -1835,6 +1868,46 @@ impl Replica {
         }
 
         false
+    }
+
+    /// Send a committed reply back to its client (upstream
+    /// `send_reply_message_to_client`, replica.zig:8946).
+    ///
+    /// If the reply was committed in an older view it is retransmitted with
+    /// the current `log_view` (`context`, the stable-with-view checksum, is
+    /// preserved), so the client never resumes against a primary that has
+    /// fallen behind (upstream replica.zig:8964-8987).
+    ///
+    /// DEVIATION: upstream sends through the message bus to the client's
+    /// address. The sans-IO port pushes the reply onto `client_send_queue`,
+    /// which the integration layer must pair with the client.
+    ///
+    /// # Panics
+    /// Panics if the message is not a reply, is addressed to the reserved
+    /// `client == 0`, or carries a view newer than `self.view` (upstream
+    /// asserts all three).
+    fn send_reply_message_to_client(&mut self, reply: &crate::message::Message) {
+        let Some(header) = reply.header::<message_header::Reply>() else {
+            return;
+        };
+        assert_eq!(header.command, crate::command::Command::Reply);
+        assert_ne!(header.client, 0);
+        assert!(header.view <= self.view);
+
+        if header.view == self.log_view {
+            self.client_send_queue.push(reply.clone());
+            return;
+        }
+
+        // Cold path: bump the view on a copy (upstream replica.zig:8968-8986).
+        let mut header = header;
+        header.view = self.log_view;
+        header.set_checksum();
+        let mut copy = crate::message::Message::new();
+        copy.set_header(&header);
+        let size = usize::try_from(header.size).unwrap_or_else(|_| unreachable!("size fits usize"));
+        copy.buffer_mut()[message_header::SIZE..size].copy_from_slice(reply.body_used());
+        self.client_send_queue.push(copy);
     }
 
     /// Send an Eviction message to a client (primary only).
@@ -5806,6 +5879,106 @@ mod tests {
         assert_eq!(entry.header.request, 1);
         assert_eq!(entry.header.op, 2);
         assert_eq!(entry.header.commit, 2);
+    }
+
+    #[test]
+    fn commit_execute_primary_replies_to_client() {
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        r.status = Status::Normal;
+
+        let op = r.primary_pipeline_prepare(7, 0, crate::Operation::REGISTER, 0).unwrap();
+        r.commit_max = op;
+        r.commit_prepare = Some(op);
+        r.commit_stage = CommitStage::Execute;
+        r.commit_execute();
+
+        // The primary always replies to the client.
+        assert_eq!(r.client_send_queue.len(), 1);
+        let reply = r.client_send_queue[0].header::<message_header::Reply>().expect("reply");
+        assert_eq!(reply.client, 7);
+        assert_eq!(reply.commit, 1);
+        assert_eq!(reply.request, 0);
+        assert_eq!(reply.op, reply.commit);
+        assert_eq!(reply.view, r.log_view);
+        assert_eq!(reply.replica, r.replica_u8());
+        assert!(reply.valid_checksum());
+        assert!(reply.valid_checksum_body(r.client_send_queue[0].body_used()));
+    }
+
+    #[test]
+    fn commit_execute_pulse_does_not_reply_to_client() {
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        r.status = Status::Normal;
+
+        // A pulse has no client, so nothing is queued for a client.
+        let op = r.primary_pipeline_prepare(0, 0, crate::Operation::PULSE, 0).unwrap();
+        r.commit_max = op;
+        r.commit_prepare = Some(op);
+        r.commit_stage = CommitStage::Execute;
+        r.commit_execute();
+
+        assert_eq!(r.client_send_queue.len(), 0, "pulse has no client to reply to");
+    }
+
+    #[test]
+    fn execute_op_reply_to_client_backups_are_deterministic() {
+        // The primary always replies.
+        let r0 = Replica::new(CLUSTER, 0, 3);
+        assert!(r0.execute_op_reply_to_client(1));
+
+        // Exactly one backup replies per op, selected deterministically.
+        let r1 = Replica::new(CLUSTER, 1, 3);
+        let r2 = Replica::new(CLUSTER, 2, 3);
+        for op in 1..=16 {
+            let a = r1.execute_op_reply_to_client(op);
+            let b = r2.execute_op_reply_to_client(op);
+            assert_ne!(a, b, "replicas 1 and 2 must pick exactly one replier (op {op})");
+            let selected_backup = if a { 1 } else { 2 };
+            let mut prng = tigerbeetle_core::stdx::prng::Prng::from_seed(op);
+            let offset = 1_u8 + prng.gen_int_inclusive_u8(1);
+            assert_eq!(
+                selected_backup,
+                u16::from(offset) % 3,
+                "selection matches the upstream PRNG (op {op})"
+            );
+        }
+    }
+
+    #[test]
+    fn send_reply_message_to_client_bumps_stale_view() {
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        r.view = 2;
+        r.log_view = 1;
+
+        let mut header = message_header::Reply::default();
+        header.cluster = CLUSTER;
+        header.replica = r.replica_u8();
+        header.view = 0; // Committed in an older view than `log_view`.
+        header.release = crate::multiversion::Release::MINIMUM;
+        header.op = 1;
+        header.commit = 1;
+        header.timestamp = 1;
+        header.client = 7;
+        header.request = 1;
+        header.request_checksum = 0x1234;
+        header.operation = crate::Operation::NOOP;
+        header.size = message_header::SIZE_U32;
+        header.set_checksum_body(&[]);
+        header.context = header.calculate_checksum();
+        header.set_checksum();
+        let mut message = crate::message::Message::new();
+        message.set_header(&header);
+
+        r.send_reply_message_to_client(&message);
+
+        assert_eq!(r.client_send_queue.len(), 1);
+        let out = r.client_send_queue[0].header::<message_header::Reply>().expect("reply");
+        assert_eq!(out.view, 1, "view is bumped to the durable log view");
+        assert!(out.valid_checksum());
+        // The checksum body and stable-with-view context survive the bump.
+        assert_eq!(out.checksum_body, header.checksum_body);
+        assert_eq!(out.context, header.context);
+        assert_eq!(out.request_checksum, header.request_checksum);
     }
 
     #[test]
