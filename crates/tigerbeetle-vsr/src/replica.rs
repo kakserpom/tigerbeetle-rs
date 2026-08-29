@@ -3123,7 +3123,7 @@ impl Replica {
         // Validate checksum (upstream verifies `header.valid_checksum()`).
 
         match header.command {
-            Command::Request => self.on_request(&header),
+            Command::Request => self.on_request(message),
             Command::Prepare => self.on_prepare_message(&header),
             Command::Commit => self.on_commit(&header, now),
             Command::ExitView => self.on_exit_view(&header),
@@ -4145,7 +4145,8 @@ impl Replica {
     ///
     /// A validated request is prepared immediately when the pipeline is not
     /// full, else it is queued on the request queue and prepared once earlier
-    /// commits execute (upstream `commit_execute`).
+    /// commits execute (upstream `commit_execute`). The request body follows
+    /// the prepare into the journal so the commit path can execute it.
     ///
     /// # Panics
     ///
@@ -4153,11 +4154,11 @@ impl Replica {
     /// `commit_min == commit_max`, replica.zig:1950).
     ///
     /// Upstream: `src/vsr/replica.zig:1944` (`on_request`).
-    pub fn on_request(&mut self, header: &message_header::Header) {
+    pub fn on_request(&mut self, message: &crate::message::Message) {
         if !self.is_primary() || self.status != Status::Normal {
             return;
         }
-        let Some(request) = header.into_typed::<message_header::Request>() else {
+        let Some(request) = message.header::<message_header::Request>() else {
             return; // Command mismatch or invalid header.
         };
         if !request.valid_checksum() || request.invalid_header().is_some() {
@@ -4179,16 +4180,11 @@ impl Replica {
                 operation: request.operation,
             });
         } else {
-            // DEVIATION: the primary prepares the request body once the message
-            // layer plumbs it (`on_request` receives only the header). Until
-            // then the prepared op records an empty body, so only ops without
-            // an input batch (register, noop, pulse) execute faithfully end to
-            // end from the client message path.
             let result = self.primary_pipeline_prepare(
                 request.client,
                 request.request,
                 request.operation,
-                &[],
+                message.body_used(),
                 request.checksum,
             );
             assert!(result.is_ok(), "valid primary-visible request must prepare");
@@ -5990,12 +5986,8 @@ mod tests {
     fn on_request_ignored_on_backup() {
         let mut r = Replica::new(0, 1, 3); // replica 1, not primary
         r.status = Status::Normal;
-        let mut header = message_header::Header::empty();
-        header.cluster = 0;
-        header.command = Command::Request;
-        header.view = 0;
-        header.set_checksum();
-        r.on_request(&header);
+        let request = request_message(1, 0, crate::Operation::REGISTER);
+        r.on_request(&request);
         // No state change — backup ignores request.
     }
 
@@ -6733,6 +6725,59 @@ mod tests {
         assert_eq!(
             u32::from_le_bytes(results[8..12].try_into().unwrap()),
             CreateTransferStatus::Exists as u32
+        );
+    }
+
+    #[test]
+    fn on_request_banking_body_flows_to_reply() {
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        r.status = Status::Normal;
+
+        // Register client 7 through the client-facing path (op 1).
+        let register_size = message_header::SIZE_U32 + message_header::REGISTER_RESULT_SIZE_U32;
+        r.on_message(
+            &request_message_full(7, 0, crate::Operation::REGISTER, 0, 0, register_size),
+            0,
+        );
+        assert_eq!(r.op, 1);
+        r.send_queue.clear();
+        commit_op_now(&mut r, 1);
+        // A follow-up request must prove it received the register reply.
+        let context = r.client_sessions.get(7).expect("session").header.context;
+        r.client_send_queue.clear();
+
+        // Client 7's create_accounts request (request 1) carries the batch body
+        // through on_message → pipeline → journal → state machine (op 2).
+        let accounts = [Account { id: 5, ledger: 1, code: 1, ..Account::default() }];
+        let body = crate::state_machine::account_batch_to_bytes(&accounts);
+        let mut header = message_header::Request::default();
+        header.cluster = CLUSTER;
+        header.client = 7;
+        header.session = 1;
+        header.request = 1;
+        header.parent = context;
+        header.operation = crate::Operation::CREATE_ACCOUNTS;
+        header.release = crate::multiversion::Release::MINIMUM;
+        header.view = 0;
+        header.size = message_header::SIZE_U32 + body.len() as u32;
+        header.set_checksum_body(&body);
+        header.set_checksum();
+        let mut request = Message::new();
+        request.set_header(&header);
+        request.set_body(&body);
+        r.on_message(&request, 0);
+
+        assert_eq!(r.op, 2);
+        assert_eq!(r.journal.body_with_op(2), Some(&body[..]));
+
+        commit_op_now(&mut r, 2);
+
+        let results = r.client_send_queue.last().expect("banking reply").body_used();
+        assert_eq!(results.len(), 16, "one result per event");
+        assert_eq!(u64::from_le_bytes(results[0..8].try_into().unwrap()), 2, "event timestamp");
+        assert_eq!(
+            u32::from_le_bytes(results[8..12].try_into().unwrap()),
+            CreateAccountStatus::Created as u32
         );
     }
 
