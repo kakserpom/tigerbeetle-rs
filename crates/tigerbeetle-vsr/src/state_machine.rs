@@ -1663,10 +1663,8 @@ pub struct StateMachine {
     /// Timestamp → transfer id for committed transfers.
     transfers_by_timestamp: HashMap<u64, u128>,
     /// Pending transfer index: timestamp → status, written at pending creation
-    /// and updated when the pending is posted/voided. Mirrors upstream's
-    /// `transfers_pending.objects` groove.
-    /// TODO(port): expiry (`expire_pending_transfers.pulse_next_timestamp`) is
-    /// deferred with the grooves.
+    /// and updated when the pending is posted, voided, or expired. Mirrors
+    /// upstream's `transfers_pending.objects` groove.
     transfers_pending: HashMap<u64, TransferPending>,
     /// Change-data-capture store of account balance changes, keyed by event
     /// timestamp. Mirrors upstream's `account_events.objects` groove (written
@@ -1818,12 +1816,22 @@ impl StateMachine {
     /// (upstream `get_change_event`, `state_machine.zig:3424-3527`).
     #[must_use]
     fn build_change_event(&self, result: &AccountEvent) -> ChangeEvent {
-        let transfer = self
-            .transfers_by_timestamp
-            .get(&result.timestamp)
-            .and_then(|id| self.transfers.get(id))
-            .copied()
-            .expect("each account event references a committed transfer");
+        // The transfer is resolved by timestamp, except for expiry events,
+        // which carry no transfer with the event's timestamp (upstream
+        // `state_machine.zig:3428-3439`).
+        let transfer = match result.transfer_pending_status {
+            TransferPendingStatus::Expired => self
+                .transfers
+                .get(&result.transfer_pending_id)
+                .copied()
+                .expect("expired account event references a committed pending transfer"),
+            _ => self
+                .transfers_by_timestamp
+                .get(&result.timestamp)
+                .and_then(|id| self.transfers.get(id))
+                .copied()
+                .expect("each account event references a committed transfer"),
+        };
         let dr_account =
             self.accounts.get(&result.dr_account_id).copied().expect("debit account committed");
         let cr_account =
@@ -1864,7 +1872,11 @@ impl StateMachine {
                 ChangeEventType::TwoPhaseVoided
             }
             TransferPendingStatus::Expired => {
-                unreachable!("expired account events are written by the deferred expiry")
+                assert!(transfer.flags.pending());
+                assert_eq!(transfer.id, result.transfer_pending_id);
+                assert!(transfer.timeout > 0);
+                assert!(transfer.timestamp < result.timestamp);
+                ChangeEventType::TwoPhaseExpired
             }
         };
 
@@ -2148,11 +2160,10 @@ impl StateMachine {
             TransferPendingStatus::None | TransferPendingStatus::Pending => {
                 assert!(transfer_pending.is_none());
             }
-            TransferPendingStatus::Posted | TransferPendingStatus::Voided => {
+            TransferPendingStatus::Posted
+            | TransferPendingStatus::Voided
+            | TransferPendingStatus::Expired => {
                 assert!(transfer_pending.is_some());
-            }
-            TransferPendingStatus::Expired => {
-                unreachable!("expired account events are written by the deferred expiry");
             }
         }
         assert_eq!(dr_account.ledger, cr_account.ledger);
@@ -2202,6 +2213,126 @@ impl StateMachine {
         }
     }
 
+    /// Expire pending transfers whose timeout has elapsed by `timestamp`
+    /// (upstream `execute_expire_pending_transfers`, `state_machine.zig:4511`).
+    ///
+    /// Upstream is driven by a pulse: a derived `expires_at` index pairs each
+    /// pending transfer's timestamp with `expires_at = timestamp + timeout_ns`,
+    /// and the next pulse fires at the soonest expiry. Sans-IO there is no beat
+    /// loop yet, so this consumes the same batching of due pendings directly:
+    /// every pending with `status == Pending` and `expires_at <= timestamp` is
+    /// expired in ascending `expires_at` order (mirroring the index scan),
+    /// `commit_timestamp` advances by one synthetic timestamp per expired
+    /// transfer, pending balances are returned to the accounts' pools
+    /// (`closing_debit`/`closing_credit` accounts are reopened), the
+    /// `transfers_pending` status becomes `Expired`, and an expired
+    /// [`AccountEvent`] is recorded.
+    ///
+    /// DEVIATION: `expire_pending_transfers` is invoked directly with the next
+    /// expiry timestamp rather than through the VSR pulse/beat machinery and
+    /// the `expires_at` derived index; the caller is responsible for calling it
+    /// once the next pending is due. This operation produces no reply body.
+    pub fn expire_pending_transfers(&mut self, timestamp: u64) {
+        assert!(
+            timestamp > self.commit_timestamp,
+            "expiry must advance commit_timestamp (upstream assert: timestamp > commit_timestamp)"
+        );
+        assert!(
+            timestamp > 0,
+            "expiry timestamps are assigned from a positive base and cannot overflow"
+        );
+
+        // Collect due pendings in the order the `expires_at` derived index would
+        // scan them: ascending `expires_at`, then ascending pending timestamp.
+        let mut due: Vec<(u64, u64, u128)> = Vec::new(); // (expires_at, pending_ts, pending_id)
+        for (&pending_ts, pending_status) in &self.transfers_pending {
+            if pending_status.status != TransferPendingStatus::Pending {
+                continue;
+            }
+            let id = self
+                .transfers_by_timestamp
+                .get(&pending_ts)
+                .copied()
+                .expect("pending transfer status row implies a committed pending transfer");
+            let p = self
+                .transfers
+                .get(&id)
+                .copied()
+                .expect("pending transfer status row implies a committed pending transfer");
+            assert!(p.flags.pending());
+            assert!(p.timeout > 0);
+            let expires_at = p.timestamp + p.timeout_ns();
+            if expires_at <= timestamp {
+                due.push((expires_at, pending_ts, id));
+            }
+        }
+        due.sort_unstable();
+
+        for (index, (_, _, id)) in due.iter().enumerate() {
+            let timestamp_event = timestamp - due.len() as u64 + index as u64 + 1;
+            assert!(self.commit_timestamp < timestamp_event);
+            self.commit_timestamp = timestamp_event;
+
+            let p = self.transfers.get(id).copied().expect("due pending transfer is committed");
+            let expires_at = p.timestamp + p.timeout_ns();
+            assert!(expires_at <= timestamp_event);
+
+            let dr = self
+                .accounts
+                .get(&p.debit_account_id)
+                .copied()
+                .expect("debit account exists: asserted debits_pending >= amount at creation");
+            let cr =
+                self.accounts.get(&p.credit_account_id).copied().expect(
+                    "credit account exists: asserted credits_pending >= amount at creation",
+                );
+            assert!(dr.debits_pending >= p.amount);
+            assert!(cr.credits_pending >= p.amount);
+
+            let mut dr_new = dr;
+            let mut cr_new = cr;
+            dr_new.debits_pending = dr_new.debits_pending.wrapping_sub(p.amount);
+            cr_new.credits_pending = cr_new.credits_pending.wrapping_sub(p.amount);
+
+            if p.flags.closing_debit() {
+                assert!(dr_new.flags.closed());
+                dr_new.flags = dr_new.flags.without_closed();
+            }
+            if p.flags.closing_credit() {
+                assert!(cr_new.flags.closed());
+                cr_new.flags = cr_new.flags.without_closed();
+            }
+
+            let dr_updated = p.amount > 0 || dr_new.flags.closed() != dr.flags.closed();
+            let cr_updated = p.amount > 0 || cr_new.flags.closed() != cr.flags.closed();
+            if dr_updated {
+                self.accounts.insert(dr_new.id, dr_new);
+            }
+            if cr_updated {
+                self.accounts.insert(cr_new.id, cr_new);
+            }
+
+            let transfer_pending = self
+                .transfers_pending
+                .get_mut(&p.timestamp)
+                .expect("due pending transfer has a pending status row");
+            assert_eq!(transfer_pending.timestamp, p.timestamp);
+            assert_eq!(transfer_pending.status, TransferPendingStatus::Pending);
+            transfer_pending.status = TransferPendingStatus::Expired;
+
+            self.account_event(
+                timestamp_event,
+                &dr_new,
+                &cr_new,
+                TransferFlags::default(),
+                TransferPendingStatus::Expired,
+                Some(&p),
+                0,
+                p.amount,
+            );
+        }
+    }
+
     /// Apply a created transfer's balance mutation to its accounts
     /// (upstream `commit_transfer`, `state_machine.zig:3913-3962`):
     /// pending transfers raise `debits_pending`/`credits_pending`, posted
@@ -2213,8 +2344,6 @@ impl StateMachine {
     /// rejects any transfer referencing an account closed earlier in the batch
     /// (see [`Self::create_transfers`]).
     ///
-    /// TODO(port): expiry (`expire_pending_transfers.pulse_next_timestamp`) is
-    /// deferred with the grooves.
     fn commit_transfer(&mut self, event: &Transfer, amount_actual: u128, amount_requested: u128) {
         let dr =
             self.accounts.get(&event.debit_account_id).copied().expect(
@@ -4388,5 +4517,201 @@ mod tests {
         let reply = sm.execute(Operation::GET_CHANGE_EVENTS, 0, &body_bytes);
         assert_eq!(reply.len(), 384);
         assert_eq!(change_event_at(&reply, 0).timestamp, 20);
+    }
+
+    // ── expire_pending_transfers tests ───────────────────────────────────
+
+    const NS_PER_S: u64 = tigerbeetle_core::types::NS_PER_S;
+
+    #[test]
+    fn expire_pending_transfer_returns_pending_balances_and_advances_timestamp() {
+        let mut sm = StateMachine::default();
+        let _ = sm.create_accounts(
+            &[
+                Account { id: 1, ledger: 1, code: 1, ..Account::default() },
+                Account { id: 2, ledger: 1, code: 1, ..Account::default() },
+            ],
+            10,
+        );
+        // Pending of 50 between 1 and 2 with a 1-second timeout, stamped 20.
+        let pending = Transfer { flags: TransferFlags::PENDING, timeout: 1, ..t(1, 2, 50) };
+        let _ = sm.create_transfers(&[pending], 20);
+        assert_eq!(sm.accounts.get(&1).expect("account 1 stored").debits_pending, 50);
+        assert_eq!(sm.accounts.get(&2).expect("account 2 stored").credits_pending, 50);
+
+        // Expire at `20 + 1s`, the exact expiry instant.
+        sm.expire_pending_transfers(20 + NS_PER_S);
+
+        // Pending balances are returned to the pools; posted stays unchanged.
+        assert_eq!(sm.accounts.get(&1).expect("account 1 stored").debits_pending, 0);
+        assert_eq!(sm.accounts.get(&2).expect("account 2 stored").credits_pending, 0);
+        assert_eq!(sm.accounts.get(&1).expect("account 1 stored").debits_posted, 0);
+        assert_eq!(sm.accounts.get(&2).expect("account 2 stored").credits_posted, 0);
+
+        // The status row is now Expired.
+        let pending_status = sm.transfers_pending.get(&20).expect("pending status row");
+        assert_eq!(pending_status.status, TransferPendingStatus::Expired);
+
+        // commit_timestamp advanced by the single synthetic expiry stamp.
+        assert_eq!(sm.commit_timestamp, 20 + NS_PER_S);
+
+        // The expired event was recorded (timestamp-linked, amount = pending amount).
+        let event = sm.account_events.get(&(20 + NS_PER_S)).expect("expired account event");
+        assert_eq!(event.transfer_pending_status, TransferPendingStatus::Expired);
+        assert_eq!(event.amount, 50);
+        assert_eq!(event.amount_requested, 0);
+        assert_eq!(event.dr_debits_pending, 0);
+        assert_eq!(event.cr_credits_pending, 0);
+    }
+
+    #[test]
+    fn expire_pending_transfers_only_expires_due_pendings() {
+        let mut sm = StateMachine::default();
+        let _ = sm.create_accounts(
+            &[
+                Account { id: 1, ledger: 1, code: 1, ..Account::default() },
+                Account { id: 2, ledger: 1, code: 1, ..Account::default() },
+            ],
+            10,
+        );
+        // Two pendings with different timeouts: id 1002 (1s) stamped 20, id 1003 (10s) stamped 40.
+        let p1 = Transfer { flags: TransferFlags::PENDING, timeout: 1, ..t(1, 2, 50) };
+        let _ = sm.create_transfers(&[p1], 20);
+        let p2 = Transfer { id: 1003, flags: TransferFlags::PENDING, timeout: 10, ..t(1, 2, 7) };
+        let _ = sm.create_transfers(&[p2], 40);
+
+        // Expire early (before either is due) → nothing happens.
+        sm.expire_pending_transfers(20 + NS_PER_S - 1);
+        assert_eq!(
+            sm.transfers_pending.get(&20).expect("pending status row").status,
+            TransferPendingStatus::Pending
+        );
+        assert_eq!(
+            sm.transfers_pending.get(&40).expect("pending status row").status,
+            TransferPendingStatus::Pending
+        );
+        assert_eq!(sm.transfers_pending.len(), 2);
+        assert_eq!(sm.account_events.len(), 2); // the two creation events only
+
+        // Expire at p1's deadline: only p1 (due) expires, p2 (10s) stays Pending.
+        sm.expire_pending_transfers(20 + NS_PER_S);
+        assert_eq!(
+            sm.transfers_pending.get(&20).expect("pending status row").status,
+            TransferPendingStatus::Expired
+        );
+        assert_eq!(
+            sm.transfers_pending.get(&40).expect("pending status row").status,
+            TransferPendingStatus::Pending
+        );
+        assert_eq!(sm.accounts.get(&1).expect("account 1 stored").debits_pending, 7);
+        assert_eq!(sm.accounts.get(&2).expect("account 2 stored").credits_pending, 7);
+        assert_eq!(sm.commit_timestamp, 20 + NS_PER_S);
+    }
+
+    #[test]
+    fn expire_multiple_pendings_in_index_order() {
+        let mut sm = StateMachine::default();
+        let _ = sm.create_accounts(
+            &[
+                Account { id: 1, ledger: 1, code: 1, ..Account::default() },
+                Account { id: 2, ledger: 1, code: 1, ..Account::default() },
+            ],
+            10,
+        );
+        // p1 (id 1002) stamped 20, timeout 1s → expires 20+1s.
+        // p2 (id 1003) stamped 30, timeout 2s → expires 30+2s = 20+1s+10.
+        let _ = sm.create_transfers(
+            &[Transfer { flags: TransferFlags::PENDING, timeout: 1, ..t(1, 2, 10) }],
+            20,
+        );
+        let _ = sm.create_transfers(
+            &[Transfer { id: 1003, flags: TransferFlags::PENDING, timeout: 2, ..t(1, 2, 20) }],
+            30,
+        );
+
+        // Expire both with a single call past the later deadline.
+        sm.expire_pending_transfers(30 + 2 * NS_PER_S);
+
+        // Two synthetic stamps were consumed: the second event is the later one.
+        let mut ts: Vec<u64> = sm.account_events.keys().copied().filter(|&ts| ts > 30).collect();
+        ts.sort_unstable();
+        assert_eq!(
+            ts,
+            vec![
+                30 + 2 * NS_PER_S - 1, // p1 expires first (earlier expires_at)
+                30 + 2 * NS_PER_S,     // p2 expires second
+            ]
+        );
+
+        // Balances fully returned to the pools.
+        assert_eq!(sm.accounts.get(&1).expect("account 1 stored").debits_pending, 0);
+        assert_eq!(sm.accounts.get(&2).expect("account 2 stored").credits_pending, 0);
+        assert_eq!(
+            sm.transfers_pending.get(&20).expect("pending status row").status,
+            TransferPendingStatus::Expired
+        );
+        assert_eq!(
+            sm.transfers_pending.get(&30).expect("pending status row").status,
+            TransferPendingStatus::Expired
+        );
+    }
+
+    #[test]
+    fn expire_pending_transfer_reopens_closing_accounts() {
+        let mut sm = StateMachine::default();
+        let _ = sm.create_accounts(
+            &[
+                Account { id: 1, ledger: 1, code: 1, ..Account::default() },
+                Account { id: 2, ledger: 1, code: 1, ..Account::default() },
+            ],
+            10,
+        );
+        // Debit account closes once the pending (its only balance) clears.
+        let pending = Transfer {
+            flags: TransferFlags::PENDING | TransferFlags::CLOSING_DEBIT,
+            timeout: 1,
+            ..t(1, 2, 10)
+        };
+        let _ = sm.create_transfers(&[pending], 20);
+        assert!(sm.accounts.get(&1).expect("account 1 stored").flags.closed());
+
+        sm.expire_pending_transfers(20 + NS_PER_S);
+        assert!(!sm.accounts.get(&1).expect("account 1 stored").flags.closed());
+        assert_eq!(sm.accounts.get(&1).expect("account 1 stored").debits_pending, 0);
+    }
+
+    #[test]
+    fn expire_pending_transfer_emits_expired_change_event() {
+        let mut sm = StateMachine::default();
+        let _ = sm.create_accounts(
+            &[
+                Account { id: 1, ledger: 1, code: 1, ..Account::default() },
+                Account { id: 2, ledger: 1, code: 1, ..Account::default() },
+            ],
+            10,
+        );
+        let _ = sm.create_transfers(
+            &[Transfer { flags: TransferFlags::PENDING, timeout: 1, ..t(1, 2, 50) }],
+            20,
+        );
+        sm.expire_pending_transfers(20 + NS_PER_S);
+
+        // The read path must canonicalize the transfer via `transfer_pending_id`,
+        // since no transfer carries the expiry event's timestamp.
+        let body = sm.get_change_events(&change_filter(0, 0, 100));
+        let expired = change_event_at(&body, 1); // creation (20) then expiry
+        assert_eq!(expired.r#type, ChangeEventType::TwoPhaseExpired);
+        assert_eq!(expired.timestamp, 20 + NS_PER_S);
+        assert_eq!(expired.transfer_id, pending_transfer_id());
+        // The ChangeEvent's `transfer_pending_id` is the transfer's own
+        // `pending_id`, which is 0 for the original pending.
+        assert_eq!(expired.transfer_pending_id, 0);
+        assert_eq!(expired.transfer_amount, 50);
+        assert_eq!(expired.transfer_timeout, 1);
+        assert_eq!(expired.debit_account_debits_pending, 0);
+        assert_eq!(expired.credit_account_credits_pending, 0);
+        // Debts cleared, nothing posted.
+        assert_eq!(expired.debit_account_debits_posted, 0);
+        assert_eq!(expired.credit_account_credits_posted, 0);
     }
 }
