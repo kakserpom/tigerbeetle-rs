@@ -333,6 +333,7 @@ pub fn create_transfer_outcome(
 
 /// Balancing amount: cap amount to the available balance
 /// (upstream `state_machine.zig:3795-3799`).
+#[must_use]
 fn compute_amount_actual(t: &Transfer, dr_account: &Account, cr_account: &Account) -> u128 {
     let mut amount_actual = t.amount;
     if t.flags.balancing_debit() {
@@ -346,6 +347,34 @@ fn compute_amount_actual(t: &Transfer, dr_account: &Account, cr_account: &Accoun
         amount_actual = amount_actual.min(available);
     }
     amount_actual
+}
+
+/// Compute the two account records after a created transfer's balance mutation
+/// (upstream `commit_transfer`, `state_machine.zig:3913-3962`). Pure: both the
+/// batch orchestrator's in-session working view and `StateMachine::commit_transfer`
+/// derive the mutation from this single rule, so they stay in lockstep.
+fn commit_transfer_accounts(
+    event: &Transfer,
+    amount_actual: u128,
+    dr_account: &Account,
+    cr_account: &Account,
+) -> (Account, Account) {
+    let mut dr = *dr_account;
+    let mut cr = *cr_account;
+    if event.flags.pending() {
+        dr.debits_pending = dr.debits_pending.wrapping_add(amount_actual);
+        cr.credits_pending = cr.credits_pending.wrapping_add(amount_actual);
+    } else {
+        dr.debits_posted = dr.debits_posted.wrapping_add(amount_actual);
+        cr.credits_posted = cr.credits_posted.wrapping_add(amount_actual);
+    }
+    if event.flags.closing_debit() {
+        dr.flags = dr.flags.with_closed();
+    }
+    if event.flags.closing_credit() {
+        cr.flags = cr.flags.with_closed();
+    }
+    (dr, cr)
 }
 
 /// Idempotency check for an existing transfer.
@@ -775,7 +804,12 @@ where
 /// `accounts.indirect_lookup` that upstream consults for imported events.
 ///
 /// `get_existing_transfer` looks up a transfer by id.
-/// `get_account` looks up an account by id — needed for both debit and credit accounts.
+/// `get_account` looks up an account by id — needed for both debit and credit
+/// accounts. It must return the committed state: this orchestrator overlays an
+/// in-session working view on top, so events later in the batch observe the
+/// balance mutations of earlier created transfers (upstream's in-session
+/// scope), with each linked chain snapshotted at open and rolled back on
+/// break.
 pub fn execute_create_transfers<F, G, FAccountAt>(
     events: &[Transfer],
     timestamp: u64,
@@ -793,6 +827,15 @@ where
     let mut chain: Option<usize> = None;
     let mut chain_broken = false;
     let mut running_key_max = transfers_key_max;
+    // In-session working view of the accounts, layered over `get_account`
+    // (upstream's open batch scope). Mutations from created events accumulate
+    // here so later batch members validate against them.
+    let mut working: HashMap<u128, Account> = HashMap::new();
+    // Chain scoping: snapshot the working view (and the running key range) when
+    // a chain opens, and restore them if it breaks (upstream `scope_close(.discard)`
+    // rolls back only the chain's own writes — events since the chain opened).
+    let mut chain_snapshot: Option<HashMap<u128, Account>> = None;
+    let mut chain_key_max_snapshot: Option<u64> = None;
 
     let batch_imported = !events.is_empty() && events[0].flags.imported();
 
@@ -807,6 +850,10 @@ where
                 if chain.is_none() {
                     chain = Some(index);
                     assert!(!chain_broken);
+                    // TODO(port): scope_open — mirrored by the working-view
+                    // snapshot/restore below.
+                    chain_snapshot = Some(working.clone());
+                    chain_key_max_snapshot = Some(running_key_max);
                 }
                 if index == events.len() - 1 {
                     break 'result (CreateTransferStatus::LinkedEventChainOpen, timestamp_event);
@@ -845,9 +892,16 @@ where
             // For regular transfers, look up existing for idempotency.
             let existing = get_existing_transfer(event.id);
 
-            // Look up debit/credit accounts.
-            let dr = get_account(event.debit_account_id);
-            let cr = get_account(event.credit_account_id);
+            // Look up debit/credit accounts: working (in-session) view first,
+            // then the committed state.
+            let dr = working
+                .get(&event.debit_account_id)
+                .copied()
+                .or_else(|| get_account(event.debit_account_id));
+            let cr = working
+                .get(&event.credit_account_id)
+                .copied()
+                .or_else(|| get_account(event.credit_account_id));
 
             let (dr_account, cr_account) = match (dr, cr) {
                 (Some(d), Some(c)) => (d, c),
@@ -894,6 +948,17 @@ where
             );
             let status = outcome.status;
             amount_actual = outcome.amount_actual;
+            if status == CreateTransferStatus::Created {
+                // Apply the mutation to the in-session view so later batch
+                // members validate against it; `persist_transfers` later derives
+                // the same values from the committed state in event order.
+                let (dr_new, cr_new) =
+                    commit_transfer_accounts(event, amount_actual, &dr_account, &cr_account);
+                debug_assert_eq!(dr_new.id, dr_account.id);
+                debug_assert_eq!(cr_new.id, cr_account.id);
+                working.insert(dr_new.id, dr_new);
+                working.insert(cr_new.id, cr_new);
+            }
             // Same rule as accounts: `.exists` reports the existing record's
             // timestamp (upstream `state_machine.zig:3669-3721`).
             let ts = match status {
@@ -918,6 +983,14 @@ where
             if let Some(chain_start) = chain {
                 if !chain_broken {
                     chain_broken = true;
+                    // TODO(port): scope_close(.discard) — roll back this chain's
+                    // in-session writes (only the events since it opened).
+                    if let (Some(snapshot), Some(key_max_snapshot)) =
+                        (chain_snapshot.as_ref(), chain_key_max_snapshot.as_ref())
+                    {
+                        working.clone_from(snapshot);
+                        running_key_max = *key_max_snapshot;
+                    }
                     for result in &mut results[chain_start..index] {
                         result.status = CreateTransferStatus::LinkedEventFailed;
                     }
@@ -932,10 +1005,12 @@ where
             && (!event.flags.linked() || status == CreateTransferStatus::LinkedEventChainOpen)
         {
             if !chain_broken {
-                // TODO(port): scope_close(persist)
+                // TODO(port): scope_close(.persist)
             }
             chain = None;
             chain_broken = false;
+            chain_snapshot = None;
+            chain_key_max_snapshot = None;
         }
     }
 
@@ -1208,13 +1283,13 @@ impl StateMachine {
     ///
     /// Created transfers apply their balance mutation to the debit/credit
     /// accounts at persist time, and are stored with the amount actually
-    /// applied (after balancing).
+    /// applied (after balancing). Within a batch, the orchestrator maintains an
+    /// in-session working view of the accounts, so later events validate
+    /// against earlier events' mutations; each linked chain is rolled back as a
+    /// unit if it breaks.
     ///
     /// DEVIATION: pending transfer expiry, the `TransferPending` index, and
-    /// `AccountEvent` history are deferred with the grooves; and because the
-    /// orchestrator validates against the committed state only, events later in
-    /// a batch do not see earlier events' in-scope mutations (see
-    /// [`Self::commit_transfer`]).
+    /// `AccountEvent` history are deferred with the grooves.
     #[must_use]
     pub fn create_transfers(&mut self, events: &[Transfer], timestamp: u64) -> Vec<u8> {
         assert!(self.commit_timestamp <= timestamp);
@@ -1368,11 +1443,10 @@ impl StateMachine {
     /// transfers raise the `*_posted` balances, and `closing_debit` /
     /// `closing_credit` set the account `CLOSED` flag.
     ///
-    /// DEVIATION: upstream asserts the accounts are not closed here, but it
-    /// validates that in-session (a later batch member sees the mutation);
-    /// without a working account view the orchestrator validates against the
-    /// committed state only, so a transfer referencing an account closed by an
-    /// earlier batch member is applied rather than rejected.
+    /// The accounts are guaranteed to exist (validated by `create_transfer`)
+    /// and, at commit time, to not be closed — upstream's in-session scope
+    /// rejects any transfer referencing an account closed earlier in the batch
+    /// (see [`Self::create_transfers`]).
     ///
     /// TODO(port): `transfers_pending` insert, `AccountEvent` CDC, and expiry
     /// (`expire_pending_transfers.pulse_next_timestamp`) are deferred.
@@ -1386,21 +1460,7 @@ impl StateMachine {
                 "credit account exists: create_transfer validated and overflow checks passed",
             );
 
-        let mut dr = dr;
-        let mut cr = cr;
-        if event.flags.pending() {
-            dr.debits_pending = dr.debits_pending.wrapping_add(amount_actual);
-            cr.credits_pending = cr.credits_pending.wrapping_add(amount_actual);
-        } else {
-            dr.debits_posted = dr.debits_posted.wrapping_add(amount_actual);
-            cr.credits_posted = cr.credits_posted.wrapping_add(amount_actual);
-        }
-        if event.flags.closing_debit() {
-            dr.flags = dr.flags.with_closed();
-        }
-        if event.flags.closing_credit() {
-            cr.flags = cr.flags.with_closed();
-        }
+        let (dr, cr) = commit_transfer_accounts(event, amount_actual, &dr, &cr);
         self.accounts.insert(dr.id, dr);
         self.accounts.insert(cr.id, cr);
     }
@@ -2648,5 +2708,104 @@ mod tests {
         assert!(sm.transfers.is_empty());
         let dr = sm.accounts.get(&1).expect("debit account stored");
         assert_eq!(dr.debits_posted, 0);
+    }
+
+    #[test]
+    fn transfer_after_closing_account_in_same_batch_is_rejected() {
+        let mut sm = StateMachine::default();
+        let _ = sm.create_accounts(
+            &[
+                Account { id: 1, ledger: 1, code: 1, ..Account::default() },
+                Account { id: 2, ledger: 1, code: 1, ..Account::default() },
+            ],
+            10,
+        );
+
+        // Close account 1 with the first event, then reference it in the second.
+        let closing = Transfer {
+            flags: TransferFlags::PENDING | TransferFlags::CLOSING_DEBIT,
+            ..t(1, 2, 10)
+        };
+        let body = sm.create_transfers(&[closing, t(1, 2, 5)], 20);
+        assert_eq!(reply_status_at(&body, 0), CreateTransferStatus::Created as u32);
+        // The in-session closing is visible to the second event: it is rejected
+        // (upstream's `create_transfer` sees the scoped mutation).
+        assert_eq!(
+            reply_status_at(&body, 1),
+            CreateTransferStatus::DebitAccountAlreadyClosed as u32
+        );
+
+        let dr = sm.accounts.get(&1).expect("debit account stored");
+        assert!(dr.flags.closed());
+        assert_eq!(dr.debits_pending, 10);
+        assert_eq!(sm.transfers.len(), 1);
+    }
+
+    #[test]
+    fn balancing_sees_earlier_in_batch_mutations() {
+        let mut sm = StateMachine::default();
+        let _ = sm.create_accounts(
+            &[
+                Account { id: 1, ledger: 1, code: 1, ..Account::default() },
+                Account { id: 2, ledger: 1, code: 1, ..Account::default() },
+                Account { id: 3, ledger: 1, code: 1, ..Account::default() },
+            ],
+            10,
+        );
+
+        // First give account 1 100 credit in-session, then balance against it.
+        let batch = [
+            t(3, 1, 100),
+            Transfer {
+                amount: 200,
+                flags: TransferFlags::PENDING | TransferFlags::BALANCING_DEBIT,
+                ..t(1, 2, 200)
+            },
+        ];
+        let body = sm.create_transfers(&batch, 20);
+        assert_eq!(reply_status_at(&body, 0), CreateTransferStatus::Created as u32);
+        assert_eq!(reply_status_at(&body, 1), CreateTransferStatus::Created as u32);
+
+        let dr = sm.accounts.get(&1).expect("debit account stored");
+        assert_eq!(dr.credits_posted, 100);
+        // The balancing cap of the second event sees the first event's credit.
+        assert_eq!(dr.debits_pending, 100);
+        assert_eq!(sm.transfers.get(&1002).expect("transfer stored").amount, 100);
+    }
+
+    #[test]
+    fn broken_chain_rolls_back_in_session_mutations_before_later_events() {
+        let mut sm = StateMachine::default();
+        let _ = sm.create_accounts(
+            &[
+                Account { id: 1, ledger: 1, code: 1, ..Account::default() },
+                Account { id: 2, ledger: 1, code: 1, ..Account::default() },
+            ],
+            10,
+        );
+
+        // A three-member chain whose middle member references a missing account
+        // (the first member is rolled back, the middle reports its own error,
+        // the last is marked failed).
+        let chain_first = Transfer { flags: TransferFlags::LINKED, ..t(1, 2, 100) };
+        let chain_middle = Transfer { flags: TransferFlags::LINKED, ..t(99, 2, 100) };
+        let chain_last = Transfer { flags: TransferFlags::LINKED, ..t(1, 2, 100) };
+        // The next non-linked event still sees the broken (open) chain and is
+        // itself marked failed, closing it; only the following event recovers.
+        let closing_event = t(1, 2, 5);
+        let recovered_event = t(1, 2, 7);
+        let batch = [chain_first, chain_middle, chain_last, closing_event, recovered_event];
+        let body = sm.create_transfers(&batch, 40);
+        assert_eq!(reply_status_at(&body, 0), CreateTransferStatus::LinkedEventFailed as u32);
+        assert_eq!(reply_status_at(&body, 1), CreateTransferStatus::DebitAccountNotFound as u32);
+        assert_eq!(reply_status_at(&body, 2), CreateTransferStatus::LinkedEventFailed as u32);
+        assert_eq!(reply_status_at(&body, 3), CreateTransferStatus::LinkedEventFailed as u32);
+        assert_eq!(reply_status_at(&body, 4), CreateTransferStatus::Created as u32);
+
+        // Only the recovered post-chain transfer persisted; the broken chain's
+        // A applied no balance (rollback) and was not stored.
+        assert_eq!(sm.transfers.len(), 1);
+        let dr = sm.accounts.get(&1).expect("debit account stored");
+        assert_eq!(dr.debits_posted, 7);
     }
 }
