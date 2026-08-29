@@ -127,6 +127,12 @@ impl AccountFlags {
         (self.0 & Self::CLOSED.0) != 0
     }
 
+    /// Return these flags with `CLOSED` set (upstream `flags.closed = true`).
+    #[must_use]
+    pub const fn with_closed(self) -> Self {
+        Self::from_raw(self.0 | Self::CLOSED.0)
+    }
+
     /// Returns `true` if any reserved/padding bits are set.
     #[must_use]
     pub const fn has_padding(self) -> bool {

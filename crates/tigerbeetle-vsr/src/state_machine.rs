@@ -244,18 +244,7 @@ pub fn create_transfer(
         return CreateTransferStatus::CreditAccountAlreadyClosed;
     }
 
-    // Balancing amount: cap amount to the available balance.
-    let mut amount_actual = t.amount;
-    if t.flags.balancing_debit() {
-        let dr_balance = dr_account.debits_posted.wrapping_add(dr_account.debits_pending);
-        let available = dr_account.credits_posted.saturating_sub(dr_balance);
-        amount_actual = amount_actual.min(available);
-    }
-    if t.flags.balancing_credit() {
-        let cr_balance = cr_account.credits_posted.wrapping_add(cr_account.credits_pending);
-        let available = cr_account.debits_posted.saturating_sub(cr_balance);
-        amount_actual = amount_actual.min(available);
-    }
+    let amount_actual = compute_amount_actual(t, dr_account, cr_account);
 
     // Overflow checks.
     if t.flags.pending() {
@@ -307,6 +296,56 @@ pub fn create_transfer(
     }
 
     CreateTransferStatus::Created
+}
+
+/// Outcome of validating a single transfer creation.
+///
+/// Mirrors upstream's tagged `CreateTransferResult` union (state_machine.zig:3703):
+/// the `.created` payload carries the amount actually applied after balancing, and
+/// every other tag carries zero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CreateTransferOutcome {
+    pub status: CreateTransferStatus,
+    /// The amount applied to the account balances (`.created => |amount_actual|`).
+    pub amount_actual: u128,
+}
+
+/// Validate a single transfer and report the amount that a successful creation
+/// applies to the account balances.
+///
+/// Same inputs as [`create_transfer`]; production callers use this to obtain
+/// `amount_actual` for the resulting balance mutation.
+pub fn create_transfer_outcome(
+    t: &Transfer,
+    timestamp_event: u64,
+    existing: Option<&Transfer>,
+    dr_account: &Account,
+    cr_account: &Account,
+) -> CreateTransferOutcome {
+    let status = create_transfer(t, timestamp_event, existing, dr_account, cr_account);
+    let amount_actual = if status == CreateTransferStatus::Created {
+        compute_amount_actual(t, dr_account, cr_account)
+    } else {
+        0
+    };
+    CreateTransferOutcome { status, amount_actual }
+}
+
+/// Balancing amount: cap amount to the available balance
+/// (upstream `state_machine.zig:3795-3799`).
+fn compute_amount_actual(t: &Transfer, dr_account: &Account, cr_account: &Account) -> u128 {
+    let mut amount_actual = t.amount;
+    if t.flags.balancing_debit() {
+        let dr_balance = dr_account.debits_posted.wrapping_add(dr_account.debits_pending);
+        let available = dr_account.credits_posted.saturating_sub(dr_balance);
+        amount_actual = amount_actual.min(available);
+    }
+    if t.flags.balancing_credit() {
+        let cr_balance = cr_account.credits_posted.wrapping_add(cr_account.credits_pending);
+        let available = cr_account.debits_posted.saturating_sub(cr_balance);
+        amount_actual = amount_actual.min(available);
+    }
+    amount_actual
 }
 
 /// Idempotency check for an existing transfer.
@@ -577,6 +616,8 @@ pub struct CreateAccountResult {
 pub struct CreateTransferResult {
     pub status: CreateTransferStatus,
     pub timestamp: u64,
+    /// The amount applied to the account balances (zero unless `status` is `Created`).
+    pub amount_actual: u128,
 }
 
 /// Execute a batch of `create_accounts` events with linked-chain support.
@@ -758,6 +799,9 @@ where
     for (index, event) in events.iter().enumerate() {
         let timestamp_event = timestamp - events.len() as u64 + index as u64 + 1;
 
+        // `amount_actual` is only set when validation runs (upstream's `.created`
+        // payload); short-circuited events report zero.
+        let mut amount_actual = 0_u128;
         let (status, ts) = 'result: {
             if event.flags.linked() {
                 if chain.is_none() {
@@ -841,13 +885,15 @@ where
                 }
             }
 
-            let status = create_transfer(
+            let outcome = create_transfer_outcome(
                 event,
                 timestamp_event,
                 existing.as_ref(),
                 &dr_account,
                 &cr_account,
             );
+            let status = outcome.status;
+            amount_actual = outcome.amount_actual;
             // Same rule as accounts: `.exists` reports the existing record's
             // timestamp (upstream `state_machine.zig:3669-3721`).
             let ts = match status {
@@ -879,7 +925,7 @@ where
             }
         }
 
-        results.push(CreateTransferResult { status, timestamp: ts });
+        results.push(CreateTransferResult { status, timestamp: ts, amount_actual });
 
         // Chain completion.
         if chain.is_some()
@@ -1160,8 +1206,15 @@ impl StateMachine {
 
     /// Execute a `create_transfers` batch and return the reply body.
     ///
-    /// DEVIATION: pending/imported balancing (balance mutations, expiry) are
-    /// deferred with the grooves.
+    /// Created transfers apply their balance mutation to the debit/credit
+    /// accounts at persist time, and are stored with the amount actually
+    /// applied (after balancing).
+    ///
+    /// DEVIATION: pending transfer expiry, the `TransferPending` index, and
+    /// `AccountEvent` history are deferred with the grooves; and because the
+    /// orchestrator validates against the committed state only, events later in
+    /// a batch do not see earlier events' in-scope mutations (see
+    /// [`Self::commit_transfer`]).
     #[must_use]
     pub fn create_transfers(&mut self, events: &[Transfer], timestamp: u64) -> Vec<u8> {
         assert!(self.commit_timestamp <= timestamp);
@@ -1248,9 +1301,15 @@ impl StateMachine {
         self.accounts.insert(id, account);
     }
 
-    /// Persist the transfers that upstream would write under the chain scope.
+    /// Persist the transfers that upstream would write under the chain scope,
+    /// applying each created transfer's balance mutation to its debit and
+    /// credit accounts (upstream `commit_transfer`,
+    /// `state_machine.zig:3913-3962`).
     ///
-    /// See [`Self::persist_accounts`] for the chain semantics.
+    /// See [`Self::persist_accounts`] for the chain semantics. Because the walk
+    /// follows event order, mutations accumulate across the batch — so within an
+    /// intact chain, later events operate on accounts already updated by earlier
+    /// members, matching upstream's in-scope application.
     fn persist_transfers(
         &mut self,
         events: &[Transfer],
@@ -1266,7 +1325,7 @@ impl StateMachine {
                         event.timestamp = Self::timestamp_event(timestamp, events.len(), index);
                     }
                     assert_eq!(event.timestamp, results[index].timestamp);
-                    self.insert_transfer(event.id, event);
+                    self.persist_transfer(event, results[index].amount_actual);
                 }
                 index += 1;
                 continue;
@@ -1288,11 +1347,62 @@ impl StateMachine {
                             Self::timestamp_event(timestamp, events.len(), start + offset);
                     }
                     assert_eq!(event.timestamp, results[start + offset].timestamp);
-                    self.insert_transfer(event.id, event);
+                    self.persist_transfer(event, results[start + offset].amount_actual);
                 }
             }
             index += 1;
         }
+    }
+
+    /// Store a created transfer (with its validated amount) and apply the
+    /// corresponding balance mutation to the debit/credit accounts.
+    fn persist_transfer(&mut self, mut event: Transfer, amount_actual: u128) {
+        event.amount = amount_actual;
+        self.insert_transfer(event.id, event);
+        self.commit_transfer(&event, amount_actual);
+    }
+
+    /// Apply a created transfer's balance mutation to its accounts
+    /// (upstream `commit_transfer`, `state_machine.zig:3913-3962`):
+    /// pending transfers raise `debits_pending`/`credits_pending`, posted
+    /// transfers raise the `*_posted` balances, and `closing_debit` /
+    /// `closing_credit` set the account `CLOSED` flag.
+    ///
+    /// DEVIATION: upstream asserts the accounts are not closed here, but it
+    /// validates that in-session (a later batch member sees the mutation);
+    /// without a working account view the orchestrator validates against the
+    /// committed state only, so a transfer referencing an account closed by an
+    /// earlier batch member is applied rather than rejected.
+    ///
+    /// TODO(port): `transfers_pending` insert, `AccountEvent` CDC, and expiry
+    /// (`expire_pending_transfers.pulse_next_timestamp`) are deferred.
+    fn commit_transfer(&mut self, event: &Transfer, amount_actual: u128) {
+        let dr =
+            self.accounts.get(&event.debit_account_id).copied().expect(
+                "debit account exists: create_transfer validated and overflow checks passed",
+            );
+        let cr =
+            self.accounts.get(&event.credit_account_id).copied().expect(
+                "credit account exists: create_transfer validated and overflow checks passed",
+            );
+
+        let mut dr = dr;
+        let mut cr = cr;
+        if event.flags.pending() {
+            dr.debits_pending = dr.debits_pending.wrapping_add(amount_actual);
+            cr.credits_pending = cr.credits_pending.wrapping_add(amount_actual);
+        } else {
+            dr.debits_posted = dr.debits_posted.wrapping_add(amount_actual);
+            cr.credits_posted = cr.credits_posted.wrapping_add(amount_actual);
+        }
+        if event.flags.closing_debit() {
+            dr.flags = dr.flags.with_closed();
+        }
+        if event.flags.closing_credit() {
+            cr.flags = cr.flags.with_closed();
+        }
+        self.accounts.insert(dr.id, dr);
+        self.accounts.insert(cr.id, cr);
     }
 
     /// Insert a committed transfer, maintaining the timestamp index that
@@ -2370,5 +2480,173 @@ mod tests {
             reply_status(&body),
             CreateTransferStatus::ImportedEventTimeoutMustBeZero as u32
         );
+    }
+
+    // ── Balance mutation (commit_transfer) tests ─────────────────────────
+
+    fn t(dr: u128, cr: u128, amount: u128) -> Transfer {
+        Transfer {
+            id: dr * 1_000 + cr,
+            debit_account_id: dr,
+            credit_account_id: cr,
+            amount,
+            ledger: 1,
+            code: 1,
+            ..Transfer::default()
+        }
+    }
+
+    #[test]
+    fn created_transfer_updates_posted_balances() {
+        let mut sm = StateMachine::default();
+        let _ = sm.create_accounts(
+            &[
+                Account { id: 1, ledger: 1, code: 1, ..Account::default() },
+                Account { id: 2, ledger: 1, code: 1, ..Account::default() },
+            ],
+            10,
+        );
+
+        let body = sm.create_transfers(&[t(1, 2, 100)], 20);
+        assert_eq!(reply_status(&body), CreateTransferStatus::Created as u32);
+
+        let dr = sm.accounts.get(&1).expect("debit account stored");
+        let cr = sm.accounts.get(&2).expect("credit account stored");
+        assert_eq!(dr.debits_posted, 100);
+        assert_eq!(cr.credits_posted, 100);
+        assert_eq!(dr.debits_pending, 0);
+        assert_eq!(cr.credits_pending, 0);
+        // The stored transfer records the amount actually applied.
+        assert_eq!(sm.transfers.get(&1002).expect("transfer stored").amount, 100);
+    }
+
+    #[test]
+    fn created_pending_transfer_updates_pending_balances() {
+        let mut sm = StateMachine::default();
+        let _ = sm.create_accounts(
+            &[
+                Account { id: 1, ledger: 1, code: 1, ..Account::default() },
+                Account { id: 2, ledger: 1, code: 1, ..Account::default() },
+            ],
+            10,
+        );
+
+        let pending = Transfer { flags: TransferFlags::PENDING, ..t(1, 2, 50) };
+        let body = sm.create_transfers(&[pending], 20);
+        assert_eq!(reply_status(&body), CreateTransferStatus::Created as u32);
+
+        let dr = sm.accounts.get(&1).expect("debit account stored");
+        let cr = sm.accounts.get(&2).expect("credit account stored");
+        assert_eq!(dr.debits_pending, 50);
+        assert_eq!(cr.credits_pending, 50);
+        assert_eq!(dr.debits_posted, 0);
+        assert_eq!(cr.credits_posted, 0);
+    }
+
+    #[test]
+    fn closing_transfer_closes_the_debit_account() {
+        let mut sm = StateMachine::default();
+        let _ = sm.create_accounts(
+            &[
+                Account { id: 1, ledger: 1, code: 1, ..Account::default() },
+                Account { id: 2, ledger: 1, code: 1, ..Account::default() },
+            ],
+            10,
+        );
+
+        let closing = Transfer {
+            flags: TransferFlags::CLOSING_DEBIT | TransferFlags::PENDING,
+            ..t(1, 2, 10)
+        };
+        let body = sm.create_transfers(&[closing], 20);
+        assert_eq!(reply_status(&body), CreateTransferStatus::Created as u32);
+
+        let dr = sm.accounts.get(&1).expect("debit account stored");
+        assert!(dr.flags.closed());
+        assert_eq!(dr.debits_pending, 10);
+        let cr = sm.accounts.get(&2).expect("credit account stored");
+        assert!(!cr.flags.closed());
+    }
+
+    #[test]
+    fn balanced_pending_transfer_records_amount_actual() {
+        let mut sm = StateMachine::default();
+        let _ = sm.create_accounts(
+            &[
+                Account { id: 1, ledger: 1, code: 1, ..Account::default() },
+                Account { id: 2, ledger: 1, code: 1, ..Account::default() },
+                Account { id: 3, ledger: 1, code: 1, ..Account::default() },
+            ],
+            10,
+        );
+        // Give account 1 100 credit via a posted transfer.
+        let _ = sm.create_transfers(&[t(3, 1, 100)], 20);
+        let dr = sm.accounts.get(&1).expect("debit account stored");
+        assert_eq!(dr.credits_posted, 100);
+
+        // A balancing_debit request of 200 applies only the 100 available
+        // (upstream `balancing_debit`, state_machine.zig:3795).
+        let balanced = Transfer {
+            amount: 200,
+            flags: TransferFlags::BALANCING_DEBIT | TransferFlags::PENDING,
+            ..t(1, 2, 200)
+        };
+        let body = sm.create_transfers(&[balanced], 30);
+        assert_eq!(reply_status(&body), CreateTransferStatus::Created as u32);
+
+        let dr = sm.accounts.get(&1).expect("debit account stored");
+        assert_eq!(dr.debits_pending, 100);
+        // The stored transfer pins the amount actually applied.
+        assert_eq!(sm.transfers.get(&1002).expect("transfer stored").amount, 100);
+    }
+
+    #[test]
+    fn sequential_created_transfers_cumulate_balances() {
+        let mut sm = StateMachine::default();
+        let _ = sm.create_accounts(
+            &[
+                Account { id: 1, ledger: 1, code: 1, ..Account::default() },
+                Account { id: 2, ledger: 1, code: 1, ..Account::default() },
+            ],
+            10,
+        );
+
+        let batch = [t(1, 2, 50), t(1, 2, 70)];
+        let body = sm.create_transfers(&batch, 20);
+        assert_eq!(reply_status_at(&body, 0), CreateTransferStatus::Created as u32);
+        assert_eq!(reply_status_at(&body, 1), CreateTransferStatus::Created as u32);
+
+        // Mutations accumulate across the batch in event order.
+        let dr = sm.accounts.get(&1).expect("debit account stored");
+        assert_eq!(dr.debits_posted, 120);
+        let cr = sm.accounts.get(&2).expect("credit account stored");
+        assert_eq!(cr.credits_posted, 120);
+    }
+
+    #[test]
+    fn broken_chain_does_not_apply_balance_mutations() {
+        let mut sm = StateMachine::default();
+        let _ = sm.create_accounts(
+            &[
+                Account { id: 1, ledger: 1, code: 1, ..Account::default() },
+                Account { id: 2, ledger: 1, code: 1, ..Account::default() },
+            ],
+            10,
+        );
+
+        // A linked chain whose second member references a missing account.
+        let first = Transfer { flags: TransferFlags::LINKED, ..t(1, 2, 100) };
+        let second = Transfer { flags: TransferFlags::LINKED, ..t(99, 2, 100) };
+        let body = sm.create_transfers(&[first, second], 20);
+        assert_eq!(reply_status_at(&body, 0), CreateTransferStatus::LinkedEventFailed as u32);
+        // The closing member of a linked chain short-circuits to
+        // `linked_event_chain_open` without validating its body
+        // (upstream state_machine.zig:3039-3042).
+        assert_eq!(reply_status_at(&body, 1), CreateTransferStatus::LinkedEventChainOpen as u32);
+
+        // The whole chain is discarded: no transfers, no balance mutations.
+        assert!(sm.transfers.is_empty());
+        let dr = sm.accounts.get(&1).expect("debit account stored");
+        assert_eq!(dr.debits_posted, 0);
     }
 }
