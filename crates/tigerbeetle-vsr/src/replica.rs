@@ -6442,6 +6442,66 @@ mod tests {
     }
 
     #[test]
+    fn commit_execute_skips_session_evicted_while_preparing() {
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        r.status = Status::Normal;
+
+        // Client 7 registers first (session 1); clients 8..=13 fill the table,
+        // leaving client 7 the oldest entry.
+        for client in 7_u64..=13 {
+            register_client(&mut r, u128::from(client));
+        }
+        assert_eq!(r.client_sessions.count(), constants::CLIENTS_MAX as usize);
+
+        // A register for a new client sharing the pipeline with client 7's next
+        // request: op 8 (client 14's register) commits first — the table is
+        // full, so the oldest entry (client 7) is evicted — and op 9 (client
+        // 7's request) executes afterwards.
+        assert_eq!(r.primary_pipeline_prepare(14, 0, crate::Operation::REGISTER, 0, 0).unwrap(), 8);
+        assert_eq!(r.primary_pipeline_prepare(7, 1, crate::Operation::NOOP, 0, 0).unwrap(), 9);
+        r.commit_max = 8;
+        r.commit_prepare = Some(8);
+        r.commit_stage = CommitStage::Execute;
+        r.commit_execute();
+
+        assert_eq!(r.client_sessions.get(7), None, "client 7 evicted at capacity");
+        assert_eq!(r.client_sessions.get(14).expect("new session").session, 8);
+        r.client_send_queue.clear();
+
+        // Op 9 executes with the session already gone: the reply is still
+        // delivered, told the client nothing was tracked (upstream
+        // `client_table_entry_update` — the next request receives an
+        // eviction).
+        r.commit_max = 9;
+        r.commit_prepare = Some(9);
+        r.commit_stage = CommitStage::Execute;
+        r.commit_execute();
+
+        assert_eq!(r.op, 9);
+        assert_eq!(r.pipeline_queue.prepare_queue.len(), 0);
+        assert_eq!(r.client_send_queue.len(), 1, "reply still delivered");
+        let reply = r
+            .client_send_queue
+            .last()
+            .expect("reply")
+            .header::<message_header::Reply>()
+            .expect("reply header");
+        assert_eq!(reply.client, 7);
+        assert_eq!(reply.op, 9);
+
+        // The evicted client is unregistered, so its next request is evicted:
+        r.on_message(&request_message(7, 2, crate::Operation::NOOP), 0);
+        let evicted = r
+            .client_send_queue
+            .last()
+            .expect("eviction")
+            .header::<message_header::Eviction>()
+            .expect("eviction header");
+        assert_eq!(evicted.reason(), Some(message_header::Reason::NoSession));
+        assert_eq!(evicted.client, 7);
+    }
+
+    #[test]
     fn on_request_repeat_reply_register_serves_ram_reply() {
         let mut r = Replica::new(CLUSTER, 0, 3);
         r.status = Status::Normal;
