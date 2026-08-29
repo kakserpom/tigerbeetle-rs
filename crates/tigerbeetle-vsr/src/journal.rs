@@ -616,6 +616,13 @@ pub struct Journal {
     pub prepare_checksums: Vec<u128>,
     /// Whether the slot holds a prepare (see `prepare_checksums`).
     pub prepare_inhabited: Vec<bool>,
+    /// The prepare body for the corresponding slot.
+    ///
+    /// DEVIATION: upstream keeps the whole prepare (header + body) in the WAL
+    /// entry. sans-IO the body rides along in memory, keyed to the slot; a
+    /// header-only prepare (repair, message-layer bodies deferred) records an
+    /// empty body here.
+    pub prepare_bodies: Vec<Vec<u8>>,
     pub status: JournalStatus,
 }
 
@@ -648,6 +655,7 @@ impl Journal {
             faulty: BitSet::new(SLOT_COUNT),
             prepare_checksums: vec![0; SLOT_COUNT],
             prepare_inhabited: vec![false; SLOT_COUNT],
+            prepare_bodies: vec![Vec::new(); SLOT_COUNT],
             status: JournalStatus::Recovered,
         }
     }
@@ -747,6 +755,22 @@ impl Journal {
             Some(existing) if existing.checksum == checksum => Some(existing),
             _ => None,
         }
+    }
+
+    /// The prepare body recorded for `op` (empty for header-only prepares).
+    #[must_use]
+    pub fn body_with_op(&self, op: u64) -> Option<&[u8]> {
+        self.header_with_op(op).map(|_| &self.prepare_bodies[Self::slot_for_op(op).index][..])
+    }
+
+    /// Record the prepare body for `op`.
+    ///
+    /// # Panics
+    /// Panics if `op` is not currently journaled (upstream records the body as
+    /// part of the prepare message, so a body always has a header).
+    pub fn set_prepare_body(&mut self, op: u64, body: &[u8]) {
+        assert!(self.header_with_op(op).is_some(), "prepare body requires a journaled header");
+        self.prepare_bodies[Self::slot_for_op(op).index] = body.to_vec();
     }
 
     #[must_use]
@@ -1014,6 +1038,7 @@ impl Journal {
         self.headers_redundant[slot.index] = reserved;
         self.dirty.clear(slot);
         self.faulty.clear(slot);
+        self.prepare_bodies[slot.index] = Vec::new();
     }
 
     /// Mark a header as dirty (needing to be written), overwriting any previous

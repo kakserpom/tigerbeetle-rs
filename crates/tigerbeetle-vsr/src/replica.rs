@@ -713,7 +713,7 @@ impl Replica {
         client: u128,
         request: u32,
         operation: crate::Operation,
-        body_size: u32,
+        body: &[u8],
         request_checksum: u128,
     ) -> Result<u64, PrepareReject> {
         if !self.is_primary() {
@@ -773,9 +773,11 @@ impl Replica {
 
         // The primary "self-sends" the prepare through the shared accept path
         // (upstream: `primary_pipeline_prepare` → `on_prepare`), which advances
-        // `op` and records the header in the journal:
+        // `op` and records the header in the journal; the request body rides
+        // along so the commit path can execute it:
         let result = self.on_prepare(&header);
         assert_eq!(result, OnPrepareResult::Accepted);
+        self.journal.set_prepare_body(header.op, body);
 
         let prepare = PipelinePrepare {
             op,
@@ -783,6 +785,7 @@ impl Replica {
             client,
             acks_received: 0,
             ok_quorum_received: false,
+            body: body.to_vec(),
         };
         self.pipeline_queue.prepare_queue.push(prepare);
         self.ok_from_all_replicas.push(0);
@@ -804,13 +807,12 @@ impl Replica {
             self.prepare_timeout = Timeout::start(constants::PIPELINE_PREPARE_QUEUE_MAX);
         }
 
-        let _ = body_size;
-
         // Replicate the prepare to every backup (upstream: `replicate` →
         // `send_message_to_other_replicas_and_standbys`, replica.zig:8550-8552).
         // DEVIATION: upstream serializes the request body into the message;
-        // sans-IO bodies are deferred, so a header-only prepare is broadcast
-        // (receivers dispatch on the header alone).
+        // sans-IO the replicated message is header-only, so a backup records an
+        // empty body and cannot execute the op itself (it can still ack and
+        // commit). The body flows into the journal for the primary's own commit.
         let mut message = crate::message::Message::new();
         message.set_header(&header);
         for _ in 1..self.replica_count {
@@ -1347,27 +1349,40 @@ impl Replica {
             unreachable!("the op being committed is journaled");
         };
 
-        // Execute on state machine.
-        // TODO(port): state_machine.execute(commit_prepare.body_used())
-        // Guard the state machine's clock: every prepare's timestamp must
-        // strictly advance the previous one, which `<` pins the primary's
-        // `prepare_timestamp` (upstream `execute_op` asserts
+        // Execute on state machine. Banking operations decode the request body
+        // recorded with the prepare and produce the reply body the client
+        // receives; every other operation only advances the state machine's
+        // clock (upstream `execute_op` asserts
         // `state_machine.commit_timestamp < prepare.header.timestamp`, and the
         // AOF-recovery exception is moot sans-IO — replica.zig:5441-5445).
-        self.state_machine.execute_op(prepare.timestamp);
+        let result_body = if matches!(
+            prepare.operation,
+            crate::Operation::CREATE_ACCOUNTS | crate::Operation::CREATE_TRANSFERS
+        ) {
+            // DEVIATION: upstream reads the prepare message (header + body)
+            // from the journal and passes `body_used()` to the state machine.
+            // The body may be empty when the prepare arrived header-only
+            // (backup replication and repairs, message-layer bodies deferred);
+            // an empty batch executes trivially and produces an empty reply.
+            let src_body = self.journal.body_with_op(op).map_or_else(Vec::new, ToOwned::to_owned);
+            self.state_machine.execute(prepare.operation, prepare.timestamp, &src_body)
+        } else {
+            self.state_machine.execute_op(prepare.timestamp);
+            Vec::new()
+        };
 
         // Construct the client reply from the committed prepare and update the
         // client sessions table (upstream `execute_op`: replica.zig:5391-5523).
         // Runs on the primary and backups alike: any replica can answer a
         // client's GetReply.
-        let reply = Self::build_reply(&prepare);
+        let reply = Self::build_reply(&prepare, &result_body);
 
         match reply.operation {
             crate::Operation::REGISTER => self.client_table_entry_create(&reply),
             crate::Operation::PULSE | crate::Operation::UPGRADE => {
                 assert_eq!(reply.client, 0);
             }
-            _ => self.client_table_entry_update(&reply),
+            _ => self.client_table_entry_update(&reply, &result_body),
         }
 
         // Reply to the client: the primary always; exactly one backup per op
@@ -1375,6 +1390,11 @@ impl Replica {
         if reply.client != 0 && self.execute_op_reply_to_client(reply.op) {
             let mut message = crate::message::Message::new();
             message.set_header(&reply);
+            if reply.operation == crate::Operation::REGISTER {
+                message.set_body(&[0_u8; message_header::REGISTER_RESULT_SIZE_U32 as usize]);
+            } else if !result_body.is_empty() {
+                message.set_body(&result_body);
+            }
             self.send_reply_message_to_client(&message);
         }
 
@@ -1395,7 +1415,10 @@ impl Replica {
                     request.client,
                     request.request,
                     request.operation,
-                    0, // DEVIATION: sans-IO bodies are deferred; unused.
+                    // TODO(port): the queued request's body is dropped by the
+                    // header-only `on_request`; carry it once the message layer
+                    // plumbs request bodies.
+                    &[],
                     request.request_checksum,
                 );
                 assert!(result.is_ok(), "popped request must be preparable");
@@ -1410,18 +1433,22 @@ impl Replica {
     /// stable-with-view checksum so a retransmitted reply stays valid
     /// (upstream replica.zig:5466-5486).
     ///
+    /// `result` is the state machine's result body: for `.register` it is
+    /// ignored (the reply carries the `RegisterResult` shape from the request);
+    /// for state-machine operations it is the batch of per-event result
+    /// records. A body-less operation passes an empty slice.
+    ///
     /// # Panics
     ///
     /// Panics if the prepare's operation is `.root` or `.reserved`.
     ///
     /// DEVIATION: upstream sizes the reply according to the state machine's
-    /// result (`.register` bodies carry a `RegisterResult`; state-machine
-    /// operations carry a `StateMachine.Result`). sans-IO the state machine
-    /// execute and the request/result bodies are deferred, so only the reply
-    /// header is built: empty-bodied except for `.register`, whose
-    /// `RegisterResult` size is preserved (the `batch_size_limit` contents are
-    /// zeroed — upstream copies them from the register request body).
-    fn build_reply(prepare: &message_header::Prepare) -> message_header::Reply {
+    /// result (`.register` bodies carry a `RegisterResult`). sans-IO the
+    /// register reply body is still zeroed (its `batch_size_limit` contents are
+    /// copied from the register request body, which the message layer has not
+    /// plumbed yet); state-machine operations now carry their real result
+    /// batch.
+    fn build_reply(prepare: &message_header::Prepare, result: &[u8]) -> message_header::Reply {
         assert_ne!(prepare.operation, crate::Operation::ROOT);
         assert_ne!(prepare.operation, crate::Operation::RESERVED);
 
@@ -1440,15 +1467,13 @@ impl Replica {
             size: message_header::SIZE_U32,
             ..message_header::Reply::default()
         };
-        // DEVIATION: the reply body is deferred (see above), so its checksum
-        // covers the zeroed `RegisterResult` that this build produces (the
-        // `batch_size_limit` contents are zeroed — upstream copies them from
-        // the register request body).
         if reply.operation == crate::Operation::REGISTER {
             reply.size += message_header::REGISTER_RESULT_SIZE_U32;
             reply.set_checksum_body(&[0_u8; message_header::REGISTER_RESULT_SIZE_U32 as usize]);
         } else {
-            reply.set_checksum_body(&[]);
+            reply.size +=
+                u32::try_from(result.len()).unwrap_or_else(|_| unreachable!("reply body fits u32"));
+            reply.set_checksum_body(result);
         }
         // `context` is the reply's checksum computed with a fixed view,
         // allowing the reply to be retransmitted in a newer view
@@ -1520,7 +1545,7 @@ impl Replica {
     /// update (the next request will receive an eviction from the primary).
     ///
     /// Upstream: `src/vsr/replica.zig:5750` (`client_table_entry_update`).
-    fn client_table_entry_update(&mut self, reply: &message_header::Reply) {
+    fn client_table_entry_update(&mut self, reply: &message_header::Reply, body: &[u8]) {
         assert_eq!(reply.command, crate::command::Command::Reply);
         assert_ne!(reply.operation, crate::Operation::REGISTER);
         assert_ne!(reply.client, 0);
@@ -1563,6 +1588,9 @@ impl Replica {
         };
         let mut message = crate::message::Message::new();
         message.set_header(reply);
+        if !body.is_empty() {
+            message.set_body(body);
+        }
         self.client_replies.write_reply(
             storage,
             slot,
@@ -2257,6 +2285,9 @@ impl Replica {
                 client: header.client,
                 acks_received: 0,
                 ok_quorum_received: false,
+                // The body recorded with the survivor (empty for prepares that
+                // arrived header-only):
+                body: self.journal.body_with_op(op).map_or_else(Vec::new, ToOwned::to_owned),
             });
             parent = header.checksum();
             self.ok_from_all_replicas.push(0);
@@ -2997,7 +3028,7 @@ impl PipelineQueue {
 }
 
 /// A prepare in the pipeline.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct PipelinePrepare {
     pub op: u64,
     pub checksum: u128,
@@ -3008,6 +3039,8 @@ pub struct PipelinePrepare {
     pub acks_received: u16,
     /// Whether a quorum of prepare_ok messages has been received.
     pub ok_quorum_received: bool,
+    /// The prepare body (the client request body, sans header).
+    pub body: Vec<u8>,
 }
 
 /// A client request queued on the primary.
@@ -4146,12 +4179,16 @@ impl Replica {
                 operation: request.operation,
             });
         } else {
-            let body_size = request.size - message_header::SIZE_U32;
+            // DEVIATION: the primary prepares the request body once the message
+            // layer plumbs it (`on_request` receives only the header). Until
+            // then the prepared op records an empty body, so only ops without
+            // an input batch (register, noop, pulse) execute faithfully end to
+            // end from the client message path.
             let result = self.primary_pipeline_prepare(
                 request.client,
                 request.request,
                 request.operation,
-                body_size,
+                &[],
                 request.checksum,
             );
             assert!(result.is_ok(), "valid primary-visible request must prepare");
@@ -4178,6 +4215,12 @@ impl Replica {
                 // A backup acks the accepted prepare; the primary contributes
                 // its own prepare_ok on the pipeline path instead (we do not
                 // self-ack here).
+                //
+                // DEVIATION: the replicated Prepare message carries no body
+                // (the sans-IO message layer broadcasts headers only), so the
+                // backup records an empty body and commits the op without its
+                // input batch. TODO(port): decode `message.body_used()` into
+                // `journal.set_prepare_body` once messages carry bodies.
                 if !self.is_primary() {
                     self.send_prepare_ok(&prepare);
                     // Opportunistically repair any gaps this prepare exposed
@@ -5188,6 +5231,7 @@ mod tests {
     use crate::message_header::BlockType;
     use crate::multiversion::Release;
     use tigerbeetle_core::constants::BLOCK_SIZE;
+    use tigerbeetle_core::types::{Account, CreateAccountStatus, CreateTransferStatus, Transfer};
     use tigerbeetle_lsm::free_set::SHARD_BITS;
 
     const CLUSTER: u128 = 0xDEAD;
@@ -5376,7 +5420,7 @@ mod tests {
     /// Commits a register for `client` at the next op, returning that op
     /// (its commit number becomes the client's session number).
     fn register_client(r: &mut Replica, client: u128) -> u64 {
-        let op = r.primary_pipeline_prepare(client, 0, crate::Operation::REGISTER, 0, 0).unwrap();
+        let op = r.primary_pipeline_prepare(client, 0, crate::Operation::REGISTER, &[], 0).unwrap();
         r.commit_max = op;
         r.commit_prepare = Some(op);
         r.commit_stage = CommitStage::Execute;
@@ -5891,6 +5935,7 @@ mod tests {
             client: 1,
             acks_received: 0,
             ok_quorum_received: false,
+            body: Vec::new(),
         };
         assert!(cache.insert(p).is_none());
         assert!(cache.find(10, 0xAB).is_some());
@@ -5907,6 +5952,7 @@ mod tests {
             client: 1,
             acks_received: 0,
             ok_quorum_received: false,
+            body: Vec::new(),
         };
         let p2 = PipelinePrepare {
             op: 2,
@@ -5914,6 +5960,7 @@ mod tests {
             client: 1,
             acks_received: 0,
             ok_quorum_received: false,
+            body: Vec::new(),
         };
         // op=0 maps to index 0, op=2 maps to index 0 (2 % 2 == 0).
         assert!(cache.insert(p1).is_none());
@@ -5994,13 +6041,13 @@ mod tests {
         // request `2` is its next (new) request with a real session. Request
         // numbers are strictly sequential per client (upstream
         // `client_table_entry_update` asserts `request + 1`).
-        let op = r.primary_pipeline_prepare(2, 0, crate::Operation::REGISTER, 0, 0).unwrap();
+        let op = r.primary_pipeline_prepare(2, 0, crate::Operation::REGISTER, &[], 0).unwrap();
         assert_eq!(op, 1);
         r.commit_max = 1;
         r.commit_prepare = Some(1);
         r.commit_stage = CommitStage::Execute;
         r.commit_execute();
-        let op = r.primary_pipeline_prepare(2, 1, crate::Operation::NOOP, 0, 0).unwrap();
+        let op = r.primary_pipeline_prepare(2, 1, crate::Operation::NOOP, &[], 0).unwrap();
         assert_eq!(op, 2);
         r.commit_max = 2;
         r.commit_prepare = Some(2);
@@ -6010,7 +6057,7 @@ mod tests {
         let (session_number, parent) = (session.session, session.header.context);
 
         for _ in 0..constants::PIPELINE_PREPARE_QUEUE_MAX {
-            let op = r.primary_pipeline_prepare(1, 1, crate::Operation::NOOP, 0, 0).unwrap();
+            let op = r.primary_pipeline_prepare(1, 1, crate::Operation::NOOP, &[], 0).unwrap();
             assert!(op > 0);
         }
         let prepare_count = constants::PIPELINE_PREPARE_QUEUE_MAX as usize;
@@ -6050,7 +6097,7 @@ mod tests {
         assert!(r.commit_min == 0 && r.commit_max == 0);
 
         // Pipeline a first op and queue a second client request behind it.
-        let op = r.primary_pipeline_prepare(1, 1, crate::Operation::NOOP, 0, 0).unwrap();
+        let op = r.primary_pipeline_prepare(1, 1, crate::Operation::NOOP, &[], 0).unwrap();
         assert_eq!(op, 1);
         r.advance_commit_max(1);
         r.pipeline_queue.request_queue.push(PipelineRequest {
@@ -6083,7 +6130,7 @@ mod tests {
         r.status = Status::Normal;
 
         // A register op (request 0, per Request::invalid_header) at commit 1.
-        let op = r.primary_pipeline_prepare(7, 0, crate::Operation::REGISTER, 0, 0).unwrap();
+        let op = r.primary_pipeline_prepare(7, 0, crate::Operation::REGISTER, &[], 0).unwrap();
         assert_eq!(op, 1);
         r.commit_max = 1;
         r.commit_prepare = Some(1);
@@ -6113,7 +6160,7 @@ mod tests {
         r.status = Status::Normal;
 
         // Register client 7 (commit 1).
-        let op = r.primary_pipeline_prepare(7, 0, crate::Operation::REGISTER, 0, 0).unwrap();
+        let op = r.primary_pipeline_prepare(7, 0, crate::Operation::REGISTER, &[], 0).unwrap();
         assert_eq!(op, 1);
         r.commit_max = 1;
         r.commit_prepare = Some(1);
@@ -6125,7 +6172,7 @@ mod tests {
         assert_eq!(entry.header.request, 0);
 
         // Client 7's next request (request 1, noop) commits as op 2.
-        let op = r.primary_pipeline_prepare(7, 1, crate::Operation::NOOP, 0, 0).unwrap();
+        let op = r.primary_pipeline_prepare(7, 1, crate::Operation::NOOP, &[], 0).unwrap();
         assert_eq!(op, 2);
         r.commit_max = 2;
         r.commit_prepare = Some(2);
@@ -6148,7 +6195,7 @@ mod tests {
         let mut r = Replica::new(CLUSTER, 0, 3);
         r.status = Status::Normal;
 
-        let op = r.primary_pipeline_prepare(7, 0, crate::Operation::REGISTER, 0, 0).unwrap();
+        let op = r.primary_pipeline_prepare(7, 0, crate::Operation::REGISTER, &[], 0).unwrap();
         r.commit_max = op;
         r.commit_prepare = Some(op);
         r.commit_stage = CommitStage::Execute;
@@ -6173,7 +6220,7 @@ mod tests {
         r.status = Status::Normal;
 
         // A pulse has no client, so nothing is queued for a client.
-        let op = r.primary_pipeline_prepare(0, 0, crate::Operation::PULSE, 0, 0).unwrap();
+        let op = r.primary_pipeline_prepare(0, 0, crate::Operation::PULSE, &[], 0).unwrap();
         r.commit_max = op;
         r.commit_prepare = Some(op);
         r.commit_stage = CommitStage::Execute;
@@ -6249,14 +6296,14 @@ mod tests {
         r.status = Status::Normal;
 
         // Register client 7 (commit 1), then commit a noop for client 8.
-        let op = r.primary_pipeline_prepare(7, 0, crate::Operation::REGISTER, 0, 0).unwrap();
+        let op = r.primary_pipeline_prepare(7, 0, crate::Operation::REGISTER, &[], 0).unwrap();
         assert_eq!(op, 1);
         r.commit_max = 1;
         r.commit_prepare = Some(1);
         r.commit_stage = CommitStage::Execute;
         r.commit_execute();
 
-        let op = r.primary_pipeline_prepare(8, 1, crate::Operation::NOOP, 0, 0).unwrap();
+        let op = r.primary_pipeline_prepare(8, 1, crate::Operation::NOOP, &[], 0).unwrap();
         assert_eq!(op, 2);
         r.commit_max = 2;
         r.commit_prepare = Some(2);
@@ -6278,7 +6325,7 @@ mod tests {
         ));
 
         // Register client 7 (commit 1): commits a body-ful reply.
-        let op = r.primary_pipeline_prepare(7, 0, crate::Operation::REGISTER, 0, 0).unwrap();
+        let op = r.primary_pipeline_prepare(7, 0, crate::Operation::REGISTER, &[], 0).unwrap();
         assert_eq!(op, 1);
         r.commit_max = 1;
         r.commit_prepare = Some(1);
@@ -6324,7 +6371,7 @@ mod tests {
         ));
 
         // Register client 7 (commit 1) then commit its body-less noop (op 2).
-        let op = r.primary_pipeline_prepare(7, 0, crate::Operation::REGISTER, 0, 0).unwrap();
+        let op = r.primary_pipeline_prepare(7, 0, crate::Operation::REGISTER, &[], 0).unwrap();
         assert_eq!(op, 1);
         r.commit_max = 1;
         r.commit_prepare = Some(1);
@@ -6332,7 +6379,7 @@ mod tests {
         r.commit_execute();
         r.poll_client_replies();
 
-        let op = r.primary_pipeline_prepare(7, 1, crate::Operation::NOOP, 0, 0).unwrap();
+        let op = r.primary_pipeline_prepare(7, 1, crate::Operation::NOOP, &[], 0).unwrap();
         assert_eq!(op, 2);
         r.commit_max = 2;
         r.commit_prepare = Some(2);
@@ -6353,7 +6400,7 @@ mod tests {
         let mut r = Replica::new(CLUSTER, 0, 3);
         r.status = Status::Normal;
 
-        let op1 = r.primary_pipeline_prepare(7, 0, crate::Operation::REGISTER, 0, 0).unwrap();
+        let op1 = r.primary_pipeline_prepare(7, 0, crate::Operation::REGISTER, &[], 0).unwrap();
         let timestamp1 = r.journal.header_with_op(op1).expect("prepare").timestamp;
         r.commit_max = op1;
         r.commit_prepare = Some(op1);
@@ -6363,7 +6410,7 @@ mod tests {
 
         // A later op is stamped strictly later, so execution advances too
         // (upstream `state_machine.commit_timestamp < prepare.header.timestamp`).
-        let op2 = r.primary_pipeline_prepare(7, 1, crate::Operation::NOOP, 0, 0).unwrap();
+        let op2 = r.primary_pipeline_prepare(7, 1, crate::Operation::NOOP, &[], 0).unwrap();
         let timestamp2 = r.journal.header_with_op(op2).expect("prepare").timestamp;
         assert!(timestamp2 > timestamp1);
         r.commit_max = op2;
@@ -6378,7 +6425,7 @@ mod tests {
     fn commit_execute_panics_on_stale_prepare_timestamp() {
         let mut r = Replica::new(CLUSTER, 0, 3);
         r.status = Status::Normal;
-        assert_eq!(r.primary_pipeline_prepare(7, 0, crate::Operation::NOOP, 0, 0).unwrap(), 1);
+        assert_eq!(r.primary_pipeline_prepare(7, 0, crate::Operation::NOOP, &[], 0).unwrap(), 1);
         r.commit_max = 1;
         r.commit_prepare = Some(1);
         r.commit_stage = CommitStage::Execute;
@@ -6455,8 +6502,11 @@ mod tests {
         // request: op 8 (client 14's register) commits first — the table is
         // full, so the oldest entry (client 7) is evicted — and op 9 (client
         // 7's request) executes afterwards.
-        assert_eq!(r.primary_pipeline_prepare(14, 0, crate::Operation::REGISTER, 0, 0).unwrap(), 8);
-        assert_eq!(r.primary_pipeline_prepare(7, 1, crate::Operation::NOOP, 0, 0).unwrap(), 9);
+        assert_eq!(
+            r.primary_pipeline_prepare(14, 0, crate::Operation::REGISTER, &[], 0).unwrap(),
+            8
+        );
+        assert_eq!(r.primary_pipeline_prepare(7, 1, crate::Operation::NOOP, &[], 0).unwrap(), 9);
         r.commit_max = 8;
         r.commit_prepare = Some(8);
         r.commit_stage = CommitStage::Execute;
@@ -6497,6 +6547,193 @@ mod tests {
             .expect("eviction header");
         assert_eq!(evicted.reason(), Some(message_header::Reason::NoSession));
         assert_eq!(evicted.client, 7);
+    }
+
+    /// Commits a single prepared op directly into the execute stage (the
+    /// shorthand the `commit_execute_*` tests use).
+    fn commit_op_now(r: &mut Replica, op: u64) {
+        assert_eq!(r.commit_min + 1, op);
+        r.commit_max = op;
+        r.commit_prepare = Some(op);
+        r.commit_stage = CommitStage::Execute;
+        r.commit_execute();
+    }
+
+    #[test]
+    fn commit_execute_create_accounts_replies_with_result_bodies() {
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        r.status = Status::Normal;
+        register_client(&mut r, 7);
+
+        // Client 7 creates two accounts in one batch (op 2).
+        let accounts = [
+            Account { id: 1, ledger: 1, code: 1, ..Account::default() },
+            Account { id: 2, ledger: 1, code: 1, ..Account::default() },
+        ];
+        let body = crate::state_machine::account_batch_to_bytes(&accounts);
+        let op =
+            r.primary_pipeline_prepare(7, 1, crate::Operation::CREATE_ACCOUNTS, &body, 0).unwrap();
+        assert_eq!(op, 2);
+        commit_op_now(&mut r, op);
+
+        // The reply carries one 16-byte result per event — the event's
+        // timestamp, a `.created` status, zeroed reserved bytes (upstream
+        // `CreateAccountResult`).
+        assert_eq!(r.client_send_queue.len(), 1);
+        let reply_message = r.client_send_queue.last().expect("reply for client 7");
+        let reply = reply_message.header::<message_header::Reply>().expect("reply header");
+        assert_eq!(reply.operation, crate::Operation::CREATE_ACCOUNTS);
+        assert_eq!(reply.size, message_header::SIZE_U32 + 2 * 16);
+        assert_eq!(reply_message.body_used().len(), 2 * 16);
+        assert!(reply.valid_checksum());
+        assert!(reply.valid_checksum_body(reply_message.body_used()));
+
+        let results = reply_message.body_used();
+        for (index, expected_timestamp) in [1_u64, 2].into_iter().enumerate() {
+            let result = &results[index * 16..index * 16 + 16];
+            assert_eq!(
+                u64::from_le_bytes(result[0..8].try_into().unwrap()),
+                expected_timestamp,
+                "event {index} timestamp"
+            );
+            assert_eq!(
+                u32::from_le_bytes(result[8..12].try_into().unwrap()),
+                CreateAccountStatus::Created as u32,
+                "event {index} status"
+            );
+            assert_eq!(&result[12..16], &[0; 4], "reserved result bytes are zeroed");
+        }
+        assert_eq!(
+            r.client_sessions.get(7).expect("session").header.op,
+            op,
+            "the client's session tracks the create_accounts reply"
+        );
+    }
+
+    #[test]
+    fn commit_execute_create_accounts_duplicate_returns_exists_with_original_timestamp() {
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        r.status = Status::Normal;
+        register_client(&mut r, 7);
+
+        let accounts = [Account { id: 1, ledger: 1, code: 1, ..Account::default() }];
+        let body = crate::state_machine::account_batch_to_bytes(&accounts);
+
+        // Create account 1 (op 2); the single event's timestamp is 2.
+        let op =
+            r.primary_pipeline_prepare(7, 1, crate::Operation::CREATE_ACCOUNTS, &body, 0).unwrap();
+        assert_eq!(op, 2);
+        commit_op_now(&mut r, op);
+        r.client_send_queue.clear();
+
+        // Recreating account 1 (op 3) reports `.exists` with the original
+        // record's timestamp (2) — not the re-execution timestamp (3).
+        let op =
+            r.primary_pipeline_prepare(7, 2, crate::Operation::CREATE_ACCOUNTS, &body, 0).unwrap();
+        assert_eq!(op, 3);
+        assert_eq!(r.prepare_timestamp, 3, "re-execution batch timestamp");
+        commit_op_now(&mut r, op);
+
+        let results = r.client_send_queue.last().expect("reply").body_used();
+        assert_eq!(
+            u64::from_le_bytes(results[0..8].try_into().unwrap()),
+            2,
+            "existing account's stored timestamp"
+        );
+        assert_eq!(
+            u32::from_le_bytes(results[8..12].try_into().unwrap()),
+            CreateAccountStatus::Exists as u32
+        );
+    }
+
+    #[test]
+    fn commit_execute_create_transfers_validates_against_created_accounts() {
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        r.status = Status::Normal;
+        register_client(&mut r, 7);
+
+        // Two accounts back the transfers. Account batch events get timestamps
+        // 1 and 2; each account's stored timestamp is its own event's.
+        let accounts = [
+            Account { id: 1, ledger: 1, code: 1, ..Account::default() },
+            Account { id: 2, ledger: 1, code: 1, ..Account::default() },
+        ];
+        let account_body = crate::state_machine::account_batch_to_bytes(&accounts);
+        let op = r
+            .primary_pipeline_prepare(7, 1, crate::Operation::CREATE_ACCOUNTS, &account_body, 0)
+            .unwrap();
+        assert_eq!(op, 2);
+        commit_op_now(&mut r, op);
+        r.client_send_queue.clear();
+
+        // A transfer between the two known accounts (op 3) commits `.created`.
+        let transfers = [Transfer {
+            id: 10,
+            debit_account_id: 1,
+            credit_account_id: 2,
+            amount: 100,
+            ledger: 1,
+            code: 1,
+            ..Transfer::default()
+        }];
+        let transfer_body = crate::state_machine::transfer_batch_to_bytes(&transfers);
+        let op = r
+            .primary_pipeline_prepare(7, 2, crate::Operation::CREATE_TRANSFERS, &transfer_body, 0)
+            .unwrap();
+        assert_eq!(op, 3);
+        commit_op_now(&mut r, op);
+
+        let results = r.client_send_queue.last().expect("reply").body_used();
+        assert_eq!(u64::from_le_bytes(results[0..8].try_into().unwrap()), 3);
+        assert_eq!(
+            u32::from_le_bytes(results[8..12].try_into().unwrap()),
+            CreateTransferStatus::Created as u32
+        );
+        r.client_send_queue.clear();
+
+        // A transfer between unknown accounts (op 4) fails with the debit
+        // account's missing status (upstream validates debit first).
+        let orphan = [Transfer {
+            id: 20,
+            debit_account_id: 3,
+            credit_account_id: 4,
+            amount: 100,
+            ledger: 1,
+            code: 1,
+            ..Transfer::default()
+        }];
+        let orphan_body = crate::state_machine::transfer_batch_to_bytes(&orphan);
+        let op = r
+            .primary_pipeline_prepare(7, 3, crate::Operation::CREATE_TRANSFERS, &orphan_body, 0)
+            .unwrap();
+        assert_eq!(op, 4);
+        commit_op_now(&mut r, op);
+
+        let results = r.client_send_queue.last().expect("reply").body_used();
+        assert_eq!(
+            u32::from_le_bytes(results[8..12].try_into().unwrap()),
+            CreateTransferStatus::DebitAccountNotFound as u32
+        );
+        r.client_send_queue.clear();
+
+        // Duplicating the first transfer (op 5) reports `.exists` (proving the
+        // op-3 transfer persisted in the state machine store).
+        let op = r
+            .primary_pipeline_prepare(7, 4, crate::Operation::CREATE_TRANSFERS, &transfer_body, 0)
+            .unwrap();
+        assert_eq!(op, 5);
+        commit_op_now(&mut r, op);
+
+        let results = r.client_send_queue.last().expect("reply").body_used();
+        assert_eq!(
+            u64::from_le_bytes(results[0..8].try_into().unwrap()),
+            3,
+            "original transfer timestamp"
+        );
+        assert_eq!(
+            u32::from_le_bytes(results[8..12].try_into().unwrap()),
+            CreateTransferStatus::Exists as u32
+        );
     }
 
     #[test]
@@ -6647,12 +6884,12 @@ mod tests {
         r.status = Status::Normal;
 
         // Client 7 has committed register (request 0) and request 1.
-        r.primary_pipeline_prepare(7, 0, crate::Operation::REGISTER, 0, 0).unwrap();
+        r.primary_pipeline_prepare(7, 0, crate::Operation::REGISTER, &[], 0).unwrap();
         r.commit_max = 1;
         r.commit_prepare = Some(1);
         r.commit_stage = CommitStage::Execute;
         r.commit_execute();
-        r.primary_pipeline_prepare(7, 1, crate::Operation::NOOP, 0, 0).unwrap();
+        r.primary_pipeline_prepare(7, 1, crate::Operation::NOOP, &[], 0).unwrap();
         r.commit_max = 2;
         r.commit_prepare = Some(2);
         r.commit_stage = CommitStage::Execute;
@@ -6726,7 +6963,7 @@ mod tests {
         r.status = Status::Normal;
 
         // Client 7 is registered (session = commit 1).
-        r.primary_pipeline_prepare(7, 0, crate::Operation::REGISTER, 0, 0).unwrap();
+        r.primary_pipeline_prepare(7, 0, crate::Operation::REGISTER, &[], 0).unwrap();
         r.commit_max = 1;
         r.commit_prepare = Some(1);
         r.commit_stage = CommitStage::Execute;
@@ -6746,7 +6983,7 @@ mod tests {
         // waits for it to commit rather than being evicted.
         r.send_queue.clear();
         r.client_send_queue.clear();
-        let op = r.primary_pipeline_prepare(9, 0, crate::Operation::REGISTER, 0, 0).unwrap();
+        let op = r.primary_pipeline_prepare(9, 0, crate::Operation::REGISTER, &[], 0).unwrap();
         assert_eq!(op, 2);
         r.on_message(&request_message(9, 1, crate::Operation::NOOP), 0);
         assert_eq!(r.op, 2, "waiting for the in-pipeline register: nothing prepared");
@@ -6842,7 +7079,7 @@ mod tests {
     }
 
     fn register_and_persist(r: &mut Replica, client: u128) -> u64 {
-        let op = r.primary_pipeline_prepare(client, 0, crate::Operation::REGISTER, 0, 0).unwrap();
+        let op = r.primary_pipeline_prepare(client, 0, crate::Operation::REGISTER, &[], 0).unwrap();
         assert_eq!(op, 1);
         r.commit_max = 1;
         r.commit_prepare = Some(1);
@@ -6894,7 +7131,7 @@ mod tests {
         ));
 
         // Commit the register but leave the reply write in flight.
-        let op = r.primary_pipeline_prepare(7, 0, crate::Operation::REGISTER, 0, 0).unwrap();
+        let op = r.primary_pipeline_prepare(7, 0, crate::Operation::REGISTER, &[], 0).unwrap();
         r.commit_max = op;
         r.commit_prepare = Some(op);
         r.commit_stage = CommitStage::Execute;
@@ -7088,7 +7325,7 @@ mod tests {
     fn primary_pipeline_prepare_basic() {
         let mut r = Replica::new(0, 0, 3); // primary
         r.status = Status::Normal;
-        let op = r.primary_pipeline_prepare(1, 100, crate::Operation(6), 64, 0).unwrap();
+        let op = r.primary_pipeline_prepare(1, 100, crate::Operation(6), &[], 0).unwrap();
         assert_eq!(op, 1);
         assert_eq!(r.op, 1);
         assert_eq!(r.pipeline_queue.prepare_queue.len(), 1);
@@ -7099,7 +7336,7 @@ mod tests {
     fn primary_pipeline_prepare_rejects_backup() {
         let mut r = Replica::new(0, 1, 3); // backup
         r.status = Status::Normal;
-        let result = r.primary_pipeline_prepare(1, 100, crate::Operation(6), 64, 0);
+        let result = r.primary_pipeline_prepare(1, 100, crate::Operation(6), &[], 0);
         assert_eq!(result, Err(PrepareReject::NotPrimary));
     }
 
@@ -7107,8 +7344,8 @@ mod tests {
     fn primary_pipeline_prepare_chain() {
         let mut r = Replica::new(0, 0, 3);
         r.status = Status::Normal;
-        let op1 = r.primary_pipeline_prepare(1, 100, crate::Operation(6), 64, 0).unwrap();
-        let op2 = r.primary_pipeline_prepare(2, 101, crate::Operation(6), 64, 0).unwrap();
+        let op1 = r.primary_pipeline_prepare(1, 100, crate::Operation(6), &[], 0).unwrap();
+        let op2 = r.primary_pipeline_prepare(2, 101, crate::Operation(6), &[], 0).unwrap();
         assert_eq!(op1, 1);
         assert_eq!(op2, 2);
         assert_eq!(r.pipeline_queue.prepare_queue.len(), 2);
@@ -7120,7 +7357,7 @@ mod tests {
     fn primary_pipeline_prepare_broadcasts_to_backups() {
         let mut r = Replica::new(0, 0, 3);
         r.status = Status::Normal;
-        r.primary_pipeline_prepare(1, 1, crate::Operation::NOOP, 0, 0).unwrap();
+        r.primary_pipeline_prepare(1, 1, crate::Operation::NOOP, &[], 0).unwrap();
         // One broadcast Prepare per backup, carrying the journaled op.
         assert_eq!(r.send_queue.len(), 2);
         for message in &r.send_queue {
@@ -7135,7 +7372,7 @@ mod tests {
     fn on_prepare_ok_quorum_3() {
         let mut r = Replica::new(0, 0, 3); // primary, quorum=2
         r.status = Status::Normal;
-        r.primary_pipeline_prepare(1, 100, crate::Operation(6), 64, 0).unwrap();
+        r.primary_pipeline_prepare(1, 100, crate::Operation(6), &[], 0).unwrap();
         let checksum = r.journal.header_with_op(1).unwrap().checksum();
 
         // The primary contributed its own prepare_ok on prepare.
@@ -7154,7 +7391,7 @@ mod tests {
     fn on_prepare_ok_duplicate_ignored() {
         let mut r = Replica::new(0, 0, 3);
         r.status = Status::Normal;
-        r.primary_pipeline_prepare(1, 100, crate::Operation(6), 64, 0).unwrap();
+        r.primary_pipeline_prepare(1, 100, crate::Operation(6), &[], 0).unwrap();
         let checksum = r.journal.header_with_op(1).unwrap().checksum();
 
         let _ = r.on_prepare_ok(1, checksum, 1);
@@ -7166,8 +7403,8 @@ mod tests {
     fn primary_pipeline_pending_tracks_unquorumed_head() {
         let mut r = Replica::new(0, 0, 3);
         r.status = Status::Normal;
-        r.primary_pipeline_prepare(1, 1, crate::Operation::NOOP, 0, 0).unwrap();
-        r.primary_pipeline_prepare(2, 2, crate::Operation::NOOP, 0, 0).unwrap();
+        r.primary_pipeline_prepare(1, 1, crate::Operation::NOOP, &[], 0).unwrap();
+        r.primary_pipeline_prepare(2, 2, crate::Operation::NOOP, &[], 0).unwrap();
 
         // Both are pending (self-ack alone is not a quorum).
         let (slot, pending) = r.primary_pipeline_pending().unwrap();
@@ -7192,7 +7429,7 @@ mod tests {
     fn on_prepare_timeout_retransmits_to_unacked_backups() {
         let mut r = Replica::new(0, 0, 3);
         r.status = Status::Normal;
-        let op = r.primary_pipeline_prepare(1, 1, crate::Operation::NOOP, 0, 0).unwrap();
+        let op = r.primary_pipeline_prepare(1, 1, crate::Operation::NOOP, &[], 0).unwrap();
         r.send_queue.clear(); // the initial broadcast is not under test
 
         // No backup has acked → both replicas 1 and 2 are waiting; the
@@ -7220,8 +7457,8 @@ mod tests {
     fn prepare_timeout_retransmits_pending_head_only() {
         let mut r = Replica::new(0, 0, 3);
         r.status = Status::Normal;
-        r.primary_pipeline_prepare(1, 1, crate::Operation::NOOP, 0, 0).unwrap();
-        r.primary_pipeline_prepare(2, 2, crate::Operation::NOOP, 0, 0).unwrap();
+        r.primary_pipeline_prepare(1, 1, crate::Operation::NOOP, &[], 0).unwrap();
+        r.primary_pipeline_prepare(2, 2, crate::Operation::NOOP, &[], 0).unwrap();
         r.send_queue.clear(); // the initial broadcasts are not under test
 
         // Quorum op 1 and commit it; op 2 remains pending.
@@ -7247,7 +7484,7 @@ mod tests {
         // acks; the primary counts the ack toward quorum and commits.
         let mut r1 = Replica::new(0, 0, 3); // primary, view 0
         r1.status = Status::Normal;
-        r1.primary_pipeline_prepare(1, 100, crate::Operation(6), 64, 0).unwrap();
+        r1.primary_pipeline_prepare(1, 100, crate::Operation(6), &[], 0).unwrap();
         assert_eq!(r1.pipeline_queue.prepare_queue.len(), 1);
         assert_eq!(r1.send_queue.len(), 2); // one broadcast Prepare per backup
 
@@ -7293,8 +7530,8 @@ mod tests {
     fn primary_pipeline_prepare_wires_journal_chain() {
         let mut r = Replica::new(0, 0, 3);
         r.status = Status::Normal;
-        r.primary_pipeline_prepare(1, 100, crate::Operation(6), 64, 0).unwrap();
-        r.primary_pipeline_prepare(2, 101, crate::Operation(6), 64, 0).unwrap();
+        r.primary_pipeline_prepare(1, 100, crate::Operation(6), &[], 0).unwrap();
+        r.primary_pipeline_prepare(2, 101, crate::Operation(6), &[], 0).unwrap();
 
         // Op 0 was never prepared — the journal ring still holds a reserved header.
         assert_eq!(r.journal.header_with_op(0), None);
@@ -7322,7 +7559,7 @@ mod tests {
     fn commit_op_marks_journal_prepare_written() {
         let mut r = Replica::new(0, 0, 3);
         r.status = Status::Normal;
-        r.primary_pipeline_prepare(1, 100, crate::Operation(6), 64, 0).unwrap();
+        r.primary_pipeline_prepare(1, 100, crate::Operation(6), &[], 0).unwrap();
         let header = *r.journal.header_with_op(1).unwrap();
         let slot = crate::journal::Journal::slot_for_op(1);
 
@@ -7343,7 +7580,7 @@ mod tests {
     fn primary_pipeline_prepare_rejects_reserved_operation() {
         let mut r = Replica::new(0, 0, 3);
         r.status = Status::Normal;
-        let _ = r.primary_pipeline_prepare(1, 100, crate::Operation::RESERVED, 64, 0);
+        let _ = r.primary_pipeline_prepare(1, 100, crate::Operation::RESERVED, &[], 0);
     }
 
     #[test]
@@ -8447,8 +8684,8 @@ mod tests {
     fn pop_committed_drains_pipeline() {
         let mut r = Replica::new(0, 0, 3);
         r.status = Status::Normal;
-        r.primary_pipeline_prepare(1, 100, crate::Operation(6), 64, 0).unwrap();
-        r.primary_pipeline_prepare(2, 101, crate::Operation(6), 64, 0).unwrap();
+        r.primary_pipeline_prepare(1, 100, crate::Operation(6), &[], 0).unwrap();
+        r.primary_pipeline_prepare(2, 101, crate::Operation(6), &[], 0).unwrap();
         assert_eq!(r.pipeline_queue.prepare_queue.len(), 2);
 
         let popped = r.pop_committed();
@@ -9468,7 +9705,7 @@ mod tests {
         // Prepare in pipeline but no quorum yet: no-op.
         let mut r = Replica::new(0, 0, 3);
         r.status = Status::Normal;
-        r.primary_pipeline_prepare(1, 1, crate::Operation::NOOP, 0, 0).unwrap();
+        r.primary_pipeline_prepare(1, 1, crate::Operation::NOOP, &[], 0).unwrap();
 
         r.commit_dispatch_enter();
         assert_eq!(r.commit_stage, CommitStage::Idle);
@@ -9480,7 +9717,7 @@ mod tests {
         // Primary with a quorum'd prepare: commit executes fully.
         let mut r = Replica::new(0, 0, 3);
         r.status = Status::Normal;
-        let op = r.primary_pipeline_prepare(1, 1, crate::Operation::NOOP, 0, 0).unwrap();
+        let op = r.primary_pipeline_prepare(1, 1, crate::Operation::NOOP, &[], 0).unwrap();
 
         // Quorum = 2 (replica_count 3): the primary's own prepare_ok was
         // contributed on prepare, so one backup ack completes the quorum.
@@ -9504,9 +9741,9 @@ mod tests {
         let mut r = Replica::new(0, 0, 3);
         r.status = Status::Normal;
 
-        let op1 = r.primary_pipeline_prepare(1, 1, crate::Operation::NOOP, 0, 0).unwrap();
-        let op2 = r.primary_pipeline_prepare(2, 2, crate::Operation::NOOP, 0, 0).unwrap();
-        let op3 = r.primary_pipeline_prepare(3, 3, crate::Operation::NOOP, 0, 0).unwrap();
+        let op1 = r.primary_pipeline_prepare(1, 1, crate::Operation::NOOP, &[], 0).unwrap();
+        let op2 = r.primary_pipeline_prepare(2, 2, crate::Operation::NOOP, &[], 0).unwrap();
+        let op3 = r.primary_pipeline_prepare(3, 3, crate::Operation::NOOP, &[], 0).unwrap();
 
         // Quorum all three; the primary's own prepare_ok brings each to
         // quorum with a single backup ack.
@@ -9539,7 +9776,7 @@ mod tests {
     fn commit_dispatch_cancel_resets_state() {
         let mut r = Replica::new(0, 0, 3);
         r.status = Status::Normal;
-        let op = r.primary_pipeline_prepare(1, 1, crate::Operation::NOOP, 0, 0).unwrap();
+        let op = r.primary_pipeline_prepare(1, 1, crate::Operation::NOOP, &[], 0).unwrap();
         let checksum = r.journal.header_with_op(op).unwrap().checksum();
         r.on_prepare_ok(op, checksum, 1); // replica 1 → quorum (with the self-ack)
 
