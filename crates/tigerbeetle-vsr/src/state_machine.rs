@@ -415,6 +415,37 @@ fn commit_post_void_accounts(
     (dr, cr)
 }
 
+/// Build the stored record for a posting/voiding transfer (upstream
+/// `state_machine.zig:4195-4209`): the pending transfer's debit/credit,
+/// ledger and code are folded in, `timeout` is zeroed, user-data fields fall
+/// back to the pending's values, and the amount is the validated
+/// `amount_actual`.
+fn fold_post_void_transfer(
+    event: &Transfer,
+    p: &Transfer,
+    amount_actual: u128,
+    timestamp: u64,
+) -> Transfer {
+    // Mirror of the orchestrator's exists-path: the pending's fields must
+    // match the stored post/void record.
+    debug_assert_eq!(event.pending_id, p.id);
+    Transfer {
+        id: event.id,
+        debit_account_id: p.debit_account_id,
+        credit_account_id: p.credit_account_id,
+        amount: amount_actual,
+        pending_id: event.pending_id,
+        user_data_128: if event.user_data_128 != 0 { event.user_data_128 } else { p.user_data_128 },
+        user_data_64: if event.user_data_64 != 0 { event.user_data_64 } else { p.user_data_64 },
+        user_data_32: if event.user_data_32 != 0 { event.user_data_32 } else { p.user_data_32 },
+        timeout: 0,
+        ledger: p.ledger,
+        code: p.code,
+        flags: event.flags,
+        timestamp,
+    }
+}
+
 /// Idempotency check for an existing transfer.
 fn create_transfer_exists(t: &Transfer, e: &Transfer) -> CreateTransferStatus {
     assert_eq!(t.id, e.id);
@@ -943,22 +974,17 @@ where
 /// the account matching a timestamp, mirroring the cross-groove
 /// `accounts.indirect_lookup` that upstream consults for imported events.
 ///
-/// `get_existing_transfer` looks up a transfer by id.
-/// `get_account` looks up an account by id — needed for both debit and credit
-/// accounts. It must return the committed state: this orchestrator overlays an
-/// in-session working view on top, so events later in the batch observe the
-/// balance mutations of earlier created transfers (upstream's in-session
-/// scope), with each linked chain snapshotted at open and rolled back on
-/// break.
+/// `get_existing_transfer` looks up a transfer by id. It must return the
+/// committed state: the orchestrator overlays an in-session working view of
+/// created transfers (`working_transfers`) on top, so later batch events see
+/// transfers created earlier in the batch — including pending transfers that a
+/// post/void event references (upstream inserts into the transfers groove at
+/// each create, so the in-session scope is visible there too).
 ///
 /// `get_pending_status` returns the committed status (`transfers_pending`) of
 /// the pending transfer with the given timestamp, which post/void events
 /// validate against. A working overlay of in-session post/void status changes
-/// sits on top, so a pending transfer posted earlier in the batch reports
-/// `pending_transfer_already_posted` to a later event (a pending transfer
-/// created and posted within the same batch is a documented `DEVIATION`:
-/// `get_existing_transfer` does not see it, so the post reports
-/// `pending_transfer_not_found`).
+/// (and pending creations) sits on top.
 pub fn execute_create_transfers<F, G, FAccountAt, FPendingStatus>(
     events: &[Transfer],
     timestamp: u64,
@@ -982,14 +1008,19 @@ where
     // (upstream's open batch scope). Mutations from created events accumulate
     // here so later batch members validate against them.
     let mut working: HashMap<u128, Account> = HashMap::new();
-    // Chain scoping: snapshot the working view (and the running key range) when
+    // In-session working view of created transfers, layered over
+    // `get_existing_transfer` (upstream inserts each transfer into the transfers
+    // groove as it commits, so the batch observes it).
+    let mut working_transfers: HashMap<u128, Transfer> = HashMap::new();
+    // Chain scoping: snapshot the working views (and the running key range) when
     // a chain opens, and restore them if it breaks (upstream `scope_close(.discard)`
-    // rolls back only the chain's own writes — events since the chain opened).
+    // rolls back the accounts, transfers and transfers_pending grooves).
     let mut chain_snapshot: Option<HashMap<u128, Account>> = None;
     let mut chain_key_max_snapshot: Option<u64> = None;
+    let mut chain_transfers_snapshot: Option<HashMap<u128, Transfer>> = None;
     // In-session view of pending-transfer statuses, layered over
     // `get_pending_status` (a post/void within the batch marks its pending as
-    // posted/voided so a later event sees it).
+    // posted/voided so a later event sees it; pending creations seed `Pending`).
     let mut working_pending: HashMap<u64, TransferPendingStatus> = HashMap::new();
     let mut chain_pending_snapshot: Option<HashMap<u64, TransferPendingStatus>> = None;
 
@@ -1010,6 +1041,7 @@ where
                     // snapshot/restore below.
                     chain_snapshot = Some(working.clone());
                     chain_key_max_snapshot = Some(running_key_max);
+                    chain_transfers_snapshot = Some(working_transfers.clone());
                     chain_pending_snapshot = Some(working_pending.clone());
                 }
                 if index == events.len() - 1 {
@@ -1046,8 +1078,13 @@ where
             }
 
             // For post/void pending transfers, the transfer must not already exist.
-            // For regular transfers, look up existing for idempotency.
-            let existing = get_existing_transfer(event.id);
+            // For regular transfers, look up existing for idempotency. The
+            // in-session working view takes precedence over the committed state
+            // (a transfer created earlier in this batch is already visible).
+            let existing = working_transfers
+                .get(&event.id)
+                .copied()
+                .or_else(|| get_existing_transfer(event.id));
 
             let post_void =
                 event.flags.post_pending_transfer() || event.flags.void_pending_transfer();
@@ -1068,7 +1105,10 @@ where
                     break 'result (CreateTransferStatus::IdMustNotBeIntMax, timestamp_event);
                 }
 
-                let pending = get_existing_transfer(event.pending_id);
+                let pending = working_transfers
+                    .get(&event.pending_id)
+                    .copied()
+                    .or_else(|| get_existing_transfer(event.pending_id));
 
                 if let Some(e) = existing.as_ref() {
                     // Idempotency (`create_transfer_exists`,
@@ -1167,9 +1207,12 @@ where
                     let status = result.status;
                     amount_actual = result.amount_actual;
                     let ts = if status == CreateTransferStatus::Created {
-                        // Apply the in-session side effects: the pending's status and
-                        // accounts, mirroring what `persist` later re-derives from
-                        // the committed state.
+                        // Apply the in-session side effects: the stored post/void
+                        // record, the pending's status and accounts, mirroring
+                        // what `persist` later re-derives from the committed
+                        // state.
+                        let ts =
+                            if event.flags.imported() { event.timestamp } else { timestamp_event };
                         let is_post = event.flags.post_pending_transfer();
                         working_pending.insert(
                             p.timestamp,
@@ -1186,7 +1229,9 @@ where
                         working.insert(dr_new.id, dr_new);
                         working.insert(cr_new.id, cr_new);
 
-                        if event.flags.imported() { event.timestamp } else { timestamp_event }
+                        let record = fold_post_void_transfer(event, p, amount_actual, ts);
+                        working_transfers.insert(record.id, record);
+                        ts
                     } else {
                         timestamp_event
                     };
@@ -1249,20 +1294,6 @@ where
                     &cr_account,
                 );
                 let status = outcome.status;
-                if status == CreateTransferStatus::Created {
-                    amount_actual = outcome.amount_actual;
-                    // Apply the mutation to the in-session view so later batch
-                    // members validate against it; `persist_transfers` later derives
-                    // the same values from the committed state in event order.
-                    let (dr_new, cr_new) =
-                        commit_transfer_accounts(event, amount_actual, &dr_account, &cr_account);
-                    debug_assert_eq!(dr_new.id, dr_account.id);
-                    debug_assert_eq!(cr_new.id, cr_account.id);
-                    working.insert(dr_new.id, dr_new);
-                    working.insert(cr_new.id, cr_new);
-                } else {
-                    amount_actual = 0;
-                }
                 // Same rule as accounts: `.exists` reports the existing record's
                 // timestamp (upstream `state_machine.zig:3669-3721`).
                 let ts = match status {
@@ -1278,6 +1309,31 @@ where
                     },
                     _ => timestamp_event,
                 };
+                if status == CreateTransferStatus::Created {
+                    amount_actual = outcome.amount_actual;
+                    // Apply the mutation to the in-session view so later batch
+                    // members validate against it; `persist_transfers` later derives
+                    // the same values from the committed state in event order.
+                    let (dr_new, cr_new) =
+                        commit_transfer_accounts(event, amount_actual, &dr_account, &cr_account);
+                    debug_assert_eq!(dr_new.id, dr_account.id);
+                    debug_assert_eq!(cr_new.id, cr_account.id);
+                    working.insert(dr_new.id, dr_new);
+                    working.insert(cr_new.id, cr_new);
+
+                    // The created transfer is visible to later batch events
+                    // (upstream inserts into the transfers groove at commit); a
+                    // pending creation also seeds its status row.
+                    let mut record = *event;
+                    record.amount = amount_actual;
+                    record.timestamp = ts;
+                    working_transfers.insert(record.id, record);
+                    if record.flags.pending() {
+                        working_pending.insert(record.timestamp, TransferPendingStatus::Pending);
+                    }
+                } else {
+                    amount_actual = 0;
+                }
                 (status, ts)
             };
             if matches!(status, CreateTransferStatus::Created) {
@@ -1293,13 +1349,20 @@ where
                     chain_broken = true;
                     // TODO(port): scope_close(.discard) — roll back this chain's
                     // in-session writes (only the events since it opened).
-                    if let (Some(snapshot), Some(key_max_snapshot), Some(pending_snapshot)) = (
+                    if let (
+                        Some(snapshot),
+                        Some(key_max_snapshot),
+                        Some(transfers_snapshot),
+                        Some(pending_snapshot),
+                    ) = (
                         chain_snapshot.as_ref(),
                         chain_key_max_snapshot.as_ref(),
+                        chain_transfers_snapshot.as_ref(),
                         chain_pending_snapshot.as_ref(),
                     ) {
                         working.clone_from(snapshot);
                         running_key_max = *key_max_snapshot;
+                        working_transfers.clone_from(transfers_snapshot);
                         working_pending.clone_from(pending_snapshot);
                     }
                     for result in &mut results[chain_start..index] {
@@ -1322,6 +1385,7 @@ where
             chain_broken = false;
             chain_snapshot = None;
             chain_key_max_snapshot = None;
+            chain_transfers_snapshot = None;
             chain_pending_snapshot = None;
         }
     }
@@ -1760,10 +1824,9 @@ impl StateMachine {
     /// routes to [`Self::persist_post_void`] instead — it folds the pending's
     /// fields into the stored record and applies the release/reopen mutation.
     fn persist_transfer(&mut self, mut event: Transfer, amount_actual: u128) {
-        event.amount = amount_actual;
-        self.insert_transfer(event.id, event);
-
         if event.flags.pending() {
+            event.amount = amount_actual;
+            self.insert_transfer(event.id, event);
             // Upstream writes the pending status on pending creation
             // (state_machine.zig:3963-3982).
             let transfer_pending = TransferPending {
@@ -1779,6 +1842,8 @@ impl StateMachine {
         } else if event.flags.post_pending_transfer() || event.flags.void_pending_transfer() {
             self.persist_post_void(event, amount_actual);
         } else {
+            event.amount = amount_actual;
+            self.insert_transfer(event.id, event);
             self.commit_transfer(&event, amount_actual);
         }
     }
@@ -1790,35 +1855,20 @@ impl StateMachine {
     /// ledger, code and user-data fallbacks; the pending status index advances
     /// to `Posted`/`Voided`; and the accounts release the pending holds
     /// ([`commit_post_void_accounts`]).
-    fn persist_post_void(&mut self, mut event: Transfer, amount_actual: u128) {
+    fn persist_post_void(&mut self, event: Transfer, amount_actual: u128) {
         let p =
             self.transfers.get(&event.pending_id).copied().expect(
                 "posting/voiding a pending transfer implies the pending transfer is committed",
             );
-        event.debit_account_id = p.debit_account_id;
-        event.credit_account_id = p.credit_account_id;
-        event.ledger = p.ledger;
-        event.code = p.code;
-        event.timeout = 0;
-        event.amount = amount_actual;
-        if event.user_data_128 == 0 {
-            event.user_data_128 = p.user_data_128;
-        }
-        if event.user_data_64 == 0 {
-            event.user_data_64 = p.user_data_64;
-        }
-        if event.user_data_32 == 0 {
-            event.user_data_32 = p.user_data_32;
-        }
-        event.pending_id = p.id;
-        self.insert_transfer(event.id, event);
+        let record = fold_post_void_transfer(&event, &p, amount_actual, event.timestamp);
+        self.insert_transfer(record.id, record);
 
         let transfer_pending = self
             .transfers_pending
             .get_mut(&p.timestamp)
             .expect("posting/voiding a pending transfer implies its pending status row");
         assert_eq!(transfer_pending.status, TransferPendingStatus::Pending);
-        transfer_pending.status = if event.flags.post_pending_transfer() {
+        transfer_pending.status = if record.flags.post_pending_transfer() {
             TransferPendingStatus::Posted
         } else {
             TransferPendingStatus::Voided
@@ -1826,15 +1876,15 @@ impl StateMachine {
 
         let dr = self
             .accounts
-            .get(&event.debit_account_id)
+            .get(&record.debit_account_id)
             .copied()
             .expect("debit account exists: post_or_void_pending_transfer validated it");
         let cr = self
             .accounts
-            .get(&event.credit_account_id)
+            .get(&record.credit_account_id)
             .copied()
             .expect("credit account exists: post_or_void_pending_transfer validated it");
-        let (dr, cr) = commit_post_void_accounts(&event, &p, amount_actual, &dr, &cr);
+        let (dr, cr) = commit_post_void_accounts(&record, &p, amount_actual, &dr, &cr);
         self.accounts.insert(dr.id, dr);
         self.accounts.insert(cr.id, cr);
     }
@@ -3074,7 +3124,10 @@ mod tests {
             10,
         );
 
-        let batch = [t(1, 2, 50), t(1, 2, 70)];
+        // Distinct ids: the transfers groove would report `.exists` for a
+        // second event reusing the first id (in-session idempotency), so the
+        // balance accumulation uses fresh ids.
+        let batch = [t(1, 2, 50), Transfer { id: 1003, ..t(1, 2, 70) }];
         let body = sm.create_transfers(&batch, 20);
         assert_eq!(reply_status_at(&body, 0), CreateTransferStatus::Created as u32);
         assert_eq!(reply_status_at(&body, 1), CreateTransferStatus::Created as u32);
@@ -3124,12 +3177,13 @@ mod tests {
             10,
         );
 
-        // Close account 1 with the first event, then reference it in the second.
+        // Close account 1 with the first event, then reference it in the
+        // second (a fresh id — reusing the first's id would report `.exists`).
         let closing = Transfer {
             flags: TransferFlags::PENDING | TransferFlags::CLOSING_DEBIT,
             ..t(1, 2, 10)
         };
-        let body = sm.create_transfers(&[closing, t(1, 2, 5)], 20);
+        let body = sm.create_transfers(&[closing, Transfer { id: 1003, ..t(1, 2, 5) }], 20);
         assert_eq!(reply_status_at(&body, 0), CreateTransferStatus::Created as u32);
         // The in-session closing is visible to the second event: it is rejected
         // (upstream's `create_transfer` sees the scoped mutation).
@@ -3498,7 +3552,7 @@ mod tests {
     }
 
     #[test]
-    fn post_of_pending_created_in_same_batch_is_not_visible() {
+    fn post_of_pending_created_in_same_batch_is_created() {
         let mut sm = StateMachine::default();
         let _ = sm.create_accounts(
             &[
@@ -3508,22 +3562,126 @@ mod tests {
             10,
         );
 
-        // `DEVIATION`: `get_existing_transfer` reads committed state only, so a
-        // pending transfer created earlier in the same batch is not yet visible
-        // to its own post/void (upstream would validate it against the in-session
-        // scope). Pinned here so the deferred behavior is explicit.
+        // A pending transfer created earlier in the batch is visible to its own
+        // post/void (the transfers groove accepts the in-session writes, so the
+        // post validates against the working view).
         let pending = Transfer { flags: TransferFlags::PENDING, ..t(1, 2, 50) };
-        let post = Transfer {
-            id: 3,
-            pending_id: pending_transfer_id(),
-            amount: u128::MAX,
-            flags: TransferFlags::POST_PENDING_TRANSFER,
-            ..Transfer::default()
-        };
+        let post = post_event(3, u128::MAX);
         let body = sm.create_transfers(&[pending, post], 30);
         assert_eq!(reply_status_at(&body, 0), CreateTransferStatus::Created as u32);
-        assert_eq!(reply_status_at(&body, 1), CreateTransferStatus::PendingTransferNotFound as u32);
-        // Only the pending transfer persisted.
+        assert_eq!(reply_status_at(&body, 1), CreateTransferStatus::Created as u32);
+        // The stored post folded the pending's account/ledger/code and the
+        // pending status advanced to `Posted`, releasing the holds.
+        let stored_post = sm.transfers.get(&3).expect("post transfer stored");
+        assert_eq!(stored_post.debit_account_id, 1);
+        assert_eq!(stored_post.credit_account_id, 2);
+        assert_eq!(stored_post.amount, 50);
+        assert_eq!(
+            sm.transfers_pending.get(&29).expect("pending status stored").status,
+            TransferPendingStatus::Posted
+        );
+        let dr = sm.accounts.get(&1).expect("debit account stored");
+        let cr = sm.accounts.get(&2).expect("credit account stored");
+        assert_eq!(dr.debits_pending, 0);
+        assert_eq!(cr.credits_pending, 0);
+        assert_eq!(dr.debits_posted, 50);
+        assert_eq!(cr.credits_posted, 50);
+    }
+
+    #[test]
+    fn void_of_pending_created_in_same_batch_is_created() {
+        let mut sm = StateMachine::default();
+        let _ = sm.create_accounts(
+            &[
+                Account { id: 1, ledger: 1, code: 1, ..Account::default() },
+                Account { id: 2, ledger: 1, code: 1, ..Account::default() },
+            ],
+            10,
+        );
+
+        let pending = Transfer { flags: TransferFlags::PENDING, ..t(1, 2, 25) };
+        let void = void_event(3, 0);
+        let body = sm.create_transfers(&[pending, void], 30);
+        assert_eq!(reply_status_at(&body, 0), CreateTransferStatus::Created as u32);
+        assert_eq!(reply_status_at(&body, 1), CreateTransferStatus::Created as u32);
+        assert_eq!(
+            sm.transfers_pending.get(&29).expect("pending status stored").status,
+            TransferPendingStatus::Voided
+        );
+        let dr = sm.accounts.get(&1).expect("debit account stored");
+        assert_eq!(dr.debits_pending, 0);
+        assert_eq!(dr.debits_posted, 0);
+    }
+
+    #[test]
+    fn post_after_vacating_pending_in_same_batch_is_rejected() {
+        let mut sm = StateMachine::default();
+        pending_setup(&mut sm, 50, TransferFlags::default());
+
+        // Post and void of the same pending within one batch: the post commits,
+        // the void then reports the pending as already posted.
+        let post = post_event(3, u128::MAX);
+        let void = void_event(4, 0);
+        let body = sm.create_transfers(&[post, void], 30);
+        assert_eq!(reply_status_at(&body, 0), CreateTransferStatus::Created as u32);
+        assert_eq!(
+            reply_status_at(&body, 1),
+            CreateTransferStatus::PendingTransferAlreadyPosted as u32
+        );
+    }
+
+    #[test]
+    fn duplicate_transfer_id_within_same_batch_reports_exists() {
+        let mut sm = StateMachine::default();
+        let _ = sm.create_accounts(
+            &[
+                Account { id: 1, ledger: 1, code: 1, ..Account::default() },
+                Account { id: 2, ledger: 1, code: 1, ..Account::default() },
+            ],
+            10,
+        );
+
+        // The second event with the same id sees the first via the working
+        // view and reports `.exists` with the first's timestamp.
+        let body = sm.create_transfers(&[t(1, 2, 5), t(1, 2, 5)], 30);
+        assert_eq!(reply_status_at(&body, 0), CreateTransferStatus::Created as u32);
+        assert_eq!(reply_status_at(&body, 1), CreateTransferStatus::Exists as u32);
         assert_eq!(sm.transfers.len(), 1);
+    }
+
+    #[test]
+    fn chain_break_rolls_back_same_batch_transfer_visibility() {
+        let mut sm = StateMachine::default();
+        let _ = sm.create_accounts(
+            &[
+                Account { id: 1, ledger: 1, code: 1, ..Account::default() },
+                Account { id: 2, ledger: 1, code: 1, ..Account::default() },
+            ],
+            10,
+        );
+
+        // A linked chain whose second member references a missing account. The
+        // chain's pending (member A) is rolled back on break, so a post of it
+        // after the chain closed reports pending-not-found.
+        let chain_first =
+            Transfer { flags: TransferFlags::LINKED | TransferFlags::PENDING, ..t(1, 2, 50) };
+        let chain_middle = Transfer { flags: TransferFlags::LINKED, ..t(99, 2, 100) };
+        let chain_last = Transfer { flags: TransferFlags::LINKED, ..t(1, 2, 100) };
+        let closing_event = t(1, 2, 5);
+        let post = post_event(4, u128::MAX);
+        let batch = [chain_first, chain_middle, chain_last, closing_event, post];
+        let body = sm.create_transfers(&batch, 40);
+        assert_eq!(reply_status_at(&body, 0), CreateTransferStatus::LinkedEventFailed as u32);
+        assert_eq!(reply_status_at(&body, 1), CreateTransferStatus::DebitAccountNotFound as u32);
+        assert_eq!(reply_status_at(&body, 2), CreateTransferStatus::LinkedEventFailed as u32);
+        assert_eq!(reply_status_at(&body, 3), CreateTransferStatus::LinkedEventFailed as u32);
+        // The pending was rolled back with the broken chain: the post cannot see
+        // it and the void's account lookups never ran.
+        assert_eq!(reply_status_at(&body, 4), CreateTransferStatus::PendingTransferNotFound as u32);
+        // Nothing from the broken chain persisted.
+        assert_eq!(sm.transfers.len(), 0);
+        let dr = sm.accounts.get(&1).expect("debit account stored");
+        assert_eq!(dr.debits_pending, 0);
+        assert_eq!(dr.debits_posted, 0);
     }
 }
