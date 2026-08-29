@@ -26,10 +26,13 @@
     clippy::module_name_repetitions
 )]
 
-use tigerbeetle_core::types::{Account, CreateAccountStatus, CreateTransferStatus, Transfer};
+use std::collections::HashMap;
 
-#[cfg(test)]
-use tigerbeetle_core::types::{AccountFlags, TransferFlags};
+use tigerbeetle_core::types::{
+    Account, AccountFlags, CreateAccountStatus, CreateTransferStatus, Transfer, TransferFlags,
+};
+
+use crate::Operation;
 
 // ---------------------------------------------------------------------------
 // Account creation
@@ -570,7 +573,7 @@ pub fn execute_create_accounts<F>(
 where
     F: FnMut(u128) -> Option<Account>,
 {
-    let mut results = Vec::with_capacity(events.len());
+    let mut results: Vec<CreateAccountResult> = Vec::with_capacity(events.len());
     let mut chain: Option<usize> = None;
     let mut chain_broken = false;
 
@@ -579,7 +582,7 @@ where
     for (index, event) in events.iter().enumerate() {
         let timestamp_event = timestamp - events.len() as u64 + index as u64 + 1;
 
-        let (status, _ts) = 'result: {
+        let (status, ts) = 'result: {
             if event.flags.linked() {
                 if chain.is_none() {
                     chain = Some(index);
@@ -618,8 +621,17 @@ where
 
             let existing = get_existing(event.id);
             let status = create_account(event, timestamp_event, existing.as_ref());
+            // Upstream `create_account` returns a tagged union whose payload is
+            // the result timestamp (`.created` => the event's, `.exists` => the
+            // existing record's); we recover it from the lookup.
             let ts = match status {
-                CreateAccountStatus::Created | CreateAccountStatus::Exists => timestamp_event,
+                CreateAccountStatus::Created => timestamp_event,
+                CreateAccountStatus::Exists => match existing {
+                    Some(existing) => existing.timestamp,
+                    None => {
+                        unreachable!("create_account returns Exists only for a matching record")
+                    }
+                },
                 _ => timestamp_event,
             };
             (status, ts)
@@ -630,18 +642,16 @@ where
             if let Some(chain_start) = chain {
                 if !chain_broken {
                     chain_broken = true;
-                    // TODO(port): scope_close(discard)
-                    // Fill linked_event_failed for prior chain events.
-                    for ci in chain_start..index {
-                        // The result slot for this index will be filled below,
-                        // but we mark it as linked_event_failed.
-                        let _ = ci;
+                    // The chain has just been broken: mark every prior member as
+                    // `linked_event_failed` (upstream state_machine.zig:3116-3145).
+                    for result in &mut results[chain_start..index] {
+                        result.status = CreateAccountStatus::LinkedEventFailed;
                     }
                 }
             }
         }
 
-        results.push(CreateAccountResult { status, timestamp: timestamp_event });
+        results.push(CreateAccountResult { status, timestamp: ts });
 
         // Chain completion.
         if chain.is_some()
@@ -677,7 +687,7 @@ where
     F: FnMut(u128) -> Option<Transfer>,
     G: FnMut(u128) -> Option<Account>,
 {
-    let mut results = Vec::with_capacity(events.len());
+    let mut results: Vec<CreateTransferResult> = Vec::with_capacity(events.len());
     let mut chain: Option<usize> = None;
     let mut chain_broken = false;
 
@@ -686,12 +696,11 @@ where
     for (index, event) in events.iter().enumerate() {
         let timestamp_event = timestamp - events.len() as u64 + index as u64 + 1;
 
-        let (status, _ts) = 'result: {
+        let (status, ts) = 'result: {
             if event.flags.linked() {
                 if chain.is_none() {
                     chain = Some(index);
                     assert!(!chain_broken);
-                    // TODO(port): scope_open
                 }
                 if index == events.len() - 1 {
                     break 'result (CreateTransferStatus::LinkedEventChainOpen, timestamp_event);
@@ -751,7 +760,19 @@ where
                 &dr_account,
                 &cr_account,
             );
-            (status, timestamp_event)
+            // Same rule as accounts: `.exists` reports the existing record's
+            // timestamp (upstream `state_machine.zig:3669-3721`).
+            let ts = match status {
+                CreateTransferStatus::Created => timestamp_event,
+                CreateTransferStatus::Exists => match existing {
+                    Some(existing) => existing.timestamp,
+                    None => {
+                        unreachable!("create_transfer returns Exists only for a matching record")
+                    }
+                },
+                _ => timestamp_event,
+            };
+            (status, ts)
         };
 
         // Chain error handling.
@@ -759,13 +780,14 @@ where
             if let Some(chain_start) = chain {
                 if !chain_broken {
                     chain_broken = true;
-                    // TODO(port): scope_close(discard)
-                    let _ = chain_start;
+                    for result in &mut results[chain_start..index] {
+                        result.status = CreateTransferStatus::LinkedEventFailed;
+                    }
                 }
             }
         }
 
-        results.push(CreateTransferResult { status, timestamp: timestamp_event });
+        results.push(CreateTransferResult { status, timestamp: ts });
 
         // Chain completion.
         if chain.is_some()
@@ -785,16 +807,184 @@ where
     results
 }
 
+// ---------------------------------------------------------------------------
+// Request/result body codecs
+// ---------------------------------------------------------------------------
+//
+// The wire bodies are arrays of `#[repr(C)]` LE records — 128 bytes per
+// account/transfer event, 16 bytes per result. Layout is pinned by the `size_of`
+// asserts in `tigerbeetle-core/src/types.rs`.
+
+fn le_u128(bytes: &[u8], offset: usize) -> u128 {
+    let mut value = [0_u8; 16];
+    value.copy_from_slice(&bytes[offset..offset + 16]);
+    u128::from_le_bytes(value)
+}
+
+fn le_u64(bytes: &[u8], offset: usize) -> u64 {
+    let mut value = [0_u8; 8];
+    value.copy_from_slice(&bytes[offset..offset + 8]);
+    u64::from_le_bytes(value)
+}
+
+fn le_u32(bytes: &[u8], offset: usize) -> u32 {
+    let mut value = [0_u8; 4];
+    value.copy_from_slice(&bytes[offset..offset + 4]);
+    u32::from_le_bytes(value)
+}
+
+fn le_u16(bytes: &[u8], offset: usize) -> u16 {
+    let mut value = [0_u8; 2];
+    value.copy_from_slice(&bytes[offset..offset + 2]);
+    u16::from_le_bytes(value)
+}
+
+/// Encode a batch of [`Account`]s as a request body (128 bytes each, LE).
+#[must_use]
+pub fn account_batch_to_bytes(events: &[Account]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(events.len() * 128);
+    for event in events {
+        let mut record = [0_u8; 128];
+        record[0..16].copy_from_slice(&event.id.to_le_bytes());
+        record[16..32].copy_from_slice(&event.debits_pending.to_le_bytes());
+        record[32..48].copy_from_slice(&event.debits_posted.to_le_bytes());
+        record[48..64].copy_from_slice(&event.credits_pending.to_le_bytes());
+        record[64..80].copy_from_slice(&event.credits_posted.to_le_bytes());
+        record[80..96].copy_from_slice(&event.user_data_128.to_le_bytes());
+        record[96..104].copy_from_slice(&event.user_data_64.to_le_bytes());
+        record[104..108].copy_from_slice(&event.user_data_32.to_le_bytes());
+        record[108..112].copy_from_slice(&event.reserved.to_le_bytes());
+        record[112..116].copy_from_slice(&event.ledger.to_le_bytes());
+        record[116..118].copy_from_slice(&event.code.to_le_bytes());
+        record[118..120].copy_from_slice(&event.flags.as_raw().to_le_bytes());
+        record[120..128].copy_from_slice(&event.timestamp.to_le_bytes());
+        bytes.extend_from_slice(&record);
+    }
+    bytes
+}
+
+/// Decode a request body into a batch of [`Account`]s.
+///
+/// Returns `None` if the body length is not a whole number of records.
+#[must_use]
+pub fn bytes_to_account_batch(bytes: &[u8]) -> Option<Vec<Account>> {
+    if !bytes.len().is_multiple_of(128) {
+        return None;
+    }
+    let (records, remainder) = bytes.as_chunks::<128>();
+    assert!(remainder.is_empty());
+    let mut events = Vec::with_capacity(records.len());
+    for record in records {
+        events.push(Account {
+            id: le_u128(record, 0),
+            debits_pending: le_u128(record, 16),
+            debits_posted: le_u128(record, 32),
+            credits_pending: le_u128(record, 48),
+            credits_posted: le_u128(record, 64),
+            user_data_128: le_u128(record, 80),
+            user_data_64: le_u64(record, 96),
+            user_data_32: le_u32(record, 104),
+            reserved: le_u32(record, 108),
+            ledger: le_u32(record, 112),
+            code: le_u16(record, 116),
+            flags: AccountFlags::from_raw(le_u16(record, 118)),
+            timestamp: le_u64(record, 120),
+        });
+    }
+    Some(events)
+}
+
+/// Encode a batch of [`Transfer`]s as a request body (128 bytes each, LE).
+#[must_use]
+pub fn transfer_batch_to_bytes(events: &[Transfer]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(events.len() * 128);
+    for event in events {
+        let mut record = [0_u8; 128];
+        record[0..16].copy_from_slice(&event.id.to_le_bytes());
+        record[16..32].copy_from_slice(&event.debit_account_id.to_le_bytes());
+        record[32..48].copy_from_slice(&event.credit_account_id.to_le_bytes());
+        record[48..64].copy_from_slice(&event.amount.to_le_bytes());
+        record[64..80].copy_from_slice(&event.pending_id.to_le_bytes());
+        record[80..96].copy_from_slice(&event.user_data_128.to_le_bytes());
+        record[96..104].copy_from_slice(&event.user_data_64.to_le_bytes());
+        record[104..108].copy_from_slice(&event.user_data_32.to_le_bytes());
+        record[108..112].copy_from_slice(&event.timeout.to_le_bytes());
+        record[112..116].copy_from_slice(&event.ledger.to_le_bytes());
+        record[116..118].copy_from_slice(&event.code.to_le_bytes());
+        record[118..120].copy_from_slice(&event.flags.as_raw().to_le_bytes());
+        record[120..128].copy_from_slice(&event.timestamp.to_le_bytes());
+        bytes.extend_from_slice(&record);
+    }
+    bytes
+}
+
+/// Decode a request body into a batch of [`Transfer`]s.
+///
+/// Returns `None` if the body length is not a whole number of records.
+#[must_use]
+pub fn bytes_to_transfer_batch(bytes: &[u8]) -> Option<Vec<Transfer>> {
+    if !bytes.len().is_multiple_of(128) {
+        return None;
+    }
+    let (records, remainder) = bytes.as_chunks::<128>();
+    assert!(remainder.is_empty());
+    let mut events = Vec::with_capacity(records.len());
+    for record in records {
+        events.push(Transfer {
+            id: le_u128(record, 0),
+            debit_account_id: le_u128(record, 16),
+            credit_account_id: le_u128(record, 32),
+            amount: le_u128(record, 48),
+            pending_id: le_u128(record, 64),
+            user_data_128: le_u128(record, 80),
+            user_data_64: le_u64(record, 96),
+            user_data_32: le_u32(record, 104),
+            timeout: le_u32(record, 108),
+            ledger: le_u32(record, 112),
+            code: le_u16(record, 116),
+            flags: TransferFlags::from_raw(le_u16(record, 118)),
+            timestamp: le_u64(record, 120),
+        });
+    }
+    Some(events)
+}
+
+/// Encode a batch of [`CreateAccountResult`]s as a reply body: one 16-byte
+/// record per event — `timestamp` LE, `status` LE (a `u32`), `reserved`
+/// zeroed. Upstream `CreateAccountResult` (`tigerbeetle.zig:471`).
+#[must_use]
+pub fn account_results_to_bytes(results: &[CreateAccountResult]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(results.len() * 16);
+    for result in results {
+        let mut record = [0_u8; 16];
+        record[0..8].copy_from_slice(&result.timestamp.to_le_bytes());
+        record[8..12].copy_from_slice(&(result.status as u32).to_le_bytes());
+        bytes.extend_from_slice(&record);
+    }
+    bytes
+}
+
+/// Encode a batch of [`CreateTransferResult`]s as a reply body (see
+/// [`account_results_to_bytes`] for the layout).
+#[must_use]
+pub fn transfer_results_to_bytes(results: &[CreateTransferResult]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(results.len() * 16);
+    for result in results {
+        let mut record = [0_u8; 16];
+        record[0..8].copy_from_slice(&result.timestamp.to_le_bytes());
+        record[8..12].copy_from_slice(&(result.status as u32).to_le_bytes());
+        bytes.extend_from_slice(&record);
+    }
+    bytes
+}
+
 /// The accounting state machine as mounted on a replica.
 ///
 /// DEVIATION: upstream (`src/state_machine.zig`) owns the account and transfer
 /// grooves (their trees and caches) and executes operations via
-/// `state_machine.commit`. That integration is deferred until the forest layer
-/// lands; the pure per-event logic (`create_account`, `create_transfer`,
-/// `post_or_void_pending_transfer`) and the batch orchestrators
-/// (`execute_create_accounts`, `execute_create_transfers`) above are the
-/// ported pieces. The struct today owns only the invariant the replica needs
-/// as it executes: the monotonic commit timestamp.
+/// `state_machine.commit`. The forest is deferred, so the stores below are
+/// plain id-keyed maps and persistence replays the chain scope decisions from
+/// the orchestrator results instead of rolling grooves back.
 ///
 /// Upstream: `src/state_machine.zig`.
 #[derive(Debug, Default)]
@@ -803,6 +993,10 @@ pub struct StateMachine {
     /// executed op must advance it strictly (upstream asserts the same in
     /// `Replica.execute_op`, replica.zig:5441).
     pub commit_timestamp: u64,
+    /// Temporary primary-key store for accounts.
+    accounts: HashMap<u128, Account>,
+    /// Temporary primary-key store for transfers.
+    transfers: HashMap<u128, Transfer>,
 }
 
 impl StateMachine {
@@ -818,6 +1012,154 @@ impl StateMachine {
     pub fn execute_op(&mut self, timestamp: u64) {
         assert!(self.commit_timestamp < timestamp);
         self.commit_timestamp = timestamp;
+    }
+
+    /// Execute a banking operation's request body and return its reply body.
+    ///
+    /// `timestamp` is the batch's last event timestamp; the caller advances
+    /// [`execute_op`](Self::execute_op) first, so this only sanity-checks the
+    /// clock (upstream guards the same way in `Replica.execute_op`).
+    ///
+    /// # Panics
+    /// Panics unless `operation` is a state-machine operation this port
+    /// executes, or the body does not decode to a whole number of events.
+    #[must_use]
+    pub fn execute(&mut self, operation: Operation, timestamp: u64, body: &[u8]) -> Vec<u8> {
+        match operation {
+            Operation::CREATE_ACCOUNTS => {
+                let Some(events) = bytes_to_account_batch(body) else {
+                    unreachable!("create_accounts body must encode whole Account events");
+                };
+                self.create_accounts(&events, timestamp)
+            }
+            Operation::CREATE_TRANSFERS => {
+                let Some(events) = bytes_to_transfer_batch(body) else {
+                    unreachable!("create_transfers body must encode whole Transfer events");
+                };
+                self.create_transfers(&events, timestamp)
+            }
+            operation => unreachable!("unsupported state-machine operation: {operation:?}"),
+        }
+    }
+
+    /// Execute a `create_accounts` batch and return the reply body.
+    #[must_use]
+    pub fn create_accounts(&mut self, events: &[Account], timestamp: u64) -> Vec<u8> {
+        assert!(self.commit_timestamp <= timestamp);
+        let results =
+            execute_create_accounts(events, timestamp, |id| self.accounts.get(&id).copied());
+        self.persist_accounts(events, &results, timestamp);
+        account_results_to_bytes(&results)
+    }
+
+    /// Execute a `create_transfers` batch and return the reply body.
+    ///
+    /// DEVIATION: pending/imported balancing (balance mutations, expiry) are
+    /// deferred with the grooves.
+    #[must_use]
+    pub fn create_transfers(&mut self, events: &[Transfer], timestamp: u64) -> Vec<u8> {
+        assert!(self.commit_timestamp <= timestamp);
+        let results = execute_create_transfers(
+            events,
+            timestamp,
+            |id| self.transfers.get(&id).copied(),
+            |id| self.accounts.get(&id).copied(),
+        );
+        self.persist_transfers(events, &results, timestamp);
+        transfer_results_to_bytes(&results)
+    }
+
+    /// The implied timestamp of the event at `index` (upstream
+    /// `timestamp - events.len + index + 1`, state_machine.zig:3031).
+    fn timestamp_event(timestamp: u64, len: usize, index: usize) -> u64 {
+        timestamp - len as u64 + index as u64 + 1
+    }
+
+    /// Persist the accounts that upstream would write under the chain scope.
+    ///
+    /// A chain persists only if it closes and every member is `Created` (any
+    /// other status — including `Exists` — breaks the chain and rolls its
+    /// preceding members back, upstream `scope_close(.discard)`). Records are
+    /// stamped with their event time before insertion (upstream bumps
+    /// `event.timestamp = timestamp_event` before `groove.put`).
+    fn persist_accounts(
+        &mut self,
+        events: &[Account],
+        results: &[CreateAccountResult],
+        timestamp: u64,
+    ) {
+        let mut index = 0;
+        while index < events.len() {
+            if !events[index].flags.linked() {
+                if results[index].status == CreateAccountStatus::Created {
+                    let mut event = events[index];
+                    event.timestamp = Self::timestamp_event(timestamp, events.len(), index);
+                    self.accounts.insert(event.id, event);
+                }
+                index += 1;
+                continue;
+            }
+            let start = index;
+            while index < events.len() && events[index].flags.linked() {
+                index += 1;
+            }
+            if index == events.len() {
+                // Trailing unclosed chain: upstream discards it.
+                continue;
+            }
+            let intact =
+                results[start..=index].iter().all(|r| r.status == CreateAccountStatus::Created);
+            if intact {
+                for (offset, event) in events[start..=index].iter().enumerate() {
+                    let mut event = *event;
+                    event.timestamp =
+                        Self::timestamp_event(timestamp, events.len(), start + offset);
+                    self.accounts.insert(event.id, event);
+                }
+            }
+            index += 1;
+        }
+    }
+
+    /// Persist the transfers that upstream would write under the chain scope.
+    ///
+    /// See [`Self::persist_accounts`] for the chain semantics.
+    fn persist_transfers(
+        &mut self,
+        events: &[Transfer],
+        results: &[CreateTransferResult],
+        timestamp: u64,
+    ) {
+        let mut index = 0;
+        while index < events.len() {
+            if !events[index].flags.linked() {
+                if results[index].status == CreateTransferStatus::Created {
+                    let mut event = events[index];
+                    event.timestamp = Self::timestamp_event(timestamp, events.len(), index);
+                    self.transfers.insert(event.id, event);
+                }
+                index += 1;
+                continue;
+            }
+            let start = index;
+            while index < events.len() && events[index].flags.linked() {
+                index += 1;
+            }
+            if index == events.len() {
+                continue;
+            }
+            let intact =
+                results[start..=index].iter().all(|r| r.status == CreateTransferStatus::Created);
+            if intact {
+                for (offset, event) in events[start..=index].iter().enumerate() {
+                    let mut event = *event;
+                    event.timestamp =
+                        Self::timestamp_event(timestamp, events.len(), start + offset);
+                    self.transfers.insert(event.id, event);
+                }
+            }
+            index += 1;
+        }
     }
 }
 
@@ -843,6 +1185,208 @@ mod tests {
         let mut state_machine = StateMachine::default();
         state_machine.execute_op(2);
         state_machine.execute_op(2);
+    }
+
+    // ── execute (batch bodies) tests ─────────────────────────────────────
+
+    #[test]
+    fn execute_accounts_writes_16_byte_results() {
+        let mut sm = StateMachine::default();
+        let events = [Account { id: 1, ledger: 1, code: 1, ..Account::default() }];
+        let body = sm.execute(Operation::CREATE_ACCOUNTS, 10, &account_batch_to_bytes(&events));
+        assert_eq!(body.len(), 16);
+        // timestamp LE, status LE, reserved zeroed.
+        assert_eq!(u64::from_le_bytes(body[0..8].try_into().unwrap_or([0; 8])), 10);
+        assert_eq!(u32::from_le_bytes(body[8..12].try_into().unwrap_or([0; 4])), u32::MAX);
+        assert_eq!(&body[12..16], &[0; 4]);
+        assert_eq!(sm.accounts.len(), 1);
+    }
+
+    #[test]
+    fn execute_accounts_persists_created_and_reports_exists_with_original_timestamp() {
+        let mut sm = StateMachine::default();
+        let events = [Account { id: 1, ledger: 1, code: 1, ..Account::default() }];
+        let first = sm.create_accounts(&events, 10);
+        assert_eq!(first.len(), 16);
+        assert_eq!(u64::from_le_bytes(first[0..8].try_into().unwrap_or([0; 8])), 10);
+        assert_eq!(u32::from_le_bytes(first[8..12].try_into().unwrap_or([0; 4])), u32::MAX);
+        assert_eq!(sm.accounts.len(), 1);
+
+        let second = sm.create_accounts(&events, 20);
+        // The duplicate reports `Exists` carrying the original record's timestamp.
+        assert_eq!(u64::from_le_bytes(second[0..8].try_into().unwrap_or([0; 8])), 10);
+        assert_eq!(
+            u32::from_le_bytes(second[8..12].try_into().unwrap_or([0; 4])),
+            CreateAccountStatus::Exists as u32
+        );
+        assert_eq!(sm.accounts.len(), 1);
+    }
+
+    #[test]
+    fn execute_accounts_rolls_back_broken_linked_chain() {
+        let mut sm = StateMachine::default();
+        let events = vec![
+            Account {
+                id: 1,
+                ledger: 1,
+                code: 1,
+                flags: AccountFlags::LINKED,
+                ..Account::default()
+            },
+            Account { id: 2, ledger: 0, code: 1, ..Account::default() },
+        ];
+        let body = sm.create_accounts(&events, 10);
+        assert_eq!(body.len(), 32);
+        assert_eq!(
+            u32::from_le_bytes(body[8..12].try_into().unwrap_or([0; 4])),
+            CreateAccountStatus::LinkedEventFailed as u32
+        );
+        assert_eq!(
+            u32::from_le_bytes(body[24..28].try_into().unwrap_or([0; 4])),
+            CreateAccountStatus::LedgerMustNotBeZero as u32
+        );
+        assert!(sm.accounts.is_empty());
+    }
+
+    #[test]
+    fn execute_accounts_discards_unclosed_trailing_chain() {
+        let mut sm = StateMachine::default();
+        let events = vec![
+            Account {
+                id: 1,
+                ledger: 1,
+                code: 1,
+                flags: AccountFlags::LINKED,
+                ..Account::default()
+            },
+            Account {
+                id: 2,
+                ledger: 1,
+                code: 1,
+                flags: AccountFlags::LINKED,
+                ..Account::default()
+            },
+        ];
+        let body = sm.create_accounts(&events, 10);
+        assert_eq!(body.len(), 32);
+        // The trailing unclosed chain breaks: its members are rolled back.
+        assert_eq!(
+            u32::from_le_bytes(body[8..12].try_into().unwrap_or([0; 4])),
+            CreateAccountStatus::LinkedEventFailed as u32
+        );
+        assert_eq!(
+            u32::from_le_bytes(body[24..28].try_into().unwrap_or([0; 4])),
+            CreateAccountStatus::LinkedEventChainOpen as u32
+        );
+        assert!(sm.accounts.is_empty());
+    }
+
+    #[test]
+    fn execute_accounts_persists_closed_chain() {
+        let mut sm = StateMachine::default();
+        let events = vec![
+            Account {
+                id: 1,
+                ledger: 1,
+                code: 1,
+                flags: AccountFlags::LINKED,
+                ..Account::default()
+            },
+            Account { id: 2, ledger: 1, code: 1, ..Account::default() },
+        ];
+        let body = sm.create_accounts(&events, 10);
+        assert_eq!(body.len(), 32);
+        assert_eq!(
+            u32::from_le_bytes(body[8..12].try_into().unwrap_or([0; 4])),
+            CreateAccountStatus::Created as u32
+        );
+        assert_eq!(
+            u32::from_le_bytes(body[24..28].try_into().unwrap_or([0; 4])),
+            CreateAccountStatus::Created as u32
+        );
+        assert_eq!(body[28..32], [0; 4]);
+        assert_eq!(sm.accounts.len(), 2);
+        assert!(sm.accounts.contains_key(&1));
+        assert!(sm.accounts.contains_key(&2));
+    }
+
+    #[test]
+    fn execute_transfers_require_existing_accounts_and_persist() {
+        let mut sm = StateMachine::default();
+        let account = |id| Account { id, ledger: 1, code: 1, ..Account::default() };
+        let transfers = vec![Transfer {
+            id: 100,
+            debit_account_id: 1,
+            credit_account_id: 2,
+            amount: 50,
+            ledger: 1,
+            code: 1,
+            ..Transfer::default()
+        }];
+        // Neither account exists yet: the debit is looked up first.
+        let body = sm.create_transfers(&transfers, 10);
+        assert_eq!(
+            u32::from_le_bytes(body[8..12].try_into().unwrap_or([0; 4])),
+            CreateTransferStatus::DebitAccountNotFound as u32
+        );
+        assert!(sm.transfers.is_empty());
+
+        let _ = sm.create_accounts(&[account(1), account(2)], 20);
+        let body = sm.create_transfers(&transfers, 30);
+        assert_eq!(body.len(), 16);
+        assert_eq!(u32::from_le_bytes(body[8..12].try_into().unwrap_or([0; 4])), u32::MAX);
+        assert_eq!(sm.transfers.len(), 1);
+
+        // Duplicate: Exists carries the original timestamp.
+        let body = sm.create_transfers(&transfers, 40);
+        assert_eq!(u64::from_le_bytes(body[0..8].try_into().unwrap_or([0; 8])), 30);
+        assert_eq!(sm.transfers.len(), 1);
+    }
+
+    #[test]
+    fn account_batch_bytes_roundtrip() {
+        let events = vec![Account {
+            id: u128::MAX,
+            debits_pending: 1,
+            debits_posted: 2,
+            credits_pending: 3,
+            credits_posted: 4,
+            user_data_128: 5,
+            user_data_64: 6,
+            user_data_32: 7,
+            reserved: 8,
+            ledger: 9,
+            code: 10,
+            flags: AccountFlags::LINKED | AccountFlags::IMPORTED,
+            timestamp: 11,
+        }];
+        let bytes = account_batch_to_bytes(&events);
+        assert_eq!(bytes.len(), 128);
+        assert_eq!(bytes_to_account_batch(&bytes), Some(events));
+        assert_eq!(bytes_to_account_batch(&bytes[..100]), None);
+    }
+
+    #[test]
+    fn transfer_batch_bytes_roundtrip() {
+        let events = vec![Transfer {
+            id: 1,
+            debit_account_id: 2,
+            credit_account_id: 3,
+            amount: 4,
+            pending_id: 5,
+            user_data_128: 6,
+            user_data_64: 7,
+            user_data_32: 8,
+            timeout: 9,
+            ledger: 10,
+            code: 11,
+            flags: TransferFlags::PENDING,
+            timestamp: 12,
+        }];
+        let bytes = transfer_batch_to_bytes(&events);
+        assert_eq!(bytes.len(), 128);
+        assert_eq!(bytes_to_transfer_batch(&bytes), Some(events));
+        assert_eq!(bytes_to_transfer_batch(&bytes[..127]), None);
     }
 
     // ── create_account tests ─────────────────────────────────────────────

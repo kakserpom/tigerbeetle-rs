@@ -75,6 +75,16 @@ impl Operation {
     /// The value 6 is reserved for noop requests.
     pub const NOOP: Self = Self(6);
 
+    /// Ports of the client-facing state-machine ordinals
+    /// (`tigerbeetle.zig::Operation`): state-machine operations live at
+    /// `vsr_operations_reserved + n` so they never collide with the control
+    /// plane. Request and prepare headers carry these ordinals.
+    pub const CREATE_ACCOUNTS: Self =
+        Self(tigerbeetle_core::constants::VSR_OPERATIONS_RESERVED + 18);
+    /// Port of `tigerbeetle.zig::Operation.create_transfers`.
+    pub const CREATE_TRANSFERS: Self =
+        Self(tigerbeetle_core::constants::VSR_OPERATIONS_RESERVED + 19);
+
     // Operations <vsr_operations_reserved are reserved for the control plane.
     // Operations ≥vsr_operations_reserved are available for the state machine.
 
