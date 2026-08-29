@@ -1420,10 +1420,7 @@ impl Replica {
                     request.client,
                     request.request,
                     request.operation,
-                    // TODO(port): the queued request's body is dropped by the
-                    // header-only `on_request`; carry it once the message layer
-                    // plumbs request bodies.
-                    &[],
+                    &request.body,
                     request.request_checksum,
                 );
                 assert!(result.is_ok(), "popped request must be preparable");
@@ -3049,12 +3046,13 @@ pub struct PipelinePrepare {
 }
 
 /// A client request queued on the primary.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct PipelineRequest {
     pub client: u128,
     pub request: u32,
     pub request_checksum: u128,
     pub operation: crate::Operation,
+    pub body: Vec<u8>,
 }
 
 /// Pipeline cache used by backups and during view changes.
@@ -4183,6 +4181,7 @@ impl Replica {
                 request: request.request,
                 request_checksum: request.checksum,
                 operation: request.operation,
+                body: message.body_used().to_vec(),
             });
         } else {
             let result = self.primary_pipeline_prepare(
@@ -6108,6 +6107,7 @@ mod tests {
             request: 9,
             request_checksum: 0,
             operation: crate::Operation::NOOP,
+            body: Vec::new(),
         });
 
         // Drive the execute stage manually: commit_prepare = op 1.
@@ -6125,6 +6125,48 @@ mod tests {
         assert_eq!(header.client, 7);
         assert_eq!(header.request, 9);
         assert_eq!(header.operation, crate::Operation::NOOP);
+    }
+
+    #[test]
+    fn queued_request_body_is_prepared_and_executed() {
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        r.status = Status::Normal;
+
+        // Pipeline op 1 so the next request is queued behind it.
+        let op = r.primary_pipeline_prepare(7, 1, crate::Operation::NOOP, &[], 0).unwrap();
+        assert_eq!(op, 1);
+
+        // Queue client 7's create_accounts together with its batch body.
+        let accounts = [Account { id: 9, ledger: 1, code: 1, ..Account::default() }];
+        let body = crate::state_machine::account_batch_to_bytes(&accounts);
+        r.pipeline_queue.request_queue.push(PipelineRequest {
+            client: 7,
+            request: 1,
+            request_checksum: 0,
+            operation: crate::Operation::CREATE_ACCOUNTS,
+            body: body.clone(),
+        });
+
+        // Committing op 1 pops and prepares op 2, carrying the queued body into
+        // the journal.
+        commit_op_now(&mut r, 1);
+        assert_eq!(r.op, 2);
+        assert_eq!(r.journal.body_with_op(2), Some(&body[..]));
+        r.client_send_queue.clear();
+
+        // Committing op 2 executes the real batch and returns the result body.
+        commit_op_now(&mut r, 2);
+        let results = r.client_send_queue.last().expect("reply").body_used();
+        assert_eq!(results.len(), 16, "one result per event");
+        assert_eq!(
+            u32::from_le_bytes(results[8..12].try_into().unwrap()),
+            CreateAccountStatus::Created as u32
+        );
+        assert_eq!(
+            r.journal.body_with_op(2),
+            Some(&body[..]),
+            "journal body retained after commit"
+        );
     }
 
     #[test]
