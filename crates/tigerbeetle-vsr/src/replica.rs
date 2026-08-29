@@ -22,6 +22,7 @@ use crate::grid::{Event, Grid, ReadBlockResult, ReadOptions};
 use crate::message_header;
 use crate::message_header::{GetBlocks, TypedHeader};
 use crate::repair_budget::{RepairBudgetGrid, RepairBudgetOptions};
+use crate::state_machine::StateMachine;
 use crate::storage::MemoryStorage;
 
 // ---------------------------------------------------------------------------
@@ -89,10 +90,9 @@ pub struct Replica {
     pub ok_from_all_replicas: Vec<u64>,
     /// Monotonically increasing timestamp for prepares.
     pub prepare_timestamp: u64,
-    /// The timestamp of the most recently executed prepare (upstream
-    /// `state_machine.commit_timestamp`; kept on the replica until the state
-    /// machine is wired into `commit_execute`).
-    pub commit_timestamp: u64,
+    /// The accounting state machine; owns the monotonic `commit_timestamp` so
+    /// far (operations are deferred, see its DEVIATION note).
+    pub state_machine: StateMachine,
     /// The prepare currently being committed (primary).
     pub commit_prepare: Option<u64>, // op of the prepare being committed
 
@@ -497,7 +497,7 @@ impl Replica {
             pipeline_queue: PipelineQueue::default(),
             ok_from_all_replicas: Vec::new(),
             prepare_timestamp: 0,
-            commit_timestamp: 0,
+            state_machine: StateMachine::default(),
             commit_prepare: None,
             commit_stage: CommitStage::Idle,
             commit_dispatch_entered: false,
@@ -1349,14 +1349,12 @@ impl Replica {
 
         // Execute on state machine.
         // TODO(port): state_machine.execute(commit_prepare.body_used())
-
-        // Track what the state machine has executed: every prepare's timestamp
-        // must strictly advance the previous one, which `<` therefore pins the
-        // primary's `prepare_timestamp` (upstream `execute_op` asserts
+        // Guard the state machine's clock: every prepare's timestamp must
+        // strictly advance the previous one, which `<` pins the primary's
+        // `prepare_timestamp` (upstream `execute_op` asserts
         // `state_machine.commit_timestamp < prepare.header.timestamp`, and the
         // AOF-recovery exception is moot sans-IO — replica.zig:5441-5445).
-        assert!(self.commit_timestamp < prepare.timestamp);
-        self.commit_timestamp = prepare.timestamp;
+        self.state_machine.execute_op(prepare.timestamp);
 
         // Construct the client reply from the committed prepare and update the
         // client sessions table (upstream `execute_op`: replica.zig:5391-5523).
@@ -6361,7 +6359,7 @@ mod tests {
         r.commit_prepare = Some(op1);
         r.commit_stage = CommitStage::Execute;
         r.commit_execute();
-        assert_eq!(r.commit_timestamp, timestamp1);
+        assert_eq!(r.state_machine.commit_timestamp, timestamp1);
 
         // A later op is stamped strictly later, so execution advances too
         // (upstream `state_machine.commit_timestamp < prepare.header.timestamp`).
@@ -6372,11 +6370,11 @@ mod tests {
         r.commit_prepare = Some(op2);
         r.commit_stage = CommitStage::Execute;
         r.commit_execute();
-        assert_eq!(r.commit_timestamp, timestamp2);
+        assert_eq!(r.state_machine.commit_timestamp, timestamp2);
     }
 
     #[test]
-    #[should_panic(expected = "commit_timestamp < prepare.timestamp")]
+    #[should_panic(expected = "commit_timestamp < timestamp")]
     fn commit_execute_panics_on_stale_prepare_timestamp() {
         let mut r = Replica::new(CLUSTER, 0, 3);
         r.status = Status::Normal;
@@ -6386,7 +6384,7 @@ mod tests {
         r.commit_stage = CommitStage::Execute;
         // The committed prepare's timestamp must advance the previous one; a
         // backwards (or stalled) state machine clock is a bug.
-        r.commit_timestamp = u64::MAX;
+        r.state_machine.commit_timestamp = u64::MAX;
         r.commit_execute();
     }
 

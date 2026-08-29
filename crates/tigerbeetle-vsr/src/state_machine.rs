@@ -785,9 +785,65 @@ where
     results
 }
 
+/// The accounting state machine as mounted on a replica.
+///
+/// DEVIATION: upstream (`src/state_machine.zig`) owns the account and transfer
+/// grooves (their trees and caches) and executes operations via
+/// `state_machine.commit`. That integration is deferred until the forest layer
+/// lands; the pure per-event logic (`create_account`, `create_transfer`,
+/// `post_or_void_pending_transfer`) and the batch orchestrators
+/// (`execute_create_accounts`, `execute_create_transfers`) above are the
+/// ported pieces. The struct today owns only the invariant the replica needs
+/// as it executes: the monotonic commit timestamp.
+///
+/// Upstream: `src/state_machine.zig`.
+#[derive(Debug, Default)]
+pub struct StateMachine {
+    /// The timestamp of the last op committed to the state machine; every
+    /// executed op must advance it strictly (upstream asserts the same in
+    /// `Replica.execute_op`, replica.zig:5441).
+    pub commit_timestamp: u64,
+}
+
+impl StateMachine {
+    /// Record that an op was executed against the state machine.
+    ///
+    /// DEVIATION: upstream threads the operation and its body through
+    /// `state_machine.commit`, which executes and returns the reply body size;
+    /// sans-IO the replica executes nothing yet, so this (called from
+    /// `Replica::commit_execute`) only guards and advances the timestamp.
+    ///
+    /// # Panics
+    /// Panics unless `timestamp` strictly advances `commit_timestamp`.
+    pub fn execute_op(&mut self, timestamp: u64) {
+        assert!(self.commit_timestamp < timestamp);
+        self.commit_timestamp = timestamp;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── StateMachine tests ───────────────────────────────────────────────
+
+    #[test]
+    fn state_machine_tracks_monotonic_commit_timestamp() {
+        let mut state_machine = StateMachine::default();
+        assert_eq!(state_machine.commit_timestamp, 0);
+        state_machine.execute_op(1);
+        assert_eq!(state_machine.commit_timestamp, 1);
+        state_machine.execute_op(2);
+        assert_eq!(state_machine.commit_timestamp, 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "commit_timestamp < timestamp")]
+    fn state_machine_rejects_stale_commit_timestamp() {
+        let mut state_machine = StateMachine::default();
+        state_machine.execute_op(2);
+        state_machine.execute_op(2);
+    }
 
     // ── create_account tests ─────────────────────────────────────────────
 
