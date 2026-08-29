@@ -6839,6 +6839,128 @@ mod tests {
         );
     }
 
+    /// Drive one client op through an N=2 primary/backup pair purely by message
+    /// exchange: the primary prepares from `request`, the prepare + commit
+    /// broadcasts replicate to the backup, the backup's prepare_ok joins the
+    /// primary's self-ack into a quorum, and the client receives replies from
+    /// both replicas (the primary always, the lone backup as the deterministic
+    /// backup). Returns the reply bodies from the primary and the backup.
+    ///
+    /// The commit to the backup is delivered via the primary's Commit heartbeat
+    /// broadcast (there is no commit-on-quorum message yet), at `stamp`.
+    fn federated_op(
+        primary: &mut Replica,
+        backup: &mut Replica,
+        request: &Message,
+        expected_op: u64,
+        stamp: u64,
+    ) -> (Vec<u8>, Vec<u8>) {
+        primary.on_message(request, 0);
+        assert_eq!(primary.op, expected_op);
+
+        let prepare = primary.send_queue.pop().expect("prepare broadcast");
+        backup.on_message(&prepare, 0);
+        assert_eq!(backup.op, expected_op);
+
+        let prepare_ok = backup.send_queue.pop().expect("prepare_ok");
+        primary.on_message(&prepare_ok, 0);
+        assert_eq!(primary.commit_max, expected_op);
+
+        let primary_reply = primary.client_send_queue.pop().expect("primary reply");
+        let primary_results = primary_reply.body_used().to_vec();
+
+        primary.send_commit(stamp);
+        let commit = primary.send_queue.pop().expect("commit broadcast");
+        backup.on_message(&commit, stamp);
+        assert_eq!(backup.commit_max, expected_op);
+
+        let backup_reply = backup.client_send_queue.pop().expect("backup reply");
+        (primary_results, backup_reply.body_used().to_vec())
+    }
+
+    #[test]
+    fn federated_primary_backup_run_end_to_end() {
+        // A full N=2 cluster driven purely by message exchange: register,
+        // banking requests, prepare replication, prepare_ok quorum, commit
+        // broadcasts and client replies all move through `on_message` and the
+        // send-queue relay — no commit internals are coerced. Both replicas
+        // execute every batch and reply identically.
+        let mut primary = Replica::new(CLUSTER, 0, 2);
+        primary.status = Status::Normal;
+        let mut backup = Replica::new(CLUSTER, 1, 2);
+        backup.status = Status::Normal;
+
+        // Register client 7 (op 1) through the wire path.
+        let register_size = message_header::SIZE_U32 + message_header::REGISTER_RESULT_SIZE_U32;
+        let register = request_message_full(7, 0, crate::Operation::REGISTER, 0, 0, register_size);
+        // The register commits and both replicas reply with the register body.
+        let (_, _) = federated_op(&mut primary, &mut backup, &register, 1, 1_000);
+        assert_eq!(
+            primary.client_sessions.get(7).expect("primary session").header.operation,
+            crate::Operation::REGISTER
+        );
+        // The next request links its parent to the register reply's checksum.
+        let mut context = backup.client_sessions.get(7).expect("backup session").header.context;
+
+        // Client 7's create_accounts (request 1, op 2).
+        let accounts = [Account { id: 21, ledger: 1, code: 1, ..Account::default() }];
+        let body = crate::state_machine::account_batch_to_bytes(&accounts);
+        let build_request = |request_number: u32, context: u128, body: &[u8]| {
+            let mut header = message_header::Request::default();
+            header.cluster = CLUSTER;
+            header.client = 7;
+            header.session = 1;
+            header.request = request_number;
+            header.parent = context;
+            header.operation = crate::Operation::CREATE_ACCOUNTS;
+            header.release = crate::multiversion::Release::MINIMUM;
+            header.view = 0;
+            header.size = message_header::SIZE_U32
+                + u32::try_from(body.len()).unwrap_or_else(|_| unreachable!("body fits u32"));
+            header.set_checksum_body(body);
+            header.set_checksum();
+            let mut request = Message::new();
+            request.set_header(&header);
+            request.set_body(body);
+            request
+        };
+        let create = build_request(1, context, &body);
+
+        let (primary_results, backup_results) =
+            federated_op(&mut primary, &mut backup, &create, 2, 2_000);
+        assert_eq!(primary_results, backup_results, "primary and backup agree");
+        assert_eq!(primary_results.len(), 16, "one result per event");
+        assert_eq!(
+            u64::from_le_bytes(primary_results[0..8].try_into().unwrap()),
+            2,
+            "event timestamp"
+        );
+        assert_eq!(
+            u32::from_le_bytes(primary_results[8..12].try_into().unwrap()),
+            CreateAccountStatus::Created as u32
+        );
+
+        // A duplicate create (request 2, op 3) reports `.exists` with the
+        // account's original timestamp, on both replicas. The request proves
+        // receipt of the op-2 reply by linking its parent to that reply's
+        // checksum.
+        context = primary.client_sessions.get(7).expect("primary session").header.context;
+        let duplicate = build_request(2, context, &body);
+        let (primary_results, backup_results) =
+            federated_op(&mut primary, &mut backup, &duplicate, 3, 3_000);
+        assert_eq!(primary_results, backup_results, "primary and backup agree");
+        assert_eq!(primary_results.len(), 16, "one result per event");
+        assert_eq!(
+            u64::from_le_bytes(primary_results[0..8].try_into().unwrap()),
+            2,
+            "original account timestamp"
+        );
+        assert_eq!(
+            u32::from_le_bytes(primary_results[8..12].try_into().unwrap()),
+            CreateAccountStatus::Exists as u32
+        );
+    }
+
     #[test]
     fn on_request_repeat_reply_register_serves_ram_reply() {
         let mut r = Replica::new(CLUSTER, 0, 3);
