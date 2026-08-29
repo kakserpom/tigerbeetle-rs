@@ -243,6 +243,50 @@ impl fmt::Debug for Transfer {
 }
 
 // ---------------------------------------------------------------------------
+// AccountEvent
+// ---------------------------------------------------------------------------
+
+/// Change-data-capture record for an account balance change (256 bytes,
+/// 16-byte aligned).
+///
+/// Written once per committed transfer (creation, posting, voiding; expiry
+/// events later), always capturing both the debit and credit account snapshots
+/// *after* the mutation. The `transfer_pending_*` fields identify the pending
+/// transfer a posting/voiding/expiring event refers to.
+///
+/// Upstream: `src/state_machine.zig:104`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[repr(C)]
+pub struct AccountEvent {
+    pub dr_account_id: u128,
+    pub dr_debits_pending: u128,
+    pub dr_debits_posted: u128,
+    pub dr_credits_pending: u128,
+    pub dr_credits_posted: u128,
+    pub cr_account_id: u128,
+    pub cr_debits_pending: u128,
+    pub cr_debits_posted: u128,
+    pub cr_credits_pending: u128,
+    pub cr_credits_posted: u128,
+    pub timestamp: u64,
+    pub dr_account_timestamp: u64,
+    pub cr_account_timestamp: u64,
+    pub dr_account_flags: AccountFlags,
+    pub cr_account_flags: AccountFlags,
+    pub transfer_flags: TransferFlags,
+    pub transfer_pending_flags: TransferFlags,
+    pub transfer_pending_id: u128,
+    pub amount_requested: u128,
+    pub amount: u128,
+    pub ledger: u32,
+    pub transfer_pending_status: TransferPendingStatus,
+    pub reserved: [u8; 11],
+}
+
+const _: () = assert!(core::mem::size_of::<AccountEvent>() == 256);
+const _: () = assert!(core::mem::align_of::<AccountEvent>() == 16);
+
+// ---------------------------------------------------------------------------
 // TransferFlags
 // ---------------------------------------------------------------------------
 

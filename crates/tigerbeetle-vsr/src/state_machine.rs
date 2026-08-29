@@ -18,6 +18,7 @@
     clippy::doc_markdown,
     clippy::manual_assert_eq,
     clippy::too_many_lines,
+    clippy::too_many_arguments,
     clippy::expect_used,
     clippy::cast_possible_truncation,
     clippy::cast_lossless,
@@ -31,8 +32,8 @@
 use std::collections::HashMap;
 
 use tigerbeetle_core::types::{
-    Account, AccountFlags, CreateAccountStatus, CreateTransferStatus, Transfer, TransferFlags,
-    TransferPending, TransferPendingStatus,
+    Account, AccountEvent, AccountFlags, CreateAccountStatus, CreateTransferStatus, Transfer,
+    TransferFlags, TransferPending, TransferPendingStatus,
 };
 
 use crate::Operation;
@@ -1601,6 +1602,16 @@ pub struct StateMachine {
     /// TODO(port): expiry (`expire_pending_transfers.pulse_next_timestamp`) is
     /// deferred with the grooves.
     transfers_pending: HashMap<u64, TransferPending>,
+    /// Change-data-capture store of account balance changes, keyed by event
+    /// timestamp. Mirrors upstream's `account_events.objects` groove (written
+    /// from [`Self::account_event`], upstream `state_machine.zig:4384`).
+    /// TODO(port): `get_change_events` scans (the CDC read path) are deferred.
+    account_events: HashMap<u64, AccountEvent>,
+    /// CDC index: account timestamp → event timestamps in increasing order,
+    /// for accounts with `AccountFlags::HISTORY`. Mirrors upstream's
+    /// `account_events.indexes.account_timestamp` derived index (only the
+    /// writes; the scan that answers `get_change_events` is deferred).
+    account_events_index: HashMap<u64, Vec<u64>>,
 }
 
 impl StateMachine {
@@ -1669,8 +1680,6 @@ impl StateMachine {
     /// in-session working view of the accounts, so later events validate
     /// against earlier events' mutations; each linked chain is rolled back as a
     /// unit if it breaks.
-    ///
-    /// DEVIATION: `AccountEvent` history is deferred with the grooves.
     #[must_use]
     pub fn create_transfers(&mut self, events: &[Transfer], timestamp: u64) -> Vec<u8> {
         assert!(self.commit_timestamp <= timestamp);
@@ -1824,6 +1833,9 @@ impl StateMachine {
     /// routes to [`Self::persist_post_void`] instead — it folds the pending's
     /// fields into the stored record and applies the release/reopen mutation.
     fn persist_transfer(&mut self, mut event: Transfer, amount_actual: u128) {
+        // The amount the user requested (upstream `t.amount`); recorded in the
+        // CDC event even when balancing or posting reduced the applied amount.
+        let amount_requested = event.amount;
         if event.flags.pending() {
             event.amount = amount_actual;
             self.insert_transfer(event.id, event);
@@ -1838,13 +1850,13 @@ impl StateMachine {
                 self.transfers_pending.insert(event.timestamp, transfer_pending).is_none(),
                 "each pending transfer has a unique timestamp"
             );
-            self.commit_transfer(&event, amount_actual);
+            self.commit_transfer(&event, amount_actual, amount_requested);
         } else if event.flags.post_pending_transfer() || event.flags.void_pending_transfer() {
             self.persist_post_void(event, amount_actual);
         } else {
             event.amount = amount_actual;
             self.insert_transfer(event.id, event);
-            self.commit_transfer(&event, amount_actual);
+            self.commit_transfer(&event, amount_actual, amount_requested);
         }
     }
 
@@ -1860,6 +1872,7 @@ impl StateMachine {
             self.transfers.get(&event.pending_id).copied().expect(
                 "posting/voiding a pending transfer implies the pending transfer is committed",
             );
+        let amount_requested = event.amount;
         let record = fold_post_void_transfer(&event, &p, amount_actual, event.timestamp);
         self.insert_transfer(record.id, record);
 
@@ -1873,6 +1886,7 @@ impl StateMachine {
         } else {
             TransferPendingStatus::Voided
         };
+        let pending_status = transfer_pending.status;
 
         let dr = self
             .accounts
@@ -1887,6 +1901,98 @@ impl StateMachine {
         let (dr, cr) = commit_post_void_accounts(&record, &p, amount_actual, &dr, &cr);
         self.accounts.insert(dr.id, dr);
         self.accounts.insert(cr.id, cr);
+        self.account_event(
+            event.timestamp,
+            &dr,
+            &cr,
+            record.flags,
+            pending_status,
+            Some(&p),
+            amount_requested,
+            amount_actual,
+        );
+    }
+
+    /// Record a change-data-capture event for a committed transfer mutation
+    /// (upstream `state_machine.zig:4384-4465`).
+    ///
+    /// `dr_account` and `cr_account` are the accounts *after* the mutation
+    /// applies. `transfer_pending_status` describes the event (`None` for a
+    /// plain transfer, `Pending`/`Posted`/`Voided` for the corresponding
+    /// pending-transfer lifecycle); `transfer_pending` is the referenced
+    /// pending transfer for post/void (and later, expiry) events.
+    ///
+    /// The event is inserted unconditionally (CDC is written regardless of
+    /// `AccountFlags::HISTORY`); the account index is populated only for
+    /// accounts advertising `HISTORY`.
+    fn account_event(
+        &mut self,
+        timestamp_event: u64,
+        dr_account: &Account,
+        cr_account: &Account,
+        transfer_flags: TransferFlags,
+        transfer_pending_status: TransferPendingStatus,
+        transfer_pending: Option<&Transfer>,
+        amount_requested: u128,
+        amount: u128,
+    ) {
+        assert!(timestamp_event > 0);
+        match transfer_pending_status {
+            TransferPendingStatus::None | TransferPendingStatus::Pending => {
+                assert!(transfer_pending.is_none());
+            }
+            TransferPendingStatus::Posted | TransferPendingStatus::Voided => {
+                assert!(transfer_pending.is_some());
+            }
+            TransferPendingStatus::Expired => {
+                unreachable!("expired account events are written by the deferred expiry");
+            }
+        }
+        assert_eq!(dr_account.ledger, cr_account.ledger);
+
+        let transfer_pending = transfer_pending.copied();
+        let event = AccountEvent {
+            dr_account_id: dr_account.id,
+            dr_debits_pending: dr_account.debits_pending,
+            dr_debits_posted: dr_account.debits_posted,
+            dr_credits_pending: dr_account.credits_pending,
+            dr_credits_posted: dr_account.credits_posted,
+            cr_account_id: cr_account.id,
+            cr_debits_pending: cr_account.debits_pending,
+            cr_debits_posted: cr_account.debits_posted,
+            cr_credits_pending: cr_account.credits_pending,
+            cr_credits_posted: cr_account.credits_posted,
+            timestamp: timestamp_event,
+            dr_account_timestamp: dr_account.timestamp,
+            cr_account_timestamp: cr_account.timestamp,
+            dr_account_flags: dr_account.flags,
+            cr_account_flags: cr_account.flags,
+            transfer_flags,
+            transfer_pending_flags: transfer_pending.map_or(TransferFlags::default(), |p| p.flags),
+            transfer_pending_id: transfer_pending.map_or(0, |p| p.id),
+            amount_requested,
+            amount,
+            ledger: dr_account.ledger,
+            transfer_pending_status,
+            reserved: [0; 11],
+        };
+        assert!(
+            self.account_events.insert(timestamp_event, event).is_none(),
+            "each account event has a unique timestamp"
+        );
+
+        if dr_account.flags.history() {
+            self.account_events_index
+                .entry(dr_account.timestamp)
+                .or_default()
+                .push(timestamp_event);
+        }
+        if cr_account.flags.history() {
+            self.account_events_index
+                .entry(cr_account.timestamp)
+                .or_default()
+                .push(timestamp_event);
+        }
     }
 
     /// Apply a created transfer's balance mutation to its accounts
@@ -1900,9 +2006,9 @@ impl StateMachine {
     /// rejects any transfer referencing an account closed earlier in the batch
     /// (see [`Self::create_transfers`]).
     ///
-    /// TODO(port): `AccountEvent` CDC and expiry
-    /// (`expire_pending_transfers.pulse_next_timestamp`) are deferred.
-    fn commit_transfer(&mut self, event: &Transfer, amount_actual: u128) {
+    /// TODO(port): expiry (`expire_pending_transfers.pulse_next_timestamp`) is
+    /// deferred with the grooves.
+    fn commit_transfer(&mut self, event: &Transfer, amount_actual: u128, amount_requested: u128) {
         let dr =
             self.accounts.get(&event.debit_account_id).copied().expect(
                 "debit account exists: create_transfer validated and overflow checks passed",
@@ -1915,6 +2021,20 @@ impl StateMachine {
         let (dr, cr) = commit_transfer_accounts(event, amount_actual, &dr, &cr);
         self.accounts.insert(dr.id, dr);
         self.accounts.insert(cr.id, cr);
+        self.account_event(
+            event.timestamp,
+            &dr,
+            &cr,
+            event.flags,
+            if event.flags.pending() {
+                TransferPendingStatus::Pending
+            } else {
+                TransferPendingStatus::None
+            },
+            None,
+            amount_requested,
+            amount_actual,
+        );
     }
 
     /// Insert a committed transfer, maintaining the timestamp index that
@@ -3683,5 +3803,180 @@ mod tests {
         let dr = sm.accounts.get(&1).expect("debit account stored");
         assert_eq!(dr.debits_pending, 0);
         assert_eq!(dr.debits_posted, 0);
+    }
+
+    // ── Account-change (CDC) event tests ─────────────────────────────────
+
+    #[test]
+    fn transfer_creation_records_account_event() {
+        let mut sm = StateMachine::default();
+        let _ = sm.create_accounts(
+            &[
+                Account { id: 1, ledger: 1, code: 1, ..Account::default() },
+                Account { id: 2, ledger: 1, code: 1, ..Account::default() },
+            ],
+            10,
+        );
+
+        let body = sm.create_transfers(&[t(1, 2, 7)], 20);
+        assert_eq!(reply_status(&body), CreateTransferStatus::Created as u32);
+
+        let event = sm.account_events.get(&20).expect("account event recorded");
+        assert_eq!(event.dr_account_id, 1);
+        assert_eq!(event.cr_account_id, 2);
+        assert_eq!(event.dr_account_timestamp, 9);
+        assert_eq!(event.cr_account_timestamp, 10);
+        assert_eq!(event.dr_debits_posted, 7);
+        assert_eq!(event.cr_credits_posted, 7);
+        assert_eq!(event.transfer_flags, TransferFlags::default());
+        assert_eq!(event.transfer_pending_status, TransferPendingStatus::None);
+        assert_eq!(event.transfer_pending_id, 0);
+        assert_eq!(event.transfer_pending_flags, TransferFlags::default());
+        assert_eq!(event.amount_requested, 7);
+        assert_eq!(event.amount, 7);
+        assert_eq!(event.ledger, 1);
+    }
+
+    #[test]
+    fn pending_transfer_creation_records_account_event() {
+        let mut sm = StateMachine::default();
+        let _ = sm.create_accounts(
+            &[
+                Account { id: 1, ledger: 1, code: 1, ..Account::default() },
+                Account { id: 2, ledger: 1, code: 1, ..Account::default() },
+            ],
+            10,
+        );
+
+        let pending = Transfer { flags: TransferFlags::PENDING, ..t(1, 2, 7) };
+        let _ = sm.create_transfers(&[pending], 20);
+
+        let event = sm.account_events.get(&20).expect("account event recorded");
+        assert_eq!(event.transfer_flags, TransferFlags::PENDING);
+        assert_eq!(event.transfer_pending_status, TransferPendingStatus::Pending);
+        assert_eq!(event.transfer_pending_id, 0);
+        assert_eq!(event.dr_debits_pending, 7);
+        assert_eq!(event.cr_credits_pending, 7);
+    }
+
+    #[test]
+    fn post_records_account_event() {
+        let mut sm = StateMachine::default();
+        pending_setup(&mut sm, 50, TransferFlags::default());
+
+        let _ = sm.create_transfers(&[post_event(3, u128::MAX)], 30);
+
+        let event = sm.account_events.get(&30).expect("post event recorded");
+        assert_eq!(event.transfer_flags, TransferFlags::POST_PENDING_TRANSFER);
+        assert_eq!(event.transfer_pending_status, TransferPendingStatus::Posted);
+        assert_eq!(event.transfer_pending_id, pending_transfer_id());
+        assert_eq!(event.transfer_pending_flags, TransferFlags::PENDING);
+        // The post requested the full pending amount.
+        assert_eq!(event.amount_requested, u128::MAX);
+        assert_eq!(event.amount, 50);
+        // Balances are snapshotted after the mutation: holds released, posted applied.
+        assert_eq!(event.dr_debits_pending, 0);
+        assert_eq!(event.cr_credits_pending, 0);
+        assert_eq!(event.dr_debits_posted, 50);
+        assert_eq!(event.cr_credits_posted, 50);
+    }
+
+    #[test]
+    fn void_records_account_event() {
+        let mut sm = StateMachine::default();
+        pending_setup(&mut sm, 50, TransferFlags::default());
+
+        let _ = sm.create_transfers(&[void_event(3, 0)], 30);
+
+        let event = sm.account_events.get(&30).expect("void event recorded");
+        assert_eq!(event.transfer_flags, TransferFlags::VOID_PENDING_TRANSFER);
+        assert_eq!(event.transfer_pending_status, TransferPendingStatus::Voided);
+        assert_eq!(event.transfer_pending_id, pending_transfer_id());
+        assert_eq!(event.amount_requested, 0);
+        // A full void (amount 0) applies the entire pending amount.
+        assert_eq!(event.amount, 50);
+        assert_eq!(event.dr_debits_pending, 0);
+        assert_eq!(event.cr_credits_pending, 0);
+    }
+
+    #[test]
+    fn account_event_amount_requested_is_original_for_balancing() {
+        let mut sm = StateMachine::default();
+        let _ = sm.create_accounts(
+            &[
+                Account { id: 1, ledger: 1, code: 1, ..Account::default() },
+                Account { id: 2, ledger: 1, code: 1, ..Account::default() },
+                Account { id: 3, ledger: 1, code: 1, ..Account::default() },
+            ],
+            10,
+        );
+
+        // Give account 1 100 credit, then balance 200 against it: 100 is applied
+        // but the event records the requested 200.
+        let batch = [
+            t(3, 1, 100),
+            Transfer {
+                amount: 200,
+                flags: TransferFlags::PENDING | TransferFlags::BALANCING_DEBIT,
+                ..t(1, 2, 200)
+            },
+        ];
+        let _ = sm.create_transfers(&batch, 20);
+
+        let event = sm.account_events.get(&20).expect("balancing event recorded");
+        assert_eq!(event.amount_requested, 200);
+        assert_eq!(event.amount, 100);
+        assert_eq!(event.dr_debits_pending, 100);
+    }
+
+    #[test]
+    fn account_events_indexed_only_for_history_accounts() {
+        let mut sm = StateMachine::default();
+        // Account 1 (timestamp 19) advertises HISTORY; account 2 does not.
+        let _ = sm.create_accounts(
+            &[
+                Account {
+                    id: 1,
+                    ledger: 1,
+                    code: 1,
+                    flags: AccountFlags::HISTORY,
+                    ..Account::default()
+                },
+                Account { id: 2, ledger: 1, code: 1, ..Account::default() },
+            ],
+            20,
+        );
+
+        let _ = sm.create_transfers(&[t(1, 2, 5)], 30);
+
+        assert_eq!(sm.account_events.len(), 1);
+        assert_eq!(sm.account_events_index.get(&19), Some(&vec![30]));
+        assert!(!sm.account_events_index.contains_key(&20));
+    }
+
+    #[test]
+    fn account_events_index_lists_events_in_increasing_order() {
+        let mut sm = StateMachine::default();
+        let _ = sm.create_accounts(
+            &[
+                Account {
+                    id: 1,
+                    ledger: 1,
+                    code: 1,
+                    flags: AccountFlags::HISTORY,
+                    ..Account::default()
+                },
+                Account { id: 2, ledger: 1, code: 1, ..Account::default() },
+            ],
+            20,
+        );
+
+        // Two events touching the history account in one batch: event timestamps 39, 40.
+        let batch = [Transfer { id: 1003, ..t(1, 2, 5) }, Transfer { id: 1004, ..t(1, 2, 6) }];
+        let _ = sm.create_transfers(&batch, 40);
+
+        assert_eq!(sm.account_events_index.get(&19), Some(&vec![39, 40]));
+        // The store mirrors the object groove: one event per timestamp.
+        assert_eq!(sm.account_events.len(), 2);
     }
 }
