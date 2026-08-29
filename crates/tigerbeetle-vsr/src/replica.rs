@@ -4220,9 +4220,9 @@ impl Replica {
         match self.on_prepare(&prepare) {
             OnPrepareResult::Accepted => {
                 // The journal records the body alongside the header, so the
-                // commit path executes the same batch as the primary. (Repair
-                // paths rebuild prepares from headers alone and still record an
-                // empty body.)
+                // commit path executes the same batch as the primary. (A
+                // header-only repair message records an empty body; the `Stale`
+                // branch refreshes it when a body-ful prepare arrives.)
                 self.journal.set_prepare_body(prepare.op, body);
                 // A backup acks the accepted prepare; the primary contributes
                 // its own prepare_ok on the pipeline path instead (we do not
@@ -4239,6 +4239,11 @@ impl Replica {
                 // whose ack was lost — refresh the journal and republish the
                 // ack if we have it clean (upstream `on_repair`).
                 self.on_repair(&prepare);
+                // (Re-)record the transmitted body: a header-only repair or a
+                // lost journal write may have left the stored body empty.
+                if self.journal.header_with_op(prepare.op).is_some() {
+                    self.journal.set_prepare_body(prepare.op, body);
+                }
             }
             OnPrepareResult::FutureOp => {
                 // The primary has moved more than one op past our head: advance
@@ -4684,11 +4689,10 @@ impl Replica {
     ///
     /// DEVIATION: upstream (replica.zig:3084-3157) serves the pipeline first,
     /// then reads the WAL prepare with `read_prepare_with_op_and_checksum` so
-    /// the response carries the prepare body. The sans-IO journal is in-memory
-    /// with deferred bodies, so the stored header is served directly; the
-    /// recipient validates it via the hash chain as usual. The flat
-    /// `send_queue` carries no routing metadata, so the single queued `Prepare`
-    /// must be delivered to `get_prepare.replica`.
+    /// the response carries the prepare body. Sans-IO the in-memory journal
+    /// holds the body alongside the header, so the response carries it too
+    /// (the flat `send_queue` lacks routing metadata, so the single queued
+    /// `Prepare` must be delivered to `get_prepare.replica`).
     ///
     /// # Panics
     ///
@@ -4720,7 +4724,16 @@ impl Replica {
         else {
             return;
         };
-        self.enqueue_header(&prepare.clone());
+        // Serve the prepare with its recorded body: the stored header's `size`
+        // and `checksum_body` cover the batch, so the recipient's receive-time
+        // body checksum validates it (upstream reads the WAL prepare with its
+        // body; sans-IO the in-memory journal records the body alongside the
+        // header). A header-only entry (no body recorded) is served as-is.
+        let mut message = crate::message::Message::new();
+        message.set_header(prepare);
+        let body = self.journal.body_with_op(get_prepare.prepare_op).unwrap_or_default();
+        message.set_body(body);
+        self.send_queue.push(message);
     }
 
     /// Request a peer to re-serve the headers for `[op_min, op_max]` (both
@@ -8551,6 +8564,69 @@ mod tests {
         assert_eq!(served.checksum(), h2.checksum());
         assert_eq!(served.parent, h1.checksum());
         assert_eq!(served.replica, 0);
+    }
+
+    #[test]
+    fn on_get_prepare_serves_the_stored_body() {
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        r.status = Status::Normal;
+
+        // Prepare a body-ful create_accounts; the journal records its batch.
+        let accounts = [Account { id: 3, ledger: 1, code: 1, ..Account::default() }];
+        let body = crate::state_machine::account_batch_to_bytes(&accounts);
+        let op = r.primary_pipeline_prepare(7, 1, crate::Operation::CREATE_ACCOUNTS, &body, 0);
+        assert_eq!(op.unwrap(), 1);
+        r.send_queue.clear(); // the initial broadcast is not under test
+
+        // Another replica requests the prepare by its checksum.
+        let checksum = r.journal.header_with_op(1).expect("op 1").checksum();
+        let mut get_prepare = message_header::GetPrepare {
+            cluster: CLUSTER,
+            replica: 2,
+            prepare_op: 1,
+            prepare_checksum: checksum,
+            ..message_header::GetPrepare::default()
+        };
+        get_prepare.set_checksum_body(&[]);
+        get_prepare.set_checksum();
+        let mut request = Message::new();
+        request.set_header(&get_prepare);
+        r.on_message(&request, 0);
+
+        // The served prepare carries the batch, checksummed for the recipient.
+        assert_eq!(r.send_queue.len(), 1);
+        let served = r.send_queue.remove(0);
+        let prepare = served.header::<message_header::Prepare>().expect("served prepare");
+        assert_eq!(prepare.op, 1);
+        assert!(prepare.valid_checksum_body(served.body_used()));
+        assert_eq!(served.body_used(), &body[..]);
+    }
+
+    #[test]
+    fn stale_rebroadcast_restores_a_lost_body() {
+        let mut primary = Replica::new(CLUSTER, 0, 2);
+        primary.status = Status::Normal;
+        let mut backup = Replica::new(CLUSTER, 1, 2);
+        backup.status = Status::Normal;
+
+        // The backup accepts a body-ful prepare (op 1).
+        let accounts = [Account { id: 3, ledger: 1, code: 1, ..Account::default() }];
+        let body = crate::state_machine::account_batch_to_bytes(&accounts);
+        primary
+            .primary_pipeline_prepare(7, 1, crate::Operation::CREATE_ACCOUNTS, &body, 0)
+            .unwrap();
+        let broadcast = primary.send_queue.pop().expect("prepare broadcast");
+        backup.on_message(&broadcast, 0);
+        assert_eq!(backup.journal.body_with_op(1), Some(&body[..]));
+
+        // The body is lost — as a header-only repair would leave the journal.
+        backup.journal.set_prepare_body(1, &[]);
+        assert_eq!(backup.journal.body_with_op(1), Some(&[][..]));
+
+        // A re-broadcast of the same prepare is stale; repairing it restores
+        // the recorded body.
+        backup.on_message(&broadcast, 0);
+        assert_eq!(backup.journal.body_with_op(1), Some(&body[..]));
     }
 
     #[test]
