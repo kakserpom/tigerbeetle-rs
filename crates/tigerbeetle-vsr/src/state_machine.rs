@@ -32,9 +32,9 @@
 use std::collections::HashMap;
 
 use tigerbeetle_core::types::{
-    Account, AccountEvent, AccountFlags, ChangeEvent, ChangeEventType, ChangeEventsFilter,
-    CreateAccountStatus, CreateTransferStatus, Transfer, TransferFlags, TransferPending,
-    TransferPendingStatus,
+    Account, AccountBalance, AccountEvent, AccountFilter, AccountFilterFlags, AccountFlags,
+    ChangeEvent, ChangeEventType, ChangeEventsFilter, CreateAccountStatus, CreateTransferStatus,
+    Transfer, TransferFlags, TransferPending, TransferPendingStatus,
 };
 
 use crate::Operation;
@@ -1513,6 +1513,24 @@ pub fn transfer_batch_to_bytes(events: &[Transfer]) -> Vec<u8> {
     bytes
 }
 
+/// Encode a batch of [`AccountBalance`] snapshots as a reply body (128 bytes
+/// each, LE).
+#[must_use]
+pub fn account_balances_to_bytes(snapshots: &[AccountBalance]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(snapshots.len() * 128);
+    for snapshot in snapshots {
+        let mut record = [0_u8; 128];
+        record[0..16].copy_from_slice(&snapshot.debits_pending.to_le_bytes());
+        record[16..32].copy_from_slice(&snapshot.debits_posted.to_le_bytes());
+        record[32..48].copy_from_slice(&snapshot.credits_pending.to_le_bytes());
+        record[48..64].copy_from_slice(&snapshot.credits_posted.to_le_bytes());
+        record[64..72].copy_from_slice(&snapshot.timestamp.to_le_bytes());
+        record[72..128].copy_from_slice(&snapshot.reserved);
+        bytes.extend_from_slice(&record);
+    }
+    bytes
+}
+
 /// Decode a request body into a batch of [`Transfer`]s.
 ///
 /// Returns `None` if the body length is not a whole number of records.
@@ -1572,6 +1590,64 @@ fn bytes_to_lookup_ids(bytes: &[u8]) -> Option<Vec<u128>> {
     let (chunks, remainder) = bytes.as_chunks::<16>();
     assert!(remainder.is_empty());
     Some(chunks.iter().map(|c| le_u128(c, 0)).collect())
+}
+
+/// Parse a `get_account_transfers`/`get_account_balances` request body: a
+/// single 128-byte LE [`AccountFilter`].
+#[must_use]
+fn bytes_to_account_filter(bytes: &[u8]) -> Option<AccountFilter> {
+    if bytes.len() != 128 {
+        return None;
+    }
+    let mut reserved = [0_u8; 58];
+    reserved.copy_from_slice(&bytes[46..104]);
+    Some(AccountFilter {
+        account_id: le_u128(bytes, 0),
+        user_data_128: le_u128(bytes, 16),
+        user_data_64: le_u64(bytes, 32),
+        user_data_32: le_u32(bytes, 40),
+        code: u16::from_le_bytes(bytes[44..46].try_into().expect("2 bytes")),
+        reserved,
+        timestamp_min: le_u64(bytes, 104),
+        timestamp_max: le_u64(bytes, 112),
+        limit: le_u32(bytes, 120),
+        flags: AccountFilterFlags::from_raw(le_u32(bytes, 124)),
+    })
+}
+
+/// Validate an [`AccountFilter`] (upstream `get_scan_from_account_filter`,
+/// `state_machine.zig:1737`): a query must name a non-zero, non-`MAX` account,
+/// have at least one of `debits`/`credits` set, no padding or reserved bits,
+/// a non-zero `limit`, and a well-formed timestamp range.
+#[must_use]
+fn account_filter_valid(filter: &AccountFilter) -> bool {
+    let timestamp_valid = |t: u64| (1..=i64::MAX as u64).contains(&t);
+    filter.account_id != 0
+        && filter.account_id != u128::MAX
+        && (filter.timestamp_min == 0 || timestamp_valid(filter.timestamp_min))
+        && (filter.timestamp_max == 0 || timestamp_valid(filter.timestamp_max))
+        && (filter.timestamp_max == 0 || filter.timestamp_min <= filter.timestamp_max)
+        && filter.limit != 0
+        && (filter.flags.credits() || filter.flags.debits())
+        && !filter.flags.has_padding()
+        && filter.reserved.iter().all(|&b| b == 0)
+}
+
+/// Whether a committed transfer satisfies the account-filter conditions
+/// (the account as its debit and/or credit side per the flags, plus the
+/// `user_data_*`/`code` equality filters; a zero filter value means "no
+/// filter", upstream `state_machine.zig:1771-1802`).
+#[must_use]
+fn transfer_matches_account_filter(t: &Transfer, filter: &AccountFilter) -> bool {
+    let side_matches = (filter.flags.debits() && t.debit_account_id == filter.account_id)
+        || (filter.flags.credits() && t.credit_account_id == filter.account_id);
+    if !side_matches {
+        return false;
+    }
+    (filter.user_data_128 == 0 || t.user_data_128 == filter.user_data_128)
+        && (filter.user_data_64 == 0 || t.user_data_64 == filter.user_data_64)
+        && (filter.user_data_32 == 0 || t.user_data_32 == filter.user_data_32)
+        && (filter.code == 0 || t.code == filter.code)
 }
 
 /// Encode a [`ChangeEvent`] as a 384-byte reply record (LE).
@@ -1749,6 +1825,18 @@ impl StateMachine {
                 };
                 self.lookup_transfers(&ids)
             }
+            Operation::GET_ACCOUNT_TRANSFERS => {
+                let Some(filter) = bytes_to_account_filter(body) else {
+                    unreachable!("get_account_transfers body must be a single AccountFilter");
+                };
+                self.get_account_transfers(&filter)
+            }
+            Operation::GET_ACCOUNT_BALANCES => {
+                let Some(filter) = bytes_to_account_filter(body) else {
+                    unreachable!("get_account_balances body must be a single AccountFilter");
+                };
+                self.get_account_balances(&filter)
+            }
             operation => unreachable!("unsupported state-machine operation: {operation:?}"),
         }
     }
@@ -1876,26 +1964,150 @@ impl StateMachine {
         reply
     }
 
-    /// Build the [`ChangeEvent`] reported for a recorded account event
-    /// (upstream `get_change_event`, `state_machine.zig:3424-3527`).
-    #[must_use]
-    fn build_change_event(&self, result: &AccountEvent) -> ChangeEvent {
-        // The transfer is resolved by timestamp, except for expiry events,
-        // which carry no transfer with the event's timestamp (upstream
-        // `state_machine.zig:3428-3439`).
-        let transfer = match result.transfer_pending_status {
-            TransferPendingStatus::Expired => self
-                .transfers
-                .get(&result.transfer_pending_id)
-                .copied()
-                .expect("expired account event references a committed pending transfer"),
+    /// The committed transfer a recorded [`AccountEvent`] refers to. Resolved by
+    /// timestamp, except for expiry events, which carry no transfer with the
+    /// event's timestamp and are resolved by `transfer_pending_id` (upstream
+    /// `state_machine.zig:3428-3439`).
+    fn account_event_transfer(&self, result: &AccountEvent) -> Option<Transfer> {
+        match result.transfer_pending_status {
+            TransferPendingStatus::Expired => {
+                self.transfers.get(&result.transfer_pending_id).copied()
+            }
             _ => self
                 .transfers_by_timestamp
                 .get(&result.timestamp)
                 .and_then(|id| self.transfers.get(id))
-                .copied()
-                .expect("each account event references a committed transfer"),
+                .copied(),
+        }
+    }
+
+    /// Execute a `get_account_transfers` query and return the reply body
+    /// (upstream `execute_get_account_transfers`, `state_machine.zig:3294`).
+    ///
+    /// Returns the transfers involving `filter.account_id` (as debit and/or
+    /// credit per the filter flags) whose timestamp falls in the (inclusive)
+    /// `[timestamp_min, timestamp_max]` range, optionally filtered by the
+    /// transfer's `user_data_*`/`code`, up to `filter.limit`, in ascending or
+    /// reverse-chronological order per `reversed`. A malformed filter or one
+    /// naming account id `MAX` yields an empty reply (upstream returns the
+    /// results but treats the filter as invalid).
+    ///
+    /// DEVIATION: upstream scans the `transfers` object groove via the
+    /// `debit_account_id`/`credit_account_id`/`user_data_*`/`code` derived
+    /// indexes (`get_scan_from_account_filter`); sans-IO the committed
+    /// transfers are filtered in memory.
+    #[must_use]
+    pub fn get_account_transfers(&self, filter: &AccountFilter) -> Vec<u8> {
+        if !account_filter_valid(filter) {
+            return Vec::new();
+        }
+
+        let min = if filter.timestamp_min == 0 { u64::MIN } else { filter.timestamp_min };
+        let max = if filter.timestamp_max == 0 { u64::MAX } else { filter.timestamp_max };
+
+        let mut results: Vec<Transfer> = self
+            .transfers
+            .values()
+            .copied()
+            .filter(|t| {
+                t.timestamp >= min
+                    && t.timestamp <= max
+                    && transfer_matches_account_filter(t, filter)
+            })
+            .collect();
+        if filter.flags.reversed() {
+            results.sort_unstable_by_key(|t| std::cmp::Reverse(t.timestamp));
+        } else {
+            results.sort_unstable_by_key(|t| t.timestamp);
+        }
+        results.truncate(filter.limit as usize);
+        transfer_batch_to_bytes(&results)
+    }
+
+    /// Execute a `get_account_balances` query and return the reply body
+    /// (upstream `execute_get_account_balances`, `state_machine.zig:3312`).
+    ///
+    /// Scans the change-data-capture history for `filter.account_id` in the
+    /// (inclusive) `[timestamp_min, timestamp_max]` range, up to `filter.limit`,
+    /// in ascending or reverse-chronological order per `reversed`, and returns
+    /// one [`AccountBalance`] snapshot per event for the account's side. The
+    /// account must exist and advertise `AccountFlags::HISTORY`; otherwise the
+    /// reply is empty.
+    ///
+    /// DEVIATION: upstream scans the `account_events` groove's
+    /// `account_timestamp` derived index built from the transfers-groove scan
+    /// conditions; sans-IO the events are filtered in memory (including
+    /// resolving an event's originating transfer to apply the
+    /// `user_data_*`/`code` filters).
+    #[must_use]
+    pub fn get_account_balances(&self, filter: &AccountFilter) -> Vec<u8> {
+        if !account_filter_valid(filter) {
+            return Vec::new();
+        }
+        let Some(account) = self.accounts.get(&filter.account_id) else {
+            return Vec::new();
         };
+        if !account.flags.history() {
+            return Vec::new();
+        }
+
+        let min = if filter.timestamp_min == 0 { u64::MIN } else { filter.timestamp_min };
+        let max = if filter.timestamp_max == 0 { u64::MAX } else { filter.timestamp_max };
+
+        let mut events: Vec<&AccountEvent> = self
+            .account_events
+            .iter()
+            .filter(|(ts, e)| {
+                **ts >= min
+                    && **ts <= max
+                    && self
+                        .account_event_transfer(e)
+                        .is_some_and(|t| transfer_matches_account_filter(&t, filter))
+            })
+            .map(|(_, e)| e)
+            .collect();
+        if filter.flags.reversed() {
+            events.sort_unstable_by_key(|e| std::cmp::Reverse(e.timestamp));
+        } else {
+            events.sort_unstable_by_key(|e| e.timestamp);
+        }
+        events.truncate(filter.limit as usize);
+
+        let mut results: Vec<AccountBalance> = Vec::with_capacity(events.len());
+        for event in events {
+            assert_ne!(event.dr_account_id, event.cr_account_id);
+            let snapshot = if filter.account_id == event.dr_account_id {
+                AccountBalance {
+                    timestamp: event.timestamp,
+                    debits_pending: event.dr_debits_pending,
+                    debits_posted: event.dr_debits_posted,
+                    credits_pending: event.dr_credits_pending,
+                    credits_posted: event.dr_credits_posted,
+                    reserved: [0; 56],
+                }
+            } else {
+                assert_eq!(filter.account_id, event.cr_account_id);
+                AccountBalance {
+                    timestamp: event.timestamp,
+                    debits_pending: event.cr_debits_pending,
+                    debits_posted: event.cr_debits_posted,
+                    credits_pending: event.cr_credits_pending,
+                    credits_posted: event.cr_credits_posted,
+                    reserved: [0; 56],
+                }
+            };
+            results.push(snapshot);
+        }
+        account_balances_to_bytes(&results)
+    }
+
+    /// Build the [`ChangeEvent`] reported for a recorded account event
+    /// (upstream `get_change_event`, `state_machine.zig:3424-3527`).
+    #[must_use]
+    fn build_change_event(&self, result: &AccountEvent) -> ChangeEvent {
+        let transfer = self
+            .account_event_transfer(result)
+            .expect("each account event references a committed transfer");
         let dr_account =
             self.accounts.get(&result.dr_account_id).copied().expect("debit account committed");
         let cr_account =
@@ -4860,5 +5072,287 @@ mod tests {
         let tparsed = bytes_to_transfer_batch(&transfers).expect("valid transfer batch");
         assert_eq!(tparsed.len(), 1);
         assert_eq!(tparsed[0].amount, 7);
+    }
+
+    // ── get_account_transfers tests ──────────────────────────────────────
+
+    fn account_filter(account_id: u128, flags: AccountFilterFlags) -> AccountFilter {
+        AccountFilter { account_id, flags, limit: 100, ..AccountFilter::default() }
+    }
+
+    #[test]
+    fn get_account_transfers_returns_transfers_for_debits_and_credits() {
+        let mut sm = StateMachine::default();
+        let _ = sm.create_accounts(
+            &[
+                Account { id: 1, ledger: 1, code: 1, ..Account::default() },
+                Account { id: 2, ledger: 1, code: 1, ..Account::default() },
+                Account { id: 3, ledger: 1, code: 1, ..Account::default() },
+            ],
+            10,
+        );
+        // Account 1 is debited (1->2), account 2 is credited (1->2) and debited
+        // (2->3); account 3 is only credited (2->3).
+        let _ = sm.create_transfers(&[t(1, 2, 10), t(2, 3, 20)], 20);
+
+        let dr_filter = account_filter(1, AccountFilterFlags::DEBITS);
+        let dr = sm.get_account_transfers(&dr_filter);
+        let dr_results = bytes_to_transfer_batch(&dr).expect("valid transfer batch");
+        assert_eq!(dr_results.len(), 1);
+        assert_eq!(dr_results[0].debit_account_id, 1);
+
+        let cr_filter = account_filter(2, AccountFilterFlags::CREDITS);
+        let cr = sm.get_account_transfers(&cr_filter);
+        let cr_results = bytes_to_transfer_batch(&cr).expect("valid transfer batch");
+        assert_eq!(cr_results.len(), 1);
+        assert_eq!(cr_results[0].credit_account_id, 2);
+
+        let both_filter =
+            account_filter(2, AccountFilterFlags::DEBITS | AccountFilterFlags::CREDITS);
+        let both = sm.get_account_transfers(&both_filter);
+        let both_results = bytes_to_transfer_batch(&both).expect("valid transfer batch");
+        assert_eq!(both_results.len(), 2);
+    }
+
+    #[test]
+    fn get_account_transfers_posted_sorted_chronologically_and_reversed() {
+        let mut sm = StateMachine::default();
+        let _ = sm.create_accounts(
+            &[
+                Account { id: 1, ledger: 1, code: 1, ..Account::default() },
+                Account { id: 2, ledger: 1, code: 1, ..Account::default() },
+            ],
+            10,
+        );
+        // Same batch of four transfers; timestamps 20..23.
+        let _ = sm.create_transfers(
+            &[
+                t(1, 2, 1),
+                Transfer { id: 1003, ..t(1, 2, 2) },
+                Transfer { id: 1004, ..t(1, 2, 3) },
+                Transfer { id: 1005, ..t(1, 2, 4) },
+            ],
+            20,
+        );
+
+        let asc_filter = account_filter(1, AccountFilterFlags::DEBITS);
+        let asc = sm.get_account_transfers(&asc_filter);
+        let asc_results = bytes_to_transfer_batch(&asc).expect("valid transfer batch");
+        let asc_ts: Vec<u64> = asc_results.iter().map(|t| t.timestamp).collect();
+        assert_eq!(asc_ts, vec![17, 18, 19, 20]);
+
+        let desc_filter =
+            account_filter(1, AccountFilterFlags::DEBITS | AccountFilterFlags::REVERSED);
+        let desc = sm.get_account_transfers(&desc_filter);
+        let desc_results = bytes_to_transfer_batch(&desc).expect("valid transfer batch");
+        let desc_ts: Vec<u64> = desc_results.iter().map(|t| t.timestamp).collect();
+        assert_eq!(desc_ts, vec![20, 19, 18, 17]);
+
+        let limited = AccountFilter { limit: 2, ..account_filter(1, AccountFilterFlags::DEBITS) };
+        let lim = sm.get_account_transfers(&limited);
+        let lim_results = bytes_to_transfer_batch(&lim).expect("valid transfer batch");
+        let lim_ts: Vec<u64> = lim_results.iter().map(|t| t.timestamp).collect();
+        assert_eq!(lim_ts, vec![17, 18]);
+    }
+
+    #[test]
+    fn get_account_transfers_filters_by_user_data_code_and_timestamp_range() {
+        let mut sm = StateMachine::default();
+        let _ = sm.create_accounts(
+            &[
+                Account { id: 1, ledger: 1, code: 1, ..Account::default() },
+                Account { id: 2, ledger: 1, code: 1, ..Account::default() },
+            ],
+            10,
+        );
+        let mut a = t(1, 2, 5);
+        a.code = 7;
+        a.user_data_64 = 99;
+        let mut b = t(1, 2, 6);
+        b.code = 8;
+        let _ = sm.create_transfers(&[a, b], 20); // timestamps 20, 21
+
+        let code_filter =
+            AccountFilter { code: 7, ..account_filter(1, AccountFilterFlags::DEBITS) };
+        let code = sm.get_account_transfers(&code_filter);
+        let code_results = bytes_to_transfer_batch(&code).expect("valid transfer batch");
+        assert_eq!(code_results.len(), 1);
+        assert_eq!(code_results[0].code, 7);
+
+        let range_filter = AccountFilter {
+            timestamp_min: 19,
+            timestamp_max: 19,
+            ..account_filter(1, AccountFilterFlags::DEBITS)
+        };
+        let range = sm.get_account_transfers(&range_filter);
+        let range_results = bytes_to_transfer_batch(&range).expect("valid transfer batch");
+        assert_eq!(range_results.len(), 1);
+        assert_eq!(range_results[0].timestamp, 19);
+    }
+
+    #[test]
+    fn get_account_transfers_rejects_invalid_filter() {
+        let mut sm = StateMachine::default();
+        let _ = sm.create_accounts(
+            &[
+                Account { id: 1, ledger: 1, code: 1, ..Account::default() },
+                Account { id: 2, ledger: 1, code: 1, ..Account::default() },
+            ],
+            10,
+        );
+        let _ = sm.create_transfers(&[t(1, 2, 5)], 20);
+
+        // No debits/credits flag, limit of zero, and padding bits are all
+        // invalid and must yield an empty reply.
+        let no_side = account_filter(1, AccountFilterFlags::default());
+        assert!(sm.get_account_transfers(&no_side).is_empty());
+
+        let no_limit = AccountFilter { limit: 0, ..account_filter(1, AccountFilterFlags::DEBITS) };
+        assert!(sm.get_account_transfers(&no_limit).is_empty());
+
+        let padding = AccountFilter {
+            flags: AccountFilterFlags::from_raw(0xFFFF_FFFF),
+            ..account_filter(1, AccountFilterFlags::default())
+        };
+        assert!(sm.get_account_transfers(&padding).is_empty());
+    }
+
+    // ── get_account_balances tests ───────────────────────────────────────
+
+    #[test]
+    fn get_account_balances_requires_history_flag() {
+        let mut sm = StateMachine::default();
+        // Accounts without the history flag still record events, but the query
+        // honors the account's `flags.history`, so the reply is empty.
+        let _ = sm.create_accounts(
+            &[
+                Account { id: 1, ledger: 1, code: 1, ..Account::default() },
+                Account { id: 2, ledger: 1, code: 1, ..Account::default() },
+            ],
+            10,
+        );
+        let _ = sm.create_transfers(&[t(1, 2, 5)], 20);
+
+        let filter = account_filter(1, AccountFilterFlags::DEBITS);
+        assert!(sm.get_account_balances(&filter).is_empty());
+
+        // A non-existent account is also empty.
+        let missing = account_filter(999, AccountFilterFlags::DEBITS);
+        assert!(sm.get_account_balances(&missing).is_empty());
+    }
+
+    #[test]
+    fn get_account_balances_snapshots_each_matching_side() {
+        let mut sm = StateMachine::default();
+        let _ = sm.create_accounts(
+            &[
+                Account {
+                    id: 1,
+                    ledger: 1,
+                    code: 1,
+                    flags: AccountFlags::HISTORY,
+                    ..Account::default()
+                },
+                Account {
+                    id: 2,
+                    ledger: 1,
+                    code: 1,
+                    flags: AccountFlags::HISTORY,
+                    ..Account::default()
+                },
+            ],
+            10,
+        );
+        // Two transfers: 1->2 (50), then 1->2 (30): account 1 ends with
+        // debits_posted 80; account 2 credits_posted 80.
+        let _ = sm.create_transfers(&[t(1, 2, 50), Transfer { id: 1003, ..t(1, 2, 30) }], 20);
+
+        let dr_filter = account_filter(1, AccountFilterFlags::DEBITS);
+        let dr_view = sm.get_account_balances(&dr_filter);
+        let (dr_snapshots, _) = dr_view.as_chunks::<128>();
+        assert_eq!(dr_snapshots.len(), 2);
+        // Chronological: first event (ts 19) has 50 debits posted, then 80
+        // (ts 20).
+        assert_eq!(le_u128(&dr_snapshots[0], 16), 50);
+        assert_eq!(le_u128(&dr_snapshots[1], 16), 80);
+        assert_eq!(le_u64(&dr_snapshots[0], 64), 19);
+        assert_eq!(le_u64(&dr_snapshots[1], 64), 20);
+
+        let cr_filter = account_filter(2, AccountFilterFlags::CREDITS);
+        let cr_view = sm.get_account_balances(&cr_filter);
+        let (cr_snapshots, _) = cr_view.as_chunks::<128>();
+        assert_eq!(cr_snapshots.len(), 2);
+        // Credit side: credits_posted field is at offset 48.
+        assert_eq!(le_u128(&cr_snapshots[1], 48), 80);
+    }
+
+    #[test]
+    fn get_account_balances_reversed_and_limited() {
+        let mut sm = StateMachine::default();
+        let _ = sm.create_accounts(
+            &[
+                Account {
+                    id: 1,
+                    ledger: 1,
+                    code: 1,
+                    flags: AccountFlags::HISTORY,
+                    ..Account::default()
+                },
+                Account {
+                    id: 2,
+                    ledger: 1,
+                    code: 1,
+                    flags: AccountFlags::HISTORY,
+                    ..Account::default()
+                },
+            ],
+            10,
+        );
+        let _ = sm.create_transfers(
+            &[t(1, 2, 1), Transfer { id: 1003, ..t(1, 2, 2) }, Transfer { id: 1004, ..t(1, 2, 3) }],
+            20,
+        );
+
+        let desc = AccountFilter {
+            limit: 2,
+            flags: AccountFilterFlags::DEBITS | AccountFilterFlags::REVERSED,
+            ..account_filter(1, AccountFilterFlags::default())
+        };
+        let view = sm.get_account_balances(&desc);
+        let (snapshots, _) = view.as_chunks::<128>();
+        assert_eq!(snapshots.len(), 2);
+        // Most recent first: timestamps 20, 19.
+        assert_eq!(le_u64(&snapshots[0], 64), 20);
+        assert_eq!(le_u64(&snapshots[1], 64), 19);
+    }
+
+    #[test]
+    fn get_account_balances_via_execute_decodes_filter() {
+        let mut sm = StateMachine::default();
+        let _ = sm.create_accounts(
+            &[
+                Account {
+                    id: 1,
+                    ledger: 1,
+                    code: 1,
+                    flags: AccountFlags::HISTORY,
+                    ..Account::default()
+                },
+                Account { id: 2, ledger: 1, code: 1, ..Account::default() },
+            ],
+            10,
+        );
+        let _ = sm.create_transfers(&[t(1, 2, 5)], 20);
+
+        // Encode a 128-byte AccountFilter for account 1 (debits, limit 100).
+        let mut body = vec![0_u8; 128];
+        body[0..16].copy_from_slice(&1_u128.to_le_bytes());
+        body[120..124].copy_from_slice(&100_u32.to_le_bytes());
+        body[124..128].copy_from_slice(&AccountFilterFlags::DEBITS.as_raw().to_le_bytes());
+
+        let reply = sm.execute(Operation::GET_ACCOUNT_BALANCES, 0, &body);
+        let (snapshots, _) = reply.as_chunks::<128>();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(le_u64(&snapshots[0], 64), 20);
     }
 }

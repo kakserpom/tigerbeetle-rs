@@ -600,6 +600,112 @@ const _: () = assert!(core::mem::size_of::<AccountBalance>() == 128);
 const _: () = assert!(core::mem::align_of::<AccountBalance>() == 16);
 
 // ---------------------------------------------------------------------------
+// AccountFilter
+// ---------------------------------------------------------------------------
+
+/// Query flags for [`AccountFilter`] (a `u32` bitfield).
+///
+/// Upstream: `src/tigerbeetle.zig:599`.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+#[repr(transparent)]
+pub struct AccountFilterFlags(u32);
+
+impl AccountFilterFlags {
+    /// Whether to include results where `debit_account_id` matches.
+    pub const DEBITS: Self = Self(1 << 0);
+    /// Whether to include results where `credit_account_id` matches.
+    pub const CREDITS: Self = Self(1 << 1);
+    /// Whether the results are sorted by timestamp in chronological or
+    /// reverse-chronological order.
+    pub const REVERSED: Self = Self(1 << 2);
+
+    /// Construct from a raw `u32` (for request decoding).
+    #[must_use]
+    pub const fn from_raw(raw: u32) -> Self {
+        Self(raw)
+    }
+
+    /// Return the raw `u32` value.
+    #[must_use]
+    pub const fn as_raw(self) -> u32 {
+        self.0
+    }
+
+    #[must_use]
+    pub const fn debits(self) -> bool {
+        (self.0 & Self::DEBITS.0) != 0
+    }
+
+    #[must_use]
+    pub const fn credits(self) -> bool {
+        (self.0 & Self::CREDITS.0) != 0
+    }
+
+    #[must_use]
+    pub const fn reversed(self) -> bool {
+        (self.0 & Self::REVERSED.0) != 0
+    }
+
+    /// The `padding` bits (upstream `account_filter_flags.padding`) must be
+    /// zero.
+    #[must_use]
+    pub const fn has_padding(self) -> bool {
+        (self.0 & !(Self::DEBITS.0 | Self::CREDITS.0 | Self::REVERSED.0)) != 0
+    }
+}
+
+impl core::ops::BitOr for AccountFilterFlags {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self::Output {
+        Self(self.0 | rhs.0)
+    }
+}
+
+/// Filters for the `get_account_transfers` and `get_account_balances` queries
+/// (128 bytes, 16-byte aligned).
+///
+/// Zero-valued fields act as "no filter". `timestamp_min`/`timestamp_max` bound
+/// the inclusive timestamp range of the results; `limit` caps the number of
+/// results and must be non-zero.
+///
+/// Upstream: `src/tigerbeetle.zig:564`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(C)]
+pub struct AccountFilter {
+    pub account_id: u128,
+    pub user_data_128: u128,
+    pub user_data_64: u64,
+    pub user_data_32: u32,
+    pub code: u16,
+    pub reserved: [u8; 58],
+    pub timestamp_min: u64,
+    pub timestamp_max: u64,
+    pub limit: u32,
+    pub flags: AccountFilterFlags,
+}
+
+impl Default for AccountFilter {
+    fn default() -> Self {
+        Self {
+            account_id: 0,
+            user_data_128: 0,
+            user_data_64: 0,
+            user_data_32: 0,
+            code: 0,
+            reserved: [0; 58],
+            timestamp_min: 0,
+            timestamp_max: 0,
+            limit: 0,
+            flags: AccountFilterFlags::default(),
+        }
+    }
+}
+
+const _: () = assert!(core::mem::size_of::<AccountFilter>() == 128);
+const _: () = assert!(core::mem::align_of::<AccountFilter>() == 16);
+const _: () = assert!(core::mem::size_of::<AccountFilterFlags>() == 4);
+
+// ---------------------------------------------------------------------------
 // Tree IDs
 // ---------------------------------------------------------------------------
 
