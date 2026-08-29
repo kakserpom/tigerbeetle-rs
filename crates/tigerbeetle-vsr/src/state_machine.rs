@@ -3,12 +3,14 @@
 // =============================================================================
 //
 // Ported from `src/state_machine.zig`. This module contains the core validation
-// and mutation logic for `create_accounts` and `create_transfer`.
+// and mutation logic for `create_accounts` and `create_transfers`.
 //
-// The full StateMachine struct (batch orchestrator, linked chains, imported
-// timestamps, prefetch, expiry scheduling) is deferred until the forest layer
-// is complete. For now we expose two standalone functions that take a mutable
-// reference to the relevant grooves plus an account-lookup callback.
+// The StateMachine struct implements the batch orchestrator (linked chains,
+// imported timestamps and their validation, persist scopes) on top of plain
+// id-keyed timestamp-indexed stores until the forest layer lands; prefetch and
+// expiry scheduling remain deferred. Two standalone functions hold the
+// per-event validation (`create_account`, `create_transfer`) and expect the
+// caller to have looked up referenced objects beforehand.
 
 #![allow(
     clippy::must_use_candidate,
@@ -91,8 +93,9 @@ pub fn create_account(
         return CreateAccountStatus::CodeMustNotBeZero;
     }
 
-    // Imported timestamp validation is deferred until the full batch orchestrator
-    // can check objects.key_range and indirect_lookup.
+    // Imported timestamps: the regression/collision checks need groove-global
+    // state (objects.key_range, indirect_lookup) and run in the batch
+    // orchestrator after the idempotency checks (upstream state_machine.zig:3648-3670).
     if !a.flags.imported() {
         assert_eq!(a.timestamp, 0);
     }
@@ -208,11 +211,28 @@ pub fn create_transfer(
         return CreateTransferStatus::TransferMustHaveTheSameLedgerAsAccounts;
     }
 
-    // Imported timestamp validation deferred until batch orchestrator.
-    if !t.flags.imported() {
+    // Imported transfers keep their own (past) timestamp; the batch-level
+    // regression/collision checks run in the orchestrator beforehand. The
+    // postdate and timeout checks below must fire before the balance checks,
+    // matching upstream state_machine.zig:3819-3828.
+    let timestamp_actual = if t.flags.imported() {
+        assert!(t.timestamp != 0);
+        assert!(t.timestamp <= timestamp_event);
+        if t.timestamp <= dr_account.timestamp {
+            return CreateTransferStatus::ImportedEventTimestampMustPostdateDebitAccount;
+        }
+        if t.timestamp <= cr_account.timestamp {
+            return CreateTransferStatus::ImportedEventTimestampMustPostdateCreditAccount;
+        }
+        if t.timeout != 0 {
+            assert!(t.flags.pending());
+            return CreateTransferStatus::ImportedEventTimeoutMustBeZero;
+        }
+        t.timestamp
+    } else {
         assert_eq!(t.timestamp, 0);
-    }
-    let timestamp_actual = timestamp_event;
+        timestamp_event
+    };
 
     assert!(timestamp_actual > dr_account.timestamp);
     assert!(timestamp_actual > cr_account.timestamp);
@@ -564,18 +584,29 @@ pub struct CreateTransferResult {
 /// `timestamp` is the commit timestamp for the batch (one higher than the last committed).
 /// The per-event timestamp is computed as `timestamp - events.len + index + 1`.
 ///
+/// `accounts_key_max` is the maximum committed account timestamp (`accounts.objects.key_range.key_max`,
+/// passes through the committed store; the orchestrator tracks the within-batch inserts itself).
+/// `transfer_with_timestamp` resolves the transfer matching a timestamp, mirroring the cross-groove
+/// `transfers.indirect_lookup` that upstream consults for imported events.
+///
 /// Returns a `Vec<CreateAccountResult>` parallel to the input events.
-pub fn execute_create_accounts<F>(
+pub fn execute_create_accounts<F, FTransferAt>(
     events: &[Account],
     timestamp: u64,
     mut get_existing: F,
+    accounts_key_max: u64,
+    transfer_with_timestamp: FTransferAt,
 ) -> Vec<CreateAccountResult>
 where
     F: FnMut(u128) -> Option<Account>,
+    FTransferAt: Fn(u64) -> Option<u128>,
 {
     let mut results: Vec<CreateAccountResult> = Vec::with_capacity(events.len());
     let mut chain: Option<usize> = None;
     let mut chain_broken = false;
+    // The running object-tree key range: committed state plus the events of this
+    // batch (upstream inserts each created account before the next event's check).
+    let mut running_key_max = accounts_key_max;
 
     let batch_imported = !events.is_empty() && events[0].flags.imported();
 
@@ -620,11 +651,30 @@ where
             }
 
             let existing = get_existing(event.id);
+            // Imported-timestamp regression/collision checks. Upstream runs these
+            // inside `create_account` _after_ the idempotency checks (state_machine.zig:3656-3665),
+            // so an existing record short-circuits to its `exists` code first.
+            if event.flags.imported() && existing.is_none() {
+                assert!(event.timestamp != 0);
+                assert!(event.timestamp <= timestamp_event);
+                // A past timestamp must not regress the account object index, and
+                // must not collide with an existing transfer's timestamp.
+                if event.timestamp <= running_key_max
+                    || transfer_with_timestamp(event.timestamp).is_some()
+                {
+                    break 'result (
+                        CreateAccountStatus::ImportedEventTimestampMustNotRegress,
+                        timestamp_event,
+                    );
+                }
+            }
             let status = create_account(event, timestamp_event, existing.as_ref());
             // Upstream `create_account` returns a tagged union whose payload is
             // the result timestamp (`.created` => the event's, `.exists` => the
-            // existing record's); we recover it from the lookup.
+            // existing record's); we recover it from the lookup. Imported events
+            // keep their own timestamp; the object index absorbs it.
             let ts = match status {
+                CreateAccountStatus::Created if event.flags.imported() => event.timestamp,
                 CreateAccountStatus::Created => timestamp_event,
                 CreateAccountStatus::Exists => match existing {
                     Some(existing) => existing.timestamp,
@@ -634,6 +684,9 @@ where
                 },
                 _ => timestamp_event,
             };
+            if matches!(status, CreateAccountStatus::Created) {
+                running_key_max = running_key_max.max(ts);
+            }
             (status, ts)
         };
 
@@ -675,21 +728,30 @@ where
 ///
 /// Same semantics as `execute_create_accounts` but for transfers.
 ///
+/// `transfers_key_max` is the maximum committed transfer timestamp
+/// (`transfers.objects.key_range.key_max`). `account_with_timestamp` resolves
+/// the account matching a timestamp, mirroring the cross-groove
+/// `accounts.indirect_lookup` that upstream consults for imported events.
+///
 /// `get_existing_transfer` looks up a transfer by id.
 /// `get_account` looks up an account by id — needed for both debit and credit accounts.
-pub fn execute_create_transfers<F, G>(
+pub fn execute_create_transfers<F, G, FAccountAt>(
     events: &[Transfer],
     timestamp: u64,
     mut get_existing_transfer: F,
     mut get_account: G,
+    transfers_key_max: u64,
+    account_with_timestamp: FAccountAt,
 ) -> Vec<CreateTransferResult>
 where
     F: FnMut(u128) -> Option<Transfer>,
     G: FnMut(u128) -> Option<Account>,
+    FAccountAt: Fn(u64) -> Option<u128>,
 {
     let mut results: Vec<CreateTransferResult> = Vec::with_capacity(events.len());
     let mut chain: Option<usize> = None;
     let mut chain_broken = false;
+    let mut running_key_max = transfers_key_max;
 
     let batch_imported = !events.is_empty() && events[0].flags.imported();
 
@@ -753,6 +815,32 @@ where
                 }
             };
 
+            // Imported-timestamp regression/collision checks. Upstream runs these
+            // inside `create_transfer` _after_ the idempotency checks
+            // (state_machine.zig:3808-3817) and before the postdate checks, so an
+            // existing record short-circuits to its `exists` code first and the
+            // postdate ordering is preserved (error codes must take precedence in
+            // the same order). Post/void transfers never run them: upstream routes
+            // those through separate functions that do not validate regression.
+            if event.flags.imported()
+                && existing.is_none()
+                && !event.flags.post_pending_transfer()
+                && !event.flags.void_pending_transfer()
+            {
+                assert!(event.timestamp != 0);
+                assert!(event.timestamp <= timestamp_event);
+                // A past timestamp must not regress the transfer object index, and
+                // must not collide with an existing account's timestamp.
+                if event.timestamp <= running_key_max
+                    || account_with_timestamp(event.timestamp).is_some()
+                {
+                    break 'result (
+                        CreateTransferStatus::ImportedEventTimestampMustNotRegress,
+                        timestamp_event,
+                    );
+                }
+            }
+
             let status = create_transfer(
                 event,
                 timestamp_event,
@@ -763,6 +851,7 @@ where
             // Same rule as accounts: `.exists` reports the existing record's
             // timestamp (upstream `state_machine.zig:3669-3721`).
             let ts = match status {
+                CreateTransferStatus::Created if event.flags.imported() => event.timestamp,
                 CreateTransferStatus::Created => timestamp_event,
                 CreateTransferStatus::Exists => match existing {
                     Some(existing) => existing.timestamp,
@@ -772,6 +861,9 @@ where
                 },
                 _ => timestamp_event,
             };
+            if matches!(status, CreateTransferStatus::Created) {
+                running_key_max = running_key_max.max(ts);
+            }
             (status, ts)
         };
 
@@ -997,6 +1089,15 @@ pub struct StateMachine {
     accounts: HashMap<u128, Account>,
     /// Temporary primary-key store for transfers.
     transfers: HashMap<u128, Transfer>,
+    /// Maximum committed account timestamp — mirrors `accounts.objects.key_range.key_max`.
+    accounts_timestamp_max: u64,
+    /// Maximum committed transfer timestamp — mirrors `transfers.objects.key_range.key_max`.
+    transfers_timestamp_max: u64,
+    /// Timestamp → account id for committed accounts, mirroring the object
+    /// tree's timestamp index (queryable upstream via `accounts.indirect_lookup`).
+    accounts_by_timestamp: HashMap<u64, u128>,
+    /// Timestamp → transfer id for committed transfers.
+    transfers_by_timestamp: HashMap<u64, u128>,
 }
 
 impl StateMachine {
@@ -1046,8 +1147,13 @@ impl StateMachine {
     #[must_use]
     pub fn create_accounts(&mut self, events: &[Account], timestamp: u64) -> Vec<u8> {
         assert!(self.commit_timestamp <= timestamp);
-        let results =
-            execute_create_accounts(events, timestamp, |id| self.accounts.get(&id).copied());
+        let results = execute_create_accounts(
+            events,
+            timestamp,
+            |id| self.accounts.get(&id).copied(),
+            self.accounts_timestamp_max,
+            |ts| self.transfers_by_timestamp.get(&ts).copied(),
+        );
         self.persist_accounts(events, &results, timestamp);
         account_results_to_bytes(&results)
     }
@@ -1064,6 +1170,8 @@ impl StateMachine {
             timestamp,
             |id| self.transfers.get(&id).copied(),
             |id| self.accounts.get(&id).copied(),
+            self.transfers_timestamp_max,
+            |ts| self.accounts_by_timestamp.get(&ts).copied(),
         );
         self.persist_transfers(events, &results, timestamp);
         transfer_results_to_bytes(&results)
@@ -1081,7 +1189,8 @@ impl StateMachine {
     /// other status — including `Exists` — breaks the chain and rolls its
     /// preceding members back, upstream `scope_close(.discard)`). Records are
     /// stamped with their event time before insertion (upstream bumps
-    /// `event.timestamp = timestamp_event` before `groove.put`).
+    /// `event.timestamp = timestamp_event` before `groove.put`); imported
+    /// events keep the timestamp the orchestrator validated.
     fn persist_accounts(
         &mut self,
         events: &[Account],
@@ -1093,8 +1202,11 @@ impl StateMachine {
             if !events[index].flags.linked() {
                 if results[index].status == CreateAccountStatus::Created {
                     let mut event = events[index];
-                    event.timestamp = Self::timestamp_event(timestamp, events.len(), index);
-                    self.accounts.insert(event.id, event);
+                    if !event.flags.imported() {
+                        event.timestamp = Self::timestamp_event(timestamp, events.len(), index);
+                    }
+                    assert_eq!(event.timestamp, results[index].timestamp);
+                    self.insert_account(event.id, event);
                 }
                 index += 1;
                 continue;
@@ -1112,13 +1224,28 @@ impl StateMachine {
             if intact {
                 for (offset, event) in events[start..=index].iter().enumerate() {
                     let mut event = *event;
-                    event.timestamp =
-                        Self::timestamp_event(timestamp, events.len(), start + offset);
-                    self.accounts.insert(event.id, event);
+                    if !event.flags.imported() {
+                        event.timestamp =
+                            Self::timestamp_event(timestamp, events.len(), start + offset);
+                    }
+                    assert_eq!(event.timestamp, results[start + offset].timestamp);
+                    self.insert_account(event.id, event);
                 }
             }
             index += 1;
         }
+    }
+
+    /// Insert a committed account, maintaining the timestamp index that
+    /// mirrors the object tree (upstream `accounts.objects.key_range` and
+    /// `accounts.indirect_lookup`).
+    fn insert_account(&mut self, id: u128, account: Account) {
+        assert!(account.timestamp != 0);
+        if let Some(previous) = self.accounts_by_timestamp.insert(account.timestamp, id) {
+            assert_eq!(previous, id, "two accounts cannot share a timestamp");
+        }
+        self.accounts_timestamp_max = self.accounts_timestamp_max.max(account.timestamp);
+        self.accounts.insert(id, account);
     }
 
     /// Persist the transfers that upstream would write under the chain scope.
@@ -1135,8 +1262,11 @@ impl StateMachine {
             if !events[index].flags.linked() {
                 if results[index].status == CreateTransferStatus::Created {
                     let mut event = events[index];
-                    event.timestamp = Self::timestamp_event(timestamp, events.len(), index);
-                    self.transfers.insert(event.id, event);
+                    if !event.flags.imported() {
+                        event.timestamp = Self::timestamp_event(timestamp, events.len(), index);
+                    }
+                    assert_eq!(event.timestamp, results[index].timestamp);
+                    self.insert_transfer(event.id, event);
                 }
                 index += 1;
                 continue;
@@ -1153,13 +1283,28 @@ impl StateMachine {
             if intact {
                 for (offset, event) in events[start..=index].iter().enumerate() {
                     let mut event = *event;
-                    event.timestamp =
-                        Self::timestamp_event(timestamp, events.len(), start + offset);
-                    self.transfers.insert(event.id, event);
+                    if !event.flags.imported() {
+                        event.timestamp =
+                            Self::timestamp_event(timestamp, events.len(), start + offset);
+                    }
+                    assert_eq!(event.timestamp, results[start + offset].timestamp);
+                    self.insert_transfer(event.id, event);
                 }
             }
             index += 1;
         }
+    }
+
+    /// Insert a committed transfer, maintaining the timestamp index that
+    /// mirrors the object tree (upstream `transfers.objects.key_range` and
+    /// `transfers.indirect_lookup`).
+    fn insert_transfer(&mut self, id: u128, transfer: Transfer) {
+        assert!(transfer.timestamp != 0);
+        if let Some(previous) = self.transfers_by_timestamp.insert(transfer.timestamp, id) {
+            assert_eq!(previous, id, "two transfers cannot share a timestamp");
+        }
+        self.transfers_timestamp_max = self.transfers_timestamp_max.max(transfer.timestamp);
+        self.transfers.insert(id, transfer);
     }
 }
 
@@ -1922,7 +2067,7 @@ mod tests {
     #[test]
     fn batch_single_account() {
         let events = vec![Account { id: 1, ledger: 1, code: 1, ..Account::default() }];
-        let results = execute_create_accounts(&events, 10, |_| None);
+        let results = execute_create_accounts(&events, 10, |_| None, 0, |_| None);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].status, CreateAccountStatus::Created);
         assert_eq!(results[0].timestamp, 10);
@@ -1935,7 +2080,7 @@ mod tests {
             Account { id: 2, ledger: 1, code: 1, ..Account::default() },
             Account { id: 3, ledger: 1, code: 1, ..Account::default() },
         ];
-        let results = execute_create_accounts(&events, 10, |_| None);
+        let results = execute_create_accounts(&events, 10, |_| None, 0, |_| None);
         assert_eq!(results.len(), 3);
         assert_eq!(results[0].timestamp, 8);
         assert_eq!(results[1].timestamp, 9);
@@ -1957,7 +2102,7 @@ mod tests {
             },
             Account { id: 2, ledger: 1, code: 1, ..Account::default() },
         ];
-        let results = execute_create_accounts(&events, 10, |_| None);
+        let results = execute_create_accounts(&events, 10, |_| None, 0, |_| None);
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].status, CreateAccountStatus::Created);
         assert_eq!(results[1].status, CreateAccountStatus::Created);
@@ -1975,7 +2120,7 @@ mod tests {
                 ..Account::default()
             },
         ];
-        let results = execute_create_accounts(&events, 10, |_| None);
+        let results = execute_create_accounts(&events, 10, |_| None, 0, |_| None);
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].status, CreateAccountStatus::Created);
         assert_eq!(results[1].status, CreateAccountStatus::LinkedEventChainOpen);
@@ -1985,7 +2130,7 @@ mod tests {
     fn batch_timestamp_must_be_zero() {
         let events =
             vec![Account { id: 1, ledger: 1, code: 1, timestamp: 5, ..Account::default() }];
-        let results = execute_create_accounts(&events, 10, |_| None);
+        let results = execute_create_accounts(&events, 10, |_| None, 0, |_| None);
         assert_eq!(results[0].status, CreateAccountStatus::TimestampMustBeZero);
     }
 
@@ -2002,7 +2147,7 @@ mod tests {
             },
             Account { id: 2, ledger: 1, code: 1, ..Account::default() },
         ];
-        let results = execute_create_accounts(&events, 10, |_| None);
+        let results = execute_create_accounts(&events, 10, |_| None, 0, |_| None);
         assert_eq!(results[0].status, CreateAccountStatus::Created);
         assert_eq!(results[1].status, CreateAccountStatus::ImportedEventExpected);
     }
@@ -2017,7 +2162,7 @@ mod tests {
             timestamp: 15,
             ..Account::default()
         }];
-        let results = execute_create_accounts(&events, 10, |_| None);
+        let results = execute_create_accounts(&events, 10, |_| None, 0, |_| None);
         assert_eq!(results[0].status, CreateAccountStatus::ImportedEventTimestampMustNotAdvance);
     }
 
@@ -2061,9 +2206,169 @@ mod tests {
                     None
                 }
             },
+            0,
+            |_| None,
         );
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].status, CreateTransferStatus::Created);
         assert_eq!(results[1].status, CreateTransferStatus::Created);
+    }
+
+    // ── Imported timestamp validation tests ──────────────────────────────
+
+    fn reply_status(body: &[u8]) -> u32 {
+        u32::from_le_bytes(body[8..12].try_into().unwrap_or([0; 4]))
+    }
+
+    fn reply_status_at(body: &[u8], index: usize) -> u32 {
+        u32::from_le_bytes(body[16 * index + 8..16 * index + 12].try_into().unwrap_or([0; 4]))
+    }
+
+    fn imported_account(id: u128, timestamp: u64) -> Account {
+        Account {
+            id,
+            ledger: 1,
+            code: 1,
+            flags: AccountFlags::IMPORTED,
+            timestamp,
+            ..Account::default()
+        }
+    }
+
+    #[test]
+    fn imported_account_keeps_and_indexes_its_timestamp() {
+        let mut sm = StateMachine::default();
+        let body = sm.create_accounts(&[imported_account(1, 5)], 10);
+        // The account is stored at its imported timestamp, not the batch slot.
+        assert_eq!(u64::from_le_bytes(body[0..8].try_into().unwrap_or([0; 8])), 5);
+        assert_eq!(reply_status(&body), CreateAccountStatus::Created as u32);
+        assert_eq!(sm.accounts.get(&1).expect("stored account").timestamp, 5);
+        assert_eq!(sm.accounts_by_timestamp.get(&5), Some(&1));
+        assert_eq!(sm.accounts_timestamp_max, 5);
+    }
+
+    #[test]
+    fn imported_account_timestamp_must_not_regress() {
+        let mut sm = StateMachine::default();
+        let _ = sm.create_accounts(&[imported_account(1, 5)], 10);
+
+        // Equal timestamp regresses the account index.
+        let body = sm.create_accounts(&[imported_account(2, 5)], 20);
+        assert_eq!(
+            reply_status(&body),
+            CreateAccountStatus::ImportedEventTimestampMustNotRegress as u32
+        );
+        assert_eq!(sm.accounts.len(), 1);
+
+        // A later capacity check: the batch orchestrator tracks within-batch
+        // inserts, so a second imported event going backward is rejected too.
+        // (The reply's first record is legitimately Created; the regression
+        // fires on the second event.)
+        let batch = [imported_account(3, 30), imported_account(4, 25)];
+        let body = sm.create_accounts(&batch, 40);
+        assert_eq!(reply_status_at(&body, 0), CreateAccountStatus::Created as u32);
+        assert_eq!(
+            reply_status_at(&body, 1),
+            CreateAccountStatus::ImportedEventTimestampMustNotRegress as u32
+        );
+        assert_eq!(sm.accounts.len(), 2);
+    }
+
+    #[test]
+    fn imported_account_timestamp_must_not_collide_with_a_transfer() {
+        let mut sm = StateMachine::default();
+        let _ = sm.create_accounts(
+            &[
+                Account { id: 1, ledger: 1, code: 1, ..Account::default() },
+                Account { id: 2, ledger: 1, code: 1, ..Account::default() },
+            ],
+            10,
+        );
+        // The transfer takes batch slot 20.
+        let _ = sm.create_transfers(
+            &[Transfer {
+                id: 1,
+                debit_account_id: 1,
+                credit_account_id: 2,
+                amount: 1,
+                ledger: 1,
+                code: 1,
+                ..Transfer::default()
+            }],
+            20,
+        );
+
+        // An account imported at the transfer's timestamp must not regress
+        // against the transfers index.
+        let body = sm.create_accounts(&[imported_account(3, 20)], 30);
+        assert_eq!(
+            reply_status(&body),
+            CreateAccountStatus::ImportedEventTimestampMustNotRegress as u32
+        );
+    }
+
+    fn imported_transfer(id: u128, timestamp: u64, flags: TransferFlags) -> Transfer {
+        Transfer {
+            id,
+            debit_account_id: 1,
+            credit_account_id: 2,
+            amount: 1,
+            ledger: 1,
+            code: 1,
+            flags,
+            timestamp,
+            ..Transfer::default()
+        }
+    }
+
+    fn accounts_for_transfers(sm: &mut StateMachine) {
+        // Separate batches so the debit account is stamped 10 and the credit
+        // account 20 — a gap that lets the postdate checks fire without the
+        // regression/collision checks (which upstream runs first) colliding.
+        let _ =
+            sm.create_accounts(&[Account { id: 1, ledger: 1, code: 1, ..Account::default() }], 10);
+        let _ =
+            sm.create_accounts(&[Account { id: 2, ledger: 1, code: 1, ..Account::default() }], 20);
+    }
+
+    #[test]
+    fn imported_transfer_timestamp_must_postdate_accounts() {
+        let mut sm = StateMachine::default();
+        accounts_for_transfers(&mut sm);
+
+        // Below the debit account's timestamp (10): debit error.
+        let body = sm.create_transfers(&[imported_transfer(3, 9, TransferFlags::IMPORTED)], 30);
+        assert_eq!(
+            reply_status(&body),
+            CreateTransferStatus::ImportedEventTimestampMustPostdateDebitAccount as u32
+        );
+
+        // Below or equal to the credit account's timestamp (20): credit error.
+        let body = sm.create_transfers(&[imported_transfer(4, 11, TransferFlags::IMPORTED)], 30);
+        assert_eq!(
+            reply_status(&body),
+            CreateTransferStatus::ImportedEventTimestampMustPostdateCreditAccount as u32
+        );
+
+        // A timestamp after both accounts is accepted and stored as-is.
+        let body = sm.create_transfers(&[imported_transfer(5, 21, TransferFlags::IMPORTED)], 30);
+        assert_eq!(reply_status(&body), CreateTransferStatus::Created as u32);
+        assert_eq!(sm.transfers.get(&5).expect("stored transfer").timestamp, 21);
+        assert_eq!(sm.transfers_by_timestamp.get(&21), Some(&5));
+        assert_eq!(sm.transfers_timestamp_max, 21);
+    }
+
+    #[test]
+    fn imported_pending_transfer_timeout_must_be_zero() {
+        let mut sm = StateMachine::default();
+        accounts_for_transfers(&mut sm);
+
+        let timed = imported_transfer(3, 21, TransferFlags::IMPORTED | TransferFlags::PENDING);
+        let timed = Transfer { timeout: 60, ..timed };
+        let body = sm.create_transfers(&[timed], 30);
+        assert_eq!(
+            reply_status(&body),
+            CreateTransferStatus::ImportedEventTimeoutMustBeZero as u32
+        );
     }
 }
