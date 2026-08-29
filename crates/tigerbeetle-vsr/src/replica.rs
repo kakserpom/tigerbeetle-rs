@@ -768,7 +768,12 @@ impl Replica {
             operation,
             ..message_header::Prepare::default()
         };
-        header.set_checksum_body(&[]);
+        // The prepare message spans the header and the request body (upstream
+        // `on_prepare_set_header_from_request`, replica.zig:7343): `size` and
+        // the body checksum cover the batch backups will receive.
+        header.size = message_header::SIZE_U32
+            + u32::try_from(body.len()).unwrap_or_else(|_| unreachable!("request body fits u32"));
+        header.set_checksum_body(body);
         header.set_checksum();
 
         // The primary "self-sends" the prepare through the shared accept path
@@ -809,12 +814,12 @@ impl Replica {
 
         // Replicate the prepare to every backup (upstream: `replicate` →
         // `send_message_to_other_replicas_and_standbys`, replica.zig:8550-8552).
-        // DEVIATION: upstream serializes the request body into the message;
-        // sans-IO the replicated message is header-only, so a backup records an
-        // empty body and cannot execute the op itself (it can still ack and
-        // commit). The body flows into the journal for the primary's own commit.
+        // The message carries the request body, so a backup records and
+        // executes the same batch as the primary. (Repair paths that rebuild a
+        // prepare from headers alone still record an empty body.)
         let mut message = crate::message::Message::new();
         message.set_header(&header);
+        message.set_body(body);
         for _ in 1..self.replica_count {
             self.send_queue.push(message.clone());
         }
@@ -3124,7 +3129,7 @@ impl Replica {
 
         match header.command {
             Command::Request => self.on_request(message),
-            Command::Prepare => self.on_prepare_message(&header),
+            Command::Prepare => self.on_prepare_message(message),
             Command::Commit => self.on_commit(&header, now),
             Command::ExitView => self.on_exit_view(&header),
             Command::JoinView => self.on_join_view(message, now),
@@ -4192,12 +4197,13 @@ impl Replica {
     }
 
     /// Handle a Prepare message from the primary — decode and forward to
-    /// [`Self::on_prepare`], then ack the accepted prepare on the backup.
+    /// [`Self::on_prepare`], record the body, then ack the accepted prepare on
+    /// the backup.
     ///
     /// Upstream: `src/vsr/replica.zig:2021` (`on_prepare`); the ack is sent
     /// from `write_prepare_callback` → `send_prepare_ok` (replica.zig:11225).
-    pub fn on_prepare_message(&mut self, header: &message_header::Header) {
-        let Some(prepare) = header.into_typed::<message_header::Prepare>() else {
+    pub fn on_prepare_message(&mut self, message: &crate::message::Message) {
+        let Some(prepare) = message.header::<message_header::Prepare>() else {
             return; // Command mismatch or invalid header.
         };
         // Upstream ignores prepares sent outside our normal current-view state
@@ -4206,17 +4212,22 @@ impl Replica {
         if self.status != Status::Normal || prepare.view != self.view {
             return;
         }
+        let body = message.body_used();
+        // Receive-time body validation the message bus performs upstream: the
+        // prepare's body checksum must cover the transmitted body.
+        if !prepare.valid_checksum_body(body) {
+            return;
+        }
         match self.on_prepare(&prepare) {
             OnPrepareResult::Accepted => {
+                // The journal records the body alongside the header, so the
+                // commit path executes the same batch as the primary. (Repair
+                // paths rebuild prepares from headers alone and still record an
+                // empty body.)
+                self.journal.set_prepare_body(prepare.op, body);
                 // A backup acks the accepted prepare; the primary contributes
                 // its own prepare_ok on the pipeline path instead (we do not
                 // self-ack here).
-                //
-                // DEVIATION: the replicated Prepare message carries no body
-                // (the sans-IO message layer broadcasts headers only), so the
-                // backup records an empty body and commits the op without its
-                // input batch. TODO(port): decode `message.body_used()` into
-                // `journal.set_prepare_body` once messages carry bodies.
                 if !self.is_primary() {
                     self.send_prepare_ok(&prepare);
                     // Opportunistically repair any gaps this prepare exposed
@@ -6775,6 +6786,53 @@ mod tests {
         let results = r.client_send_queue.last().expect("banking reply").body_used();
         assert_eq!(results.len(), 16, "one result per event");
         assert_eq!(u64::from_le_bytes(results[0..8].try_into().unwrap()), 2, "event timestamp");
+        assert_eq!(
+            u32::from_le_bytes(results[8..12].try_into().unwrap()),
+            CreateAccountStatus::Created as u32
+        );
+    }
+
+    #[test]
+    fn backup_records_and_executes_replicated_prepare_body() {
+        // Two-node cluster: the lone backup is deterministically the reply to
+        // every client op, so its commit executes the same batch the primary
+        // prepared.
+        let mut primary = Replica::new(CLUSTER, 0, 2);
+        primary.status = Status::Normal;
+        let mut backup = Replica::new(CLUSTER, 1, 2);
+        backup.status = Status::Normal;
+
+        // The primary prepares a body-ful create_accounts; the replicated
+        // message carries the body and a checksum covering it.
+        let accounts = [Account { id: 9, ledger: 1, code: 1, ..Account::default() }];
+        let body = crate::state_machine::account_batch_to_bytes(&accounts);
+        let op = primary
+            .primary_pipeline_prepare(7, 1, crate::Operation::CREATE_ACCOUNTS, &body, 0)
+            .unwrap();
+        assert_eq!(op, 1);
+
+        let broadcast = primary.send_queue.pop().expect("prepare broadcast");
+        let prepare = broadcast.header::<message_header::Prepare>().expect("prepare header");
+        assert_eq!(prepare.size, message_header::SIZE_U32 + body.len() as u32);
+        assert!(prepare.valid_checksum_body(broadcast.body_used()));
+        assert_eq!(broadcast.body_used(), &body[..]);
+
+        // The backup accepts the prepare and records the body in its journal.
+        backup.on_message(&broadcast, 0);
+        assert_eq!(backup.op, 1);
+        assert_eq!(backup.journal.body_with_op(1), Some(&body[..]));
+        assert_eq!(primary.journal.body_with_op(1), Some(&body[..]));
+
+        // Committing on the backup executes the real batch; being the sole
+        // backup it replies to the client with the created result.
+        backup.commit_max = 1;
+        backup.commit_prepare = Some(1);
+        backup.commit_stage = CommitStage::Execute;
+        backup.commit_execute();
+
+        let reply = backup.client_send_queue.last().expect("reply");
+        let results = reply.body_used();
+        assert_eq!(results.len(), 16, "one result per event");
         assert_eq!(
             u32::from_le_bytes(results[8..12].try_into().unwrap()),
             CreateAccountStatus::Created as u32
