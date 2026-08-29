@@ -164,10 +164,14 @@ pub fn create_transfer(
         return create_transfer_exists(t, e);
     }
 
-    // Post/void pending transfers are handled separately.
-    if t.flags.post_pending_transfer() || t.flags.void_pending_transfer() {
-        return CreateTransferStatus::DeprecatedOk;
-    }
+    // Post/void pending transfers are dispatched upstream inside `create_transfer`
+    // (`state_machine.zig:3744-3746`); in this port the orchestrator
+    // (`execute_create_transfers`) routes them to `post_or_void_pending_transfer`
+    // before calling this helper, so a plain creation must never carry those flags.
+    assert!(
+        !t.flags.post_pending_transfer() && !t.flags.void_pending_transfer(),
+        "post/void transfers are handled by post_or_void_pending_transfer"
+    );
 
     if t.debit_account_id == 0 {
         return CreateTransferStatus::DebitAccountIdMustNotBeZero;
