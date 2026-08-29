@@ -287,6 +287,104 @@ const _: () = assert!(core::mem::size_of::<AccountEvent>() == 256);
 const _: () = assert!(core::mem::align_of::<AccountEvent>() == 16);
 
 // ---------------------------------------------------------------------------
+// ChangeEvent
+// ---------------------------------------------------------------------------
+
+/// The kind of balance-level change a [`ChangeEvent`] records.
+///
+/// Upstream: `src/tigerbeetle.zig:614`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ChangeEventType {
+    #[default]
+    SinglePhase = 0,
+    TwoPhasePending = 1,
+    TwoPhasePosted = 2,
+    TwoPhaseVoided = 3,
+    TwoPhaseExpired = 4,
+}
+
+const _: () = assert!(core::mem::size_of::<ChangeEventType>() == 1);
+
+/// A single account-balance change returned by `get_change_events` (384 bytes,
+/// 16-byte aligned — the size of one transfer plus two accounts).
+///
+/// Upstream: `src/tigerbeetle.zig:622`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
+pub struct ChangeEvent {
+    pub transfer_id: u128,
+    pub transfer_amount: u128,
+    pub transfer_pending_id: u128,
+    pub transfer_user_data_128: u128,
+    pub transfer_user_data_64: u64,
+    pub transfer_user_data_32: u32,
+    pub transfer_timeout: u32,
+    pub transfer_code: u16,
+    pub transfer_flags: TransferFlags,
+
+    pub ledger: u32,
+    pub r#type: ChangeEventType,
+    pub reserved: [u8; 39],
+
+    pub debit_account_id: u128,
+    pub debit_account_debits_pending: u128,
+    pub debit_account_debits_posted: u128,
+    pub debit_account_credits_pending: u128,
+    pub debit_account_credits_posted: u128,
+    pub debit_account_user_data_128: u128,
+    pub debit_account_user_data_64: u64,
+    pub debit_account_user_data_32: u32,
+    pub debit_account_code: u16,
+    pub debit_account_flags: AccountFlags,
+
+    pub credit_account_id: u128,
+    pub credit_account_debits_pending: u128,
+    pub credit_account_debits_posted: u128,
+    pub credit_account_credits_pending: u128,
+    pub credit_account_credits_posted: u128,
+    pub credit_account_user_data_128: u128,
+    pub credit_account_user_data_64: u64,
+    pub credit_account_user_data_32: u32,
+    pub credit_account_code: u16,
+    pub credit_account_flags: AccountFlags,
+
+    pub timestamp: u64,
+    pub transfer_timestamp: u64,
+    pub debit_account_timestamp: u64,
+    pub credit_account_timestamp: u64,
+}
+
+const _: () = assert!(core::mem::size_of::<ChangeEvent>() == 384);
+const _: () = assert!(core::mem::align_of::<ChangeEvent>() == 16);
+const _: () = assert!(core::mem::align_of::<ChangeEvent>() == 16);
+
+// ---------------------------------------------------------------------------
+// ChangeEventsFilter
+// ---------------------------------------------------------------------------
+
+/// Query filter for `get_change_events` (64 bytes). A zero bound is
+/// "unbounded"; `limit != 0` is required.
+///
+/// Upstream: `src/tigerbeetle.zig:672`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
+pub struct ChangeEventsFilter {
+    pub timestamp_min: u64,
+    pub timestamp_max: u64,
+    pub limit: u32,
+    pub reserved: [u8; 44],
+}
+
+impl Default for ChangeEventsFilter {
+    fn default() -> Self {
+        Self { timestamp_min: 0, timestamp_max: 0, limit: 0, reserved: [0; 44] }
+    }
+}
+
+const _: () = assert!(core::mem::size_of::<ChangeEventsFilter>() == 64);
+
+// ---------------------------------------------------------------------------
 // TransferFlags
 // ---------------------------------------------------------------------------
 

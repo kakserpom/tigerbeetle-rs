@@ -32,8 +32,9 @@
 use std::collections::HashMap;
 
 use tigerbeetle_core::types::{
-    Account, AccountEvent, AccountFlags, CreateAccountStatus, CreateTransferStatus, Transfer,
-    TransferFlags, TransferPending, TransferPendingStatus,
+    Account, AccountEvent, AccountFlags, ChangeEvent, ChangeEventType, ChangeEventsFilter,
+    CreateAccountStatus, CreateTransferStatus, Transfer, TransferFlags, TransferPending,
+    TransferPendingStatus,
 };
 
 use crate::Operation;
@@ -1539,6 +1540,71 @@ pub fn bytes_to_transfer_batch(bytes: &[u8]) -> Option<Vec<Transfer>> {
     Some(events)
 }
 
+/// Decode a request body into a single [`ChangeEventsFilter`] (64 bytes).
+///
+/// Returns `None` unless the body is exactly one filter record.
+#[must_use]
+pub fn bytes_to_change_events_filter(bytes: &[u8]) -> Option<ChangeEventsFilter> {
+    if bytes.len() != 64 {
+        return None;
+    }
+    let mut reserved = [0_u8; 44];
+    reserved.copy_from_slice(&bytes[20..64]);
+    Some(ChangeEventsFilter {
+        timestamp_min: le_u64(bytes, 0),
+        timestamp_max: le_u64(bytes, 8),
+        limit: le_u32(bytes, 16),
+        reserved,
+    })
+}
+
+/// Encode a [`ChangeEvent`] as a 384-byte reply record (LE).
+///
+/// Upstream `ChangeEvent` (`tigerbeetle.zig:622`) layout; the `reserved` and
+/// flag fields occupy fixed offsets so the wire order must be explicit.
+#[must_use]
+pub fn change_bytes(event: &ChangeEvent) -> [u8; 384] {
+    let mut r = [0_u8; 384];
+    let mut put = |off: usize, bytes: &[u8]| r[off..off + bytes.len()].copy_from_slice(bytes);
+    put(0, &event.transfer_id.to_le_bytes());
+    put(16, &event.transfer_amount.to_le_bytes());
+    put(32, &event.transfer_pending_id.to_le_bytes());
+    put(48, &event.transfer_user_data_128.to_le_bytes());
+    put(64, &event.transfer_user_data_64.to_le_bytes());
+    put(72, &event.transfer_user_data_32.to_le_bytes());
+    put(76, &event.transfer_timeout.to_le_bytes());
+    put(80, &event.transfer_code.to_le_bytes());
+    put(82, &event.transfer_flags.as_raw().to_le_bytes());
+    put(84, &event.ledger.to_le_bytes());
+    put(88, &[event.r#type as u8]);
+    put(89, &event.reserved);
+    put(128, &event.debit_account_id.to_le_bytes());
+    put(144, &event.debit_account_debits_pending.to_le_bytes());
+    put(160, &event.debit_account_debits_posted.to_le_bytes());
+    put(176, &event.debit_account_credits_pending.to_le_bytes());
+    put(192, &event.debit_account_credits_posted.to_le_bytes());
+    put(208, &event.debit_account_user_data_128.to_le_bytes());
+    put(224, &event.debit_account_user_data_64.to_le_bytes());
+    put(232, &event.debit_account_user_data_32.to_le_bytes());
+    put(236, &event.debit_account_code.to_le_bytes());
+    put(238, &event.debit_account_flags.as_raw().to_le_bytes());
+    put(240, &event.credit_account_id.to_le_bytes());
+    put(256, &event.credit_account_debits_pending.to_le_bytes());
+    put(272, &event.credit_account_debits_posted.to_le_bytes());
+    put(288, &event.credit_account_credits_pending.to_le_bytes());
+    put(304, &event.credit_account_credits_posted.to_le_bytes());
+    put(320, &event.credit_account_user_data_128.to_le_bytes());
+    put(336, &event.credit_account_user_data_64.to_le_bytes());
+    put(344, &event.credit_account_user_data_32.to_le_bytes());
+    put(348, &event.credit_account_code.to_le_bytes());
+    put(350, &event.credit_account_flags.as_raw().to_le_bytes());
+    put(352, &event.timestamp.to_le_bytes());
+    put(360, &event.transfer_timestamp.to_le_bytes());
+    put(368, &event.debit_account_timestamp.to_le_bytes());
+    put(376, &event.credit_account_timestamp.to_le_bytes());
+    r
+}
+
 /// Encode a batch of [`CreateAccountResult`]s as a reply body: one 16-byte
 /// record per event — `timestamp` LE, `status` LE (a `u32`), `reserved`
 /// zeroed. Upstream `CreateAccountResult` (`tigerbeetle.zig:471`).
@@ -1604,13 +1670,11 @@ pub struct StateMachine {
     transfers_pending: HashMap<u64, TransferPending>,
     /// Change-data-capture store of account balance changes, keyed by event
     /// timestamp. Mirrors upstream's `account_events.objects` groove (written
-    /// from [`Self::account_event`], upstream `state_machine.zig:4384`).
-    /// TODO(port): `get_change_events` scans (the CDC read path) are deferred.
+    /// from [`Self::account_event`], read by [`Self::get_change_events`]).
     account_events: HashMap<u64, AccountEvent>,
     /// CDC index: account timestamp → event timestamps in increasing order,
     /// for accounts with `AccountFlags::HISTORY`. Mirrors upstream's
-    /// `account_events.indexes.account_timestamp` derived index (only the
-    /// writes; the scan that answers `get_change_events` is deferred).
+    /// `account_events.indexes.account_timestamp` derived index.
     account_events_index: HashMap<u64, Vec<u64>>,
 }
 
@@ -1652,6 +1716,12 @@ impl StateMachine {
                     unreachable!("create_transfers body must encode whole Transfer events");
                 };
                 self.create_transfers(&events, timestamp)
+            }
+            Operation::GET_CHANGE_EVENTS => {
+                let Some(filter) = bytes_to_change_events_filter(body) else {
+                    unreachable!("get_change_events body must be a single ChangeEventsFilter");
+                };
+                self.get_change_events(&filter)
             }
             operation => unreachable!("unsupported state-machine operation: {operation:?}"),
         }
@@ -1699,6 +1769,143 @@ impl StateMachine {
         );
         self.persist_transfers(events, &results, timestamp);
         transfer_results_to_bytes(&results)
+    }
+
+    /// Execute a `get_change_events` query and return the reply body.
+    ///
+    /// Sweeps the change-data-capture events whose timestamps fall in
+    /// `[timestamp_min, timestamp_max]` (a zero bound is unbounded) in
+    /// ascending order, up to `filter.limit` events, and encodes each as a
+    /// [`ChangeEvent`] (upstream `execute_get_change_events`,
+    /// `state_machine.zig:3395`).
+    ///
+    /// Every recorded event references a committed transfer; a post/void
+    /// resolves its referenced pending transfer from the committed store.
+    ///
+    /// DEVIATION: upstream drives this through an async scan over the
+    /// `account_events` object groove plus account/transfer prefetch
+    /// (state_machine.zig:2198-2380). Sans-IO the store is a plain map and the
+    /// scan is synchronous; the produced [`ChangeEvent`]s are identical.
+    #[must_use]
+    pub fn get_change_events(&self, filter: &ChangeEventsFilter) -> Vec<u8> {
+        debug_assert!(
+            filter.reserved.iter().all(|&b| b == 0),
+            "reserved bits must be zero: filter validated upstream"
+        );
+        let min = if filter.timestamp_min == 0 { u64::MIN } else { filter.timestamp_min };
+        let max = if filter.timestamp_max == 0 { u64::MAX } else { filter.timestamp_max };
+        assert!(min <= max, "timestamp_max must not be less than timestamp_min");
+        assert!(filter.limit != 0, "limit must not be zero");
+
+        let mut events: Vec<&AccountEvent> = self
+            .account_events
+            .iter()
+            .filter(|&(&ts, _)| ts >= min && ts <= max)
+            .map(|(_, e)| e)
+            .collect();
+        events.sort_unstable_by_key(|e| e.timestamp);
+        events.truncate(filter.limit as usize);
+
+        let mut reply = Vec::with_capacity(events.len() * 384);
+        for result in events {
+            let change = self.build_change_event(result);
+            reply.extend_from_slice(&change_bytes(&change));
+        }
+        reply
+    }
+
+    /// Build the [`ChangeEvent`] reported for a recorded account event
+    /// (upstream `get_change_event`, `state_machine.zig:3424-3527`).
+    #[must_use]
+    fn build_change_event(&self, result: &AccountEvent) -> ChangeEvent {
+        let transfer = self
+            .transfers_by_timestamp
+            .get(&result.timestamp)
+            .and_then(|id| self.transfers.get(id))
+            .copied()
+            .expect("each account event references a committed transfer");
+        let dr_account =
+            self.accounts.get(&result.dr_account_id).copied().expect("debit account committed");
+        let cr_account =
+            self.accounts.get(&result.cr_account_id).copied().expect("credit account committed");
+        assert_eq!(transfer.debit_account_id, dr_account.id);
+        assert_eq!(transfer.credit_account_id, cr_account.id);
+        assert_eq!(transfer.ledger, result.ledger);
+        assert_eq!(dr_account.ledger, result.ledger);
+        assert_eq!(cr_account.ledger, result.ledger);
+
+        // For expiry events the event timestamp carries no transfer, but expiry
+        // writes are deferred; every recorded event here is timestamp-linked.
+        let event_type: ChangeEventType = match result.transfer_pending_status {
+            TransferPendingStatus::None => {
+                assert_eq!(transfer.timestamp, result.timestamp);
+                assert!(!transfer.flags.pending());
+                assert!(!transfer.flags.post_pending_transfer());
+                assert!(!transfer.flags.void_pending_transfer());
+                assert_eq!(transfer.pending_id, 0);
+                ChangeEventType::SinglePhase
+            }
+            TransferPendingStatus::Pending => {
+                assert_eq!(transfer.timestamp, result.timestamp);
+                assert!(transfer.flags.pending());
+                assert_eq!(transfer.pending_id, 0);
+                ChangeEventType::TwoPhasePending
+            }
+            TransferPendingStatus::Posted => {
+                assert_eq!(transfer.timestamp, result.timestamp);
+                assert!(transfer.flags.post_pending_transfer());
+                assert_eq!(transfer.pending_id, result.transfer_pending_id);
+                ChangeEventType::TwoPhasePosted
+            }
+            TransferPendingStatus::Voided => {
+                assert_eq!(transfer.timestamp, result.timestamp);
+                assert!(transfer.flags.void_pending_transfer());
+                assert_eq!(transfer.pending_id, result.transfer_pending_id);
+                ChangeEventType::TwoPhaseVoided
+            }
+            TransferPendingStatus::Expired => {
+                unreachable!("expired account events are written by the deferred expiry")
+            }
+        };
+
+        ChangeEvent {
+            transfer_id: transfer.id,
+            transfer_amount: result.amount,
+            transfer_pending_id: transfer.pending_id,
+            transfer_user_data_128: transfer.user_data_128,
+            transfer_user_data_64: transfer.user_data_64,
+            transfer_user_data_32: transfer.user_data_32,
+            transfer_timeout: transfer.timeout,
+            transfer_code: transfer.code,
+            transfer_flags: transfer.flags,
+            ledger: result.ledger,
+            r#type: event_type,
+            reserved: [0; 39],
+            debit_account_id: dr_account.id,
+            debit_account_debits_pending: result.dr_debits_pending,
+            debit_account_debits_posted: result.dr_debits_posted,
+            debit_account_credits_pending: result.dr_credits_pending,
+            debit_account_credits_posted: result.dr_credits_posted,
+            debit_account_user_data_128: dr_account.user_data_128,
+            debit_account_user_data_64: dr_account.user_data_64,
+            debit_account_user_data_32: dr_account.user_data_32,
+            debit_account_code: dr_account.code,
+            debit_account_flags: result.dr_account_flags,
+            credit_account_id: cr_account.id,
+            credit_account_debits_pending: result.cr_debits_pending,
+            credit_account_debits_posted: result.cr_debits_posted,
+            credit_account_credits_pending: result.cr_credits_pending,
+            credit_account_credits_posted: result.cr_credits_posted,
+            credit_account_user_data_128: cr_account.user_data_128,
+            credit_account_user_data_64: cr_account.user_data_64,
+            credit_account_user_data_32: cr_account.user_data_32,
+            credit_account_code: cr_account.code,
+            credit_account_flags: result.cr_account_flags,
+            timestamp: result.timestamp,
+            transfer_timestamp: transfer.timestamp,
+            debit_account_timestamp: dr_account.timestamp,
+            credit_account_timestamp: cr_account.timestamp,
+        }
     }
 
     /// The implied timestamp of the event at `index` (upstream
@@ -3978,5 +4185,208 @@ mod tests {
         assert_eq!(sm.account_events_index.get(&19), Some(&vec![39, 40]));
         // The store mirrors the object groove: one event per timestamp.
         assert_eq!(sm.account_events.len(), 2);
+    }
+
+    // ── get_change_events tests ──────────────────────────────────────────
+
+    /// Decode a single `ChangeEvent` from the reply body offset `i`.
+    fn change_event_at(body: &[u8], i: usize) -> ChangeEvent {
+        let r = &body[i * 384..(i + 1) * 384];
+        ChangeEvent {
+            transfer_id: u128::from_le_bytes(r[0..16].try_into().unwrap_or([0; 16])),
+            transfer_amount: u128::from_le_bytes(r[16..32].try_into().unwrap_or([0; 16])),
+            transfer_pending_id: u128::from_le_bytes(r[32..48].try_into().unwrap_or([0; 16])),
+            transfer_user_data_128: u128::from_le_bytes(r[48..64].try_into().unwrap_or([0; 16])),
+            transfer_user_data_64: u64::from_le_bytes(r[64..72].try_into().unwrap_or([0; 8])),
+            transfer_user_data_32: u32::from_le_bytes(r[72..76].try_into().unwrap_or([0; 4])),
+            transfer_timeout: u32::from_le_bytes(r[76..80].try_into().unwrap_or([0; 4])),
+            transfer_code: u16::from_le_bytes(r[80..82].try_into().unwrap_or([0; 2])),
+            transfer_flags: TransferFlags::from_raw(u16::from_le_bytes(
+                r[82..84].try_into().unwrap_or([0; 2]),
+            )),
+            ledger: u32::from_le_bytes(r[84..88].try_into().unwrap_or([0; 4])),
+            r#type: match r[88] {
+                0 => ChangeEventType::SinglePhase,
+                1 => ChangeEventType::TwoPhasePending,
+                2 => ChangeEventType::TwoPhasePosted,
+                3 => ChangeEventType::TwoPhaseVoided,
+                4 => ChangeEventType::TwoPhaseExpired,
+                other => unreachable!("invalid ChangeEventType: {other}"),
+            },
+            reserved: r[89..128].try_into().unwrap_or([0; 39]),
+            debit_account_id: u128::from_le_bytes(r[128..144].try_into().unwrap_or([0; 16])),
+            debit_account_debits_pending: u128::from_le_bytes(
+                r[144..160].try_into().unwrap_or([0; 16]),
+            ),
+            debit_account_debits_posted: u128::from_le_bytes(
+                r[160..176].try_into().unwrap_or([0; 16]),
+            ),
+            debit_account_credits_pending: u128::from_le_bytes(
+                r[176..192].try_into().unwrap_or([0; 16]),
+            ),
+            debit_account_credits_posted: u128::from_le_bytes(
+                r[192..208].try_into().unwrap_or([0; 16]),
+            ),
+            debit_account_user_data_128: u128::from_le_bytes(
+                r[208..224].try_into().unwrap_or([0; 16]),
+            ),
+            debit_account_user_data_64: u64::from_le_bytes(
+                r[224..232].try_into().unwrap_or([0; 8]),
+            ),
+            debit_account_user_data_32: u32::from_le_bytes(
+                r[232..236].try_into().unwrap_or([0; 4]),
+            ),
+            debit_account_code: u16::from_le_bytes(r[236..238].try_into().unwrap_or([0; 2])),
+            debit_account_flags: AccountFlags::from_raw(u16::from_le_bytes(
+                r[238..240].try_into().unwrap_or([0; 2]),
+            )),
+            credit_account_id: u128::from_le_bytes(r[240..256].try_into().unwrap_or([0; 16])),
+            credit_account_debits_pending: u128::from_le_bytes(
+                r[256..272].try_into().unwrap_or([0; 16]),
+            ),
+            credit_account_debits_posted: u128::from_le_bytes(
+                r[272..288].try_into().unwrap_or([0; 16]),
+            ),
+            credit_account_credits_pending: u128::from_le_bytes(
+                r[288..304].try_into().unwrap_or([0; 16]),
+            ),
+            credit_account_credits_posted: u128::from_le_bytes(
+                r[304..320].try_into().unwrap_or([0; 16]),
+            ),
+            credit_account_user_data_128: u128::from_le_bytes(
+                r[320..336].try_into().unwrap_or([0; 16]),
+            ),
+            credit_account_user_data_64: u64::from_le_bytes(
+                r[336..344].try_into().unwrap_or([0; 8]),
+            ),
+            credit_account_user_data_32: u32::from_le_bytes(
+                r[344..348].try_into().unwrap_or([0; 4]),
+            ),
+            credit_account_code: u16::from_le_bytes(r[348..350].try_into().unwrap_or([0; 2])),
+            credit_account_flags: AccountFlags::from_raw(u16::from_le_bytes(
+                r[350..352].try_into().unwrap_or([0; 2]),
+            )),
+            timestamp: u64::from_le_bytes(r[352..360].try_into().unwrap_or([0; 8])),
+            transfer_timestamp: u64::from_le_bytes(r[360..368].try_into().unwrap_or([0; 8])),
+            debit_account_timestamp: u64::from_le_bytes(r[368..376].try_into().unwrap_or([0; 8])),
+            credit_account_timestamp: u64::from_le_bytes(r[376..384].try_into().unwrap_or([0; 8])),
+        }
+    }
+
+    fn change_filter(timestamp_min: u64, timestamp_max: u64, limit: u32) -> ChangeEventsFilter {
+        ChangeEventsFilter { timestamp_min, timestamp_max, limit, reserved: [0; 44] }
+    }
+
+    #[test]
+    fn get_change_events_returns_single_phase_event() {
+        let mut sm = StateMachine::default();
+        let _ = sm.create_accounts(
+            &[
+                Account { id: 1, ledger: 1, code: 1, ..Account::default() },
+                Account { id: 2, ledger: 1, code: 1, ..Account::default() },
+            ],
+            10,
+        );
+        let _ = sm.create_transfers(&[t(1, 2, 7)], 20);
+
+        let body = sm.get_change_events(&change_filter(0, 0, 100));
+        assert_eq!(body.len(), 384);
+        let e = change_event_at(&body, 0);
+        assert_eq!(e.timestamp, 20);
+        assert_eq!(e.transfer_id, 1002);
+        assert_eq!(e.transfer_timestamp, 20);
+        assert_eq!(e.r#type, ChangeEventType::SinglePhase);
+        assert_eq!(e.debit_account_id, 1);
+        assert_eq!(e.credit_account_id, 2);
+        assert_eq!(e.debit_account_timestamp, 9);
+        assert_eq!(e.credit_account_timestamp, 10);
+        assert_eq!(e.debit_account_debits_posted, 7);
+        assert_eq!(e.credit_account_credits_posted, 7);
+        assert_eq!(e.transfer_amount, 7);
+    }
+
+    #[test]
+    fn get_change_events_returns_pending_and_post_events_in_order() {
+        let mut sm = StateMachine::default();
+        let _ = sm.create_accounts(
+            &[
+                Account { id: 1, ledger: 1, code: 1, ..Account::default() },
+                Account { id: 2, ledger: 1, code: 1, ..Account::default() },
+            ],
+            10,
+        );
+        // Pending at 20, then a post at 30 (separate batch).
+        let pending = Transfer { flags: TransferFlags::PENDING, ..t(1, 2, 50) };
+        let _ = sm.create_transfers(&[pending], 20);
+        let _ = sm.create_transfers(&[post_event(3, u128::MAX)], 30);
+
+        let body = sm.get_change_events(&change_filter(0, 0, 100));
+        assert_eq!(body.len(), 2 * 384);
+        let pending_event = change_event_at(&body, 0);
+        let post_event_ = change_event_at(&body, 1);
+        assert_eq!(pending_event.r#type, ChangeEventType::TwoPhasePending);
+        assert_eq!(pending_event.timestamp, 20);
+        assert_eq!(post_event_.r#type, ChangeEventType::TwoPhasePosted);
+        assert_eq!(post_event_.timestamp, 30);
+        assert_eq!(post_event_.transfer_pending_id, pending_transfer_id());
+        assert_eq!(post_event_.transfer_amount, 50);
+        assert_eq!(post_event_.debit_account_debits_posted, 50);
+        assert_eq!(post_event_.debit_account_debits_pending, 0);
+    }
+
+    #[test]
+    fn get_change_events_respects_timestamp_range_and_limit() {
+        let mut sm = StateMachine::default();
+        let _ = sm.create_accounts(
+            &[
+                Account { id: 1, ledger: 1, code: 1, ..Account::default() },
+                Account { id: 2, ledger: 1, code: 1, ..Account::default() },
+            ],
+            10,
+        );
+        // Two events at timestamps 20 (single), 40 (pending).
+        let _ = sm.create_transfers(&[t(1, 2, 1)], 20);
+        let pending = Transfer { id: 1003, flags: TransferFlags::PENDING, ..t(1, 2, 2) };
+        let _ = sm.create_transfers(&[pending], 40);
+
+        // Range [20, 20] → only the first.
+        let body = sm.get_change_events(&change_filter(20, 20, 100));
+        assert_eq!(body.len(), 384);
+        assert_eq!(change_event_at(&body, 0).timestamp, 20);
+
+        // Range starting at 21 → only the second.
+        let body = sm.get_change_events(&change_filter(21, 0, 100));
+        assert_eq!(body.len(), 384);
+        assert_eq!(change_event_at(&body, 0).timestamp, 40);
+
+        // Limit 1 → only the first (ascending order).
+        let body = sm.get_change_events(&change_filter(0, 0, 1));
+        assert_eq!(body.len(), 384);
+        assert_eq!(change_event_at(&body, 0).timestamp, 20);
+    }
+
+    #[test]
+    fn get_change_events_via_execute_decodes_filter() {
+        let mut sm = StateMachine::default();
+        let _ = sm.create_accounts(
+            &[
+                Account { id: 1, ledger: 1, code: 1, ..Account::default() },
+                Account { id: 2, ledger: 1, code: 1, ..Account::default() },
+            ],
+            10,
+        );
+        let _ = sm.create_transfers(&[t(1, 2, 7)], 20);
+
+        // Encode the filter and route through `execute` like the replica would.
+        let filter = change_filter(0, 0, 100);
+        let mut body_bytes = Vec::with_capacity(64);
+        body_bytes.extend_from_slice(&filter.timestamp_min.to_le_bytes());
+        body_bytes.extend_from_slice(&filter.timestamp_max.to_le_bytes());
+        body_bytes.extend_from_slice(&filter.limit.to_le_bytes());
+        body_bytes.extend_from_slice(&[0_u8; 44]);
+
+        let reply = sm.execute(Operation::GET_CHANGE_EVENTS, 0, &body_bytes);
+        assert_eq!(reply.len(), 384);
+        assert_eq!(change_event_at(&reply, 0).timestamp, 20);
     }
 }

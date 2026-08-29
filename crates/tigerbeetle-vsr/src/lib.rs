@@ -84,6 +84,9 @@ impl Operation {
     /// Port of `tigerbeetle.zig::Operation.create_transfers`.
     pub const CREATE_TRANSFERS: Self =
         Self(tigerbeetle_core::constants::VSR_OPERATIONS_RESERVED + 19);
+    /// Port of `tigerbeetle.zig::Operation.get_change_events`.
+    pub const GET_CHANGE_EVENTS: Self =
+        Self(tigerbeetle_core::constants::VSR_OPERATIONS_RESERVED + 9);
 
     // Operations <vsr_operations_reserved are reserved for the control plane.
     // Operations ≥vsr_operations_reserved are available for the state machine.
