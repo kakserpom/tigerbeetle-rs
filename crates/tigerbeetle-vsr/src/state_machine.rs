@@ -1562,6 +1562,18 @@ pub fn bytes_to_change_events_filter(bytes: &[u8]) -> Option<ChangeEventsFilter>
     })
 }
 
+/// Parse a `lookup_accounts`/`lookup_transfers` request body: a batch of
+/// `u128` ids (8 bytes each, LE), exactly dividing the buffer.
+#[must_use]
+fn bytes_to_lookup_ids(bytes: &[u8]) -> Option<Vec<u128>> {
+    if !bytes.len().is_multiple_of(16) {
+        return None;
+    }
+    let (chunks, remainder) = bytes.as_chunks::<16>();
+    assert!(remainder.is_empty());
+    Some(chunks.iter().map(|c| le_u128(c, 0)).collect())
+}
+
 /// Encode a [`ChangeEvent`] as a 384-byte reply record (LE).
 ///
 /// Upstream `ChangeEvent` (`tigerbeetle.zig:622`) layout; the `reserved` and
@@ -1725,6 +1737,18 @@ impl StateMachine {
                 };
                 self.get_change_events(&filter)
             }
+            Operation::LOOKUP_ACCOUNTS => {
+                let Some(ids) = bytes_to_lookup_ids(body) else {
+                    unreachable!("lookup_accounts body must encode whole u128 ids");
+                };
+                self.lookup_accounts(&ids)
+            }
+            Operation::LOOKUP_TRANSFERS => {
+                let Some(ids) = bytes_to_lookup_ids(body) else {
+                    unreachable!("lookup_transfers body must encode whole u128 ids");
+                };
+                self.lookup_transfers(&ids)
+            }
             operation => unreachable!("unsupported state-machine operation: {operation:?}"),
         }
     }
@@ -1771,6 +1795,42 @@ impl StateMachine {
         );
         self.persist_transfers(events, &results, timestamp);
         transfer_results_to_bytes(&results)
+    }
+
+    /// Execute a `lookup_accounts` query and return the reply body (upstream
+    /// `execute_lookup_accounts`, `state_machine.zig:3255`).
+    ///
+    /// The request is a batch of account ids (`u128` each). The reply is the
+    /// compact list of the accounts that exist, in request order (ids that do
+    /// not exist are omitted). This is a read operation and does not advance
+    /// `commit_timestamp`.
+    #[must_use]
+    pub fn lookup_accounts(&self, ids: &[u128]) -> Vec<u8> {
+        let mut results: Vec<Account> = Vec::new();
+        for &id in ids {
+            if let Some(account) = self.accounts.get(&id) {
+                results.push(*account);
+            }
+        }
+        account_batch_to_bytes(&results)
+    }
+
+    /// Execute a `lookup_transfers` query and return the reply body (upstream
+    /// `execute_lookup_transfers`, `state_machine.zig:3275`).
+    ///
+    /// The request is a batch of transfer ids (`u128` each). The reply is the
+    /// compact list of the transfers that exist, in request order (ids that do
+    /// not exist are omitted). This is a read operation and does not advance
+    /// `commit_timestamp`.
+    #[must_use]
+    pub fn lookup_transfers(&self, ids: &[u128]) -> Vec<u8> {
+        let mut results: Vec<Transfer> = Vec::new();
+        for &id in ids {
+            if let Some(transfer) = self.transfers.get(&id) {
+                results.push(*transfer);
+            }
+        }
+        transfer_batch_to_bytes(&results)
     }
 
     /// Execute a `get_change_events` query and return the reply body.
@@ -4717,5 +4777,88 @@ mod tests {
         // Debts cleared, nothing posted.
         assert_eq!(expired.debit_account_debits_posted, 0);
         assert_eq!(expired.credit_account_credits_posted, 0);
+    }
+
+    // ── lookup_accounts / lookup_transfers tests ─────────────────────────
+
+    #[test]
+    fn lookup_accounts_returns_matching_accounts_in_request_order() {
+        let mut sm = StateMachine::default();
+        let _ = sm.create_accounts(
+            &[
+                Account { id: 1, ledger: 1, code: 1, ..Account::default() },
+                Account { id: 2, ledger: 1, code: 1, ..Account::default() },
+                Account { id: 3, ledger: 1, code: 1, ..Account::default() },
+            ],
+            30,
+        );
+
+        // Out-of-order request, with a missing id (99) omitted.
+        let reply = sm.lookup_accounts(&[3, 99, 1, 2]);
+        let results = bytes_to_account_batch(&reply).expect("valid account batch");
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].id, 3);
+        assert_eq!(results[1].id, 1);
+        assert_eq!(results[2].id, 2);
+        // Accounts keep their committed timestamps (account 2 <- 30 - 3 + 1).
+        assert_eq!(results[2].timestamp, 29);
+    }
+
+    #[test]
+    fn lookup_accounts_empty_when_nothing_matches() {
+        let sm = StateMachine::default();
+        let reply = sm.lookup_accounts(&[1, 2]);
+        assert!(reply.is_empty());
+    }
+
+    #[test]
+    fn lookup_transfers_returns_matching_transfers_in_request_order() {
+        let mut sm = StateMachine::default();
+        let _ = sm.create_accounts(
+            &[
+                Account { id: 1, ledger: 1, code: 1, ..Account::default() },
+                Account { id: 2, ledger: 1, code: 1, ..Account::default() },
+            ],
+            10,
+        );
+        // Transfer id 1002 = t(1,2,1), plus a second transfer 1003 -> t(1,2,2).
+        let _ = sm.create_transfers(&[t(1, 2, 1), Transfer { id: 1003, ..t(1, 2, 2) }], 20);
+
+        let reply = sm.lookup_transfers(&[1003, 9999, 1002]);
+        let results = bytes_to_transfer_batch(&reply).expect("valid transfer batch");
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].id, 1003);
+        assert_eq!(results[1].id, 1002);
+        assert_eq!(results[1].amount, 1);
+    }
+
+    #[test]
+    fn lookup_via_execute_decodes_ids() {
+        let mut sm = StateMachine::default();
+        let _ = sm.create_accounts(
+            &[
+                Account { id: 1, ledger: 1, code: 1, ..Account::default() },
+                Account { id: 2, ledger: 1, code: 1, ..Account::default() },
+            ],
+            10,
+        );
+        let _ = sm.create_transfers(&[t(1, 2, 7)], 20);
+
+        // Encode a lookup request body (one id, 16 bytes LE) and route through
+        // `execute` like the replica would; read ops take timestamp 0.
+        let mut body = Vec::with_capacity(16);
+        body.extend_from_slice(&1_u128.to_le_bytes());
+
+        let accounts = sm.execute(Operation::LOOKUP_ACCOUNTS, 0, &body);
+        let parsed = bytes_to_account_batch(&accounts).expect("valid account batch");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].id, 1);
+
+        let mut tbody = Vec::with_capacity(16);
+        tbody.extend_from_slice(&1002_u128.to_le_bytes());
+        let transfers = sm.execute(Operation::LOOKUP_TRANSFERS, 0, &tbody);
+        let tparsed = bytes_to_transfer_batch(&transfers).expect("valid transfer batch");
+        assert_eq!(tparsed.len(), 1);
+        assert_eq!(tparsed[0].amount, 7);
     }
 }

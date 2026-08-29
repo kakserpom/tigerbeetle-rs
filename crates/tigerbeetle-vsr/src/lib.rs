@@ -87,6 +87,12 @@ impl Operation {
     /// Port of `tigerbeetle.zig::Operation.get_change_events`.
     pub const GET_CHANGE_EVENTS: Self =
         Self(tigerbeetle_core::constants::VSR_OPERATIONS_RESERVED + 9);
+    /// Port of `tigerbeetle.zig::Operation.lookup_accounts`.
+    pub const LOOKUP_ACCOUNTS: Self =
+        Self(tigerbeetle_core::constants::VSR_OPERATIONS_RESERVED + 12);
+    /// Port of `tigerbeetle.zig::Operation.lookup_transfers`.
+    pub const LOOKUP_TRANSFERS: Self =
+        Self(tigerbeetle_core::constants::VSR_OPERATIONS_RESERVED + 13);
 
     // Operations <vsr_operations_reserved are reserved for the control plane.
     // Operations ≥vsr_operations_reserved are available for the state machine.
