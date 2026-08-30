@@ -7032,6 +7032,17 @@ get_account_transfers account=1 ts=[5000000200,5000000230] reversed=1;
 382:5000000206:3:0:1:2:1:1:0:0
 381:5000000204:2:0:1:2:1:1:0:0
 380:5000000202:1:0:1:2:1:1:0:0
+get_change_events ts=[5000000190,5000000260] limit=100;
+5000000196:two_phase_expired:370:100:0:4:0:0:0:0:2:0:0:0:803
+5000000199:single_phase:373:10:0:4:0:10:0:0:2:0:0:0:813
+5000000202:single_phase:380:1:0:1:0:804:0:0:2:0:0:0:814
+5000000204:single_phase:381:2:0:1:0:806:0:0:2:0:0:0:816
+5000000206:single_phase:382:3:0:1:0:809:0:0:2:0:0:0:819
+5000000208:single_phase:383:4:0:1:0:813:0:0:2:0:0:0:823
+5000000210:single_phase:384:5:0:1:0:818:0:0:2:0:0:0:828
+5000000214:single_phase:385:6:0:1:0:824:0:0:2:0:0:0:834
+5000000216:single_phase:386:7:0:1:0:831:0:0:2:0:0:0:841
+5000000218:single_phase:387:8:0:1:0:839:0:0:2:0:0:0:849
 ";
 
     #[test]
@@ -7906,6 +7917,26 @@ get_account_transfers account=1 ts=[5000000200,5000000230] reversed=1;
             .expect("valid transfer batch")
         {
             let _ = writeln!(out, "{}", format_transfer(&transfer));
+        }
+
+        // A timestamp window on the global `get_change_events` stream that
+        // starts after the 360-expiry (at 4000000152): rows begin with the
+        // account-4 expiry of transfer 370 (pulse at 5000000196), run through
+        // 373@199 and the 380..387 single-phase run, and cap at 10.
+        let cdc = ChangeEventsFilter {
+            timestamp_min: 5_000_000_190,
+            timestamp_max: 5_000_000_260,
+            limit: 100,
+            reserved: [0; 44],
+        };
+        let _ = writeln!(
+            out,
+            "get_change_events ts=[{},{}] limit={};",
+            cdc.timestamp_min, cdc.timestamp_max, cdc.limit
+        );
+        for row in sm.get_change_events(&cdc).as_chunks::<384>().0 {
+            let event = change_event_at(row, 0);
+            let _ = writeln!(out, "{}", format_change_event(&event));
         }
 
         assert_eq!(out, GOLDEN_ACCOUNTING);
