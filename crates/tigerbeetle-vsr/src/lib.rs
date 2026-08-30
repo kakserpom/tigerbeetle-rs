@@ -30,6 +30,7 @@ pub mod message_header;
 pub mod message_pool;
 pub mod multi_batch;
 pub mod multiversion;
+pub mod objects_cache;
 pub mod repair_budget;
 pub mod replica;
 pub mod schema;
