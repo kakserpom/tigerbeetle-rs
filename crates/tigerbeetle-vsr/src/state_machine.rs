@@ -880,6 +880,127 @@ pub struct CreateTransferResult {
     pub amount_actual: u128,
 }
 
+// ---------------------------------------------------------------------------
+// Prefetch key-set computation
+// ---------------------------------------------------------------------------
+//
+// Upstream prefetches every object a `create_*` batch might read _before_
+// execution, enqueuing keys per groove (`state_machine.zig:1244-1420`). The
+// enqueued key-set is the sans-IO seam for that async pipeline: it is pure
+// (each groove's keys derive only from the batch and the committed object
+// stores), and the executor CAV asserts it never reads a key outside the set —
+// mirroring the `constants.verify` asserts upstream places at every read
+// (`state_machine.zig:3633/3741/3777/3786/4083`).
+
+/// An insertion-ordered set of unique keys, mirroring an upstream groove's
+/// `prefetch_keys` (deduplicated by the set, first-seen order preserved).
+#[derive(Debug, Default)]
+struct PrefetchKeys<K> {
+    ordered: Vec<K>,
+    seen: HashSet<K>,
+}
+
+impl<K> PrefetchKeys<K>
+where
+    K: Eq + std::hash::Hash + Copy,
+{
+    fn enqueue(&mut self, key: K) {
+        if self.seen.insert(key) {
+            self.ordered.push(key);
+        }
+    }
+
+    fn contains(&self, key: K) -> bool {
+        self.seen.contains(&key)
+    }
+}
+
+/// The keys enqueued for a `create_accounts` batch: the account object ids and,
+/// for imported batches, the account timestamps (to detect a transfer with the
+/// same timestamp — `state_machine.zig:1283-1288`).
+#[derive(Debug, Default)]
+struct AccountPrefetchKeys {
+    account_ids: PrefetchKeys<u128>,
+    transfer_timestamps: PrefetchKeys<u64>,
+}
+
+fn prefetch_create_accounts(events: &[Account]) -> AccountPrefetchKeys {
+    let mut keys = AccountPrefetchKeys::default();
+    for event in events {
+        keys.account_ids.enqueue(event.id);
+    }
+    // Only imported batches consult the transfers groove (looking for a
+    // transfer colliding with an account's past timestamp).
+    if events.first().is_some_and(|event| event.flags.imported()) {
+        for event in events {
+            keys.transfer_timestamps.enqueue(event.timestamp);
+        }
+    }
+    keys
+}
+
+/// The keys enqueued for a `create_transfers` batch.
+///
+/// - `transfer_ids`: every event's id and, for post/void events, the pending
+///   transfer's id (idempotency + pending lookup).
+/// - `pending_timestamps`: the pending transfers' timestamps, enqueued only when
+///   the pending resolves from the committed transfers store (upstream resolves
+///   `get_transfer(t.pending_id)` in the transfers prefetch callback,
+///   `state_machine.zig:1352-1367`).
+/// - `account_ids`: the debit/credit accounts of regular transfers; for
+///   post/void events the pending's accounts (enqueued only when the pending
+///   resolves — an in-batch pending's accounts were enqueued by its own
+///   creation event).
+/// - `account_timestamps`: for imported batches, every event's timestamp (to
+///   detect an account with the same timestamp).
+#[derive(Debug, Default)]
+struct TransferPrefetchKeys {
+    transfer_ids: PrefetchKeys<u128>,
+    pending_timestamps: PrefetchKeys<u64>,
+    account_ids: PrefetchKeys<u128>,
+    account_timestamps: PrefetchKeys<u64>,
+}
+
+fn prefetch_create_transfers(
+    events: &[Transfer],
+    get_transfer: impl Fn(u128) -> Option<Transfer>,
+) -> TransferPrefetchKeys {
+    let mut keys = TransferPrefetchKeys::default();
+
+    // Phase 1: the transfers groove (`state_machine.zig:1323-1329`).
+    for event in events {
+        keys.transfer_ids.enqueue(event.id);
+        if event.flags.post_pending_transfer() || event.flags.void_pending_transfer() {
+            keys.transfer_ids.enqueue(event.pending_id);
+        }
+    }
+
+    // Phase 2: accounts (+ the transfers_pending timestamps), derived from the
+    // resolved transfers (`state_machine.zig:1352-1371`).
+    for event in events {
+        if event.flags.post_pending_transfer() || event.flags.void_pending_transfer() {
+            if let Some(pending) = get_transfer(event.pending_id) {
+                keys.pending_timestamps.enqueue(pending.timestamp);
+                keys.account_ids.enqueue(pending.debit_account_id);
+                keys.account_ids.enqueue(pending.credit_account_id);
+            }
+        } else {
+            keys.account_ids.enqueue(event.debit_account_id);
+            keys.account_ids.enqueue(event.credit_account_id);
+        }
+    }
+
+    // Phase 3: accounts-by-timestamp for imported batches
+    // (`state_machine.zig:1374-1385`).
+    if events.first().is_some_and(|event| event.flags.imported()) {
+        for event in events {
+            keys.account_timestamps.enqueue(event.timestamp);
+        }
+    }
+
+    keys
+}
+
 /// Execute a batch of `create_accounts` events with linked-chain support.
 ///
 /// `timestamp` is the commit timestamp for the batch (one higher than the last committed).
@@ -2038,12 +2159,28 @@ impl StateMachine {
     #[must_use]
     pub fn create_accounts(&mut self, events: &[Account], timestamp: u64) -> Vec<u8> {
         assert!(self.commit_timestamp <= timestamp);
+        // Prefetch the batch's key-set before executing (upstream
+        // `state_machine.zig:1244`); every read during execution asserts its
+        // key was enqueued, mirroring the upstream `constants.verify` asserts.
+        let prefetch = prefetch_create_accounts(events);
         let results = execute_create_accounts(
             events,
             timestamp,
-            |id| self.accounts.get(&id).copied(),
+            |id| {
+                assert!(
+                    prefetch.account_ids.contains(id),
+                    "create_accounts read an unprefetched account id"
+                );
+                self.accounts.get(&id).copied()
+            },
             self.accounts_timestamp_max,
-            |ts| self.transfers_by_timestamp.get(&ts).copied(),
+            |ts| {
+                assert!(
+                    prefetch.transfer_timestamps.contains(ts),
+                    "create_accounts read an unprefetched transfer timestamp"
+                );
+                self.transfers_by_timestamp.get(&ts).copied()
+            },
         );
         self.persist_accounts(events, &results, timestamp);
         account_results_to_bytes(&results)
@@ -2060,20 +2197,52 @@ impl StateMachine {
     #[must_use]
     pub fn create_transfers(&mut self, events: &[Transfer], timestamp: u64) -> Vec<u8> {
         assert!(self.commit_timestamp <= timestamp);
+        // Prefetch the batch's key-set before executing (upstream
+        // `state_machine.zig:1312`); every read during execution asserts its
+        // key was enqueued, mirroring the upstream `constants.verify` asserts.
+        let prefetch = prefetch_create_transfers(events, |id| self.transfers.get(&id).copied());
         let results = execute_create_transfers(
             events,
             timestamp,
-            |id| self.transfers.get(&id).copied(),
-            |id| self.accounts.get(&id).copied(),
+            |id| {
+                assert!(
+                    prefetch.transfer_ids.contains(id),
+                    "create_transfers read an unprefetched transfer id"
+                );
+                self.transfers.get(&id).copied()
+            },
+            |id| {
+                assert!(
+                    prefetch.account_ids.contains(id),
+                    "create_transfers read an unprefetched account id"
+                );
+                self.accounts.get(&id).copied()
+            },
             self.transfers_timestamp_max,
-            |ts| self.accounts_by_timestamp.get(&ts).copied(),
             |ts| {
+                assert!(
+                    prefetch.account_timestamps.contains(ts),
+                    "create_transfers read an unprefetched account timestamp"
+                );
+                self.accounts_by_timestamp.get(&ts).copied()
+            },
+            |ts| {
+                assert!(
+                    prefetch.pending_timestamps.contains(ts),
+                    "create_transfers read an unprefetched pending timestamp"
+                );
                 self.transfers_pending
                     .get(&ts)
                     .copied()
                     .map_or(TransferPendingStatus::None, |p| p.status)
             },
-            |id| self.transfers_orphaned.contains(&id),
+            |id| {
+                assert!(
+                    prefetch.transfer_ids.contains(id),
+                    "create_transfers read an unprefetched orphaned id"
+                );
+                self.transfers_orphaned.contains(&id)
+            },
         );
         self.persist_transfers(events, &results, timestamp);
         transfer_results_to_bytes(&results)
@@ -3096,6 +3265,95 @@ mod tests {
         let mut state_machine = StateMachine::default();
         state_machine.execute_op(2);
         state_machine.execute_op(2);
+    }
+
+    // ── prefetch key-set tests ──────────────────────────────────────────
+
+    fn account(id: u128) -> Account {
+        Account { id, ledger: 1, code: 1, ..Account::default() }
+    }
+
+    fn transfer(id: u128, dr: u128, cr: u128) -> Transfer {
+        Transfer {
+            id,
+            debit_account_id: dr,
+            credit_account_id: cr,
+            amount: 5,
+            ledger: 1,
+            code: 1,
+            ..Transfer::default()
+        }
+    }
+
+    #[test]
+    fn prefetch_accounts_keys_enqueue_ids_and_imported_timestamps() {
+        let imported = |id: u128, ts: u64| Account {
+            timestamp: ts,
+            flags: AccountFlags::IMPORTED,
+            ..account(id)
+        };
+        let keys = prefetch_create_accounts(&[imported(1, 55), imported(2, 56), imported(1, 55)]);
+        assert_eq!(keys.account_ids.ordered, vec![1, 2]);
+        assert_eq!(keys.transfer_timestamps.ordered, vec![55, 56]);
+    }
+
+    #[test]
+    fn prefetch_accounts_keys_drop_indirect_lookup_for_local_batches() {
+        // Local batches never consult the transfers groove, so the
+        // account timestamps must not be enqueued.
+        let keys = prefetch_create_accounts(&[Account { timestamp: 500, ..account(1) }]);
+        assert_eq!(keys.account_ids.ordered, vec![1]);
+        assert!(keys.transfer_timestamps.ordered.is_empty());
+    }
+
+    #[test]
+    fn prefetch_transfers_keys_enqueue_ids_accounts_and_pending() {
+        let mut state = StateMachine::default();
+        let _ = state.create_accounts(&[account(10), account(11)], 2);
+        let _ = state.create_transfers(&[transfer(100, 10, 11)], 3);
+
+        // A post of the committed pending plus a regular transfer to new accounts.
+        let events = [
+            Transfer {
+                pending_id: 100,
+                flags: TransferFlags::POST_PENDING_TRANSFER,
+                ..transfer(200, 10, 11)
+            },
+            transfer(201, 20, 21),
+        ];
+        let keys = prefetch_create_transfers(&events, |id| state.transfers.get(&id).copied());
+        assert_eq!(keys.transfer_ids.ordered, vec![200, 100, 201]);
+        assert_eq!(keys.account_ids.ordered, vec![10, 11, 20, 21]);
+        assert_eq!(keys.pending_timestamps.ordered, vec![3]);
+        assert!(keys.account_timestamps.ordered.is_empty());
+    }
+
+    #[test]
+    fn prefetch_transfers_keys_skip_unresolved_pending_accounts() {
+        // post/void against a missing pending still prefetches the pending id
+        // (for the lookup), but cannot resolve its accounts or timestamp.
+        let events = [Transfer {
+            pending_id: 999,
+            flags: TransferFlags::POST_PENDING_TRANSFER,
+            ..transfer(300, 1, 2)
+        }];
+        let keys = prefetch_create_transfers(&events, |_| None);
+        assert_eq!(keys.transfer_ids.ordered, vec![300, 999]);
+        assert!(keys.pending_timestamps.ordered.is_empty());
+        assert!(keys.account_ids.ordered.is_empty());
+    }
+
+    #[test]
+    fn prefetch_transfers_keys_imported_batch_enqueues_timestamps() {
+        let imported = |id: u128, ts: u64| Transfer {
+            timestamp: ts,
+            flags: TransferFlags::IMPORTED,
+            ..transfer(id, 1, 2)
+        };
+        let keys = prefetch_create_transfers(&[imported(400, 70), imported(401, 71)], |_| None);
+        assert_eq!(keys.transfer_ids.ordered, vec![400, 401]);
+        assert_eq!(keys.account_ids.ordered, vec![1, 2]);
+        assert_eq!(keys.account_timestamps.ordered, vec![70, 71]);
     }
 
     // ── execute (batch bodies) tests ─────────────────────────────────────
