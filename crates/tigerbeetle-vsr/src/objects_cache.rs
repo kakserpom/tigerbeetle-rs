@@ -26,7 +26,7 @@
 use std::collections::HashMap;
 use std::hash::Hash;
 
-use tigerbeetle_core::types::Account;
+use tigerbeetle_core::types::{Account, Transfer, TransferPending};
 use tigerbeetle_lsm::tree::ScopeCloseMode;
 
 /// The primary key of an object, used as the cache key.
@@ -41,6 +41,18 @@ pub trait ObjectKey<K> {
 impl ObjectKey<u128> for Account {
     fn object_key(&self) -> u128 {
         self.id
+    }
+}
+
+impl ObjectKey<u128> for Transfer {
+    fn object_key(&self) -> u128 {
+        self.id
+    }
+}
+
+impl ObjectKey<u64> for TransferPending {
+    fn object_key(&self) -> u64 {
+        self.timestamp
     }
 }
 

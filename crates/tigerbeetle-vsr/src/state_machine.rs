@@ -552,14 +552,16 @@ pub struct PostVoidPendingResult {
 /// `t` is the posting/voiding transfer event.
 /// `p` is the original pending transfer (looked up by `t.pending_id`).
 /// `dr_account` and `cr_account` are the debit/credit accounts of the pending transfer.
-/// `running_key_max` and `account_with_timestamp` back the imported-timestamp
+/// `running_key_max` and `account_timestamps` back the imported-timestamp
 /// regression/collision checks (the transfers object tree's key range and the
-/// accounts timestamp index, per upstream `state_machine.zig:4158-4180`).
+/// accounts timestamp index, per upstream `state_machine.zig:4158-4180`);
+/// `account_timestamps_enqueued` is the prefetched key-set the found timestamps
+/// were resolved from.
 ///
 /// Returns the result status and the amount to apply.
 ///
 /// Upstream: `src/state_machine.zig:4053` (`post_or_void_pending_transfer`).
-pub fn post_or_void_pending_transfer(
+pub(crate) fn post_or_void_pending_transfer(
     t: &Transfer,
     timestamp_event: u64,
     p: &Transfer,
@@ -567,7 +569,8 @@ pub fn post_or_void_pending_transfer(
     cr_account: &Account,
     pending_status: tigerbeetle_core::types::TransferPendingStatus,
     running_key_max: u64,
-    account_with_timestamp: &impl Fn(u64) -> Option<u128>,
+    account_timestamps: &HashSet<u64>,
+    account_timestamps_enqueued: &PrefetchKeys<u64>,
 ) -> PostVoidPendingResult {
     use tigerbeetle_core::types::TransferPendingStatus;
     assert!(timestamp_event != 0);
@@ -735,7 +738,13 @@ pub fn post_or_void_pending_transfer(
     if t.flags.imported() {
         assert!(t.timestamp != 0);
         assert!(t.timestamp <= timestamp_event);
-        if t.timestamp <= running_key_max || account_with_timestamp(t.timestamp).is_some() {
+        // `accounts.indirect_lookup` consults the accounts prefetch key set; a
+        // colliding timestamp must have been enqueued.
+        let account_collides = {
+            assert!(account_timestamps_enqueued.contains(t.timestamp));
+            account_timestamps.contains(&t.timestamp)
+        };
+        if t.timestamp <= running_key_max || account_collides {
             return PostVoidPendingResult {
                 status: CreateTransferStatus::ImportedEventTimestampMustNotRegress,
                 amount_actual,
@@ -1189,76 +1198,61 @@ pub(crate) fn execute_create_accounts(
     results
 }
 
+/// Read an account from the batch's objects cache, asserting that a miss was
+/// resolved as not-found during prefetch (upstream's `get_account` verify
+/// asserts, `state_machine.zig:4467-4474`).
+fn read_cached_account(
+    accounts_objects: &mut ObjectsCache<u128, Account>,
+    prefetch: &TransferPrefetchKeys,
+    id: u128,
+) -> Option<Account> {
+    let account = accounts_objects.get(&id).copied();
+    if account.is_none() {
+        assert!(
+            prefetch.account_ids.contains(id),
+            "create_transfers read an account id that was not prefetched"
+        );
+    }
+    account
+}
+
 /// Execute a batch of `create_transfers` events with linked-chain support.
 ///
 /// Same semantics as `execute_create_accounts` but for transfers.
 ///
 /// `transfers_key_max` is the maximum committed transfer timestamp
-/// (`transfers.objects.key_range.key_max`). `account_with_timestamp` resolves
-/// the account matching a timestamp, mirroring the cross-groove
-/// `accounts.indirect_lookup` that upstream consults for imported events.
-///
-/// `get_existing_transfer` looks up a transfer by id. It must return the
-/// committed state: the orchestrator overlays an in-session working view of
-/// created transfers (`working_transfers`) on top, so later batch events see
-/// transfers created earlier in the batch — including pending transfers that a
-/// post/void event references (upstream inserts into the transfers groove at
-/// each create, so the in-session scope is visible there too).
-///
-/// `get_pending_status` returns the committed status (`transfers_pending`) of
-/// the pending transfer with the given timestamp, which post/void events
-/// validate against. A working overlay of in-session post/void status changes
-/// (and pending creations) sits on top.
-///
-/// `is_orphaned` reports whether an id sits in the committed orphaned
-/// primary-key set (transfer ids that failed with a transient status and can
-/// never be created again); ids orphaned earlier in this batch are layered on
-/// top, mirroring upstream's in-session groove state.
-pub(crate) fn execute_create_transfers<F, G, FAccountAt, FPendingStatus, FOrphaned>(
+/// (`transfers.objects.key_range.key_max`). Reads go through the batch's object
+/// caches (`accounts_objects`, `transfers_objects`, `transfers_pending_objects`):
+/// the orchestrator fills them from the committed state resolved by `prefetch`
+/// (`prefetch_create_transfers`), creates upsert into them, and a chain
+/// opening/closing drives `scope_open`/`scope_close` so a broken chain's
+/// in-session writes are rolled back (upstream `state_machine.zig:3037-3202`).
+/// `account_timestamps` holds the committed accounts whose timestamps were
+/// looked up during prefetch (`accounts.indirect_lookup` for imported events).
+/// `working_orphaned` layers the batch's transient failures over the committed
+/// orphaned set `is_orphaned`; orphans are written outside the chain scope and
+/// survive a rollback (upstream `state_machine.zig:3215-3252`).
+pub(crate) fn execute_create_transfers(
     events: &[Transfer],
     timestamp: u64,
-    mut get_existing_transfer: F,
-    mut get_account: G,
+    accounts_objects: &mut ObjectsCache<u128, Account>,
+    transfers_objects: &mut ObjectsCache<u128, Transfer>,
+    transfers_pending_objects: &mut ObjectsCache<u64, TransferPending>,
     transfers_key_max: u64,
-    account_with_timestamp: FAccountAt,
-    mut get_pending_status: FPendingStatus,
-    is_orphaned: FOrphaned,
-) -> Vec<CreateTransferResult>
-where
-    F: FnMut(u128) -> Option<Transfer>,
-    G: FnMut(u128) -> Option<Account>,
-    FAccountAt: Fn(u64) -> Option<u128>,
-    FPendingStatus: FnMut(u64) -> TransferPendingStatus,
-    FOrphaned: Fn(u128) -> bool,
-{
+    account_timestamps: &HashSet<u64>,
+    account_timestamps_enqueued: &PrefetchKeys<u64>,
+    working_orphaned: &mut HashSet<u128>,
+    is_orphaned: impl Fn(u128) -> bool,
+    prefetch: &TransferPrefetchKeys,
+) -> Vec<CreateTransferResult> {
     let mut results: Vec<CreateTransferResult> = Vec::with_capacity(events.len());
     let mut chain: Option<usize> = None;
     let mut chain_broken = false;
     let mut running_key_max = transfers_key_max;
-    // In-session working view of the accounts, layered over `get_account`
-    // (upstream's open batch scope). Mutations from created events accumulate
-    // here so later batch members validate against them.
-    let mut working: HashMap<u128, Account> = HashMap::new();
-    // In-session working view of created transfers, layered over
-    // `get_existing_transfer` (upstream inserts each transfer into the transfers
-    // groove as it commits, so the batch observes it).
-    let mut working_transfers: HashMap<u128, Transfer> = HashMap::new();
-    // Chain scoping: snapshot the working views (and the running key range) when
-    // a chain opens, and restore them if it breaks (upstream `scope_close(.discard)`
-    // rolls back the accounts, transfers and transfers_pending grooves).
-    let mut chain_snapshot: Option<HashMap<u128, Account>> = None;
+    // Chain scoping restores the running key range on a break (upstream's
+    // `transfers.objects.key_range` is part of the tree and rolled back by
+    // `scope_close(.discard)`).
     let mut chain_key_max_snapshot: Option<u64> = None;
-    let mut chain_transfers_snapshot: Option<HashMap<u128, Transfer>> = None;
-    // In-session view of orphaned ids, layered over `is_orphaned`. Upstream
-    // writes orphans outside the chain scope (`transient_error`,
-    // `state_machine.zig:3215-3252`), so they survive a chain rollback — the
-    // chain snapshots above deliberately exclude this set.
-    let mut working_orphaned: HashSet<u128> = HashSet::new();
-    // In-session view of pending-transfer statuses, layered over
-    // `get_pending_status` (a post/void within the batch marks its pending as
-    // posted/voided so a later event sees it; pending creations seed `Pending`).
-    let mut working_pending: HashMap<u64, TransferPendingStatus> = HashMap::new();
-    let mut chain_pending_snapshot: Option<HashMap<u64, TransferPendingStatus>> = None;
 
     let batch_imported = !events.is_empty() && events[0].flags.imported();
 
@@ -1273,12 +1267,14 @@ where
                 if chain.is_none() {
                     chain = Some(index);
                     assert!(!chain_broken);
-                    // TODO(port): scope_open — mirrored by the working-view
-                    // snapshot/restore below.
-                    chain_snapshot = Some(working.clone());
+                    // Open batch scopes over the accounts, transfers and
+                    // transfers_pending object caches; each chain's in-session
+                    // writes are rolled back on a chain break
+                    // (upstream `scope_open`, state_machine.zig:3037).
+                    accounts_objects.scope_open();
+                    transfers_objects.scope_open();
+                    transfers_pending_objects.scope_open();
                     chain_key_max_snapshot = Some(running_key_max);
-                    chain_transfers_snapshot = Some(working_transfers.clone());
-                    chain_pending_snapshot = Some(working_pending.clone());
                 }
                 if index == events.len() - 1 {
                     break 'result (CreateTransferStatus::LinkedEventChainOpen, timestamp_event);
@@ -1314,13 +1310,20 @@ where
             }
 
             // For post/void pending transfers, the transfer must not already exist.
-            // For regular transfers, look up existing for idempotency. The
-            // in-session working view takes precedence over the committed state
-            // (a transfer created earlier in this batch is already visible).
-            let existing = working_transfers
-                .get(&event.id)
-                .copied()
-                .or_else(|| get_existing_transfer(event.id));
+            // For regular transfers, look up existing for idempotency. The object
+            // cache holds the prefetched committed transfers plus the in-session
+            // creates; upstream reads the transfers groove's objects cache the
+            // same way (`get_transfer`, state_machine.zig:4477-4479).
+            let existing = transfers_objects.get(&event.id).copied();
+            if existing.is_none() {
+                // A cache miss must have been resolved as not-found during
+                // prefetch, i.e. the id was enqueued
+                // (state_machine.zig:3741-3743).
+                assert!(
+                    prefetch.transfer_ids.contains(event.id),
+                    "create_transfers read a transfer id that was not prefetched"
+                );
+            }
 
             // Upstream consults the orphaned primary-key set in the same switch
             // as the existing record (state_machine.zig:3734-3737): an id that
@@ -1349,10 +1352,13 @@ where
                     break 'result (CreateTransferStatus::IdMustNotBeIntMax, timestamp_event);
                 }
 
-                let pending = working_transfers
-                    .get(&event.pending_id)
-                    .copied()
-                    .or_else(|| get_existing_transfer(event.pending_id));
+                let pending = transfers_objects.get(&event.pending_id).copied();
+                if pending.is_none() {
+                    assert!(
+                        prefetch.transfer_ids.contains(event.pending_id),
+                        "create_transfers read a pending transfer id that was not prefetched"
+                    );
+                }
 
                 if let Some(e) = existing.as_ref() {
                     // Idempotency (`create_transfer_exists`,
@@ -1406,21 +1412,21 @@ where
 
                     // The pending transfer carries the account ids: a post/void
                     // event leaves them zero by convention.
-                    let dr = working
-                        .get(&p.debit_account_id)
-                        .copied()
-                        .or_else(|| get_account(p.debit_account_id))
+                    let dr = read_cached_account(accounts_objects, prefetch, p.debit_account_id)
                         .expect("post_or_void_pending_transfer: committed pending implies its debit account");
-                    let cr = working
-                        .get(&p.credit_account_id)
-                        .copied()
-                        .or_else(|| get_account(p.credit_account_id))
+                    let cr = read_cached_account(accounts_objects, prefetch, p.credit_account_id)
                         .expect("post_or_void_pending_transfer: committed pending implies its credit account");
 
-                    let pending_status = working_pending
+                    let pending_status = transfers_pending_objects
                         .get(&p.timestamp)
                         .copied()
-                        .unwrap_or_else(|| get_pending_status(p.timestamp));
+                        .map_or(TransferPendingStatus::None, |pending| pending.status);
+                    if pending_status == TransferPendingStatus::None {
+                        assert!(
+                            prefetch.pending_timestamps.contains(p.timestamp),
+                            "create_transfers read a pending timestamp that was not prefetched"
+                        );
+                    }
                     let result = post_or_void_pending_transfer(
                         event,
                         timestamp_event,
@@ -1429,7 +1435,8 @@ where
                         &cr,
                         pending_status,
                         running_key_max,
-                        &account_with_timestamp,
+                        account_timestamps,
+                        account_timestamps_enqueued,
                     );
                     let status = result.status;
                     amount_actual = result.amount_actual;
@@ -1441,23 +1448,24 @@ where
                         let ts =
                             if event.flags.imported() { event.timestamp } else { timestamp_event };
                         let is_post = event.flags.post_pending_transfer();
-                        working_pending.insert(
-                            p.timestamp,
-                            if is_post {
+                        transfers_pending_objects.upsert(TransferPending {
+                            timestamp: p.timestamp,
+                            status: if is_post {
                                 TransferPendingStatus::Posted
                             } else {
                                 TransferPendingStatus::Voided
                             },
-                        );
+                            ..TransferPending::default()
+                        });
                         let (dr_new, cr_new) =
                             commit_post_void_accounts(event, p, amount_actual, &dr, &cr);
                         debug_assert_eq!(dr_new.id, dr.id);
                         debug_assert_eq!(cr_new.id, cr.id);
-                        working.insert(dr_new.id, dr_new);
-                        working.insert(cr_new.id, cr_new);
+                        accounts_objects.upsert(dr_new);
+                        accounts_objects.upsert(cr_new);
 
                         let record = fold_post_void_transfer(event, p, amount_actual, ts);
-                        working_transfers.insert(record.id, record);
+                        transfers_objects.upsert(record);
                         ts
                     } else {
                         timestamp_event
@@ -1465,16 +1473,9 @@ where
                     (status, ts)
                 }
             } else {
-                // Look up debit/credit accounts: working (in-session) view first,
-                // then the committed state.
-                let dr = working
-                    .get(&event.debit_account_id)
-                    .copied()
-                    .or_else(|| get_account(event.debit_account_id));
-                let cr = working
-                    .get(&event.credit_account_id)
-                    .copied()
-                    .or_else(|| get_account(event.credit_account_id));
+                // Look up debit/credit accounts through the object cache.
+                let dr = read_cached_account(accounts_objects, prefetch, event.debit_account_id);
+                let cr = read_cached_account(accounts_objects, prefetch, event.credit_account_id);
 
                 let (dr_account, cr_account) = match (dr, cr) {
                     (Some(d), Some(c)) => (d, c),
@@ -1502,10 +1503,13 @@ where
                     assert!(event.timestamp != 0);
                     assert!(event.timestamp <= timestamp_event);
                     // A past timestamp must not regress the transfer object index, and
-                    // must not collide with an existing account's timestamp.
-                    if event.timestamp <= running_key_max
-                        || account_with_timestamp(event.timestamp).is_some()
-                    {
+                    // must not collide with an existing account's timestamp
+                    // (`accounts.indirect_lookup`).
+                    let account_collides = {
+                        assert!(account_timestamps_enqueued.contains(event.timestamp));
+                        account_timestamps.contains(&event.timestamp)
+                    };
+                    if event.timestamp <= running_key_max || account_collides {
                         break 'result (
                             CreateTransferStatus::ImportedEventTimestampMustNotRegress,
                             timestamp_event,
@@ -1538,15 +1542,16 @@ where
                 };
                 if status == CreateTransferStatus::Created {
                     amount_actual = outcome.amount_actual;
-                    // Apply the mutation to the in-session view so later batch
-                    // members validate against it; `persist_transfers` later derives
-                    // the same values from the committed state in event order.
+                    // Apply the mutation to the object caches so later batch
+                    // members validate against it; `persist_transfers` later
+                    // derives the same values from the committed state in event
+                    // order.
                     let (dr_new, cr_new) =
                         commit_transfer_accounts(event, amount_actual, &dr_account, &cr_account);
                     debug_assert_eq!(dr_new.id, dr_account.id);
                     debug_assert_eq!(cr_new.id, cr_account.id);
-                    working.insert(dr_new.id, dr_new);
-                    working.insert(cr_new.id, cr_new);
+                    accounts_objects.upsert(dr_new);
+                    accounts_objects.upsert(cr_new);
 
                     // The created transfer is visible to later batch events
                     // (upstream inserts into the transfers groove at commit); a
@@ -1554,9 +1559,13 @@ where
                     let mut record = *event;
                     record.amount = amount_actual;
                     record.timestamp = ts;
-                    working_transfers.insert(record.id, record);
+                    transfers_objects.upsert(record);
                     if record.flags.pending() {
-                        working_pending.insert(record.timestamp, TransferPendingStatus::Pending);
+                        transfers_pending_objects.upsert(TransferPending {
+                            timestamp: record.timestamp,
+                            status: TransferPendingStatus::Pending,
+                            ..TransferPending::default()
+                        });
                     }
                 } else {
                     amount_actual = 0;
@@ -1581,23 +1590,15 @@ where
             if let Some(chain_start) = chain {
                 if !chain_broken {
                     chain_broken = true;
-                    // TODO(port): scope_close(.discard) — roll back this chain's
-                    // in-session writes (only the events since it opened).
-                    if let (
-                        Some(snapshot),
-                        Some(key_max_snapshot),
-                        Some(transfers_snapshot),
-                        Some(pending_snapshot),
-                    ) = (
-                        chain_snapshot.as_ref(),
-                        chain_key_max_snapshot.as_ref(),
-                        chain_transfers_snapshot.as_ref(),
-                        chain_pending_snapshot.as_ref(),
-                    ) {
-                        working.clone_from(snapshot);
-                        running_key_max = *key_max_snapshot;
-                        working_transfers.clone_from(transfers_snapshot);
-                        working_pending.clone_from(pending_snapshot);
+                    // The chain has just been broken: mark every prior member as
+                    // `linked_event_failed` and roll the chain's in-session cache
+                    // writes and key range back (upstream `scope_close` with
+                    // `.discard`, state_machine.zig:3116-3145).
+                    accounts_objects.scope_close(ScopeCloseMode::Discard);
+                    transfers_objects.scope_close(ScopeCloseMode::Discard);
+                    transfers_pending_objects.scope_close(ScopeCloseMode::Discard);
+                    if let Some(key_max_snapshot) = chain_key_max_snapshot {
+                        running_key_max = key_max_snapshot;
                     }
                     for result in &mut results[chain_start..index] {
                         result.status = CreateTransferStatus::LinkedEventFailed;
@@ -1613,14 +1614,16 @@ where
             && (!event.flags.linked() || status == CreateTransferStatus::LinkedEventChainOpen)
         {
             if !chain_broken {
-                // TODO(port): scope_close(.persist)
+                // Commit the chain's in-session writes
+                // (upstream `scope_close` with `.persist`,
+                // state_machine.zig:3197-3202).
+                accounts_objects.scope_close(ScopeCloseMode::Persist);
+                transfers_objects.scope_close(ScopeCloseMode::Persist);
+                transfers_pending_objects.scope_close(ScopeCloseMode::Persist);
             }
             chain = None;
             chain_broken = false;
-            chain_snapshot = None;
             chain_key_max_snapshot = None;
-            chain_transfers_snapshot = None;
-            chain_pending_snapshot = None;
         }
     }
 
@@ -2229,59 +2232,62 @@ impl StateMachine {
     ///
     /// Created transfers apply their balance mutation to the debit/credit
     /// accounts at persist time, and are stored with the amount actually
-    /// applied (after balancing). Within a batch, the orchestrator maintains an
-    /// in-session working view of the accounts, so later events validate
-    /// against earlier events' mutations; each linked chain is rolled back as a
-    /// unit if it breaks.
+    /// applied (after balancing). Within a batch, the orchestrator maintains
+    /// an in-session view of the accounts via the object caches, so later
+    /// events validate against earlier events' mutations; each linked chain is
+    /// rolled back as a unit if it breaks.
     #[must_use]
     pub fn create_transfers(&mut self, events: &[Transfer], timestamp: u64) -> Vec<u8> {
         assert!(self.commit_timestamp <= timestamp);
         // Prefetch the batch's key-set before executing (upstream
-        // `state_machine.zig:1312`); every read during execution asserts its
-        // key was enqueued, mirroring the upstream `constants.verify` asserts.
+        // `state_machine.zig:1312`); the key-set then fills the batch's object
+        // caches, and every miss during execution asserts its key was enqueued
+        // (the upstream `constants.verify` asserts).
         let prefetch = prefetch_create_transfers(events, |id| self.transfers.get(&id).copied());
+        // Resolve the enqueued keys against the committed stores into the
+        // batch's object caches (upstream's prefetch callbacks fill the
+        // grooves' ObjectsCaches, state_machine.zig:1320-1385).
+        let mut accounts_objects = ObjectsCache::default();
+        for &id in prefetch.account_ids.iter() {
+            if let Some(account) = self.accounts.get(&id) {
+                accounts_objects.upsert(*account);
+            }
+        }
+        let mut transfers_objects = ObjectsCache::default();
+        for &id in prefetch.transfer_ids.iter() {
+            if let Some(transfer) = self.transfers.get(&id) {
+                transfers_objects.upsert(*transfer);
+            }
+        }
+        let mut transfers_pending_objects = ObjectsCache::default();
+        for &ts in prefetch.pending_timestamps.iter() {
+            if let Some(pending) = self.transfers_pending.get(&ts) {
+                transfers_pending_objects.upsert(*pending);
+            }
+        }
+        // The imported-timestamp collision check needs the _found_ subset of
+        // the enqueued account timestamps (`accounts.indirect_lookup`).
+        let mut account_timestamps = HashSet::new();
+        for &ts in prefetch.account_timestamps.iter() {
+            if self.accounts_by_timestamp.contains_key(&ts) {
+                account_timestamps.insert(ts);
+            }
+        }
+        // In-session orphaned ids (upstream writes these outside the chain
+        // scope, state_machine.zig:3215-3252).
+        let mut working_orphaned = HashSet::new();
         let results = execute_create_transfers(
             events,
             timestamp,
-            |id| {
-                assert!(
-                    prefetch.transfer_ids.contains(id),
-                    "create_transfers read an unprefetched transfer id"
-                );
-                self.transfers.get(&id).copied()
-            },
-            |id| {
-                assert!(
-                    prefetch.account_ids.contains(id),
-                    "create_transfers read an unprefetched account id"
-                );
-                self.accounts.get(&id).copied()
-            },
+            &mut accounts_objects,
+            &mut transfers_objects,
+            &mut transfers_pending_objects,
             self.transfers_timestamp_max,
-            |ts| {
-                assert!(
-                    prefetch.account_timestamps.contains(ts),
-                    "create_transfers read an unprefetched account timestamp"
-                );
-                self.accounts_by_timestamp.get(&ts).copied()
-            },
-            |ts| {
-                assert!(
-                    prefetch.pending_timestamps.contains(ts),
-                    "create_transfers read an unprefetched pending timestamp"
-                );
-                self.transfers_pending
-                    .get(&ts)
-                    .copied()
-                    .map_or(TransferPendingStatus::None, |p| p.status)
-            },
-            |id| {
-                assert!(
-                    prefetch.transfer_ids.contains(id),
-                    "create_transfers read an unprefetched orphaned id"
-                );
-                self.transfers_orphaned.contains(&id)
-            },
+            &account_timestamps,
+            &prefetch.account_timestamps,
+            &mut working_orphaned,
+            |id| self.transfers_orphaned.contains(&id),
+            &prefetch,
         );
         self.persist_transfers(events, &results, timestamp);
         transfer_results_to_bytes(&results)
@@ -4260,6 +4266,37 @@ mod tests {
         assert_eq!(results[0].status, CreateAccountStatus::ImportedEventTimestampMustNotAdvance);
     }
 
+    /// Run a `create_transfers` batch over an empty committed transfer/pending
+    /// state but with the given committed accounts (mirrors the historical
+    /// pure-fn tests, which bypassed the orchestrator's prefetch wiring).
+    fn execute_create_transfers_no_state(
+        events: &[Transfer],
+        timestamp: u64,
+        accounts: &[Account],
+    ) -> Vec<CreateTransferResult> {
+        let prefetch = prefetch_create_transfers(events, |_| None);
+        let mut accounts_objects = ObjectsCache::default();
+        for account in accounts {
+            accounts_objects.upsert(*account);
+        }
+        let mut transfers_objects = ObjectsCache::default();
+        let mut transfers_pending_objects = ObjectsCache::default();
+        let mut working_orphaned = HashSet::new();
+        execute_create_transfers(
+            events,
+            timestamp,
+            &mut accounts_objects,
+            &mut transfers_objects,
+            &mut transfers_pending_objects,
+            0,
+            &HashSet::new(),
+            &prefetch.account_timestamps,
+            &mut working_orphaned,
+            |_| false,
+            &prefetch,
+        )
+    }
+
     #[test]
     fn batch_transfers_linked_chain_breaks() {
         let events = vec![
@@ -4283,28 +4320,11 @@ mod tests {
                 ..Transfer::default()
             },
         ];
-        let dr =
-            Account { id: 100, credits_posted: 1_000, ledger: 1, code: 1, ..Account::default() };
-        let cr =
-            Account { id: 200, debits_posted: 1_000, ledger: 1, code: 1, ..Account::default() };
-        let results = execute_create_transfers(
-            &events,
-            10,
-            |_| None,
-            |id| {
-                if id == 100 {
-                    Some(dr)
-                } else if id == 200 {
-                    Some(cr)
-                } else {
-                    None
-                }
-            },
-            0,
-            |_| None,
-            |_| TransferPendingStatus::None,
-            |_| false,
-        );
+        let accounts = vec![
+            Account { id: 100, credits_posted: 1_000, ledger: 1, code: 1, ..Account::default() },
+            Account { id: 200, debits_posted: 1_000, ledger: 1, code: 1, ..Account::default() },
+        ];
+        let results = execute_create_transfers_no_state(&events, 10, &accounts);
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].status, CreateTransferStatus::Created);
         assert_eq!(results[1].status, CreateTransferStatus::Created);
@@ -4995,7 +5015,7 @@ mod tests {
         assert_eq!(reply_status(&body), CreateTransferStatus::PendingTransferAlreadyPosted as u32);
 
         // Within a batch: the second post sees the first's in-session status
-        // change (the `working_pending` overlay).
+        // change (the transfers_pending object cache).
         let mut sm2 = StateMachine::default();
         pending_setup(&mut sm2, 50, TransferFlags::default());
         let batch = [post_event(3, u128::MAX), post_event(4, u128::MAX)];
