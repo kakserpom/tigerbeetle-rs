@@ -908,6 +908,11 @@ where
     // The running object-tree key range: committed state plus the events of this
     // batch (upstream inserts each created account before the next event's check).
     let mut running_key_max = accounts_key_max;
+    // In-session working view of accounts created earlier in this batch:
+    // upstream's `get_account` reads through the accounts object cache, which
+    // `insert` updates, so a duplicate id later in the batch sees the record
+    // just created and reports `exists` with its stored timestamp.
+    let mut working_accounts: HashMap<u128, Account> = HashMap::new();
 
     let batch_imported = !events.is_empty() && events[0].flags.imported();
 
@@ -951,7 +956,10 @@ where
                 break 'result (CreateAccountStatus::TimestampMustBeZero, timestamp_event);
             }
 
-            let existing = get_existing(event.id);
+            // The in-session working view takes precedence over the committed
+            // state (an account created earlier in this batch is visible).
+            let existing =
+                working_accounts.get(&event.id).copied().or_else(|| get_existing(event.id));
             // Imported-timestamp regression/collision checks. Upstream runs these
             // inside `create_account` _after_ the idempotency checks (state_machine.zig:3656-3665),
             // so an existing record short-circuits to its `exists` code first.
@@ -986,6 +994,9 @@ where
                 _ => timestamp_event,
             };
             if matches!(status, CreateAccountStatus::Created) {
+                let mut stored = *event;
+                stored.timestamp = ts;
+                working_accounts.insert(event.id, stored);
                 running_key_max = running_key_max.max(ts);
             }
             (status, ts)
@@ -6976,6 +6987,36 @@ get_account_transfers account=1 reversed=1;
 350:3000000110:777:0:1:2:1:1:200:2
 340:3000000102:201:334:1:2:1:1:0:4
 334:65:500:0:1:2:1:1:100:2
+create_accounts;
+5000000265:created
+5000000266:created
+5000000267:created
+5000000268:created
+5000000269:created
+5000000270:created
+5000000271:created
+5000000272:created
+5000000273:created
+5000000274:created
+5000000275:created
+5000000276:created
+5000000277:created
+5000000278:created
+5000000279:created
+5000000280:created
+5000000281:created
+5000000282:created
+5000000283:created
+5000000284:created
+5000000285:created
+5000000286:created
+5000000287:created
+5000000288:created
+5000000289:created
+5000000290:created
+5000000291:created
+5000000292:created
+5000000265:exists
 ";
 
     #[test]
@@ -7814,6 +7855,15 @@ get_account_transfers account=1 reversed=1;
         {
             let _ = writeln!(out, "{}", format_transfer(&transfer));
         }
+
+        // A near-boundary multi-event `create_accounts` batch: 29 accounts is
+        // the harness maximum (the MultiBatch trailer inflates the element
+        // count one past `event_max` at 30). 901..928 create at slots
+        // descending from the head; the closing duplicate of 901 reports
+        // `exists` and reuses account 901's stored slot, not its own.
+        let mut many: Vec<Account> = (901..=928).map(|id| a(id, 1, 1)).collect();
+        many.push(a(901, 1, 1));
+        accounts_batch(&mut sm, &mut out, &many, 5_000_000_293);
 
         assert_eq!(out, GOLDEN_ACCOUNTING);
     }
