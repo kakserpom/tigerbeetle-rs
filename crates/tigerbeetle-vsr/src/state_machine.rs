@@ -6329,6 +6329,12 @@ mod tests {
             s if s == CreateTransferStatus::CreditAccountNotFound as u32 => {
                 "credit_account_not_found"
             }
+            s if s == CreateTransferStatus::DebitAccountAlreadyClosed as u32 => {
+                "debit_account_already_closed"
+            }
+            s if s == CreateTransferStatus::CreditAccountAlreadyClosed as u32 => {
+                "credit_account_already_closed"
+            }
             s if s == CreateTransferStatus::IdAlreadyFailed as u32 => "id_already_failed",
             s if s == CreateTransferStatus::ImportedEventTimestampMustNotRegress as u32 => {
                 "imported_event_timestamp_must_not_regress"
@@ -6670,6 +6676,24 @@ get_account_balances account=2;
 get_change_events ts=[3000000116,0] limit=15;
 3000000120:two_phase_pending:360:50:0:1:50:803:0:0:2:0:0:50:803
 4000000152:two_phase_expired:360:50:0:1:0:803:0:0:2:0:0:0:803
+create_accounts;
+4000000158:created
+create_transfers;
+4000000160:created
+lookup_accounts n=1;
+4:4000000158:100:0:0:0:1:1:40
+create_transfers;
+4000000163:debit_account_already_closed
+create_transfers;
+4000000165:credit_account_already_closed
+pulse at 5000000196;
+lookup_accounts n=1;
+4:4000000158:0:0:0:0:1:1:8
+create_transfers;
+5000000199:created
+get_account_balances account=4;
+4000000160:100:0:0:0
+5000000199:0:10:0:0
 ";
 
     #[test]
@@ -7218,6 +7242,90 @@ get_change_events ts=[3000000116,0] limit=15;
             let event = change_event_at(row, 0);
             let _ = writeln!(out, "{}", format_change_event(&event));
         }
+
+        // Account-level closure: a `closing_debit` pending (370) closes
+        // account 4 as 360 closed account 1; while it, single-phase
+        // debits/credits into account 4 are rejected
+        // (`debit_account_already_closed` / `credit_account_already_closed`).
+        // The expiry full-clear reopens 4 (flags back to 8) and a plain
+        // transfer then succeeds; account 4's balance history shows the hold
+        // and the plain transfer, but not the expiry.
+        out.push_str("create_accounts;\n");
+        for row in sm.create_accounts(&[a(4, 1, 1)], 4_000_000_158).as_chunks::<16>().0 {
+            let ts = u64::from_le_bytes(row[0..8].try_into().expect("8-byte slice"));
+            let status = u32::from_le_bytes(row[8..12].try_into().expect("4-byte slice"));
+            let _ = writeln!(out, "{ts}:{}", account_status_name(status));
+        }
+        bulk(
+            &mut sm,
+            &mut out,
+            &[Transfer {
+                id: 370,
+                debit_account_id: 4,
+                credit_account_id: 2,
+                amount: 100,
+                ledger: 1,
+                code: 1,
+                timeout: 1,
+                flags: TransferFlags::PENDING | TransferFlags::CLOSING_DEBIT,
+                ..Transfer::default()
+            }],
+            4_000_000_160,
+        );
+        out.push_str("lookup_accounts n=1;\n");
+        for acc in bytes_to_account_batch(&sm.lookup_accounts(&[4])).expect("valid account batch") {
+            let _ = writeln!(out, "{}", format_account(&acc));
+        }
+        bulk(
+            &mut sm,
+            &mut out,
+            &[Transfer {
+                id: 371,
+                debit_account_id: 4,
+                credit_account_id: 2,
+                amount: 10,
+                ledger: 1,
+                code: 1,
+                ..Transfer::default()
+            }],
+            4_000_000_163,
+        );
+        bulk(
+            &mut sm,
+            &mut out,
+            &[Transfer {
+                id: 372,
+                debit_account_id: 2,
+                credit_account_id: 4,
+                amount: 10,
+                ledger: 1,
+                code: 1,
+                ..Transfer::default()
+            }],
+            4_000_000_165,
+        );
+        out.push_str("pulse at 5000000196;\n");
+        let reply = sm.execute(Operation::STATE_MACHINE_PULSE, 5_000_000_196, &[]);
+        assert!(reply.is_empty());
+        out.push_str("lookup_accounts n=1;\n");
+        for acc in bytes_to_account_batch(&sm.lookup_accounts(&[4])).expect("valid account batch") {
+            let _ = writeln!(out, "{}", format_account(&acc));
+        }
+        bulk(
+            &mut sm,
+            &mut out,
+            &[Transfer {
+                id: 373,
+                debit_account_id: 4,
+                credit_account_id: 2,
+                amount: 10,
+                ledger: 1,
+                code: 1,
+                ..Transfer::default()
+            }],
+            5_000_000_199,
+        );
+        account_balances(&mut sm, &mut out, 4);
 
         assert_eq!(out, GOLDEN_ACCOUNTING);
     }
