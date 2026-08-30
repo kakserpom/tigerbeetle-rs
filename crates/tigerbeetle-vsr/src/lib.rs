@@ -99,6 +99,12 @@ impl Operation {
     /// Port of `tigerbeetle.zig::Operation.get_account_balances`.
     pub const GET_ACCOUNT_BALANCES: Self =
         Self(tigerbeetle_core::constants::VSR_OPERATIONS_RESERVED + 15);
+    /// Port of `tigerbeetle.zig::Operation.query_accounts`.
+    pub const QUERY_ACCOUNTS: Self =
+        Self(tigerbeetle_core::constants::VSR_OPERATIONS_RESERVED + 16);
+    /// Port of `tigerbeetle.zig::Operation.query_transfers`.
+    pub const QUERY_TRANSFERS: Self =
+        Self(tigerbeetle_core::constants::VSR_OPERATIONS_RESERVED + 17);
 
     // Operations <vsr_operations_reserved are reserved for the control plane.
     // Operations ≥vsr_operations_reserved are available for the state machine.

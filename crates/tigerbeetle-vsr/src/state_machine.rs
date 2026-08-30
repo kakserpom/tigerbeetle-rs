@@ -34,7 +34,7 @@ use std::collections::HashMap;
 use tigerbeetle_core::types::{
     Account, AccountBalance, AccountEvent, AccountFilter, AccountFilterFlags, AccountFlags,
     ChangeEvent, ChangeEventType, ChangeEventsFilter, CreateAccountStatus, CreateTransferStatus,
-    Transfer, TransferFlags, TransferPending, TransferPendingStatus,
+    QueryFilter, QueryFilterFlags, Transfer, TransferFlags, TransferPending, TransferPendingStatus,
 };
 
 use crate::Operation;
@@ -1615,6 +1615,29 @@ fn bytes_to_account_filter(bytes: &[u8]) -> Option<AccountFilter> {
     })
 }
 
+/// Parse a `query_accounts`/`query_transfers` request body: a single 64-byte
+/// LE [`QueryFilter`].
+#[must_use]
+fn bytes_to_query_filter(bytes: &[u8]) -> Option<QueryFilter> {
+    if bytes.len() != 64 {
+        return None;
+    }
+    let mut reserved = [0_u8; 6];
+    reserved.copy_from_slice(&bytes[34..40]);
+    Some(QueryFilter {
+        user_data_128: le_u128(bytes, 0),
+        user_data_64: le_u64(bytes, 16),
+        user_data_32: le_u32(bytes, 24),
+        ledger: le_u32(bytes, 28),
+        code: u16::from_le_bytes(bytes[32..34].try_into().expect("2 bytes")),
+        reserved,
+        timestamp_min: le_u64(bytes, 40),
+        timestamp_max: le_u64(bytes, 48),
+        limit: le_u32(bytes, 56),
+        flags: QueryFilterFlags::from_raw(le_u32(bytes, 60)),
+    })
+}
+
 /// Validate an [`AccountFilter`] (upstream `get_scan_from_account_filter`,
 /// `state_machine.zig:1737`): a query must name a non-zero, non-`MAX` account,
 /// have at least one of `debits`/`credits` set, no padding or reserved bits,
@@ -1648,6 +1671,45 @@ fn transfer_matches_account_filter(t: &Transfer, filter: &AccountFilter) -> bool
         && (filter.user_data_64 == 0 || t.user_data_64 == filter.user_data_64)
         && (filter.user_data_32 == 0 || t.user_data_32 == filter.user_data_32)
         && (filter.code == 0 || t.code == filter.code)
+}
+
+/// Validate a [`QueryFilter`] (upstream `get_scan_from_query_filter`,
+/// `state_machine.zig:2062`): a query needs a non-zero `limit`, a well-formed
+/// timestamp range, no padding or reserved bits, and — unlike
+/// [`AccountFilter`] — does not require any user_data/ledger/code value.
+#[must_use]
+fn query_filter_valid(filter: &QueryFilter) -> bool {
+    let timestamp_valid = |t: u64| (1..=i64::MAX as u64).contains(&t);
+    (filter.timestamp_min == 0 || timestamp_valid(filter.timestamp_min))
+        && (filter.timestamp_max == 0 || timestamp_valid(filter.timestamp_max))
+        && (filter.timestamp_max == 0 || filter.timestamp_min <= filter.timestamp_max)
+        && filter.limit != 0
+        && !filter.flags.has_padding()
+        && filter.reserved.iter().all(|&b| b == 0)
+}
+
+/// Whether an object carrying a `user_data_128/64/32/ledger/code/timestamp`
+/// satisfies the query filter's AND conditions (each non-zero filter value is
+/// an equality; upstream `state_machine.zig:2086-2107`).
+#[must_use]
+fn query_matches(
+    user_data_128: u128,
+    user_data_64: u64,
+    user_data_32: u32,
+    ledger: u32,
+    code: u16,
+    timestamp: u64,
+    min: u64,
+    max: u64,
+    filter: &QueryFilter,
+) -> bool {
+    timestamp >= min
+        && timestamp <= max
+        && (filter.user_data_128 == 0 || user_data_128 == filter.user_data_128)
+        && (filter.user_data_64 == 0 || user_data_64 == filter.user_data_64)
+        && (filter.user_data_32 == 0 || user_data_32 == filter.user_data_32)
+        && (filter.ledger == 0 || ledger == filter.ledger)
+        && (filter.code == 0 || code == filter.code)
 }
 
 /// Encode a [`ChangeEvent`] as a 384-byte reply record (LE).
@@ -1836,6 +1898,18 @@ impl StateMachine {
                     unreachable!("get_account_balances body must be a single AccountFilter");
                 };
                 self.get_account_balances(&filter)
+            }
+            Operation::QUERY_ACCOUNTS => {
+                let Some(filter) = bytes_to_query_filter(body) else {
+                    unreachable!("query_accounts body must be a single QueryFilter");
+                };
+                self.query_accounts(&filter)
+            }
+            Operation::QUERY_TRANSFERS => {
+                let Some(filter) = bytes_to_query_filter(body) else {
+                    unreachable!("query_transfers body must be a single QueryFilter");
+                };
+                self.query_transfers(&filter)
             }
             operation => unreachable!("unsupported state-machine operation: {operation:?}"),
         }
@@ -2099,6 +2173,102 @@ impl StateMachine {
             results.push(snapshot);
         }
         account_balances_to_bytes(&results)
+    }
+
+    /// Execute a `query_accounts` operation and return the reply body
+    /// (upstream `execute_query_accounts`, `state_machine.zig:3359`).
+    ///
+    /// Returns the accounts whose timestamp falls in the (inclusive)
+    /// `[timestamp_min, timestamp_max]` range (a zero bound is unbounded) and
+    /// that satisfy the AND of the non-zero `user_data_128`/`user_data_64`/
+    /// `user_data_32`/`ledger`/`code` equality filters, up to `filter.limit`,
+    /// in ascending or reverse-chronological order per `reversed`.
+    ///
+    /// DEVIATION: upstream scans the `accounts` object groove via the
+    /// `user_data_*`/`ledger`/`code` derived index prefixes intersected with
+    /// the timestamp range (`get_scan_from_query_filter`); sans-IO the
+    /// committed accounts are filtered in memory.
+    #[must_use]
+    pub fn query_accounts(&self, filter: &QueryFilter) -> Vec<u8> {
+        if !query_filter_valid(filter) {
+            return Vec::new();
+        }
+        let min = if filter.timestamp_min == 0 { u64::MIN } else { filter.timestamp_min };
+        let max = if filter.timestamp_max == 0 { u64::MAX } else { filter.timestamp_max };
+
+        let mut results: Vec<Account> = self
+            .accounts
+            .values()
+            .copied()
+            .filter(|a| {
+                query_matches(
+                    a.user_data_128,
+                    a.user_data_64,
+                    a.user_data_32,
+                    a.ledger,
+                    a.code,
+                    a.timestamp,
+                    min,
+                    max,
+                    filter,
+                )
+            })
+            .collect();
+        if filter.flags.reversed() {
+            results.sort_unstable_by_key(|a| std::cmp::Reverse(a.timestamp));
+        } else {
+            results.sort_unstable_by_key(|a| a.timestamp);
+        }
+        results.truncate(filter.limit as usize);
+        account_batch_to_bytes(&results)
+    }
+
+    /// Execute a `query_transfers` operation and return the reply body
+    /// (upstream `execute_query_transfers`, `state_machine.zig:3377`).
+    ///
+    /// Returns the committed transfers whose timestamp falls in the
+    /// (inclusive) `[timestamp_min, timestamp_max]` range (a zero bound is
+    /// unbounded) and that satisfy the AND of the non-zero
+    /// `user_data_128`/`user_data_64`/`user_data_32`/`ledger`/`code` equality
+    /// filters, up to `filter.limit`, in ascending or reverse-chronological
+    /// order per `reversed`.
+    ///
+    /// DEVIATION: upstream scans the `transfers` object groove via the derived
+    /// index prefixes (`get_scan_from_query_filter`); sans-IO the committed
+    /// transfers are filtered in memory.
+    #[must_use]
+    pub fn query_transfers(&self, filter: &QueryFilter) -> Vec<u8> {
+        if !query_filter_valid(filter) {
+            return Vec::new();
+        }
+        let min = if filter.timestamp_min == 0 { u64::MIN } else { filter.timestamp_min };
+        let max = if filter.timestamp_max == 0 { u64::MAX } else { filter.timestamp_max };
+
+        let mut results: Vec<Transfer> = self
+            .transfers
+            .values()
+            .copied()
+            .filter(|t| {
+                query_matches(
+                    t.user_data_128,
+                    t.user_data_64,
+                    t.user_data_32,
+                    t.ledger,
+                    t.code,
+                    t.timestamp,
+                    min,
+                    max,
+                    filter,
+                )
+            })
+            .collect();
+        if filter.flags.reversed() {
+            results.sort_unstable_by_key(|t| std::cmp::Reverse(t.timestamp));
+        } else {
+            results.sort_unstable_by_key(|t| t.timestamp);
+        }
+        results.truncate(filter.limit as usize);
+        transfer_batch_to_bytes(&results)
     }
 
     /// Build the [`ChangeEvent`] reported for a recorded account event
@@ -5354,5 +5524,154 @@ mod tests {
         let (snapshots, _) = reply.as_chunks::<128>();
         assert_eq!(snapshots.len(), 1);
         assert_eq!(le_u64(&snapshots[0], 64), 20);
+    }
+
+    // ── query_accounts / query_transfers tests ───────────────────────────
+
+    fn query_filter() -> QueryFilter {
+        QueryFilter { limit: 100, ..QueryFilter::default() }
+    }
+
+    #[test]
+    fn query_accounts_filters_by_user_data_ledger_code_and_range() {
+        let mut sm = StateMachine::default();
+        let _ = sm.create_accounts(
+            &[
+                Account { id: 1, ledger: 1, code: 1, ..Account::default() },
+                Account { id: 2, ledger: 2, code: 1, user_data_64: 99, ..Account::default() },
+                Account { id: 3, ledger: 1, code: 7, ..Account::default() },
+            ],
+            10,
+        );
+
+        // All three created in one batch at base ts 10 (N=3): timestamps
+        // 8, 9, 10.
+        let all = sm.query_accounts(&query_filter());
+        let all_results = bytes_to_account_batch(&all).expect("valid account batch");
+        let ts: Vec<u64> = all_results.iter().map(|a| a.timestamp).collect();
+        assert_eq!(ts, vec![8, 9, 10]);
+
+        let ledger = QueryFilter { ledger: 2, ..query_filter() };
+        let l = sm.query_accounts(&ledger);
+        let lr = bytes_to_account_batch(&l).expect("valid account batch");
+        assert_eq!(lr.len(), 1);
+        assert_eq!(lr[0].id, 2);
+
+        let code = QueryFilter { code: 7, ..query_filter() };
+        let c = sm.query_accounts(&code);
+        let cr = bytes_to_account_batch(&c).expect("valid account batch");
+        assert_eq!(cr.len(), 1);
+        assert_eq!(cr[0].id, 3);
+
+        let range = QueryFilter { timestamp_min: 8, timestamp_max: 9, ..query_filter() };
+        let r = sm.query_accounts(&range);
+        let rr = bytes_to_account_batch(&r).expect("valid account batch");
+        assert_eq!(rr.len(), 2);
+        assert_eq!(rr[0].timestamp, 8);
+        assert_eq!(rr[1].timestamp, 9);
+    }
+
+    #[test]
+    fn query_accounts_reversed_and_limited() {
+        let mut sm = StateMachine::default();
+        let _ = sm.create_accounts(
+            &[
+                Account { id: 1, ledger: 1, code: 1, ..Account::default() },
+                Account { id: 2, ledger: 1, code: 1, ..Account::default() },
+                Account { id: 3, ledger: 1, code: 1, ..Account::default() },
+            ],
+            10,
+        );
+        let desc = QueryFilter { flags: QueryFilterFlags::REVERSED, limit: 2, ..query_filter() };
+        let view = sm.query_accounts(&desc);
+        let results = bytes_to_account_batch(&view).expect("valid account batch");
+        // Most recent first: ts 10, 9.
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].timestamp, 10);
+        assert_eq!(results[1].timestamp, 9);
+    }
+
+    #[test]
+    fn query_transfers_filters_and_orders() {
+        let mut sm = StateMachine::default();
+        let _ = sm.create_accounts(
+            &[
+                Account { id: 1, ledger: 1, code: 1, ..Account::default() },
+                Account { id: 2, ledger: 1, code: 1, ..Account::default() },
+                Account { id: 5, ledger: 2, code: 1, ..Account::default() },
+                Account { id: 6, ledger: 2, code: 1, ..Account::default() },
+            ],
+            10,
+        );
+        // `a`: 1->2 on ledger 1, user_data_32 = 7. `b`: 5->6 on ledger 2.
+        let mut a = t(1, 2, 5);
+        a.user_data_32 = 7;
+        let mut b = Transfer { id: 1003, ..t(5, 6, 6) };
+        b.ledger = 2;
+        let _ = sm.create_transfers(&[a, b], 20); // timestamps 20, 21
+
+        let user_data = QueryFilter { user_data_32: 7, ..query_filter() };
+        let u = sm.query_transfers(&user_data);
+        let ur = bytes_to_transfer_batch(&u).expect("valid transfer batch");
+        assert_eq!(ur.len(), 1);
+        assert_eq!(ur[0].amount, 5);
+
+        let ledger = QueryFilter { ledger: 2, ..query_filter() };
+        let l = sm.query_transfers(&ledger);
+        let lr = bytes_to_transfer_batch(&l).expect("valid transfer batch");
+        assert_eq!(lr.len(), 1);
+        assert_eq!(lr[0].amount, 6);
+
+        // No conditions: all in ascending timestamp order.
+        let all = sm.query_transfers(&query_filter());
+        let ar = bytes_to_transfer_batch(&all).expect("valid transfer batch");
+        let ts: Vec<u64> = ar.iter().map(|t| t.timestamp).collect();
+        assert_eq!(ts, vec![19, 20]);
+    }
+
+    #[test]
+    fn query_rejects_invalid_filter() {
+        let mut sm = StateMachine::default();
+        let _ = sm.create_accounts(
+            &[
+                Account { id: 1, ledger: 1, code: 1, ..Account::default() },
+                Account { id: 2, ledger: 1, code: 1, ..Account::default() },
+            ],
+            10,
+        );
+        let _ = sm.create_transfers(&[t(1, 2, 5)], 20);
+
+        let no_limit = QueryFilter { limit: 0, ..QueryFilter::default() };
+        assert!(sm.query_accounts(&no_limit).is_empty());
+        assert!(sm.query_transfers(&no_limit).is_empty());
+
+        let padding =
+            QueryFilter { flags: QueryFilterFlags::from_raw(0xFFFF_FFFF), ..query_filter() };
+        assert!(sm.query_accounts(&padding).is_empty());
+    }
+
+    #[test]
+    fn query_via_execute_decodes_filter() {
+        let mut sm = StateMachine::default();
+        let _ = sm.create_accounts(
+            &[
+                Account { id: 1, ledger: 5, code: 1, ..Account::default() },
+                Account { id: 2, ledger: 5, code: 1, ..Account::default() },
+            ],
+            10,
+        );
+
+        // Encode a 64-byte QueryFilter for ledger 5, limit 100.
+        let mut body = vec![0_u8; 64];
+        body[28..32].copy_from_slice(&5_u32.to_le_bytes());
+        body[56..60].copy_from_slice(&100_u32.to_le_bytes());
+
+        let reply = sm.execute(Operation::QUERY_ACCOUNTS, 0, &body);
+        let results = bytes_to_account_batch(&reply).expect("valid account batch");
+        assert_eq!(results.len(), 2);
+
+        let transfers = sm.execute(Operation::QUERY_TRANSFERS, 0, &body);
+        // No transfers exist; empty reply.
+        assert!(transfers.is_empty());
     }
 }

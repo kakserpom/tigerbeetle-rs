@@ -706,6 +706,82 @@ const _: () = assert!(core::mem::align_of::<AccountFilter>() == 16);
 const _: () = assert!(core::mem::size_of::<AccountFilterFlags>() == 4);
 
 // ---------------------------------------------------------------------------
+// QueryFilter
+// ---------------------------------------------------------------------------
+
+/// Query flags for the `query_accounts`/`query_transfers` operations (a `u32`
+/// bitfield).
+///
+/// Upstream: `src/tigerbeetle.zig:552`.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+#[repr(transparent)]
+pub struct QueryFilterFlags(u32);
+
+impl QueryFilterFlags {
+    /// Whether the results are sorted by timestamp in chronological or
+    /// reverse-chronological order.
+    pub const REVERSED: Self = Self(1 << 0);
+
+    /// Construct from a raw `u32` (for request decoding).
+    #[must_use]
+    pub const fn from_raw(raw: u32) -> Self {
+        Self(raw)
+    }
+
+    /// Return the raw `u32` value.
+    #[must_use]
+    pub const fn as_raw(self) -> u32 {
+        self.0
+    }
+
+    #[must_use]
+    pub const fn reversed(self) -> bool {
+        (self.0 & Self::REVERSED.0) != 0
+    }
+
+    /// The `padding` bits (upstream `query_filter_flags.padding`) must be zero.
+    #[must_use]
+    pub const fn has_padding(self) -> bool {
+        (self.0 & !Self::REVERSED.0) != 0
+    }
+}
+
+impl core::ops::BitOr for QueryFilterFlags {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self::Output {
+        Self(self.0 | rhs.0)
+    }
+}
+
+/// Filters for the `query_accounts` and `query_transfers` operations
+/// (64 bytes, 16-byte aligned).
+///
+/// Applies an AND of the non-zero `user_data_*`/`ledger`/`code` equality
+/// filters over the timestamp range `[timestamp_min, timestamp_max]`; zero
+/// fields act as "no filter". `limit` caps the number of results and must be
+/// non-zero.
+///
+/// Upstream: `src/tigerbeetle.zig:517`.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+#[repr(C)]
+pub struct QueryFilter {
+    pub user_data_128: u128,
+    pub user_data_64: u64,
+    pub user_data_32: u32,
+    pub ledger: u32,
+    pub code: u16,
+    pub reserved: [u8; 6],
+    pub timestamp_min: u64,
+    pub timestamp_max: u64,
+    pub limit: u32,
+    pub flags: QueryFilterFlags,
+}
+
+const _: () = assert!(core::mem::size_of::<QueryFilter>() == 64);
+const _: () = assert!(core::mem::align_of::<QueryFilter>() == 16);
+const _: () = assert!(core::mem::size_of::<QueryFilterFlags>() == 4);
+
+// ---------------------------------------------------------------------------
 // Tree IDs
 // ---------------------------------------------------------------------------
 
