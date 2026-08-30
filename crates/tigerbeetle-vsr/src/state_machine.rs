@@ -31,6 +31,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use tigerbeetle_core::constants;
 use tigerbeetle_core::types::{
     Account, AccountBalance, AccountEvent, AccountFilter, AccountFilterFlags, AccountFlags,
     ChangeEvent, ChangeEventType, ChangeEventsFilter, CreateAccountStatus, CreateTransferStatus,
@@ -39,6 +40,34 @@ use tigerbeetle_core::types::{
 use tigerbeetle_lsm::timestamp_range::TimestampRange;
 
 use crate::Operation;
+
+// ---------------------------------------------------------------------------
+// Query reply limits
+// ---------------------------------------------------------------------------
+
+/// The maximum number of results in a scan-based query reply, given the result
+/// size (upstream `Operation.result_max`, `tigerbeetle.zig:907`).
+///
+/// DEVIATION: upstream also constrains `get_change_events` by the runtime
+/// `batch_size_limit`-derived prefetch budget
+/// (`prefetch_get_change_events`, `state_machine.zig:2251-2262`); sans-IO the
+/// batch/prefetch budget is deferred (Phase 3), and the message-body bound is
+/// the binding constraint whenever `batch_size_limit >= message_body_size_max`.
+fn result_max(result_size: usize) -> usize {
+    constants::MESSAGE_BODY_SIZE_MAX / result_size
+}
+
+/// Like [`result_max`], but for multi-batch operations whose reply carries a
+/// multi-batch trailer (upstream `Operation.result_max`,
+/// `tigerbeetle.zig:923-930`, `multi_batch.trailer_total_size`).
+fn result_max_multi_batch(result_size: usize) -> usize {
+    // The trailer for an operand-count of one: a `TrailerItem` + `Postamble`
+    // (2 bytes each), padded up to the element size.
+    debug_assert!(result_size.is_power_of_two());
+
+    let trailer_size = 4usize.div_ceil(result_size) * result_size;
+    (constants::MESSAGE_BODY_SIZE_MAX - trailer_size) / result_size
+}
 
 // ---------------------------------------------------------------------------
 // Account creation
@@ -2108,9 +2137,11 @@ impl StateMachine {
             .map(|(_, e)| e)
             .collect();
         events.sort_unstable_by_key(|e| e.timestamp);
-        events.truncate(filter.limit as usize);
-
-        let mut reply = Vec::with_capacity(events.len() * 384);
+        // Upstream `prefetch_get_change_events` caps the reply at
+        // `min(filter.limit, limit_max)` (state_machine.zig:2245-2275).
+        events
+            .truncate((filter.limit as usize).min(result_max(core::mem::size_of::<ChangeEvent>())));
+        let mut reply = Vec::with_capacity(events.len() * core::mem::size_of::<ChangeEvent>());
         for result in events {
             let change = self.build_change_event(result);
             reply.extend_from_slice(&change_bytes(&change));
@@ -2174,7 +2205,10 @@ impl StateMachine {
         } else {
             results.sort_unstable_by_key(|t| t.timestamp);
         }
-        results.truncate(filter.limit as usize);
+        // Upstream `prefetch_get_account_transfers` caps the reply at
+        // `min(filter.limit, result_max(message_body_size_max))`
+        // (state_machine.zig:1641-1648).
+        results.truncate((filter.limit as usize).min(result_max(core::mem::size_of::<Transfer>())));
         transfer_batch_to_bytes(&results)
     }
 
@@ -2229,7 +2263,12 @@ impl StateMachine {
         } else {
             events.sort_unstable_by_key(|e| e.timestamp);
         }
-        events.truncate(filter.limit as usize);
+        // Upstream `prefetch_get_account_balances` caps the reply at
+        // `min(filter.limit, result_max(message_body_size_max))`
+        // (state_machine.zig:1641-1648).
+        events.truncate(
+            (filter.limit as usize).min(result_max(core::mem::size_of::<AccountEvent>())),
+        );
 
         let mut results: Vec<AccountBalance> = Vec::with_capacity(events.len());
         for event in events {
@@ -2303,7 +2342,11 @@ impl StateMachine {
         } else {
             results.sort_unstable_by_key(|a| a.timestamp);
         }
-        results.truncate(filter.limit as usize);
+        // Upstream `prefetch_query_accounts_scan` caps the reply at
+        // `min(filter.limit, result_max)` (state_machine.zig:1887-1894).
+        results.truncate(
+            (filter.limit as usize).min(result_max_multi_batch(core::mem::size_of::<Account>())),
+        );
         account_batch_to_bytes(&results)
     }
 
@@ -2351,7 +2394,9 @@ impl StateMachine {
         } else {
             results.sort_unstable_by_key(|t| t.timestamp);
         }
-        results.truncate(filter.limit as usize);
+        results.truncate(
+            (filter.limit as usize).min(result_max_multi_batch(core::mem::size_of::<Transfer>())),
+        );
         transfer_batch_to_bytes(&results)
     }
 
@@ -6272,6 +6317,15 @@ mod tests {
             s if s == CreateTransferStatus::PendingTransferNotPending as u32 => {
                 "pending_transfer_not_pending"
             }
+            s if s == CreateTransferStatus::PendingTransferHasDifferentAmount as u32 => {
+                "pending_transfer_has_different_amount"
+            }
+            s if s == CreateTransferStatus::PendingTransferAlreadyVoided as u32 => {
+                "pending_transfer_already_voided"
+            }
+            s if s == CreateTransferStatus::PendingTransferExpired as u32 => {
+                "pending_transfer_expired"
+            }
             s if s == CreateTransferStatus::CreditAccountNotFound as u32 => {
                 "credit_account_not_found"
             }
@@ -6527,6 +6581,59 @@ get_change_events ts=[0,0] limit=10;
 63:two_phase_pending:333:1234:0:1:1234:602:0:0:2:0:0:1234:602
 65:two_phase_pending:334:500:0:1:1734:602:0:0:2:0:0:1734:602
 3000000096:two_phase_expired:333:1234:0:1:500:602:0:0:2:0:0:500:602
+create_transfers;
+3000000102:created
+create_transfers;
+3000000104:pending_transfer_expired
+create_transfers;
+3000000106:pending_transfer_has_different_amount
+create_transfers;
+3000000108:pending_transfer_already_posted
+create_transfers;
+3000000110:created
+create_transfers;
+3000000112:created
+create_transfers;
+3000000114:pending_transfer_already_voided
+lookup_transfers n=7;
+340:3000000102:201:334:1:2:1:1:0:4
+350:3000000110:777:0:1:2:1:1:200:2
+351:3000000112:777:350:1:2:1:1:0:8
+get_account_balances account=1;
+7:500:0:0:0
+9:500:100:0:0
+14:0:600:0:0
+15:0:601:0:0
+16:1:601:0:0
+17:0:602:0:0
+63:1234:602:0:0
+65:1734:602:0:0
+3000000102:0:803:0:0
+3000000110:777:803:0:0
+3000000112:0:803:0:0
+get_account_balances account=2;
+7:0:0:500:0
+9:0:0:500:100
+14:0:0:0:600
+15:0:0:0:601
+16:0:0:1:601
+17:0:0:0:602
+63:0:0:1234:602
+65:0:0:1734:602
+3000000102:0:0:0:803
+3000000110:0:0:777:803
+3000000112:0:0:0:803
+get_change_events ts=[0,0] limit=15;
+7:two_phase_pending:1:500:0:1:500:0:0:0:2:0:0:500:0
+9:single_phase:2:100:0:1:500:100:0:0:2:0:0:500:100
+14:two_phase_posted:4:500:1:1:0:600:0:0:2:0:0:0:600
+15:single_phase:22:1:0:1:0:601:0:0:2:0:0:0:601
+16:two_phase_pending:24:1:0:1:1:601:0:0:2:0:0:1:601
+17:two_phase_posted:25:1:24:1:0:602:0:0:2:0:0:0:602
+63:two_phase_pending:333:1234:0:1:1234:602:0:0:2:0:0:1234:602
+65:two_phase_pending:334:500:0:1:1734:602:0:0:2:0:0:1734:602
+3000000096:two_phase_expired:333:1234:0:1:500:602:0:0:2:0:0:500:602
+3000000102:two_phase_posted:340:201:334:1:0:803:0:0:2:0:0:0:803
 ";
 
     #[test]
@@ -6962,6 +7069,65 @@ get_change_events ts=[0,0] limit=10;
         account_balances(&mut sm, &mut out, 2);
         let filter =
             ChangeEventsFilter { timestamp_min: 0, timestamp_max: 0, limit: 10, reserved: [0; 44] };
+        let _ = writeln!(
+            out,
+            "get_change_events ts=[{},{}] limit={};",
+            filter.timestamp_min, filter.timestamp_max, filter.limit
+        );
+        for row in sm.get_change_events(&filter).as_chunks::<384>().0 {
+            let event = change_event_at(row, 0);
+            let _ = writeln!(out, "{}", format_change_event(&event));
+        }
+
+        // Post/void after expiry: a partial post (201 of the 500 pending)
+        // closes 334 — the remainder is released, not posted; the expired 333
+        // and the now-posted 334 reject (post and void have different rules):
+        // voiding 334 for 300 fails before the status check (amount must
+        // equal the full pending), and re-posting fails with
+        // `pending_transfer_already_posted`. A fresh 777 pending (350) is then
+        // fully voided (successful `two_phase_voided` pin) and re-voided.
+        let posting = |id: u128, amount: u128, pending_id: u128| Transfer {
+            id,
+            amount,
+            pending_id,
+            flags: TransferFlags::POST_PENDING_TRANSFER,
+            ..Transfer::default()
+        };
+        let voiding = |id: u128, amount: u128, pending_id: u128| Transfer {
+            id,
+            amount,
+            pending_id,
+            flags: TransferFlags::VOID_PENDING_TRANSFER,
+            ..Transfer::default()
+        };
+        bulk(&mut sm, &mut out, &[posting(340, 201, 334)], 3_000_000_102);
+        bulk(&mut sm, &mut out, &[posting(341, 1234, 333)], 3_000_000_104);
+        bulk(&mut sm, &mut out, &[voiding(342, 300, 334)], 3_000_000_106);
+        bulk(&mut sm, &mut out, &[posting(344, 1, 334)], 3_000_000_108);
+        bulk(
+            &mut sm,
+            &mut out,
+            &[Transfer { timeout: 200, ..pending_never(350, 777) }],
+            3_000_000_110,
+        );
+        bulk(&mut sm, &mut out, &[voiding(351, 777, 350)], 3_000_000_112);
+        bulk(&mut sm, &mut out, &[voiding(352, 777, 350)], 3_000_000_114);
+
+        out.push_str("lookup_transfers n=7;\n");
+        for transfer in
+            bytes_to_transfer_batch(&sm.lookup_transfers(&[340, 341, 342, 344, 350, 351, 352]))
+                .expect("valid transfer batch")
+        {
+            let _ = writeln!(out, "{}", format_transfer(&transfer));
+        }
+        account_balances(&mut sm, &mut out, 1);
+        account_balances(&mut sm, &mut out, 2);
+        // Upstream caps the change-events reply at the message-body
+        // `result_max` (10 events in `test_min`) — the two newest events
+        // (350/351) fall beyond it even though `limit` is 15
+        // (state_machine.zig:2245-2275).
+        let filter =
+            ChangeEventsFilter { timestamp_min: 0, timestamp_max: 0, limit: 15, reserved: [0; 44] };
         let _ = writeln!(
             out,
             "get_change_events ts=[{},{}] limit={};",
