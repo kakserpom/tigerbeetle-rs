@@ -2190,9 +2190,12 @@ impl StateMachine {
     ///
     /// DEVIATION: upstream scans the `account_events` groove's
     /// `account_timestamp` derived index built from the transfers-groove scan
-    /// conditions; sans-IO the events are filtered in memory (including
-    /// resolving an event's originating transfer to apply the
-    /// `user_data_*`/`code` filters).
+    /// conditions — events are yielded only when a *transfer* exists at the
+    /// event's timestamp (`AccountBalancesScanLookup`), so expiry events,
+    /// which carry no transfer at their own timestamp, never appear in the
+    /// balance history; sans-IO the events are filtered in memory (including
+    /// excluding `Expired` events and resolving an event's originating
+    /// transfer to apply the `user_data_*`/`code` filters).
     #[must_use]
     pub fn get_account_balances(&self, filter: &AccountFilter) -> Vec<u8> {
         if !account_filter_valid(filter) {
@@ -2214,6 +2217,7 @@ impl StateMachine {
             .filter(|(ts, e)| {
                 **ts >= min
                     && **ts <= max
+                    && e.transfer_pending_status != TransferPendingStatus::Expired
                     && self
                         .account_event_transfer(e)
                         .is_some_and(|t| transfer_matches_account_filter(&t, filter))
@@ -6015,6 +6019,48 @@ mod tests {
     }
 
     #[test]
+    fn get_account_balances_excludes_expired_events() {
+        let mut sm = StateMachine::default();
+        let _ = sm.create_accounts(
+            &[
+                Account {
+                    id: 1,
+                    ledger: 1,
+                    code: 1,
+                    flags: AccountFlags::HISTORY,
+                    ..Account::default()
+                },
+                Account {
+                    id: 2,
+                    ledger: 1,
+                    code: 1,
+                    flags: AccountFlags::HISTORY,
+                    ..Account::default()
+                },
+            ],
+            10,
+        );
+        let _ = sm.create_transfers(
+            &[Transfer { flags: TransferFlags::PENDING, timeout: 1, ..t(1, 2, 50) }],
+            20,
+        );
+        let _ = sm.execute(Operation::STATE_MACHINE_PULSE, 20 + NS_PER_S, &[]);
+
+        // The CDC records the expiry event, but the balance history does not:
+        // upstream yields balances only for events with a transfer at their
+        // timestamp (AccountBalancesScanLookup scans via the transfers groove).
+        let filter =
+            ChangeEventsFilter { timestamp_min: 0, timestamp_max: 0, limit: 10, reserved: [0; 44] };
+        assert_eq!(sm.get_change_events(&filter).len(), 2 * 384);
+
+        let view = sm.get_account_balances(&account_filter(1, AccountFilterFlags::DEBITS));
+        let (snapshots, _) = view.as_chunks::<128>();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(le_u64(&snapshots[0], 64), 20);
+        assert_eq!(le_u128(&snapshots[0], 0), 50);
+    }
+
+    #[test]
     fn get_account_balances_via_execute_decodes_filter() {
         let mut sm = StateMachine::default();
         let _ = sm.create_accounts(
@@ -6445,6 +6491,42 @@ get_change_events ts=[0,0] limit=10;
 15:single_phase:22:1:0:1:0:601:0:0:2:0:0:0:601
 16:two_phase_pending:24:1:0:1:1:601:0:0:2:0:0:1:601
 17:two_phase_posted:25:1:24:1:0:602:0:0:2:0:0:0:602
+create_transfers;
+63:created
+create_transfers;
+65:created
+pulse at 3000000096;
+lookup_transfers n=2;
+333:63:1234:0:1:2:1:1:2:2
+334:65:500:0:1:2:1:1:100:2
+get_account_balances account=1;
+7:500:0:0:0
+9:500:100:0:0
+14:0:600:0:0
+15:0:601:0:0
+16:1:601:0:0
+17:0:602:0:0
+63:1234:602:0:0
+65:1734:602:0:0
+get_account_balances account=2;
+7:0:0:500:0
+9:0:0:500:100
+14:0:0:0:600
+15:0:0:0:601
+16:0:0:1:601
+17:0:0:0:602
+63:0:0:1234:602
+65:0:0:1734:602
+get_change_events ts=[0,0] limit=10;
+7:two_phase_pending:1:500:0:1:500:0:0:0:2:0:0:500:0
+9:single_phase:2:100:0:1:500:100:0:0:2:0:0:500:100
+14:two_phase_posted:4:500:1:1:0:600:0:0:2:0:0:0:600
+15:single_phase:22:1:0:1:0:601:0:0:2:0:0:0:601
+16:two_phase_pending:24:1:0:1:1:601:0:0:2:0:0:1:601
+17:two_phase_posted:25:1:24:1:0:602:0:0:2:0:0:0:602
+63:two_phase_pending:333:1234:0:1:1234:602:0:0:2:0:0:1234:602
+65:two_phase_pending:334:500:0:1:1734:602:0:0:2:0:0:1734:602
+3000000096:two_phase_expired:333:1234:0:1:500:602:0:0:2:0:0:500:602
 ";
 
     #[test]
@@ -6846,6 +6928,38 @@ get_change_events ts=[0,0] limit=10;
             }
         };
         account_balances(&mut sm, &mut out, 1);
+        let filter =
+            ChangeEventsFilter { timestamp_min: 0, timestamp_max: 0, limit: 10, reserved: [0; 44] };
+        let _ = writeln!(
+            out,
+            "get_change_events ts=[{},{}] limit={};",
+            filter.timestamp_min, filter.timestamp_max, filter.limit
+        );
+        for row in sm.get_change_events(&filter).as_chunks::<384>().0 {
+            let event = change_event_at(row, 0);
+            let _ = writeln!(out, "{}", format_change_event(&event));
+        }
+
+        // Expiry: a short-lived pending (333, 2s) and a long-lived one (334,
+        // 100s). A pulse at 3_000_000_096 expires only 333, releasing its
+        // holds (both sides down by 1234); 334 stays pending. The balance
+        // history omits the expiry event (no transfer at its timestamp), but
+        // the CDC records it.
+        bulk(&mut sm, &mut out, &[Transfer { timeout: 2, ..pending_never(333, 1234) }], 63);
+        bulk(&mut sm, &mut out, &[Transfer { timeout: 100, ..pending_never(334, 500) }], 65);
+
+        out.push_str("pulse at 3000000096;\n");
+        let reply = sm.execute(Operation::STATE_MACHINE_PULSE, 3_000_000_096, &[]);
+        assert!(reply.is_empty());
+
+        out.push_str("lookup_transfers n=2;\n");
+        for transfer in bytes_to_transfer_batch(&sm.lookup_transfers(&[333, 334]))
+            .expect("valid transfer batch")
+        {
+            let _ = writeln!(out, "{}", format_transfer(&transfer));
+        }
+        account_balances(&mut sm, &mut out, 1);
+        account_balances(&mut sm, &mut out, 2);
         let filter =
             ChangeEventsFilter { timestamp_min: 0, timestamp_max: 0, limit: 10, reserved: [0; 44] };
         let _ = writeln!(
