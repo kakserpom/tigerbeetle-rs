@@ -6262,6 +6262,59 @@ mod tests {
         )
     }
 
+    /// Returns the `{id}:{ts}:{dp}:{dpost}:{cp}:{cpost}:{ledger}:{code}:{flags}`
+    /// line of an `Account` (same line used by lookup and query sections).
+    fn format_account(acc: &Account) -> String {
+        format!(
+            "{}:{}:{}:{}:{}:{}:{}:{}:{}",
+            acc.id,
+            acc.timestamp,
+            acc.debits_pending,
+            acc.debits_posted,
+            acc.credits_pending,
+            acc.credits_posted,
+            acc.ledger,
+            acc.code,
+            acc.flags.as_raw()
+        )
+    }
+
+    /// Upstream `@tagName` of a [`ChangeEventType`].
+    fn change_event_type_name(t: ChangeEventType) -> &'static str {
+        match t {
+            ChangeEventType::SinglePhase => "single_phase",
+            ChangeEventType::TwoPhasePending => "two_phase_pending",
+            ChangeEventType::TwoPhasePosted => "two_phase_posted",
+            ChangeEventType::TwoPhaseVoided => "two_phase_voided",
+            ChangeEventType::TwoPhaseExpired => "two_phase_expired",
+        }
+    }
+
+    /// Returns the `{ts}:{type}:{transfer_id}:{transfer_amount}:
+    /// {transfer_pending_id}:{dr}:{dr_dp}:{dr_dpost}:{dr_cp}:{dr_cpost}:
+    /// {cr}:{cr_dp}:{cr_dpost}:{cr_cp}:{cr_cpost}` line of a `ChangeEvent`
+    /// (the recorded account balance snapshots, not the live state).
+    fn format_change_event(e: &ChangeEvent) -> String {
+        format!(
+            "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+            e.timestamp,
+            change_event_type_name(e.r#type),
+            e.transfer_id,
+            e.transfer_amount,
+            e.transfer_pending_id,
+            e.debit_account_id,
+            e.debit_account_debits_pending,
+            e.debit_account_debits_posted,
+            e.debit_account_credits_pending,
+            e.debit_account_credits_posted,
+            e.credit_account_id,
+            e.credit_account_debits_pending,
+            e.credit_account_debits_posted,
+            e.credit_account_credits_pending,
+            e.credit_account_credits_posted,
+        )
+    }
+
     /// The exact stdout of `reference/tigerbeetle/src/tbcross_accounting.zig`
     /// driven against the real upstream `StateMachine` (`test_min` config).
     ///
@@ -6318,6 +6371,31 @@ lookup_transfers n=4;
 1:7:500:0:1:2:1:1:0:2
 2:9:100:0:1:2:1:1:0:0
 4:14:500:1:1:2:1:1:0:4
+get_account_transfers account=1 reversed=0;
+1:7:500:0:1:2:1:1:0:2
+2:9:100:0:1:2:1:1:0:0
+4:14:500:1:1:2:1:1:0:4
+get_account_transfers account=2 reversed=1;
+4:14:500:1:1:2:1:1:0:4
+2:9:100:0:1:2:1:1:0:0
+1:7:500:0:1:2:1:1:0:2
+query_accounts ts=[0,0] limit=10 reversed=0;
+1:2:0:600:0:0:1:1:8
+2:3:0:0:0:600:1:2:8
+3:5:0:0:0:0:2:1:8
+query_accounts ts=[3,0] limit=1 reversed=1;
+3:5:0:0:0:0:2:1:8
+query_transfers ts=[0,0] limit=10 reversed=0;
+1:7:500:0:1:2:1:1:0:2
+2:9:100:0:1:2:1:1:0:0
+4:14:500:1:1:2:1:1:0:4
+query_transfers ts=[0,0] limit=2 reversed=1;
+4:14:500:1:1:2:1:1:0:4
+2:9:100:0:1:2:1:1:0:0
+get_change_events ts=[0,0] limit=10;
+7:two_phase_pending:1:500:0:1:500:0:0:0:2:0:0:500:0
+9:single_phase:2:100:0:1:500:100:0:0:2:0:0:500:100
+14:two_phase_posted:4:500:1:1:0:600:0:0:2:0:0:0:600
 ";
 
     #[test]
@@ -6475,19 +6553,7 @@ lookup_transfers n=4;
         for acc in
             bytes_to_account_batch(&sm.lookup_accounts(&[1, 3, 99])).expect("valid account batch")
         {
-            let _ = writeln!(
-                out,
-                "{}:{}:{}:{}:{}:{}:{}:{}:{}",
-                acc.id,
-                acc.timestamp,
-                acc.debits_pending,
-                acc.debits_posted,
-                acc.credits_pending,
-                acc.credits_posted,
-                acc.ledger,
-                acc.code,
-                acc.flags.as_raw()
-            );
+            let _ = writeln!(out, "{}", format_account(&acc));
         }
 
         out.push_str("lookup_transfers n=4;\n");
@@ -6495,6 +6561,109 @@ lookup_transfers n=4;
             .expect("valid transfer batch")
         {
             let _ = writeln!(out, "{}", format_transfer(&transfer));
+        }
+
+        // Index-scanned queries: debit side of account 1 (ascending), credit
+        // side of account 2 (reversed).
+        let transfers_filter = |account_id: u128, debits: bool, reversed: bool| AccountFilter {
+            account_id,
+            flags: if debits { AccountFilterFlags::DEBITS } else { AccountFilterFlags::CREDITS }
+                | if reversed {
+                    AccountFilterFlags::REVERSED
+                } else {
+                    AccountFilterFlags::default()
+                },
+            limit: 100,
+            ..AccountFilter::default()
+        };
+        for (account_id, debits, reversed) in [(1, true, false), (2, false, true)] {
+            let filter = transfers_filter(account_id, debits, reversed);
+            let _ = writeln!(
+                out,
+                "get_account_transfers account={account_id} reversed={};",
+                reversed as u8
+            );
+            for transfer in bytes_to_transfer_batch(&sm.get_account_transfers(&filter))
+                .expect("valid transfer batch")
+            {
+                let _ = writeln!(out, "{}", format_transfer(&transfer));
+            }
+        }
+
+        // Filter queries: full range ascending, and a trimmed descending window.
+        let query = |min: u64, max: u64, limit: u32, reversed: bool| QueryFilter {
+            timestamp_min: min,
+            timestamp_max: max,
+            limit,
+            flags: if reversed { QueryFilterFlags::REVERSED } else { QueryFilterFlags::default() },
+            ..QueryFilter::default()
+        };
+
+        let q = query(0, 0, 10, false);
+        let _ = writeln!(
+            out,
+            "query_accounts ts=[{},{}] limit={} reversed={};",
+            q.timestamp_min,
+            q.timestamp_max,
+            q.limit,
+            q.flags.reversed() as u8
+        );
+        for acc in bytes_to_account_batch(&sm.query_accounts(&q)).expect("valid account batch") {
+            let _ = writeln!(out, "{}", format_account(&acc));
+        }
+        let q = query(3, 0, 1, true);
+        let _ = writeln!(
+            out,
+            "query_accounts ts=[{},{}] limit={} reversed={};",
+            q.timestamp_min,
+            q.timestamp_max,
+            q.limit,
+            q.flags.reversed() as u8
+        );
+        for acc in bytes_to_account_batch(&sm.query_accounts(&q)).expect("valid account batch") {
+            let _ = writeln!(out, "{}", format_account(&acc));
+        }
+
+        let q = query(0, 0, 10, false);
+        let _ = writeln!(
+            out,
+            "query_transfers ts=[{},{}] limit={} reversed={};",
+            q.timestamp_min,
+            q.timestamp_max,
+            q.limit,
+            q.flags.reversed() as u8
+        );
+        for transfer in
+            bytes_to_transfer_batch(&sm.query_transfers(&q)).expect("valid transfer batch")
+        {
+            let _ = writeln!(out, "{}", format_transfer(&transfer));
+        }
+        let q = query(0, 0, 2, true);
+        let _ = writeln!(
+            out,
+            "query_transfers ts=[{},{}] limit={} reversed={};",
+            q.timestamp_min,
+            q.timestamp_max,
+            q.limit,
+            q.flags.reversed() as u8
+        );
+        for transfer in
+            bytes_to_transfer_batch(&sm.query_transfers(&q)).expect("valid transfer batch")
+        {
+            let _ = writeln!(out, "{}", format_transfer(&transfer));
+        }
+
+        // CDC: every recorded change event (pending, single-phase, posted).
+        let filter =
+            ChangeEventsFilter { timestamp_min: 0, timestamp_max: 0, limit: 10, reserved: [0; 44] };
+        let _ = writeln!(
+            out,
+            "get_change_events ts=[{},{}] limit={};",
+            filter.timestamp_min, filter.timestamp_max, filter.limit
+        );
+        for row in sm.get_change_events(&filter).as_chunks::<384>().0 {
+            let event = change_event_at(row, 0);
+            let _ = writeln!(out, "{}", format_change_event(&event));
         }
 
         assert_eq!(out, GOLDEN_ACCOUNTING);
