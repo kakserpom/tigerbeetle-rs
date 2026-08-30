@@ -26,6 +26,7 @@
 use std::collections::HashMap;
 use std::hash::Hash;
 
+use tigerbeetle_core::types::Account;
 use tigerbeetle_lsm::tree::ScopeCloseMode;
 
 /// The primary key of an object, used as the cache key.
@@ -35,6 +36,12 @@ use tigerbeetle_lsm::tree::ScopeCloseMode;
 /// trait here.
 pub trait ObjectKey<K> {
     fn object_key(&self) -> K;
+}
+
+impl ObjectKey<u128> for Account {
+    fn object_key(&self) -> u128 {
+        self.id
+    }
 }
 
 /// The actions a scope must reverse if it is discarded, recorded in insertion

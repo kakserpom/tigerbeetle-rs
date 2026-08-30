@@ -38,8 +38,10 @@ use tigerbeetle_core::types::{
     QueryFilter, QueryFilterFlags, Transfer, TransferFlags, TransferPending, TransferPendingStatus,
 };
 use tigerbeetle_lsm::timestamp_range::TimestampRange;
+use tigerbeetle_lsm::tree::ScopeCloseMode;
 
 use crate::Operation;
+use crate::objects_cache::ObjectsCache;
 
 // ---------------------------------------------------------------------------
 // Query reply limits
@@ -895,7 +897,7 @@ pub struct CreateTransferResult {
 /// An insertion-ordered set of unique keys, mirroring an upstream groove's
 /// `prefetch_keys` (deduplicated by the set, first-seen order preserved).
 #[derive(Debug, Default)]
-struct PrefetchKeys<K> {
+pub(crate) struct PrefetchKeys<K> {
     ordered: Vec<K>,
     seen: HashSet<K>,
 }
@@ -913,13 +915,17 @@ where
     fn contains(&self, key: K) -> bool {
         self.seen.contains(&key)
     }
+
+    fn iter(&self) -> impl Iterator<Item = &K> {
+        self.ordered.iter()
+    }
 }
 
 /// The keys enqueued for a `create_accounts` batch: the account object ids and,
 /// for imported batches, the account timestamps (to detect a transfer with the
 /// same timestamp — `state_machine.zig:1283-1288`).
 #[derive(Debug, Default)]
-struct AccountPrefetchKeys {
+pub(crate) struct AccountPrefetchKeys {
     account_ids: PrefetchKeys<u128>,
     transfer_timestamps: PrefetchKeys<u64>,
 }
@@ -954,7 +960,7 @@ fn prefetch_create_accounts(events: &[Account]) -> AccountPrefetchKeys {
 /// - `account_timestamps`: for imported batches, every event's timestamp (to
 ///   detect an account with the same timestamp).
 #[derive(Debug, Default)]
-struct TransferPrefetchKeys {
+pub(crate) struct TransferPrefetchKeys {
     transfer_ids: PrefetchKeys<u128>,
     pending_timestamps: PrefetchKeys<u64>,
     account_ids: PrefetchKeys<u128>,
@@ -1011,29 +1017,30 @@ fn prefetch_create_transfers(
 /// `transfer_with_timestamp` resolves the transfer matching a timestamp, mirroring the cross-groove
 /// `transfers.indirect_lookup` that upstream consults for imported events.
 ///
+/// Reads go through the batch's objects cache (`accounts_objects`): the
+/// orchestrator fills it from the committed accounts resolved by `prefetch`
+/// (`prefetch_create_accounts`), each create upserts its account, and a chain
+/// opening/closing drives `scope_open`/`scope_close` so a broken chain's
+/// in-session creates are rolled back (upstream `state_machine.zig:3037-3202`).
+/// `transfer_timestamps` holds the committed transfers whose timestamps were
+/// looked up during prefetch (upstream's `transfers.indirect_lookup` for
+/// imported events).
+///
 /// Returns a `Vec<CreateAccountResult>` parallel to the input events.
-pub fn execute_create_accounts<F, FTransferAt>(
+pub(crate) fn execute_create_accounts(
     events: &[Account],
     timestamp: u64,
-    mut get_existing: F,
+    prefetch: &AccountPrefetchKeys,
+    accounts_objects: &mut ObjectsCache<u128, Account>,
     accounts_key_max: u64,
-    transfer_with_timestamp: FTransferAt,
-) -> Vec<CreateAccountResult>
-where
-    F: FnMut(u128) -> Option<Account>,
-    FTransferAt: Fn(u64) -> Option<u128>,
-{
+    transfer_timestamps: &HashSet<u64>,
+) -> Vec<CreateAccountResult> {
     let mut results: Vec<CreateAccountResult> = Vec::with_capacity(events.len());
     let mut chain: Option<usize> = None;
     let mut chain_broken = false;
     // The running object-tree key range: committed state plus the events of this
     // batch (upstream inserts each created account before the next event's check).
     let mut running_key_max = accounts_key_max;
-    // In-session working view of accounts created earlier in this batch:
-    // upstream's `get_account` reads through the accounts object cache, which
-    // `insert` updates, so a duplicate id later in the batch sees the record
-    // just created and reports `exists` with its stored timestamp.
-    let mut working_accounts: HashMap<u128, Account> = HashMap::new();
 
     let batch_imported = !events.is_empty() && events[0].flags.imported();
 
@@ -1045,7 +1052,10 @@ where
                 if chain.is_none() {
                     chain = Some(index);
                     assert!(!chain_broken);
-                    // TODO(port): scope_open
+                    // Open a batch scope over the accounts object cache; its
+                    // in-session creates are rolled back on a chain break
+                    // (`state_machine.zig:3037`).
+                    accounts_objects.scope_open();
                 }
                 if index == events.len() - 1 {
                     break 'result (CreateAccountStatus::LinkedEventChainOpen, timestamp_event);
@@ -1077,10 +1087,18 @@ where
                 break 'result (CreateAccountStatus::TimestampMustBeZero, timestamp_event);
             }
 
-            // The in-session working view takes precedence over the committed
-            // state (an account created earlier in this batch is visible).
-            let existing =
-                working_accounts.get(&event.id).copied().or_else(|| get_existing(event.id));
+            // The object cache holds the prefetched committed accounts plus the
+            // in-session creates; upstream reads the groove's objects cache the
+            // same way (`get_account`, state_machine.zig:4467-4474).
+            let existing = accounts_objects.get(&event.id).copied();
+            if existing.is_none() {
+                // A cache miss must have been resolved as not-found during
+                // prefetch, i.e. the id was enqueued (`state_machine.zig:3633-3635`).
+                assert!(
+                    prefetch.account_ids.contains(event.id),
+                    "create_accounts read an account id that was not prefetched"
+                );
+            }
             // Imported-timestamp regression/collision checks. Upstream runs these
             // inside `create_account` _after_ the idempotency checks (state_machine.zig:3656-3665),
             // so an existing record short-circuits to its `exists` code first.
@@ -1088,10 +1106,15 @@ where
                 assert!(event.timestamp != 0);
                 assert!(event.timestamp <= timestamp_event);
                 // A past timestamp must not regress the account object index, and
-                // must not collide with an existing transfer's timestamp.
+                // must not collide with an existing transfer's timestamp
+                // (`transfers.indirect_lookup`).
                 if event.timestamp <= running_key_max
-                    || transfer_with_timestamp(event.timestamp).is_some()
+                    || transfer_timestamps.contains(&event.timestamp)
                 {
+                    // `indirect_lookup` consults the transfers prefetch key set;
+                    // a colliding timestamp must have been enqueued
+                    // (state_machine.zig:1283-1309).
+                    assert!(prefetch.transfer_timestamps.contains(event.timestamp));
                     break 'result (
                         CreateAccountStatus::ImportedEventTimestampMustNotRegress,
                         timestamp_event,
@@ -1117,7 +1140,10 @@ where
             if matches!(status, CreateAccountStatus::Created) {
                 let mut stored = *event;
                 stored.timestamp = ts;
-                working_accounts.insert(event.id, stored);
+                // Insert into the object cache so later events in the batch see
+                // this account (upstream `Accounts.objects_cache.upsert`,
+                // state_machine.zig:3667).
+                accounts_objects.upsert(stored);
                 running_key_max = running_key_max.max(ts);
             }
             (status, ts)
@@ -1129,7 +1155,10 @@ where
                 if !chain_broken {
                     chain_broken = true;
                     // The chain has just been broken: mark every prior member as
-                    // `linked_event_failed` (upstream state_machine.zig:3116-3145).
+                    // `linked_event_failed` and roll the chain's in-session cache
+                    // creates back (upstream `scope_close` with `.discard`,
+                    // state_machine.zig:3116-3145).
+                    accounts_objects.scope_close(ScopeCloseMode::Discard);
                     for result in &mut results[chain_start..index] {
                         result.status = CreateAccountStatus::LinkedEventFailed;
                     }
@@ -1144,7 +1173,10 @@ where
             && (!event.flags.linked() || status == CreateAccountStatus::LinkedEventChainOpen)
         {
             if !chain_broken {
-                // TODO(port): scope_close(persist)
+                // Commit the chain's in-session creates
+                // (upstream `scope_close` with `.persist`,
+                // state_machine.zig:3197-3202).
+                accounts_objects.scope_close(ScopeCloseMode::Persist);
             }
             chain = None;
             chain_broken = false;
@@ -1182,7 +1214,7 @@ where
 /// primary-key set (transfer ids that failed with a transient status and can
 /// never be created again); ids orphaned earlier in this batch are layered on
 /// top, mirroring upstream's in-session groove state.
-pub fn execute_create_transfers<F, G, FAccountAt, FPendingStatus, FOrphaned>(
+pub(crate) fn execute_create_transfers<F, G, FAccountAt, FPendingStatus, FOrphaned>(
     events: &[Transfer],
     timestamp: u64,
     mut get_existing_transfer: F,
@@ -2160,27 +2192,34 @@ impl StateMachine {
     pub fn create_accounts(&mut self, events: &[Account], timestamp: u64) -> Vec<u8> {
         assert!(self.commit_timestamp <= timestamp);
         // Prefetch the batch's key-set before executing (upstream
-        // `state_machine.zig:1244`); every read during execution asserts its
-        // key was enqueued, mirroring the upstream `constants.verify` asserts.
+        // `state_machine.zig:1244`); the same key-set then fills the batch's
+        // objects cache, and every miss during execution asserts its key was
+        // enqueued (the upstream `constants.verify` asserts).
         let prefetch = prefetch_create_accounts(events);
+        // Resolve the enqueued keys against the committed stores into the
+        // batch's objects cache (upstream's prefetch callbacks fill the
+        // grooves' ObjectsCaches, state_machine.zig:1264-1309).
+        let mut accounts_objects = ObjectsCache::default();
+        for &id in prefetch.account_ids.iter() {
+            if let Some(account) = self.accounts.get(&id) {
+                accounts_objects.upsert(*account);
+            }
+        }
+        // The imported-timestamp collision check needs the _found_ subset of
+        // the enqueued transfer timestamps (`transfers.indirect_lookup`).
+        let mut transfer_timestamps = HashSet::new();
+        for &ts in prefetch.transfer_timestamps.iter() {
+            if self.transfers_by_timestamp.contains_key(&ts) {
+                transfer_timestamps.insert(ts);
+            }
+        }
         let results = execute_create_accounts(
             events,
             timestamp,
-            |id| {
-                assert!(
-                    prefetch.account_ids.contains(id),
-                    "create_accounts read an unprefetched account id"
-                );
-                self.accounts.get(&id).copied()
-            },
+            &prefetch,
+            &mut accounts_objects,
             self.accounts_timestamp_max,
-            |ts| {
-                assert!(
-                    prefetch.transfer_timestamps.contains(ts),
-                    "create_accounts read an unprefetched transfer timestamp"
-                );
-                self.transfers_by_timestamp.get(&ts).copied()
-            },
+            &transfer_timestamps,
         );
         self.persist_accounts(events, &results, timestamp);
         account_results_to_bytes(&results)
@@ -4100,10 +4139,29 @@ mod tests {
 
     // ── batch orchestrator tests ─────────────────────────────────────────
 
+    /// Run a `create_accounts` batch against an empty committed state
+    /// (mirrors the historical `execute_create_accounts` pure-fn tests, which
+    /// bypassed the orchestrator's prefetch wiring).
+    fn execute_create_accounts_no_state(
+        events: &[Account],
+        timestamp: u64,
+    ) -> Vec<CreateAccountResult> {
+        let prefetch = prefetch_create_accounts(events);
+        let mut accounts_objects = ObjectsCache::default();
+        execute_create_accounts(
+            events,
+            timestamp,
+            &prefetch,
+            &mut accounts_objects,
+            0,
+            &HashSet::new(),
+        )
+    }
+
     #[test]
     fn batch_single_account() {
         let events = vec![Account { id: 1, ledger: 1, code: 1, ..Account::default() }];
-        let results = execute_create_accounts(&events, 10, |_| None, 0, |_| None);
+        let results = execute_create_accounts_no_state(&events, 10);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].status, CreateAccountStatus::Created);
         assert_eq!(results[0].timestamp, 10);
@@ -4116,7 +4174,7 @@ mod tests {
             Account { id: 2, ledger: 1, code: 1, ..Account::default() },
             Account { id: 3, ledger: 1, code: 1, ..Account::default() },
         ];
-        let results = execute_create_accounts(&events, 10, |_| None, 0, |_| None);
+        let results = execute_create_accounts_no_state(&events, 10);
         assert_eq!(results.len(), 3);
         assert_eq!(results[0].timestamp, 8);
         assert_eq!(results[1].timestamp, 9);
@@ -4138,7 +4196,7 @@ mod tests {
             },
             Account { id: 2, ledger: 1, code: 1, ..Account::default() },
         ];
-        let results = execute_create_accounts(&events, 10, |_| None, 0, |_| None);
+        let results = execute_create_accounts_no_state(&events, 10);
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].status, CreateAccountStatus::Created);
         assert_eq!(results[1].status, CreateAccountStatus::Created);
@@ -4156,7 +4214,7 @@ mod tests {
                 ..Account::default()
             },
         ];
-        let results = execute_create_accounts(&events, 10, |_| None, 0, |_| None);
+        let results = execute_create_accounts_no_state(&events, 10);
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].status, CreateAccountStatus::Created);
         assert_eq!(results[1].status, CreateAccountStatus::LinkedEventChainOpen);
@@ -4166,7 +4224,7 @@ mod tests {
     fn batch_timestamp_must_be_zero() {
         let events =
             vec![Account { id: 1, ledger: 1, code: 1, timestamp: 5, ..Account::default() }];
-        let results = execute_create_accounts(&events, 10, |_| None, 0, |_| None);
+        let results = execute_create_accounts_no_state(&events, 10);
         assert_eq!(results[0].status, CreateAccountStatus::TimestampMustBeZero);
     }
 
@@ -4183,7 +4241,7 @@ mod tests {
             },
             Account { id: 2, ledger: 1, code: 1, ..Account::default() },
         ];
-        let results = execute_create_accounts(&events, 10, |_| None, 0, |_| None);
+        let results = execute_create_accounts_no_state(&events, 10);
         assert_eq!(results[0].status, CreateAccountStatus::Created);
         assert_eq!(results[1].status, CreateAccountStatus::ImportedEventExpected);
     }
@@ -4198,7 +4256,7 @@ mod tests {
             timestamp: 15,
             ..Account::default()
         }];
-        let results = execute_create_accounts(&events, 10, |_| None, 0, |_| None);
+        let results = execute_create_accounts_no_state(&events, 10);
         assert_eq!(results[0].status, CreateAccountStatus::ImportedEventTimestampMustNotAdvance);
     }
 
