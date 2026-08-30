@@ -6356,6 +6356,10 @@ mod tests {
             }
             s if s == CreateTransferStatus::Exists as u32 => "exists",
             s if s == CreateTransferStatus::Created as u32 => "created",
+            s if s == CreateTransferStatus::LinkedEventFailed as u32 => "linked_event_failed",
+            s if s == CreateTransferStatus::LinkedEventChainOpen as u32 => {
+                "linked_event_chain_open"
+            }
             other => panic!("unexpected transfer status {other}"),
         }
     }
@@ -6893,6 +6897,25 @@ lookup_transfers n=29;
 390:5000000224:11:0:1:2:1:1:0:0
 391:5000000226:12:0:1:2:1:1:0:0
 392:5000000228:13:0:1:2:1:1:0:0
+create_transfers;
+5000000248:created
+5000000249:created
+5000000250:created
+create_transfers;
+5000000252:linked_event_failed
+5000000253:credit_account_not_found
+5000000254:linked_event_failed
+5000000255:linked_event_failed
+create_transfers;
+5000000257:linked_event_failed
+5000000258:linked_event_chain_open
+create_transfers;
+5000000260:created
+lookup_transfers n=10;
+505:5000000248:30:0:1:2:1:1:0:1
+506:5000000249:40:0:1:2:1:1:0:1
+507:5000000250:50:0:1:2:1:1:0:0
+514:5000000260:1:0:1:2:1:1:0:0
 ";
 
     #[test]
@@ -7625,6 +7648,71 @@ lookup_transfers n=29;
             384, 380, 399, 398, 1, 2, 4, 22, 24, 25, 333, 334, 340, 350, 351, 360, 370, 373, 381,
             382, 383, 385, 386, 387, 388, 389, 390, 391, 392,
         ]))
+        .expect("valid transfer batch")
+        {
+            let _ = writeln!(out, "{}", format_transfer(&transfer));
+        }
+
+        // Linked chains (upstream create logic state_machine.zig:3015-3070):
+        // a status other than `.created` breaks the chain — it rolls back the
+        // in-scope writes and rewrites the preceding members' results to
+        // `linked_event_failed`; a chain whose last event is linked reports
+        // `linked_event_chain_open` on that event (its object is deferred)
+        // while ALSO breaking the chain (its status != created), so the whole
+        // open chain is discarded. Only chains that close in-batch persist.
+        //
+        // Batch 1 (closes in-batch): 505/506 report `created` (chain open),
+        // 507 `created` closes it — all three persist.
+        let chain1 = |id: u128, amount: u128, linked: bool| Transfer {
+            id,
+            debit_account_id: 1,
+            credit_account_id: 2,
+            amount,
+            ledger: 1,
+            code: 1,
+            flags: if linked { TransferFlags::LINKED } else { TransferFlags::default() },
+            ..Transfer::default()
+        };
+        bulk(
+            &mut sm,
+            &mut out,
+            &[chain1(505, 30, true), chain1(506, 40, true), chain1(507, 50, false)],
+            5_000_000_250,
+        );
+        // Batch 2 (breaks): 508 is created in-scope, but the failure of 509
+        // (credit account 9 missing) rewrites 508 to `linked_event_failed`
+        // and rolls it back; 510 (linked) and 511 (plain, still within the
+        // poisoned chain) both get `linked_event_failed`. Nothing persists.
+        bulk(
+            &mut sm,
+            &mut out,
+            &[
+                chain1(508, 60, true),
+                Transfer {
+                    id: 509,
+                    debit_account_id: 1,
+                    credit_account_id: 9,
+                    amount: 1,
+                    ledger: 1,
+                    code: 1,
+                    flags: TransferFlags::LINKED,
+                    ..Transfer::default()
+                },
+                chain1(510, 70, true),
+                chain1(511, 80, false),
+            ],
+            5_000_000_255,
+        );
+        // Batch 3 (chain open at the boundary): 512's `created` is rewritten
+        // to `linked_event_failed` because the batch's last event (513) is
+        // linked → `linked_event_chain_open` breaks the chain; neither is
+        // created.
+        bulk(&mut sm, &mut out, &[chain1(512, 90, true), chain1(513, 100, true)], 5_000_000_258);
+        bulk(&mut sm, &mut out, &[chain1(514, 1, false)], 5_000_000_260);
+        out.push_str("lookup_transfers n=10;\n");
+        for transfer in bytes_to_transfer_batch(
+            &sm.lookup_transfers(&[505, 506, 507, 508, 509, 510, 511, 512, 513, 514]),
+        )
         .expect("valid transfer batch")
         {
             let _ = writeln!(out, "{}", format_transfer(&transfer));
