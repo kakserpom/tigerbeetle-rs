@@ -2208,7 +2208,9 @@ impl StateMachine {
         // Upstream `prefetch_get_account_transfers` caps the reply at
         // `min(filter.limit, result_max(message_body_size_max))`
         // (state_machine.zig:1641-1648).
-        results.truncate((filter.limit as usize).min(result_max(core::mem::size_of::<Transfer>())));
+        results.truncate(
+            (filter.limit as usize).min(result_max_multi_batch(core::mem::size_of::<Transfer>())),
+        );
         transfer_batch_to_bytes(&results)
     }
 
@@ -2269,7 +2271,8 @@ impl StateMachine {
         // (128 bytes; 4032/128 = 31 in `test_min`), not the `AccountEvent`
         // (256) events are scanned from (state_machine.zig:1641-1648).
         events.truncate(
-            (filter.limit as usize).min(result_max(core::mem::size_of::<AccountBalance>())),
+            (filter.limit as usize)
+                .min(result_max_multi_batch(core::mem::size_of::<AccountBalance>())),
         );
 
         let mut results: Vec<AccountBalance> = Vec::with_capacity(events.len());
@@ -6730,6 +6733,126 @@ get_account_balances account=1 ts=[5000000202,0] limit=100;
 5000000206:0:809:0:0
 5000000208:0:813:0:0
 5000000210:0:818:0:0
+create_transfers;
+5000000214:created
+create_transfers;
+5000000216:created
+create_transfers;
+5000000218:created
+create_transfers;
+5000000220:created
+create_transfers;
+5000000222:created
+create_transfers;
+5000000224:created
+create_transfers;
+5000000226:created
+create_transfers;
+5000000228:created
+create_transfers;
+5000000230:created
+create_transfers;
+5000000232:created
+create_transfers;
+5000000234:created
+create_transfers;
+5000000236:created
+create_transfers;
+5000000238:created
+create_transfers;
+5000000240:created
+create_transfers;
+5000000242:created
+query_transfers ts=[0,0] limit=50 reversed=0;
+1:7:500:0:1:2:1:1:0:2
+2:9:100:0:1:2:1:1:0:0
+4:14:500:1:1:2:1:1:0:4
+22:15:1:0:1:2:1:1:0:256
+24:16:1:0:1:2:1:1:0:258
+25:17:1:24:1:2:1:1:0:260
+333:63:1234:0:1:2:1:1:2:2
+334:65:500:0:1:2:1:1:100:2
+340:3000000102:201:334:1:2:1:1:0:4
+350:3000000110:777:0:1:2:1:1:200:2
+351:3000000112:777:350:1:2:1:1:0:8
+360:3000000120:50:0:1:2:1:1:1:66
+370:4000000160:100:0:4:2:1:1:1:66
+373:5000000199:10:0:4:2:1:1:0:0
+380:5000000202:1:0:1:2:1:1:0:0
+381:5000000204:2:0:1:2:1:1:0:0
+382:5000000206:3:0:1:2:1:1:0:0
+383:5000000208:4:0:1:2:1:1:0:0
+384:5000000210:5:0:1:2:1:1:0:0
+385:5000000214:6:0:1:2:1:1:0:0
+386:5000000216:7:0:1:2:1:1:0:0
+387:5000000218:8:0:1:2:1:1:0:0
+388:5000000220:9:0:1:2:1:1:0:0
+389:5000000222:10:0:1:2:1:1:0:0
+390:5000000224:11:0:1:2:1:1:0:0
+391:5000000226:12:0:1:2:1:1:0:0
+392:5000000228:13:0:1:2:1:1:0:0
+393:5000000230:14:0:1:2:1:1:0:0
+394:5000000232:15:0:1:2:1:1:0:0
+get_account_transfers account=1 reversed=0;
+1:7:500:0:1:2:1:1:0:2
+2:9:100:0:1:2:1:1:0:0
+4:14:500:1:1:2:1:1:0:4
+22:15:1:0:1:2:1:1:0:256
+24:16:1:0:1:2:1:1:0:258
+25:17:1:24:1:2:1:1:0:260
+333:63:1234:0:1:2:1:1:2:2
+334:65:500:0:1:2:1:1:100:2
+340:3000000102:201:334:1:2:1:1:0:4
+350:3000000110:777:0:1:2:1:1:200:2
+351:3000000112:777:350:1:2:1:1:0:8
+360:3000000120:50:0:1:2:1:1:1:66
+380:5000000202:1:0:1:2:1:1:0:0
+381:5000000204:2:0:1:2:1:1:0:0
+382:5000000206:3:0:1:2:1:1:0:0
+383:5000000208:4:0:1:2:1:1:0:0
+384:5000000210:5:0:1:2:1:1:0:0
+385:5000000214:6:0:1:2:1:1:0:0
+386:5000000216:7:0:1:2:1:1:0:0
+387:5000000218:8:0:1:2:1:1:0:0
+388:5000000220:9:0:1:2:1:1:0:0
+389:5000000222:10:0:1:2:1:1:0:0
+390:5000000224:11:0:1:2:1:1:0:0
+391:5000000226:12:0:1:2:1:1:0:0
+392:5000000228:13:0:1:2:1:1:0:0
+393:5000000230:14:0:1:2:1:1:0:0
+394:5000000232:15:0:1:2:1:1:0:0
+395:5000000234:16:0:1:2:1:1:0:0
+396:5000000236:17:0:1:2:1:1:0:0
+get_account_balances account=1;
+7:500:0:0:0
+9:500:100:0:0
+14:0:600:0:0
+15:0:601:0:0
+16:1:601:0:0
+17:0:602:0:0
+63:1234:602:0:0
+65:1734:602:0:0
+3000000102:0:803:0:0
+3000000110:777:803:0:0
+3000000112:0:803:0:0
+3000000120:50:803:0:0
+5000000202:0:804:0:0
+5000000204:0:806:0:0
+5000000206:0:809:0:0
+5000000208:0:813:0:0
+5000000210:0:818:0:0
+5000000214:0:824:0:0
+5000000216:0:831:0:0
+5000000218:0:839:0:0
+5000000220:0:848:0:0
+5000000222:0:858:0:0
+5000000224:0:869:0:0
+5000000226:0:881:0:0
+5000000228:0:894:0:0
+5000000230:0:908:0:0
+5000000232:0:923:0:0
+5000000234:0:939:0:0
+5000000236:0:956:0:0
 ";
 
     #[test]
@@ -7363,12 +7486,18 @@ get_account_balances account=1 ts=[5000000202,0] limit=100;
         );
         account_balances(&mut sm, &mut out, 4);
 
-        // Push account 1 past what would be a 15-row bug: `get_account_balances`
-        // caps at `min(filter.limit, result_max)` where `result_max` divides the
-        // body by the RESULT size — `AccountBalance` (128 bytes → 31 in
-        // `test_min`) — not the `AccountEvent` (256 → 15) scan size. All 17
-        // rows come through (the golden fixes the port's 15-cap divergence from
-        // upstream); a windowed dump also verifies `timestamp_min` scanning.
+        // Multi-batch reply caps. `test_min` message body =
+        // `message_size_max_min(4)` - 256-byte header = alignForward(5*256,
+        // 4096) - 256 = 3840. `get_account_balances` and `get_account_transfers`
+        // are MULTI-batch ops like the queries (tigerbeetle.zig `is_multi_batch`
+        // 819-833), so their caps subtract the one-batch trailer
+        // `div_ceil(4, 128)*128` = 128: (3840-128)/128 = 29. The port got this
+        // wrong twice: originally capping balances at `size_of::<AccountEvent>`
+        // (256) → 15, caught in c7e43a8 by the 17-row dump below; then at the
+        // plain `result_max` (30) instead of the multi-batch variant — caught
+        // here. Transfers 380-384 (17-balance dump) plus 385-399 raise account
+        // 1 to 32 events, so the capped dumps that follow all pin 29 rows
+        // exactly (and query_transfers, with 34 transfers, 29 as well).
         let debit1 = |id: u128, amount: u128| Transfer {
             id,
             debit_account_id: 1,
@@ -7400,6 +7529,49 @@ get_account_balances account=1 ts=[5000000202,0] limit=100;
         for row in sm.get_account_balances(&filter).as_chunks::<128>().0 {
             let _ = writeln!(out, "{}", format_balance(row));
         }
+
+        bulk(&mut sm, &mut out, &[debit1(385, 6)], 5_000_000_214);
+        bulk(&mut sm, &mut out, &[debit1(386, 7)], 5_000_000_216);
+        bulk(&mut sm, &mut out, &[debit1(387, 8)], 5_000_000_218);
+        bulk(&mut sm, &mut out, &[debit1(388, 9)], 5_000_000_220);
+        bulk(&mut sm, &mut out, &[debit1(389, 10)], 5_000_000_222);
+        bulk(&mut sm, &mut out, &[debit1(390, 11)], 5_000_000_224);
+        bulk(&mut sm, &mut out, &[debit1(391, 12)], 5_000_000_226);
+        bulk(&mut sm, &mut out, &[debit1(392, 13)], 5_000_000_228);
+        bulk(&mut sm, &mut out, &[debit1(393, 14)], 5_000_000_230);
+        bulk(&mut sm, &mut out, &[debit1(394, 15)], 5_000_000_232);
+        bulk(&mut sm, &mut out, &[debit1(395, 16)], 5_000_000_234);
+        bulk(&mut sm, &mut out, &[debit1(396, 17)], 5_000_000_236);
+        bulk(&mut sm, &mut out, &[debit1(397, 18)], 5_000_000_238);
+        bulk(&mut sm, &mut out, &[debit1(398, 19)], 5_000_000_240);
+        bulk(&mut sm, &mut out, &[debit1(399, 20)], 5_000_000_242);
+        let q = query(0, 0, 50, false);
+        let _ = writeln!(
+            out,
+            "query_transfers ts=[{},{}] limit={} reversed={};",
+            q.timestamp_min,
+            q.timestamp_max,
+            q.limit,
+            q.flags.reversed() as u8
+        );
+        for transfer in
+            bytes_to_transfer_batch(&sm.query_transfers(&q)).expect("valid transfer batch")
+        {
+            let _ = writeln!(out, "{}", format_transfer(&transfer));
+        }
+        let filter = AccountFilter {
+            account_id: 1,
+            limit: 100,
+            flags: AccountFilterFlags::DEBITS | AccountFilterFlags::CREDITS,
+            ..AccountFilter::default()
+        };
+        let _ = writeln!(out, "get_account_transfers account={} reversed=0;", filter.account_id);
+        for transfer in bytes_to_transfer_batch(&sm.get_account_transfers(&filter))
+            .expect("valid transfer batch")
+        {
+            let _ = writeln!(out, "{}", format_transfer(&transfer));
+        }
+        account_balances(&mut sm, &mut out, 1);
 
         assert_eq!(out, GOLDEN_ACCOUNTING);
     }
