@@ -7301,10 +7301,58 @@ get_change_events ts=[5000000190,5000000260] limit=100;
 5000000214:single_phase:385:6:0:1:0:824:0:0:2:0:0:0:834
 5000000216:single_phase:386:7:0:1:0:831:0:0:2:0:0:0:841
 5000000218:single_phase:387:8:0:1:0:839:0:0:2:0:0:0:849
+create_transfers;
+5000000295:created
+query_transfers u128=11112222333344445555666677778888 u64=0 u32=0 ledger=0 code=0 ts=[0,0] limit=100 reversed=0;
+600:5000000295:1:0:1:2:1:5:0:0
+query_transfers u128=0 u64=2459584641779389781 u32=0 ledger=0 code=0 ts=[0,0] limit=100 reversed=0;
+600:5000000295:1:0:1:2:1:5:0:0
+query_transfers u128=0 u64=0 u32=858997828 ledger=0 code=0 ts=[0,0] limit=100 reversed=0;
+600:5000000295:1:0:1:2:1:5:0:0
+create_transfers;
+5000000300:created
+create_transfers;
+5000000302:created
+create_transfers;
+5000000304:created
+create_transfers;
+5000000306:created
+create_transfers;
+5000000308:created
+create_accounts;
+5000000310:created
+5000000311:created
+create_transfers;
+5000000313:created
+query_transfers u128=0 u64=0 u32=0 ledger=7 code=0 ts=[0,0] limit=100 reversed=0;
+702:5000000313:1:0:700:701:7:5:0:0
+query_transfers u128=0 u64=0 u32=0 ledger=0 code=5 ts=[0,0] limit=100 reversed=0;
+600:5000000295:1:0:1:2:1:5:0:0
+702:5000000313:1:0:700:701:7:5:0:0
+query_transfers u128=0 u64=0 u32=0 ledger=0 code=7 ts=[0,0] limit=100 reversed=0;
+601:5000000300:1:0:1:2:1:7:0:0
+602:5000000302:2:0:1:2:1:7:0:0
+603:5000000304:3:0:1:2:1:7:0:0
+604:5000000306:4:0:1:2:1:7:0:0
+605:5000000308:5:0:1:2:1:7:0:0
+query_accounts u128=0 u64=0 u32=0 ledger=7 code=0 ts=[0,0] limit=100 reversed=0;
+700:5000000310:0:1:0:0:7:70:0
+701:5000000311:0:0:0:1:7:71:0
+query_accounts u128=0 u64=0 u32=0 ledger=0 code=70 ts=[0,0] limit=100 reversed=0;
+700:5000000310:0:1:0:0:7:70:0
+query_transfers u128=55550000000000000000000000000000 u64=0 u32=0 ledger=0 code=0 ts=[0,0] limit=100 reversed=0;
+get_account_transfers account=2 u64=2459584641779389781 u32=0 code=0 ts=[0,0] reversed=0;
+600:5000000295:1:0:1:2:1:5:0:0
+get_account_transfers account=700 u64=0 u32=0 code=5 ts=[0,0] reversed=0;
+702:5000000313:1:0:700:701:7:5:0:0
 ";
 
     #[test]
     fn accounting_matches_upstream_golden() {
+        const ALPHA_128: u128 = 0x1111_2222_3333_4444_5555_6666_7777_8888;
+        const ALPHA_64: u64 = 0x2222_3333_4444_5555;
+        const ALPHA_32: u32 = 0x3333_4444;
+
         let mut sm = StateMachine::default();
         let mut out = String::new();
 
@@ -8195,6 +8243,210 @@ get_change_events ts=[5000000190,5000000260] limit=100;
         for row in sm.get_change_events(&cdc).as_chunks::<384>().0 {
             let event = change_event_at(row, 0);
             let _ = writeln!(out, "{}", format_change_event(&event));
+        }
+
+        // Field filters: everything before this is ledger 1/code 1 with zero
+        // user_data, so `query_matches`/`transfer_matches_account_filter`'s
+        // non-zero-equality branches were never differentiated against
+        // upstream. Add a tagged transfer (600, code 5), five untagged code-7
+        // transfers (601-605), a ledger-7 account pair (700/701) and a
+        // ledger-7 code-5 transfer (702).
+        bulk(
+            &mut sm,
+            &mut out,
+            &[Transfer {
+                id: 600,
+                debit_account_id: 1,
+                credit_account_id: 2,
+                amount: 1,
+                ledger: 1,
+                code: 5,
+                user_data_128: ALPHA_128,
+                user_data_64: ALPHA_64,
+                user_data_32: ALPHA_32,
+                ..Transfer::default()
+            }],
+            5_000_000_295,
+        );
+        // Each user_data dimension filters to the one tagged transfer (the
+        // untagged 601-605 and all older transfers are excluded).
+        for (f_128, f_64, f_32) in [(ALPHA_128, 0, 0), (0, ALPHA_64, 0), (0, 0, ALPHA_32)] {
+            let q = QueryFilter {
+                user_data_128: f_128,
+                user_data_64: f_64,
+                user_data_32: f_32,
+                limit: 100,
+                ..QueryFilter::default()
+            };
+            let _ = writeln!(
+                out,
+                "query_transfers u128={:x} u64={} u32={} ledger={} code={} ts=[{},{}] limit={} reversed={};",
+                q.user_data_128,
+                q.user_data_64,
+                q.user_data_32,
+                q.ledger,
+                q.code,
+                q.timestamp_min,
+                q.timestamp_max,
+                q.limit,
+                q.flags.reversed() as u8
+            );
+            for transfer in
+                bytes_to_transfer_batch(&sm.query_transfers(&q)).expect("valid transfer batch")
+            {
+                let _ = writeln!(out, "{}", format_transfer(&transfer));
+            }
+        }
+        // Five plain transfers 601-605 (ledger 1, code 7): the code=7 filter
+        // selects exactly them; code=5 selects 600; ledger=7 selects 702.
+        for id in 601..=605 {
+            bulk(
+                &mut sm,
+                &mut out,
+                &[Transfer {
+                    id,
+                    debit_account_id: 1,
+                    credit_account_id: 2,
+                    amount: (id - 600) as u128,
+                    ledger: 1,
+                    code: 7,
+                    ..Transfer::default()
+                }],
+                5_000_000_300 + 2 * (id - 601) as u64,
+            );
+        }
+        // A ledger-7 account pair (no history), then one ledger-7 code-5
+        // transfer, so `ledger` has a positive match on both queries.
+        accounts_batch(
+            &mut sm,
+            &mut out,
+            &[
+                Account { id: 700, ledger: 7, code: 70, ..Account::default() },
+                Account { id: 701, ledger: 7, code: 71, ..Account::default() },
+            ],
+            5_000_000_311,
+        );
+        bulk(
+            &mut sm,
+            &mut out,
+            &[Transfer {
+                id: 702,
+                debit_account_id: 700,
+                credit_account_id: 701,
+                amount: 1,
+                ledger: 7,
+                code: 5,
+                ..Transfer::default()
+            }],
+            5_000_000_313,
+        );
+        // query_transfers by ledger (702), by code 5 (600 + 702), by code 7
+        // (601-605); query_accounts by ledger 7 (700 + 701) and by code 70
+        // (700 only); a valid but zero-match user_data_128 filter (empty).
+        let print_query_transfers_fields =
+            |sm: &mut StateMachine, out: &mut String, q: &QueryFilter| {
+                let _ = writeln!(
+                    out,
+                    "query_transfers u128={:x} u64={} u32={} ledger={} code={} ts=[{},{}] limit={} reversed={};",
+                    q.user_data_128,
+                    q.user_data_64,
+                    q.user_data_32,
+                    q.ledger,
+                    q.code,
+                    q.timestamp_min,
+                    q.timestamp_max,
+                    q.limit,
+                    q.flags.reversed() as u8
+                );
+                for transfer in
+                    bytes_to_transfer_batch(&sm.query_transfers(q)).expect("valid transfer batch")
+                {
+                    let _ = writeln!(out, "{}", format_transfer(&transfer));
+                }
+            };
+        let print_query_accounts_fields =
+            |sm: &mut StateMachine, out: &mut String, q: &QueryFilter| {
+                let _ = writeln!(
+                    out,
+                    "query_accounts u128={:x} u64={} u32={} ledger={} code={} ts=[{},{}] limit={} reversed={};",
+                    q.user_data_128,
+                    q.user_data_64,
+                    q.user_data_32,
+                    q.ledger,
+                    q.code,
+                    q.timestamp_min,
+                    q.timestamp_max,
+                    q.limit,
+                    q.flags.reversed() as u8
+                );
+                for acc in
+                    bytes_to_account_batch(&sm.query_accounts(q)).expect("valid account batch")
+                {
+                    let _ = writeln!(out, "{}", format_account(&acc));
+                }
+            };
+        print_query_transfers_fields(
+            &mut sm,
+            &mut out,
+            &QueryFilter { ledger: 7, limit: 100, ..QueryFilter::default() },
+        );
+        print_query_transfers_fields(
+            &mut sm,
+            &mut out,
+            &QueryFilter { code: 5, limit: 100, ..QueryFilter::default() },
+        );
+        print_query_transfers_fields(
+            &mut sm,
+            &mut out,
+            &QueryFilter { code: 7, limit: 100, ..QueryFilter::default() },
+        );
+        print_query_accounts_fields(
+            &mut sm,
+            &mut out,
+            &QueryFilter { ledger: 7, limit: 100, ..QueryFilter::default() },
+        );
+        print_query_accounts_fields(
+            &mut sm,
+            &mut out,
+            &QueryFilter { code: 70, limit: 100, ..QueryFilter::default() },
+        );
+        print_query_transfers_fields(
+            &mut sm,
+            &mut out,
+            &QueryFilter {
+                user_data_128: 0x5555_0000_0000_0000_0000_0000_0000_0000,
+                limit: 100,
+                ..QueryFilter::default()
+            },
+        );
+        // get_account_transfers combining the side filter with user_data_64
+        // (only 600 on account 2's credit side) and with code (only 702 on
+        // account 700).
+        for (account_id, u64_f, code_f) in [(2, ALPHA_64, 0), (700, 0, 5)] {
+            let filter = AccountFilter {
+                account_id,
+                user_data_64: u64_f,
+                code: code_f,
+                limit: 100,
+                flags: AccountFilterFlags::DEBITS | AccountFilterFlags::CREDITS,
+                ..AccountFilter::default()
+            };
+            let _ = writeln!(
+                out,
+                "get_account_transfers account={} u64={} u32={} code={} ts=[{},{}] reversed={};",
+                filter.account_id,
+                filter.user_data_64,
+                filter.user_data_32,
+                filter.code,
+                filter.timestamp_min,
+                filter.timestamp_max,
+                filter.flags.reversed() as u8
+            );
+            for transfer in bytes_to_transfer_batch(&sm.get_account_transfers(&filter))
+                .expect("valid transfer batch")
+            {
+                let _ = writeln!(out, "{}", format_transfer(&transfer));
+            }
         }
 
         assert_eq!(out, GOLDEN_ACCOUNTING);
