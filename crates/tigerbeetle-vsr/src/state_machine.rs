@@ -7017,6 +7017,21 @@ create_accounts;
 5000000291:created
 5000000292:created
 5000000265:exists
+get_account_transfers account=1 ts=[5000000200,5000000230] reversed=1;
+393:5000000230:14:0:1:2:1:1:0:0
+392:5000000228:13:0:1:2:1:1:0:0
+391:5000000226:12:0:1:2:1:1:0:0
+390:5000000224:11:0:1:2:1:1:0:0
+389:5000000222:10:0:1:2:1:1:0:0
+388:5000000220:9:0:1:2:1:1:0:0
+387:5000000218:8:0:1:2:1:1:0:0
+386:5000000216:7:0:1:2:1:1:0:0
+385:5000000214:6:0:1:2:1:1:0:0
+384:5000000210:5:0:1:2:1:1:0:0
+383:5000000208:4:0:1:2:1:1:0:0
+382:5000000206:3:0:1:2:1:1:0:0
+381:5000000204:2:0:1:2:1:1:0:0
+380:5000000202:1:0:1:2:1:1:0:0
 ";
 
     #[test]
@@ -7864,6 +7879,34 @@ create_accounts;
         let mut many: Vec<Account> = (901..=928).map(|id| a(id, 1, 1)).collect();
         many.push(a(901, 1, 1));
         accounts_batch(&mut sm, &mut out, &many, 5_000_000_293);
+
+        // A mid-history timestamp window on `get_account_transfers`: account 1
+        // is excluded below 5000000200 (360@120, 351/350/340/334/333) and above
+        // 5000000230 (505@248, 506/507/514); within the window only the
+        // 380..393 ledger-1 run matches, returned reversed (393..380).
+        let window = AccountFilter {
+            account_id: 1,
+            timestamp_min: 5_000_000_200,
+            timestamp_max: 5_000_000_230,
+            limit: 100,
+            flags: AccountFilterFlags::DEBITS
+                | AccountFilterFlags::CREDITS
+                | AccountFilterFlags::REVERSED,
+            ..AccountFilter::default()
+        };
+        let _ = writeln!(
+            out,
+            "get_account_transfers account={} ts=[{},{}] reversed={};",
+            window.account_id,
+            window.timestamp_min,
+            window.timestamp_max,
+            window.flags.reversed() as u8
+        );
+        for transfer in bytes_to_transfer_batch(&sm.get_account_transfers(&window))
+            .expect("valid transfer batch")
+        {
+            let _ = writeln!(out, "{}", format_transfer(&transfer));
+        }
 
         assert_eq!(out, GOLDEN_ACCOUNTING);
     }
