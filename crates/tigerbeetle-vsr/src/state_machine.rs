@@ -2953,6 +2953,7 @@ impl StateMachine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
 
     // ── StateMachine tests ───────────────────────────────────────────────
 
@@ -5956,5 +5957,289 @@ mod tests {
         let transfers = sm.execute(Operation::QUERY_TRANSFERS, 0, &body);
         // No transfers exist; empty reply.
         assert!(transfers.is_empty());
+    }
+
+    // ── Upstream golden cross-validation ─────────────────────────────────
+
+    /// Snake-cases a [`CreateAccountStatus`] into upstream's `@tagName`
+    /// string; the harness prints `{timestamp}:{@tagName(status)}`.
+    fn account_status_name(status: u32) -> &'static str {
+        match status {
+            s if s == CreateAccountStatus::LinkedEventFailed as u32 => "linked_event_failed",
+            s if s == CreateAccountStatus::LinkedEventChainOpen as u32 => "linked_event_chain_open",
+            s if s == CreateAccountStatus::Exists as u32 => "exists",
+            s if s == CreateAccountStatus::Created as u32 => "created",
+            other => panic!("unexpected account status {other}"),
+        }
+    }
+
+    /// Snake-cases a [`CreateTransferStatus`] into upstream's `@tagName`
+    /// string.
+    fn transfer_status_name(status: u32) -> &'static str {
+        match status {
+            s if s == CreateTransferStatus::AccountsMustHaveTheSameLedger as u32 => {
+                "accounts_must_have_the_same_ledger"
+            }
+            s if s == CreateTransferStatus::PendingTransferNotFound as u32 => {
+                "pending_transfer_not_found"
+            }
+            s if s == CreateTransferStatus::PendingTransferAlreadyPosted as u32 => {
+                "pending_transfer_already_posted"
+            }
+            s if s == CreateTransferStatus::PendingTransferNotPending as u32 => {
+                "pending_transfer_not_pending"
+            }
+            s if s == CreateTransferStatus::Exists as u32 => "exists",
+            s if s == CreateTransferStatus::Created as u32 => "created",
+            other => panic!("unexpected transfer status {other}"),
+        }
+    }
+
+    /// Returns the `{timestamp}:{dp}:{dpost}:{cp}:{cpost}` line of a
+    /// 128-byte `AccountBalance` record.
+    fn format_balance(row: &[u8]) -> String {
+        let ts = u64::from_le_bytes(row[64..72].try_into().expect("8-byte slice"));
+        let dp = u128::from_le_bytes(row[0..16].try_into().expect("16-byte slice"));
+        let dpost = u128::from_le_bytes(row[16..32].try_into().expect("16-byte slice"));
+        let cp = u128::from_le_bytes(row[32..48].try_into().expect("16-byte slice"));
+        let cpost = u128::from_le_bytes(row[48..64].try_into().expect("16-byte slice"));
+        format!("{ts}:{dp}:{dpost}:{cp}:{cpost}")
+    }
+
+    /// Returns the `{id}:{ts}:{amount}:{pending_id}:{dr}:{cr}:{ledger}:{code}:{timeout}:{flags}`
+    /// line of a `Transfer` (upstream field order).
+    fn format_transfer(t: &Transfer) -> String {
+        format!(
+            "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+            t.id,
+            t.timestamp,
+            t.amount,
+            t.pending_id,
+            t.debit_account_id,
+            t.credit_account_id,
+            t.ledger,
+            t.code,
+            t.timeout,
+            t.flags.as_raw()
+        )
+    }
+
+    /// The exact stdout of `reference/tigerbeetle/src/tbcross_accounting.zig`
+    /// driven against the real upstream `StateMachine` (`test_min` config).
+    ///
+    /// Recompile the harness and rerun it whenever this script changes:
+    ///
+    /// ```sh
+    /// cd reference/tigerbeetle/src && ../zig/zig build-exe \
+    ///   --dep stdx -Mroot=tbcross_accounting.zig \
+    ///   -Mstdx=$PWD/stdx/stdx.zig -femit-bin=/tmp/tbaccounting && \
+    /// /tmp/tbaccounting 2>/dev/null
+    /// ```
+    ///
+    /// Each batch commits at `1 + batch_len` past the previous batch's last
+    /// timestamp (upstream `prepare()` advances by the event count), giving
+    /// this port its exact per-event timestamps. Compare statuses, timestamps,
+    /// balances and lookups line-by-line.
+    const GOLDEN_ACCOUNTING: &str = "\
+create_accounts;
+2:created
+3:created
+create_accounts;
+5:created
+create_transfers;
+7:created
+create_transfers;
+9:created
+create_transfers;
+7:exists
+12:accounts_must_have_the_same_ledger
+create_transfers;
+14:created
+create_transfers;
+16:pending_transfer_not_found
+create_transfers;
+18:pending_transfer_already_posted
+create_transfers;
+20:pending_transfer_not_pending
+get_account_balances account=1;
+7:500:0:0:0
+9:500:100:0:0
+14:0:600:0:0
+get_account_balances account=2;
+7:0:0:500:0
+9:0:0:500:100
+14:0:0:0:600
+lookup_accounts n=3;
+1:2:0:600:0:0:1:1:8
+3:5:0:0:0:0:2:1:8
+lookup_transfers n=4;
+1:7:500:0:1:2:1:1:0:2
+2:9:100:0:1:2:1:1:0:0
+4:14:500:1:1:2:1:1:0:4
+";
+
+    #[test]
+    fn accounting_matches_upstream_golden() {
+        let mut sm = StateMachine::default();
+        let mut out = String::new();
+
+        let a = |id: u128, ledger: u32, code: u16| Account {
+            id,
+            ledger,
+            code,
+            flags: AccountFlags::HISTORY,
+            ..Account::default()
+        };
+        let pending_never = |id: u128, amount: u128| Transfer {
+            id,
+            debit_account_id: 1,
+            credit_account_id: 2,
+            amount,
+            ledger: 1,
+            code: 1,
+            flags: TransferFlags::PENDING,
+            ..Transfer::default()
+        };
+
+        // Accounts 1 and 2 (ledger 1) and account 3 (ledger 2, for a
+        // cross-ledger failure).
+        let a1 = a(1, 1, 1);
+        let a2 = a(2, 1, 2);
+        let a3 = a(3, 2, 1);
+
+        out.push_str("create_accounts;\n");
+        for row in sm.create_accounts(&[a1, a2], 3).as_chunks::<16>().0 {
+            let ts = u64::from_le_bytes(row[0..8].try_into().expect("8-byte slice"));
+            let status = u32::from_le_bytes(row[8..12].try_into().expect("4-byte slice"));
+            let _ = writeln!(out, "{ts}:{}", account_status_name(status));
+        }
+
+        out.push_str("create_accounts;\n");
+        for row in sm.create_accounts(&[a3], 5).as_chunks::<16>().0 {
+            let ts = u64::from_le_bytes(row[0..8].try_into().expect("8-byte slice"));
+            let status = u32::from_le_bytes(row[8..12].try_into().expect("4-byte slice"));
+            let _ = writeln!(out, "{ts}:{}", account_status_name(status));
+        }
+
+        // A pending transfer and a plain transfer.
+        let t1 = pending_never(1, 500);
+        let t2 = Transfer { id: 2, amount: 100, flags: TransferFlags::default(), ..t1 };
+        let t3 = Transfer {
+            id: 3,
+            debit_account_id: 1,
+            amount: 1,
+            credit_account_id: 3,
+            ledger: 1,
+            code: 1,
+            ..Transfer::default()
+        };
+        let bulk =
+            |sm: &mut StateMachine, out: &mut String, events: &[Transfer], timestamp: u64| {
+                out.push_str("create_transfers;\n");
+                for row in sm.create_transfers(events, timestamp).as_chunks::<16>().0 {
+                    let ts = u64::from_le_bytes(row[0..8].try_into().expect("8-byte slice"));
+                    let status = u32::from_le_bytes(row[8..12].try_into().expect("4-byte slice"));
+                    let _ = writeln!(out, "{ts}:{}", transfer_status_name(status));
+                }
+            };
+
+        bulk(&mut sm, &mut out, &[t1], 7);
+        bulk(&mut sm, &mut out, &[t2], 9);
+        // Duplicate of t1 (`.exists`) and a ledger-mismatched transfer
+        // (`.accounts_must_have_the_same_ledger`).
+        bulk(&mut sm, &mut out, &[t1, t3], 12);
+
+        // Post the full pending amount, void of an unknown pending, post an
+        // already-posted pending (different id), void a non-pending transfer.
+        bulk(
+            &mut sm,
+            &mut out,
+            &[Transfer {
+                id: 4,
+                amount: 500,
+                pending_id: 1,
+                flags: TransferFlags::POST_PENDING_TRANSFER,
+                ..Transfer::default()
+            }],
+            14,
+        );
+        bulk(
+            &mut sm,
+            &mut out,
+            &[Transfer {
+                id: 5,
+                amount: 0,
+                pending_id: 9,
+                flags: TransferFlags::VOID_PENDING_TRANSFER,
+                ..Transfer::default()
+            }],
+            16,
+        );
+        bulk(
+            &mut sm,
+            &mut out,
+            &[Transfer {
+                id: 6,
+                amount: 500,
+                pending_id: 1,
+                flags: TransferFlags::POST_PENDING_TRANSFER,
+                ..Transfer::default()
+            }],
+            18,
+        );
+        bulk(
+            &mut sm,
+            &mut out,
+            &[Transfer {
+                id: 7,
+                amount: 0,
+                pending_id: 2,
+                flags: TransferFlags::VOID_PENDING_TRANSFER,
+                ..Transfer::default()
+            }],
+            20,
+        );
+
+        // Both sides of the accounts, debit for 1 and credit for 2.
+        for account_id in [1, 2] {
+            let filter = AccountFilter {
+                account_id,
+                flags: AccountFilterFlags::DEBITS | AccountFilterFlags::CREDITS,
+                limit: 100,
+                ..AccountFilter::default()
+            };
+            let _ = writeln!(out, "get_account_balances account={account_id};");
+            for row in sm.get_account_balances(&filter).as_chunks::<128>().0 {
+                let _ = writeln!(out, "{}", format_balance(row));
+            }
+        }
+
+        out.push_str("lookup_accounts n=3;\n");
+        for acc in
+            bytes_to_account_batch(&sm.lookup_accounts(&[1, 3, 99])).expect("valid account batch")
+        {
+            let _ = writeln!(
+                out,
+                "{}:{}:{}:{}:{}:{}:{}:{}:{}",
+                acc.id,
+                acc.timestamp,
+                acc.debits_pending,
+                acc.debits_posted,
+                acc.credits_pending,
+                acc.credits_posted,
+                acc.ledger,
+                acc.code,
+                acc.flags.as_raw()
+            );
+        }
+
+        out.push_str("lookup_transfers n=4;\n");
+        for transfer in bytes_to_transfer_batch(&sm.lookup_transfers(&[1, 2, 4, 9]))
+            .expect("valid transfer batch")
+        {
+            let _ = writeln!(out, "{}", format_transfer(&transfer));
+        }
+
+        assert_eq!(out, GOLDEN_ACCOUNTING);
     }
 }
