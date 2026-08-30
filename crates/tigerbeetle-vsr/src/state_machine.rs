@@ -7423,6 +7423,66 @@ get_account_transfers account=2 u64=2459584641779389781 u32=0 code=0 ts=[0,0] re
 600:5000000295:1:0:1:2:1:5:0:0
 get_account_transfers account=700 u64=0 u32=0 code=5 ts=[0,0] reversed=0;
 702:5000000313:1:0:700:701:7:5:0:0
+create_transfers;
+5000000325:created
+5000000326:created
+create_transfers;
+5000000328:created
+5000000329:created
+create_transfers;
+5000000331:created
+5000000332:created
+5000000333:created
+create_transfers;
+5000000335:linked_event_failed
+5000000336:linked_event_failed
+5000000337:credit_account_not_found
+create_transfers;
+5000000339:pending_transfer_already_posted
+create_transfers;
+5000000341:pending_transfer_not_found
+create_transfers;
+5000000343:pending_transfer_already_posted
+create_transfers;
+5000000345:id_already_failed
+lookup_transfers n=12;
+950:5000000325:100:0:1:2:1:1:0:2
+951:5000000326:100:950:1:2:1:1:0:4
+952:5000000328:200:0:1:2:1:1:0:2
+953:5000000329:200:952:1:2:1:1:0:8
+954:5000000331:50:0:1:2:1:1:0:3
+955:5000000332:50:954:1:2:1:1:0:5
+956:5000000333:1:0:1:2:1:1:0:0
+get_account_balances account=1;
+7:500:0:0:0
+9:500:100:0:0
+14:0:600:0:0
+15:0:601:0:0
+16:1:601:0:0
+17:0:602:0:0
+63:1234:602:0:0
+65:1734:602:0:0
+3000000102:0:803:0:0
+3000000110:777:803:0:0
+3000000112:0:803:0:0
+3000000120:50:803:0:0
+5000000202:0:804:0:0
+5000000204:0:806:0:0
+5000000206:0:809:0:0
+5000000208:0:813:0:0
+5000000210:0:818:0:0
+5000000214:0:824:0:0
+5000000216:0:831:0:0
+5000000218:0:839:0:0
+5000000220:0:848:0:0
+5000000222:0:858:0:0
+5000000224:0:869:0:0
+5000000226:0:881:0:0
+5000000228:0:894:0:0
+5000000230:0:908:0:0
+5000000232:0:923:0:0
+5000000234:0:939:0:0
+5000000236:0:956:0:0
 ";
 
     #[test]
@@ -8526,6 +8586,101 @@ get_account_transfers account=700 u64=0 u32=0 code=5 ts=[0,0] reversed=0;
                 let _ = writeln!(out, "{}", format_transfer(&transfer));
             }
         }
+
+        // In-batch pending visibility. Every pending above was posted/voided
+        // in a batch AFTER its creation (resolution against a COMMITTED
+        // row); here the post/void shares a batch with its pending. The
+        // pending's timestamp is never enqueued (the committed index lacks
+        // it), so the transfers-pending read must hit the in-batch cache
+        // entry — the miss-assert path only fires for genuinely absent
+        // rows. Linked chains add the cache-scope rollback: a broken chain
+        // retracts the in-batch pending AND its post.
+        let pending = |id: u128, amount: u128, linked: bool| Transfer {
+            id,
+            debit_account_id: 1,
+            credit_account_id: 2,
+            amount,
+            ledger: 1,
+            code: 1,
+            flags: TransferFlags::PENDING
+                | if linked { TransferFlags::LINKED } else { TransferFlags::default() },
+            ..Transfer::default()
+        };
+        let post = |id: u128, amount: u128, pending_id: u128, linked: bool| Transfer {
+            id,
+            amount,
+            pending_id,
+            ledger: 1,
+            code: 1,
+            flags: TransferFlags::POST_PENDING_TRANSFER
+                | if linked { TransferFlags::LINKED } else { TransferFlags::default() },
+            ..Transfer::default()
+        };
+        let void = |id: u128, pending_id: u128| Transfer {
+            id,
+            pending_id,
+            ledger: 1,
+            code: 1,
+            flags: TransferFlags::VOID_PENDING_TRANSFER,
+            ..Transfer::default()
+        };
+        // 950 posted at 951 in the same batch (both created).
+        bulk(
+            &mut sm,
+            &mut out,
+            &[pending(950, 100, false), post(951, 100, 950, false)],
+            5_000_000_326,
+        );
+        // 952 voided at 953 in the same batch (both created).
+        bulk(&mut sm, &mut out, &[pending(952, 200, false), void(953, 952)], 5_000_000_329);
+        // A closed chain [954 pending, 955 post, 956 plain] — all persist.
+        bulk(
+            &mut sm,
+            &mut out,
+            &[pending(954, 50, true), post(955, 50, 954, true), chain1(956, 1, false)],
+            5_000_000_333,
+        );
+        // A broken chain [957 pending, 958 post, 959 credit-999-missing]:
+        // the failure rolls the pending AND its post back; 957 (created
+        // in-scope) is rewritten to `linked_event_failed`, and the plain
+        // 959 (still within the poisoned chain) too.
+        bulk(
+            &mut sm,
+            &mut out,
+            &[
+                pending(957, 300, true),
+                post(958, 300, 957, true),
+                Transfer {
+                    id: 959,
+                    debit_account_id: 1,
+                    credit_account_id: 999,
+                    amount: 1,
+                    ledger: 1,
+                    code: 1,
+                    ..Transfer::default()
+                },
+            ],
+            5_000_000_337,
+        );
+        // Post of an already-posted pending (954 was posted by 955) and of a
+        // rolled-back pending (957 never persisted). The first is NOT
+        // orphaned (retry re-reports the same status); the second is, so its
+        // retry reports `id_already_failed`.
+        bulk(&mut sm, &mut out, &[post(960, 50, 954, false)], 5_000_000_339);
+        bulk(&mut sm, &mut out, &[post(961, 300, 957, false)], 5_000_000_341);
+        bulk(&mut sm, &mut out, &[post(960, 50, 954, false)], 5_000_000_343);
+        bulk(&mut sm, &mut out, &[post(961, 300, 957, false)], 5_000_000_345);
+        out.push_str("lookup_transfers n=12;\n");
+        for transfer in bytes_to_transfer_batch(
+            &sm.lookup_transfers(&[950, 951, 952, 953, 954, 955, 956, 957, 958, 959, 960, 961]),
+        )
+        .expect("valid transfer batch")
+        {
+            let _ = writeln!(out, "{}", format_transfer(&transfer));
+        }
+        // The reply cap drops the section's newest balance events: account 1
+        // still ends at the 939-row (5000000236), unchanged by 950-956.
+        account_balances(&mut sm, &mut out, 1);
 
         assert_eq!(out, GOLDEN_ACCOUNTING);
     }
