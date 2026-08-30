@@ -6203,6 +6203,9 @@ mod tests {
             s if s == CreateAccountStatus::LinkedEventChainOpen as u32 => "linked_event_chain_open",
             s if s == CreateAccountStatus::Exists as u32 => "exists",
             s if s == CreateAccountStatus::Created as u32 => "created",
+            s if s == CreateAccountStatus::ImportedEventTimestampMustNotRegress as u32 => {
+                "imported_event_timestamp_must_not_regress"
+            }
             other => panic!("unexpected account status {other}"),
         }
     }
@@ -6227,6 +6230,9 @@ mod tests {
                 "credit_account_not_found"
             }
             s if s == CreateTransferStatus::IdAlreadyFailed as u32 => "id_already_failed",
+            s if s == CreateTransferStatus::ImportedEventTimestampMustNotRegress as u32 => {
+                "imported_event_timestamp_must_not_regress"
+            }
             s if s == CreateTransferStatus::Exists as u32 => "exists",
             s if s == CreateTransferStatus::Created as u32 => "created",
             other => panic!("unexpected transfer status {other}"),
@@ -6396,6 +6402,49 @@ get_change_events ts=[0,0] limit=10;
 7:two_phase_pending:1:500:0:1:500:0:0:0:2:0:0:500:0
 9:single_phase:2:100:0:1:500:100:0:0:2:0:0:500:100
 14:two_phase_posted:4:500:1:1:0:600:0:0:2:0:0:0:600
+create_accounts;
+37:imported_event_timestamp_must_not_regress
+create_accounts;
+6:created
+30:created
+create_accounts;
+6:exists
+create_accounts;
+30:exists
+create_accounts;
+40:created
+47:imported_event_timestamp_must_not_regress
+create_transfers;
+49:imported_event_timestamp_must_not_regress
+create_transfers;
+15:created
+create_transfers;
+53:imported_event_timestamp_must_not_regress
+create_transfers;
+16:created
+create_transfers;
+17:created
+lookup_accounts n=2;
+10:6:0:0:0:0:1:1:16
+20:30:0:0:0:0:1:1:16
+lookup_transfers n=3;
+24:16:1:0:1:2:1:1:0:258
+25:17:1:24:1:2:1:1:0:260
+22:15:1:0:1:2:1:1:0:256
+get_account_balances account=1;
+7:500:0:0:0
+9:500:100:0:0
+14:0:600:0:0
+15:0:601:0:0
+16:1:601:0:0
+17:0:602:0:0
+get_change_events ts=[0,0] limit=10;
+7:two_phase_pending:1:500:0:1:500:0:0:0:2:0:0:500:0
+9:single_phase:2:100:0:1:500:100:0:0:2:0:0:500:100
+14:two_phase_posted:4:500:1:1:0:600:0:0:2:0:0:0:600
+15:single_phase:22:1:0:1:0:601:0:0:2:0:0:0:601
+16:two_phase_pending:24:1:0:1:1:601:0:0:2:0:0:1:601
+17:two_phase_posted:25:1:24:1:0:602:0:0:2:0:0:0:602
 ";
 
     #[test]
@@ -6654,6 +6703,149 @@ get_change_events ts=[0,0] limit=10;
         }
 
         // CDC: every recorded change event (pending, single-phase, posted).
+        let filter =
+            ChangeEventsFilter { timestamp_min: 0, timestamp_max: 0, limit: 10, reserved: [0; 44] };
+        let _ = writeln!(
+            out,
+            "get_change_events ts=[{},{}] limit={};",
+            filter.timestamp_min, filter.timestamp_max, filter.limit
+        );
+        for row in sm.get_change_events(&filter).as_chunks::<384>().0 {
+            let event = change_event_at(row, 0);
+            let _ = writeln!(out, "{}", format_change_event(&event));
+        }
+
+        // Imported events: past timestamps are stored as-is. The batch heads
+        // mirror the harness `submit` cadence — a single-event batch's batch
+        // head IS the error-slot timestamp pinned above (37/49/53), the
+        // two-event batches land at 40/47 — so the slot lines match exactly.
+        let imported_account = |id: u128, timestamp: u64| Account {
+            id,
+            ledger: 1,
+            code: 1,
+            flags: AccountFlags::IMPORTED,
+            timestamp,
+            ..Account::default()
+        };
+        let accounts_batch =
+            |sm: &mut StateMachine, out: &mut String, events: &[Account], head: u64| {
+                out.push_str("create_accounts;\n");
+                for row in sm.create_accounts(events, head).as_chunks::<16>().0 {
+                    let ts = u64::from_le_bytes(row[0..8].try_into().expect("8-byte slice"));
+                    let status = u32::from_le_bytes(row[8..12].try_into().expect("4-byte slice"));
+                    let _ = writeln!(out, "{ts}:{}", account_status_name(status));
+                }
+            };
+
+        // An account imported at a transfer's timestamp (7) is a cross-index
+        // regression.
+        accounts_batch(&mut sm, &mut out, &[imported_account(33, 7)], 37);
+        // Imported accounts stored at their own timestamps.
+        accounts_batch(&mut sm, &mut out, &[imported_account(10, 6), imported_account(20, 30)], 40);
+        // Retry: idempotency precedes the regression check (reports `.exists`
+        // at the stored timestamp even when the imported one differs).
+        accounts_batch(&mut sm, &mut out, &[imported_account(10, 6)], 42);
+        accounts_batch(&mut sm, &mut out, &[imported_account(20, 29)], 44);
+        // A within-batch regression against the running key max (35 < 40).
+        accounts_batch(
+            &mut sm,
+            &mut out,
+            &[imported_account(31, 40), imported_account(32, 35)],
+            47,
+        );
+
+        let imported_transfer = |id: u128,
+                                 dr: u128,
+                                 cr: u128,
+                                 amount: u128,
+                                 pending_id: u128,
+                                 ledger: u32,
+                                 code: u16,
+                                 flags: TransferFlags,
+                                 timestamp: u64| Transfer {
+            id,
+            debit_account_id: dr,
+            credit_account_id: cr,
+            amount,
+            pending_id,
+            ledger,
+            code,
+            flags: flags | TransferFlags::IMPORTED,
+            timestamp,
+            ..Transfer::default()
+        };
+        // Below the existing transfer key max (14) is a regression; at 30 an
+        // imported account's timestamp collides; 15 stores as-is.
+        bulk(
+            &mut sm,
+            &mut out,
+            &[imported_transfer(21, 1, 2, 1, 0, 1, 1, TransferFlags::default(), 12)],
+            49,
+        );
+        bulk(
+            &mut sm,
+            &mut out,
+            &[imported_transfer(22, 1, 2, 1, 0, 1, 1, TransferFlags::default(), 15)],
+            51,
+        );
+        bulk(
+            &mut sm,
+            &mut out,
+            &[imported_transfer(23, 1, 2, 1, 0, 1, 1, TransferFlags::default(), 30)],
+            53,
+        );
+        // An imported pending (timeout 0 required) and its imported posting.
+        bulk(
+            &mut sm,
+            &mut out,
+            &[imported_transfer(24, 1, 2, 1, 0, 1, 1, TransferFlags::PENDING, 16)],
+            55,
+        );
+        bulk(
+            &mut sm,
+            &mut out,
+            &[imported_transfer(
+                25,
+                0,
+                0,
+                u128::MAX,
+                24,
+                0,
+                0,
+                TransferFlags::POST_PENDING_TRANSFER,
+                17,
+            )],
+            57,
+        );
+
+        // The imported records are stored at their own timestamps (account
+        // flags 16 = imported; the post carries the pending's dr/cr/ledger/
+        // code), account 1's balance moved per event, and the CDC dump grew.
+        out.push_str("lookup_accounts n=2;\n");
+        for acc in
+            bytes_to_account_batch(&sm.lookup_accounts(&[10, 20])).expect("valid account batch")
+        {
+            let _ = writeln!(out, "{}", format_account(&acc));
+        }
+        out.push_str("lookup_transfers n=3;\n");
+        for transfer in bytes_to_transfer_batch(&sm.lookup_transfers(&[24, 25, 22]))
+            .expect("valid transfer batch")
+        {
+            let _ = writeln!(out, "{}", format_transfer(&transfer));
+        }
+        let account_balances = |sm: &mut StateMachine, out: &mut String, account_id: u128| {
+            let filter = AccountFilter {
+                account_id,
+                limit: 100,
+                flags: AccountFilterFlags::DEBITS | AccountFilterFlags::CREDITS,
+                ..AccountFilter::default()
+            };
+            let _ = writeln!(out, "get_account_balances account={account_id};");
+            for row in sm.get_account_balances(&filter).as_chunks::<128>().0 {
+                let _ = writeln!(out, "{}", format_balance(row));
+            }
+        };
+        account_balances(&mut sm, &mut out, 1);
         let filter =
             ChangeEventsFilter { timestamp_min: 0, timestamp_max: 0, limit: 10, reserved: [0; 44] };
         let _ = writeln!(
