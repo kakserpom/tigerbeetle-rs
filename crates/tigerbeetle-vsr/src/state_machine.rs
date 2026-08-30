@@ -6634,6 +6634,42 @@ get_change_events ts=[0,0] limit=15;
 65:two_phase_pending:334:500:0:1:1734:602:0:0:2:0:0:1734:602
 3000000096:two_phase_expired:333:1234:0:1:500:602:0:0:2:0:0:500:602
 3000000102:two_phase_posted:340:201:334:1:0:803:0:0:2:0:0:0:803
+create_transfers;
+3000000120:created
+lookup_accounts n=1;
+1:2:50:803:0:0:1:1:40
+pulse at 4000000152;
+lookup_accounts n=1;
+1:2:0:803:0:0:1:1:8
+get_account_balances account=1;
+7:500:0:0:0
+9:500:100:0:0
+14:0:600:0:0
+15:0:601:0:0
+16:1:601:0:0
+17:0:602:0:0
+63:1234:602:0:0
+65:1734:602:0:0
+3000000102:0:803:0:0
+3000000110:777:803:0:0
+3000000112:0:803:0:0
+3000000120:50:803:0:0
+get_account_balances account=2;
+7:0:0:500:0
+9:0:0:500:100
+14:0:0:0:600
+15:0:0:0:601
+16:0:0:1:601
+17:0:0:0:602
+63:0:0:1234:602
+65:0:0:1734:602
+3000000102:0:0:0:803
+3000000110:0:0:777:803
+3000000112:0:0:0:803
+3000000120:0:0:50:803
+get_change_events ts=[3000000116,0] limit=15;
+3000000120:two_phase_pending:360:50:0:1:50:803:0:0:2:0:0:50:803
+4000000152:two_phase_expired:360:50:0:1:0:803:0:0:2:0:0:0:803
 ";
 
     #[test]
@@ -7128,6 +7164,51 @@ get_change_events ts=[0,0] limit=15;
         // (state_machine.zig:2245-2275).
         let filter =
             ChangeEventsFilter { timestamp_min: 0, timestamp_max: 0, limit: 15, reserved: [0; 44] };
+        let _ = writeln!(
+            out,
+            "get_change_events ts=[{},{}] limit={};",
+            filter.timestamp_min, filter.timestamp_max, filter.limit
+        );
+        for row in sm.get_change_events(&filter).as_chunks::<384>().0 {
+            let event = change_event_at(row, 0);
+            let _ = writeln!(out, "{}", format_change_event(&event));
+        }
+
+        // A pending that closes its debit account: 360 debits account 1 with
+        // `closing_debit`, so account 1 reports CLOSED (40 = HISTORY|CLOSED)
+        // while the hold is outstanding; the expiry full-clear reopens it (8)
+        // and the hold returns to the pool. Balance history omits the expiry
+        // row (as if the pending never existed); the change-event window pins
+        // the `two_phase_expired` canonicalized via `transfer_pending_id`.
+        bulk(
+            &mut sm,
+            &mut out,
+            &[Transfer {
+                timeout: 1,
+                flags: TransferFlags::PENDING | TransferFlags::CLOSING_DEBIT,
+                ..pending_never(360, 50)
+            }],
+            3_000_000_120,
+        );
+        out.push_str("lookup_accounts n=1;\n");
+        for acc in bytes_to_account_batch(&sm.lookup_accounts(&[1])).expect("valid account batch") {
+            let _ = writeln!(out, "{}", format_account(&acc));
+        }
+        out.push_str("pulse at 4000000152;\n");
+        let reply = sm.execute(Operation::STATE_MACHINE_PULSE, 4_000_000_152, &[]);
+        assert!(reply.is_empty());
+        out.push_str("lookup_accounts n=1;\n");
+        for acc in bytes_to_account_batch(&sm.lookup_accounts(&[1])).expect("valid account batch") {
+            let _ = writeln!(out, "{}", format_account(&acc));
+        }
+        account_balances(&mut sm, &mut out, 1);
+        account_balances(&mut sm, &mut out, 2);
+        let filter = ChangeEventsFilter {
+            timestamp_min: 3_000_000_116,
+            timestamp_max: 0,
+            limit: 15,
+            reserved: [0; 44],
+        };
         let _ = writeln!(
             out,
             "get_change_events ts=[{},{}] limit={};",
