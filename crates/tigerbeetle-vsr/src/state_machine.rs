@@ -521,6 +521,9 @@ pub struct PostVoidPendingResult {
 /// `t` is the posting/voiding transfer event.
 /// `p` is the original pending transfer (looked up by `t.pending_id`).
 /// `dr_account` and `cr_account` are the debit/credit accounts of the pending transfer.
+/// `running_key_max` and `account_with_timestamp` back the imported-timestamp
+/// regression/collision checks (the transfers object tree's key range and the
+/// accounts timestamp index, per upstream `state_machine.zig:4158-4180`).
 ///
 /// Returns the result status and the amount to apply.
 ///
@@ -532,6 +535,8 @@ pub fn post_or_void_pending_transfer(
     dr_account: &Account,
     cr_account: &Account,
     pending_status: tigerbeetle_core::types::TransferPendingStatus,
+    running_key_max: u64,
+    account_with_timestamp: &impl Fn(u64) -> Option<u128>,
 ) -> PostVoidPendingResult {
     use tigerbeetle_core::types::TransferPendingStatus;
     assert!(timestamp_event != 0);
@@ -687,6 +692,25 @@ pub fn post_or_void_pending_transfer(
             amount_actual,
             is_post,
         };
+    }
+
+    // Imported-timestamp regression/collision checks. Upstream runs these after
+    // the pending-status and expiry-time checks — so those codes take precedence
+    // over a regressing timestamp — and before the closed-account checks
+    // (state_machine.zig:4158-4180). A past timestamp must not regress the
+    // transfer object index, and must not collide with an account's timestamp.
+    // Imported post/void events skip the postdate asserts (the pending's
+    // accounts make them moot: the committed pending predates them).
+    if t.flags.imported() {
+        assert!(t.timestamp != 0);
+        assert!(t.timestamp <= timestamp_event);
+        if t.timestamp <= running_key_max || account_with_timestamp(t.timestamp).is_some() {
+            return PostVoidPendingResult {
+                status: CreateTransferStatus::ImportedEventTimestampMustNotRegress,
+                amount_actual,
+                is_post,
+            };
+        }
     }
 
     // Closed accounts: posting is rejected on a closed account; voiding is the
@@ -1167,25 +1191,6 @@ where
                         );
                     }
 
-                    // Imported-timestamp regression/collision checks. Upstream runs
-                    // these after the pending-status checks
-                    // (state_machine.zig:4158-4180); running them here makes regress
-                    // take precedence over the flag/account-match checks below.
-                    // `DEVIATION`: imported post/void events skip the postdate
-                    // asserts (the pending's accounts make them moot).
-                    if event.flags.imported() {
-                        assert!(event.timestamp != 0);
-                        assert!(event.timestamp <= timestamp_event);
-                        if event.timestamp <= running_key_max
-                            || account_with_timestamp(event.timestamp).is_some()
-                        {
-                            break 'result (
-                                CreateTransferStatus::ImportedEventTimestampMustNotRegress,
-                                timestamp_event,
-                            );
-                        }
-                    }
-
                     // The pending transfer carries the account ids: a post/void
                     // event leaves them zero by convention.
                     let dr = working
@@ -1210,6 +1215,8 @@ where
                         &dr,
                         &cr,
                         pending_status,
+                        running_key_max,
+                        &account_with_timestamp,
                     );
                     let status = result.status;
                     amount_actual = result.amount_actual;
@@ -3957,6 +3964,30 @@ mod tests {
         }
     }
 
+    /// An imported post (or void, when `is_post` is false) of `pending_id`,
+    /// posting the full pending amount and naming the pending's ledger/code.
+    fn imported_post_or_void(
+        id: u128,
+        pending_id: u128,
+        timestamp: u64,
+        is_post: bool,
+    ) -> Transfer {
+        Transfer {
+            id,
+            pending_id,
+            amount: u128::MAX,
+            ledger: 1,
+            code: 1,
+            flags: if is_post {
+                TransferFlags::IMPORTED | TransferFlags::POST_PENDING_TRANSFER
+            } else {
+                TransferFlags::IMPORTED | TransferFlags::VOID_PENDING_TRANSFER
+            },
+            timestamp,
+            ..Transfer::default()
+        }
+    }
+
     fn accounts_for_transfers(sm: &mut StateMachine) {
         // Separate batches so the debit account is stamped 10 and the credit
         // account 20 — a gap that lets the postdate checks fire without the
@@ -4006,6 +4037,37 @@ mod tests {
             reply_status(&body),
             CreateTransferStatus::ImportedEventTimeoutMustBeZero as u32
         );
+    }
+
+    #[test]
+    fn imported_post_void_status_and_expiry_checks_precede_timestamp_regression() {
+        let mut sm = StateMachine::default();
+        accounts_for_transfers(&mut sm);
+
+        // A pending imported at 21 (past both accounts' stamps, no regress).
+        let pending = imported_transfer(1002, 21, TransferFlags::IMPORTED | TransferFlags::PENDING);
+        let body = sm.create_transfers(&[pending], 30);
+        assert_eq!(reply_status(&body), CreateTransferStatus::Created as u32);
+
+        // Imported post of the full amount at 25 — accepted.
+        let body = sm.create_transfers(&[imported_post_or_void(1003, 1002, 25, true)], 40);
+        assert_eq!(reply_status(&body), CreateTransferStatus::Created as u32);
+        assert_eq!(
+            sm.transfers_pending.get(&21).expect("pending status row").status,
+            TransferPendingStatus::Posted
+        );
+
+        // A second post of the same (now posted) pending whose timestamp regresses
+        // (21 <= transfers key-max 25): the status check must win over the
+        // regression check — upstream runs the pending-status switch
+        // (state_machine.zig:4130-4143) before the imported regression
+        // (state_machine.zig:4158-4180). Same for a full-amount void (amount 0)
+        // of the posted pending.
+        let body = sm.create_transfers(&[imported_post_or_void(1004, 1002, 21, true)], 50);
+        assert_eq!(reply_status(&body), CreateTransferStatus::PendingTransferAlreadyPosted as u32);
+        let void = Transfer { amount: 0, ..imported_post_or_void(1005, 1002, 21, false) };
+        let body = sm.create_transfers(&[void], 50);
+        assert_eq!(reply_status(&body), CreateTransferStatus::PendingTransferAlreadyPosted as u32);
     }
 
     // ── Balance mutation (commit_transfer) tests ─────────────────────────
