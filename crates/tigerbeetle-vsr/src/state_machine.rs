@@ -2264,10 +2264,12 @@ impl StateMachine {
             events.sort_unstable_by_key(|e| e.timestamp);
         }
         // Upstream `prefetch_get_account_balances` caps the reply at
-        // `min(filter.limit, result_max(message_body_size_max))`
-        // (state_machine.zig:1641-1648).
+        // `min(filter.limit, result_max(message_body_size_max))`, where
+        // `result_max` divides the body by the RESULT size — `AccountBalance`
+        // (128 bytes; 4032/128 = 31 in `test_min`), not the `AccountEvent`
+        // (256) events are scanned from (state_machine.zig:1641-1648).
         events.truncate(
-            (filter.limit as usize).min(result_max(core::mem::size_of::<AccountEvent>())),
+            (filter.limit as usize).min(result_max(core::mem::size_of::<AccountBalance>())),
         );
 
         let mut results: Vec<AccountBalance> = Vec::with_capacity(events.len());
@@ -6694,6 +6696,40 @@ create_transfers;
 get_account_balances account=4;
 4000000160:100:0:0:0
 5000000199:0:10:0:0
+create_transfers;
+5000000202:created
+create_transfers;
+5000000204:created
+create_transfers;
+5000000206:created
+create_transfers;
+5000000208:created
+create_transfers;
+5000000210:created
+get_account_balances account=1;
+7:500:0:0:0
+9:500:100:0:0
+14:0:600:0:0
+15:0:601:0:0
+16:1:601:0:0
+17:0:602:0:0
+63:1234:602:0:0
+65:1734:602:0:0
+3000000102:0:803:0:0
+3000000110:777:803:0:0
+3000000112:0:803:0:0
+3000000120:50:803:0:0
+5000000202:0:804:0:0
+5000000204:0:806:0:0
+5000000206:0:809:0:0
+5000000208:0:813:0:0
+5000000210:0:818:0:0
+get_account_balances account=1 ts=[5000000202,0] limit=100;
+5000000202:0:804:0:0
+5000000204:0:806:0:0
+5000000206:0:809:0:0
+5000000208:0:813:0:0
+5000000210:0:818:0:0
 ";
 
     #[test]
@@ -7326,6 +7362,44 @@ get_account_balances account=4;
             5_000_000_199,
         );
         account_balances(&mut sm, &mut out, 4);
+
+        // Push account 1 past what would be a 15-row bug: `get_account_balances`
+        // caps at `min(filter.limit, result_max)` where `result_max` divides the
+        // body by the RESULT size — `AccountBalance` (128 bytes → 31 in
+        // `test_min`) — not the `AccountEvent` (256 → 15) scan size. All 17
+        // rows come through (the golden fixes the port's 15-cap divergence from
+        // upstream); a windowed dump also verifies `timestamp_min` scanning.
+        let debit1 = |id: u128, amount: u128| Transfer {
+            id,
+            debit_account_id: 1,
+            credit_account_id: 2,
+            amount,
+            ledger: 1,
+            code: 1,
+            ..Transfer::default()
+        };
+        bulk(&mut sm, &mut out, &[debit1(380, 1)], 5_000_000_202);
+        bulk(&mut sm, &mut out, &[debit1(381, 2)], 5_000_000_204);
+        bulk(&mut sm, &mut out, &[debit1(382, 3)], 5_000_000_206);
+        bulk(&mut sm, &mut out, &[debit1(383, 4)], 5_000_000_208);
+        bulk(&mut sm, &mut out, &[debit1(384, 5)], 5_000_000_210);
+        account_balances(&mut sm, &mut out, 1);
+        let filter = AccountFilter {
+            account_id: 1,
+            timestamp_min: 5_000_000_202,
+            timestamp_max: 0,
+            limit: 100,
+            flags: AccountFilterFlags::DEBITS | AccountFilterFlags::CREDITS,
+            ..AccountFilter::default()
+        };
+        let _ = writeln!(
+            out,
+            "get_account_balances account={} ts=[{},0] limit=100;",
+            filter.account_id, filter.timestamp_min
+        );
+        for row in sm.get_account_balances(&filter).as_chunks::<128>().0 {
+            let _ = writeln!(out, "{}", format_balance(row));
+        }
 
         assert_eq!(out, GOLDEN_ACCOUNTING);
     }
