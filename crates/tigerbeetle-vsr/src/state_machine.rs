@@ -2075,6 +2075,12 @@ impl StateMachine {
     /// compact list of the accounts that exist, in request order (ids that do
     /// not exist are omitted). This is a read operation and does not advance
     /// `commit_timestamp`.
+    ///
+    /// DEVIATION: upstream bounds the reply by the message body — upstream
+    /// `execute_lookup_accounts` writes into a reply buffer of the request
+    /// size and asserts `events.len <= results.len` (state_machine.zig:3266),
+    /// so it cannot return more objects than fit a message. Sans-IO there is no
+    /// message buffer; the results are unbounded by request size.
     #[must_use]
     pub fn lookup_accounts(&self, ids: &[u128]) -> Vec<u8> {
         let mut results: Vec<Account> = Vec::new();
@@ -2093,6 +2099,10 @@ impl StateMachine {
     /// compact list of the transfers that exist, in request order (ids that do
     /// not exist are omitted). This is a read operation and does not advance
     /// `commit_timestamp`.
+    ///
+    /// DEVIATION: as for [`Self::lookup_accounts`], upstream only guarantees a
+    /// reply that fits one message (state_machine.zig:3286); sans-IO the
+    /// results are unbounded by request size.
     #[must_use]
     pub fn lookup_transfers(&self, ids: &[u128]) -> Vec<u8> {
         let mut results: Vec<Transfer> = Vec::new();
@@ -6853,6 +6863,36 @@ get_account_balances account=1;
 5000000232:0:923:0:0
 5000000234:0:939:0:0
 5000000236:0:956:0:0
+lookup_transfers n=29;
+384:5000000210:5:0:1:2:1:1:0:0
+380:5000000202:1:0:1:2:1:1:0:0
+399:5000000242:20:0:1:2:1:1:0:0
+398:5000000240:19:0:1:2:1:1:0:0
+1:7:500:0:1:2:1:1:0:2
+2:9:100:0:1:2:1:1:0:0
+4:14:500:1:1:2:1:1:0:4
+22:15:1:0:1:2:1:1:0:256
+24:16:1:0:1:2:1:1:0:258
+25:17:1:24:1:2:1:1:0:260
+333:63:1234:0:1:2:1:1:2:2
+334:65:500:0:1:2:1:1:100:2
+340:3000000102:201:334:1:2:1:1:0:4
+350:3000000110:777:0:1:2:1:1:200:2
+351:3000000112:777:350:1:2:1:1:0:8
+360:3000000120:50:0:1:2:1:1:1:66
+370:4000000160:100:0:4:2:1:1:1:66
+373:5000000199:10:0:4:2:1:1:0:0
+381:5000000204:2:0:1:2:1:1:0:0
+382:5000000206:3:0:1:2:1:1:0:0
+383:5000000208:4:0:1:2:1:1:0:0
+385:5000000214:6:0:1:2:1:1:0:0
+386:5000000216:7:0:1:2:1:1:0:0
+387:5000000218:8:0:1:2:1:1:0:0
+388:5000000220:9:0:1:2:1:1:0:0
+389:5000000222:10:0:1:2:1:1:0:0
+390:5000000224:11:0:1:2:1:1:0:0
+391:5000000226:12:0:1:2:1:1:0:0
+392:5000000228:13:0:1:2:1:1:0:0
 ";
 
     #[test]
@@ -7572,6 +7612,23 @@ get_account_balances account=1;
             let _ = writeln!(out, "{}", format_transfer(&transfer));
         }
         account_balances(&mut sm, &mut out, 1);
+
+        // Upstream fills lookup replies in REQUEST order (execute_lookup_transfers
+        // iterates the request ids, state_machine.zig:3286-3297), which the
+        // earlier small lookups could not distinguish from timestamp order.
+        // Ids 384 (ts 210) before 380 (ts 202) and 399 (ts 242) before 398
+        // (ts 240) pin it. 29 is the harness maximum — its submit MultiBatch-
+        // encodes even lookups, so the 16-byte u128 trailer inflates the count
+        // over `event_max` (30) with 30 ids.
+        out.push_str("lookup_transfers n=29;\n");
+        for transfer in bytes_to_transfer_batch(&sm.lookup_transfers(&[
+            384, 380, 399, 398, 1, 2, 4, 22, 24, 25, 333, 334, 340, 350, 351, 360, 370, 373, 381,
+            382, 383, 385, 386, 387, 388, 389, 390, 391, 392,
+        ]))
+        .expect("valid transfer batch")
+        {
+            let _ = writeln!(out, "{}", format_transfer(&transfer));
+        }
 
         assert_eq!(out, GOLDEN_ACCOUNTING);
     }
