@@ -29,7 +29,7 @@
     clippy::module_name_repetitions
 )]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use tigerbeetle_core::types::{
     Account, AccountBalance, AccountEvent, AccountFilter, AccountFilterFlags, AccountFlags,
@@ -1016,7 +1016,12 @@ where
 /// the pending transfer with the given timestamp, which post/void events
 /// validate against. A working overlay of in-session post/void status changes
 /// (and pending creations) sits on top.
-pub fn execute_create_transfers<F, G, FAccountAt, FPendingStatus>(
+///
+/// `is_orphaned` reports whether an id sits in the committed orphaned
+/// primary-key set (transfer ids that failed with a transient status and can
+/// never be created again); ids orphaned earlier in this batch are layered on
+/// top, mirroring upstream's in-session groove state.
+pub fn execute_create_transfers<F, G, FAccountAt, FPendingStatus, FOrphaned>(
     events: &[Transfer],
     timestamp: u64,
     mut get_existing_transfer: F,
@@ -1024,12 +1029,14 @@ pub fn execute_create_transfers<F, G, FAccountAt, FPendingStatus>(
     transfers_key_max: u64,
     account_with_timestamp: FAccountAt,
     mut get_pending_status: FPendingStatus,
+    is_orphaned: FOrphaned,
 ) -> Vec<CreateTransferResult>
 where
     F: FnMut(u128) -> Option<Transfer>,
     G: FnMut(u128) -> Option<Account>,
     FAccountAt: Fn(u64) -> Option<u128>,
     FPendingStatus: FnMut(u64) -> TransferPendingStatus,
+    FOrphaned: Fn(u128) -> bool,
 {
     let mut results: Vec<CreateTransferResult> = Vec::with_capacity(events.len());
     let mut chain: Option<usize> = None;
@@ -1049,6 +1056,11 @@ where
     let mut chain_snapshot: Option<HashMap<u128, Account>> = None;
     let mut chain_key_max_snapshot: Option<u64> = None;
     let mut chain_transfers_snapshot: Option<HashMap<u128, Transfer>> = None;
+    // In-session view of orphaned ids, layered over `is_orphaned`. Upstream
+    // writes orphans outside the chain scope (`transient_error`,
+    // `state_machine.zig:3215-3252`), so they survive a chain rollback — the
+    // chain snapshots above deliberately exclude this set.
+    let mut working_orphaned: HashSet<u128> = HashSet::new();
     // In-session view of pending-transfer statuses, layered over
     // `get_pending_status` (a post/void within the batch marks its pending as
     // posted/voided so a later event sees it; pending creations seed `Pending`).
@@ -1116,6 +1128,14 @@ where
                 .get(&event.id)
                 .copied()
                 .or_else(|| get_existing_transfer(event.id));
+
+            // Upstream consults the orphaned primary-key set in the same switch
+            // as the existing record (state_machine.zig:3734-3737): an id that
+            // previously failed with a transient status can never be created
+            // again, short-circuiting everything else (including post/void).
+            if working_orphaned.contains(&event.id) || is_orphaned(event.id) {
+                break 'result (CreateTransferStatus::IdAlreadyFailed, timestamp_event);
+            }
 
             let post_void =
                 event.flags.post_pending_transfer() || event.flags.void_pending_transfer();
@@ -1358,6 +1378,13 @@ where
 
         // Chain error handling.
         if status != CreateTransferStatus::Created {
+            // Upstream `transient_error` (state_machine.zig:3215-3252): a
+            // transfer that fails with a transient code poisons the id in the
+            // orphaned primary-key set. This runs _after_ the chain rollback, so
+            // the orphan survives it.
+            if status.transient() {
+                working_orphaned.insert(event.id);
+            }
             if let Some(chain_start) = chain {
                 if !chain_broken {
                     chain_broken = true;
@@ -1815,6 +1842,13 @@ pub struct StateMachine {
     accounts: HashMap<u128, Account>,
     /// Temporary primary-key store for transfers.
     transfers: HashMap<u128, Transfer>,
+    /// Transfer ids that failed with a transient status and therefore can
+    /// never be created again (strong idempotency). Mirrors upstream's
+    /// transfers-groove orphaned primary-key set (`insert_orphaned_primary_key`,
+    /// `state_machine.zig:3248`); `create_transfer` reports `id_already_failed`
+    /// for ids in this set (`state_machine.zig:3736`), and it is disjoint from
+    /// [`Self::transfers`] because a transient failure never commits a record.
+    transfers_orphaned: HashSet<u128>,
     /// Maximum committed account timestamp — mirrors `accounts.objects.key_range.key_max`.
     accounts_timestamp_max: u64,
     /// Maximum committed transfer timestamp — mirrors `transfers.objects.key_range.key_max`.
@@ -1853,6 +1887,7 @@ impl Default for StateMachine {
             commit_timestamp: 0,
             accounts: HashMap::new(),
             transfers: HashMap::new(),
+            transfers_orphaned: HashSet::new(),
             accounts_timestamp_max: 0,
             transfers_timestamp_max: 0,
             accounts_by_timestamp: HashMap::new(),
@@ -1998,6 +2033,7 @@ impl StateMachine {
                     .copied()
                     .map_or(TransferPendingStatus::None, |p| p.status)
             },
+            |id| self.transfers_orphaned.contains(&id),
         );
         self.persist_transfers(events, &results, timestamp);
         transfer_results_to_bytes(&results)
@@ -2496,6 +2532,18 @@ impl StateMachine {
         results: &[CreateTransferResult],
         timestamp: u64,
     ) {
+        // Upstream records transient failures in the transfers groove's
+        // orphaned primary-key set (`transient_error`,
+        // `state_machine.zig:3215-3252`), outside the chain scope — so the
+        // orphan applies even when the failed event belonged to a chain that
+        // was rolled back. Replay it over the full event list before the
+        // created-only walk below.
+        for (event, result) in events.iter().zip(results) {
+            if result.status.transient() {
+                self.transfers_orphaned.insert(event.id);
+            }
+        }
+
         let mut index = 0;
         while index < events.len() {
             if !events[index].flags.linked() {
@@ -3119,15 +3167,27 @@ mod tests {
         );
         assert!(sm.transfers.is_empty());
 
-        let _ = sm.create_accounts(&[account(1), account(2)], 20);
-        let body = sm.create_transfers(&transfers, 30);
+        // The transient failure poisoned the id: retrying it reports
+        // `id_already_failed` (upstream `transient_error`).
+        let body = sm.create_transfers(&transfers, 20);
+        assert_eq!(
+            u32::from_le_bytes(body[8..12].try_into().unwrap_or([0; 4])),
+            CreateTransferStatus::IdAlreadyFailed as u32
+        );
+        assert!(sm.transfers.is_empty());
+
+        // A fresh id succeeds once the accounts exist.
+        let _ = sm.create_accounts(&[account(1), account(2)], 30);
+        let mut retry = transfers[0];
+        retry.id = 101;
+        let body = sm.create_transfers(&[retry], 40);
         assert_eq!(body.len(), 16);
         assert_eq!(u32::from_le_bytes(body[8..12].try_into().unwrap_or([0; 4])), u32::MAX);
         assert_eq!(sm.transfers.len(), 1);
 
         // Duplicate: Exists carries the original timestamp.
-        let body = sm.create_transfers(&transfers, 40);
-        assert_eq!(u64::from_le_bytes(body[0..8].try_into().unwrap_or([0; 8])), 30);
+        let body = sm.create_transfers(&[retry], 50);
+        assert_eq!(u64::from_le_bytes(body[0..8].try_into().unwrap_or([0; 8])), 40);
         assert_eq!(sm.transfers.len(), 1);
     }
 
@@ -3852,6 +3912,7 @@ mod tests {
             0,
             |_| None,
             |_| TransferPendingStatus::None,
+            |_| false,
         );
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].status, CreateTransferStatus::Created);
@@ -5139,6 +5200,179 @@ mod tests {
         assert_eq!(change_event_at(&reply, 0).timestamp, 20);
     }
 
+    // ── id_already_failed orphan tests ───────────────────────────────────
+    // Upstream `transient_error` (state_machine.zig:3215-3252): a transfer that
+    // fails with a transient status poisons its id so it can never be created
+    // again (strong idempotency, reported as `id_already_failed`).
+
+    /// A transfer with a missing debit account fails transiently; retrying the
+    /// same id reports `id_already_failed` instead.
+    #[test]
+    fn transient_failure_poisons_the_id() {
+        let mut sm = StateMachine::default();
+        let _ = sm.create_accounts(
+            &[
+                Account { id: 1, ledger: 1, code: 1, ..Account::default() },
+                Account { id: 2, ledger: 1, code: 1, ..Account::default() },
+            ],
+            10,
+        );
+        let transfer = |id| Transfer {
+            id,
+            debit_account_id: 1,
+            credit_account_id: 2,
+            amount: 50,
+            ledger: 1,
+            code: 1,
+            ..Transfer::default()
+        };
+
+        // Credit account 3 is missing: `credit_account_not_found`, transient.
+        let mut missing_cr = transfer(100);
+        missing_cr.credit_account_id = 3;
+        let body = sm.create_transfers(&[missing_cr], 20);
+        assert_eq!(reply_status(&body), CreateTransferStatus::CreditAccountNotFound as u32);
+
+        // The id is poisoned even once the account exists.
+        let _ =
+            sm.create_accounts(&[Account { id: 3, ledger: 1, code: 1, ..Account::default() }], 30);
+        let body = sm.create_transfers(&[transfer(100)], 40);
+        assert_eq!(reply_status(&body), CreateTransferStatus::IdAlreadyFailed as u32);
+
+        // The same request under a fresh id succeeds.
+        let body = sm.create_transfers(&[transfer(101)], 50);
+        assert_eq!(reply_status(&body), CreateTransferStatus::Created as u32);
+    }
+
+    /// An event that fails transiently poisons the id for later events of the
+    /// same batch.
+    #[test]
+    fn orphaned_id_fails_in_same_batch() {
+        let mut sm = StateMachine::default();
+        let _ =
+            sm.create_accounts(&[Account { id: 1, ledger: 1, code: 1, ..Account::default() }], 10);
+        let a = Transfer {
+            id: 100,
+            debit_account_id: 1,
+            credit_account_id: 2,
+            amount: 50,
+            ledger: 1,
+            code: 1,
+            ..Transfer::default()
+        };
+        // Second event reuses the same id after the first poisons it.
+        let body = sm.create_transfers(&[a, a], 20);
+        // Account 2 is missing: the credit lookup fails transiently.
+        assert_eq!(reply_status(&body), CreateTransferStatus::CreditAccountNotFound as u32);
+        assert_eq!(reply_status_at(&body, 1), CreateTransferStatus::IdAlreadyFailed as u32);
+    }
+
+    /// A post/void event whose id is orphaned reports `id_already_failed` — the
+    /// orphan check runs before the post/void dispatch (state_machine.zig:3734-3737).
+    #[test]
+    fn orphaned_id_fails_for_post_void() {
+        let mut sm = StateMachine::default();
+        let _ = sm.create_accounts(
+            &[
+                Account { id: 1, ledger: 1, code: 1, ..Account::default() },
+                Account { id: 2, ledger: 1, code: 1, ..Account::default() },
+            ],
+            10,
+        );
+        // Poisons id 100 via a regular transfer against a missing account.
+        let failed = Transfer {
+            id: 100,
+            debit_account_id: 3,
+            credit_account_id: 2,
+            amount: 50,
+            ledger: 1,
+            code: 1,
+            ..Transfer::default()
+        };
+        let _ = sm.create_transfers(&[failed], 20);
+
+        // A post event reusing id 100 is rejected before any pending lookup.
+        let post = Transfer {
+            id: 100,
+            pending_id: 1,
+            amount: 50,
+            flags: TransferFlags::POST_PENDING_TRANSFER,
+            ..Transfer::default()
+        };
+        let body = sm.create_transfers(&[post], 30);
+        assert_eq!(reply_status(&body), CreateTransferStatus::IdAlreadyFailed as u32);
+    }
+
+    /// Non-transient failures do not poison the id: a fixable event retries
+    /// under the same id.
+    #[test]
+    fn non_transient_failure_does_not_poison() {
+        let mut sm = StateMachine::default();
+        let _ = sm.create_accounts(
+            &[
+                Account { id: 1, ledger: 1, code: 1, ..Account::default() },
+                Account { id: 2, ledger: 1, code: 1, ..Account::default() },
+            ],
+            10,
+        );
+        let transfer = Transfer {
+            id: 100,
+            debit_account_id: 1,
+            credit_account_id: 2,
+            amount: 50,
+            ledger: 1,
+            code: 0,
+            ..Transfer::default()
+        };
+        let body = sm.create_transfers(&[transfer], 20);
+        assert_eq!(reply_status(&body), CreateTransferStatus::CodeMustNotBeZero as u32);
+
+        let mut fixed = transfer;
+        fixed.code = 1;
+        let body = sm.create_transfers(&[fixed], 30);
+        assert_eq!(reply_status(&body), CreateTransferStatus::Created as u32);
+    }
+
+    /// A chain rollback orphans the breaking event's id but not the rolled-back
+    /// members' ids: the former resolves to `id_already_failed` forever, the
+    /// latter can be recreated.
+    #[test]
+    fn chain_rollback_orphans_only_the_breaker() {
+        let mut sm = StateMachine::default();
+        let _ = sm.create_accounts(
+            &[
+                Account { id: 1, ledger: 1, code: 1, ..Account::default() },
+                Account { id: 2, ledger: 1, code: 1, ..Account::default() },
+            ],
+            10,
+        );
+        let transfer = |id| Transfer {
+            id,
+            debit_account_id: 1,
+            credit_account_id: 2,
+            amount: 50,
+            ledger: 1,
+            code: 1,
+            ..Transfer::default()
+        };
+        let mut breaker = transfer(200);
+        breaker.credit_account_id = 3;
+        let events = [Transfer { flags: TransferFlags::LINKED, ..transfer(100) }, breaker];
+        let body = sm.create_transfers(&events, 20);
+        assert_eq!(reply_status(&body), CreateTransferStatus::LinkedEventFailed as u32);
+        assert_eq!(reply_status_at(&body, 1), CreateTransferStatus::CreditAccountNotFound as u32);
+
+        // Member 100 was rolled back: recreatable.
+        let body = sm.create_transfers(&[transfer(100)], 30);
+        assert_eq!(reply_status(&body), CreateTransferStatus::Created as u32);
+
+        // Breaker 200 stays poisoned even after account 3 exists.
+        let _ =
+            sm.create_accounts(&[Account { id: 3, ledger: 1, code: 1, ..Account::default() }], 40);
+        let body = sm.create_transfers(&[transfer(200)], 50);
+        assert_eq!(reply_status(&body), CreateTransferStatus::IdAlreadyFailed as u32);
+    }
+
     // ── expire_pending_transfers tests ───────────────────────────────────
 
     const NS_PER_S: u64 = tigerbeetle_core::types::NS_PER_S;
@@ -5989,6 +6223,10 @@ mod tests {
             s if s == CreateTransferStatus::PendingTransferNotPending as u32 => {
                 "pending_transfer_not_pending"
             }
+            s if s == CreateTransferStatus::CreditAccountNotFound as u32 => {
+                "credit_account_not_found"
+            }
+            s if s == CreateTransferStatus::IdAlreadyFailed as u32 => "id_already_failed",
             s if s == CreateTransferStatus::Exists as u32 => "exists",
             s if s == CreateTransferStatus::Created as u32 => "created",
             other => panic!("unexpected transfer status {other}"),
@@ -6061,6 +6299,10 @@ create_transfers;
 18:pending_transfer_already_posted
 create_transfers;
 20:pending_transfer_not_pending
+create_transfers;
+22:credit_account_not_found
+create_transfers;
+24:id_already_failed
 get_account_balances account=1;
 7:500:0:0:0
 9:500:100:0:0
@@ -6199,6 +6441,21 @@ lookup_transfers n=4;
             }],
             20,
         );
+
+        // Id 8 fails with a transient code (credit account 4 never exists);
+        // retrying the same id reports `id_already_failed` (orphaned key,
+        // state_machine.zig:3215-3252).
+        let orphan_fail = Transfer {
+            id: 8,
+            debit_account_id: 1,
+            credit_account_id: 4,
+            amount: 1,
+            ledger: 1,
+            code: 1,
+            ..Transfer::default()
+        };
+        bulk(&mut sm, &mut out, &[orphan_fail], 22);
+        bulk(&mut sm, &mut out, &[orphan_fail], 24);
 
         // Both sides of the accounts, debit for 1 and credit for 2.
         for account_id in [1, 2] {
