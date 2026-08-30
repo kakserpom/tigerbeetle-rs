@@ -36,6 +36,7 @@ use tigerbeetle_core::types::{
     ChangeEvent, ChangeEventType, ChangeEventsFilter, CreateAccountStatus, CreateTransferStatus,
     QueryFilter, QueryFilterFlags, Transfer, TransferFlags, TransferPending, TransferPendingStatus,
 };
+use tigerbeetle_lsm::timestamp_range::TimestampRange;
 
 use crate::Operation;
 
@@ -1797,7 +1798,7 @@ pub fn transfer_results_to_bytes(results: &[CreateTransferResult]) -> Vec<u8> {
 /// the orchestrator results instead of rolling grooves back.
 ///
 /// Upstream: `src/state_machine.zig`.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct StateMachine {
     /// The timestamp of the last op committed to the state machine; every
     /// executed op must advance it strictly (upstream asserts the same in
@@ -1828,6 +1829,33 @@ pub struct StateMachine {
     /// for accounts with `AccountFlags::HISTORY`. Mirrors upstream's
     /// `account_events.indexes.account_timestamp` derived index.
     account_events_index: HashMap<u64, Vec<u64>>,
+    /// The timestamp of the next pending transfer to expire, or the sentinel
+    /// that tells the driver whether a `pulse` is needed at any op timestamp
+    /// (upstream `expire_pending_transfers.pulse_next_timestamp`,
+    /// `state_machine.zig:4920`).
+    ///
+    /// Starts at [`TimestampRange::TIMESTAMP_MIN`] so the first pulse always
+    /// runs (and finds any pre-existing expired pendings); becomes
+    /// `timestamp_max` when there is nothing left to expire.
+    pulse_next_timestamp: u64,
+}
+
+impl Default for StateMachine {
+    fn default() -> Self {
+        Self {
+            commit_timestamp: 0,
+            accounts: HashMap::new(),
+            transfers: HashMap::new(),
+            accounts_timestamp_max: 0,
+            transfers_timestamp_max: 0,
+            accounts_by_timestamp: HashMap::new(),
+            transfers_by_timestamp: HashMap::new(),
+            transfers_pending: HashMap::new(),
+            account_events: HashMap::new(),
+            account_events_index: HashMap::new(),
+            pulse_next_timestamp: TimestampRange::TIMESTAMP_MIN,
+        }
+    }
 }
 
 impl StateMachine {
@@ -1857,6 +1885,15 @@ impl StateMachine {
     #[must_use]
     pub fn execute(&mut self, operation: Operation, timestamp: u64, body: &[u8]) -> Vec<u8> {
         match operation {
+            Operation::STATE_MACHINE_PULSE => {
+                if !body.is_empty() {
+                    unreachable!(
+                        "pulse must carry an empty body (Operation.valid, state_machine.zig:1044)"
+                    );
+                }
+                self.expire_pending_transfers(timestamp);
+                Vec::new()
+            }
             Operation::CREATE_ACCOUNTS => {
                 let Some(events) = bytes_to_account_batch(body) else {
                     unreachable!("create_accounts body must encode whole Account events");
@@ -2576,6 +2613,11 @@ impl StateMachine {
             amount_requested,
             amount_actual,
         );
+
+        // The posted/voided pending is no longer outstanding; if it was the
+        // next due, re-point the pulse (upstream resets to `timestamp_min` to
+        // force a rescan, `state_machine.zig:4226-4230`).
+        self.update_pulse_next_timestamp();
     }
 
     /// Record a change-data-capture event for a committed transfer mutation
@@ -2656,6 +2698,57 @@ impl StateMachine {
                 .entry(cr_account.timestamp)
                 .or_default()
                 .push(timestamp_event);
+        }
+    }
+
+    /// Whether a `pulse` operation is needed at `timestamp` (upstream
+    /// `StateMachine.pulse_needed`, `state_machine.zig:1138`): a pending
+    /// transfer is already due (or a scan is still owed), so the driver calls
+    /// [`Self::expire_pending_transfers`] at `timestamp`.
+    #[must_use]
+    pub fn pulse_needed(&self, timestamp: u64) -> bool {
+        self.pulse_next_timestamp <= timestamp
+    }
+
+    /// The next timestamp at which a pending transfer expires (upstream
+    /// `expire_pending_transfers.pulse_next_timestamp`, `state_machine.zig:4920`):
+    /// `timestamp_min` while a pulse is owed, `timestamp_max` when nothing is
+    /// due, otherwise the soonest `expires_at`.
+    #[must_use]
+    pub fn pulse_next_timestamp(&self) -> u64 {
+        self.pulse_next_timestamp
+    }
+
+    /// Re-derive `pulse_next_timestamp` from the outstanding pending transfers:
+    /// the soonest `expires_at` among remaining `Pending` transfers, or
+    /// `timestamp_max` when none remain.
+    ///
+    /// DEVIATION: upstream fixes up the value incrementally (min-update on
+    /// creation, `state_machine.zig:3979-3980`; reset to `timestamp_min` on
+    /// post/void when the removed pending was the next due, `state_machine.zig`
+    /// `:4227`), driving the `expires_at` index scan on the next pulse. Sans-IO
+    /// the pending map is authoritative and cheap to scan, so recomputing is
+    /// exact and always leaves `pulse_needed` pointing at the true next expiry.
+    fn update_pulse_next_timestamp(&mut self) {
+        self.pulse_next_timestamp = TimestampRange::TIMESTAMP_MAX;
+        for (&pending_ts, pending_status) in &self.transfers_pending {
+            if pending_status.status != TransferPendingStatus::Pending {
+                continue;
+            }
+            let id = self
+                .transfers_by_timestamp
+                .get(&pending_ts)
+                .copied()
+                .expect("the pending status index implies a committed pending transfer");
+            let p = self
+                .transfers
+                .get(&id)
+                .copied()
+                .expect("the pending status index implies a committed pending transfer");
+            assert!(p.flags.pending());
+            assert!(p.timeout > 0);
+            let expires_at = p.timestamp + p.timeout_ns();
+            self.pulse_next_timestamp = self.pulse_next_timestamp.min(expires_at);
         }
     }
 
@@ -2777,6 +2870,11 @@ impl StateMachine {
                 p.amount,
             );
         }
+
+        // Re-point the pulse at the next outstanding expiry (or `timestamp_max`
+        // when nothing remains). Upstream advances the value in the expiry
+        // pump's `finish`, `state_machine.zig:4984-4996`.
+        self.update_pulse_next_timestamp();
     }
 
     /// Apply a created transfer's balance mutation to its accounts
@@ -2817,6 +2915,19 @@ impl StateMachine {
             amount_requested,
             amount_actual,
         );
+
+        // A created pending transfer binds the next pulse to its expiry
+        // (upstream `state_machine.zig:3975-3982`); the pending status row and
+        // `timeout > 0` together imply a created (non-imported) pending, so the
+        // asserts mirror upstream's.
+        if event.timeout > 0 {
+            assert!(event.flags.pending());
+            assert!(!event.flags.imported());
+            let expires_at = event.timestamp + event.timeout_ns();
+            if expires_at < self.pulse_next_timestamp {
+                self.pulse_next_timestamp = expires_at;
+            }
+        }
     }
 
     /// Insert a committed transfer, maintaining the timestamp index that
@@ -5159,6 +5270,116 @@ mod tests {
         // Debts cleared, nothing posted.
         assert_eq!(expired.debit_account_debits_posted, 0);
         assert_eq!(expired.credit_account_credits_posted, 0);
+    }
+
+    // ── state-machine pulse tests ────────────────────────────────────────
+
+    /// `pulse_next_timestamp` starts at `timestamp_min`, so the first possible
+    /// pulse fires; a no-op pulse (no pendings outstanding) parks it at
+    /// `timestamp_max`.
+    #[test]
+    fn pulse_needed_starts_owed_and_noop_pulse_parks_it() {
+        let mut sm = StateMachine::default();
+        assert_eq!(sm.pulse_next_timestamp(), TimestampRange::TIMESTAMP_MIN);
+        assert!(!sm.pulse_needed(0));
+        assert!(sm.pulse_needed(1));
+
+        let reply = sm.execute(Operation::STATE_MACHINE_PULSE, 1, &[]);
+        assert!(reply.is_empty());
+        assert_eq!(sm.pulse_next_timestamp(), TimestampRange::TIMESTAMP_MAX);
+        assert!(!sm.pulse_needed(1));
+    }
+
+    /// Creating a pending transfer arms the pulse as *owed* (`timestamp_min`); the
+    /// first pulse scans, then arms the next expiry exactly. Executing the pulse at
+    /// that expiry expires the pending and parks the pulse at `timestamp_max` once
+    /// nothing is outstanding.
+    #[test]
+    fn execute_pulse_expires_due_pending_transfer() {
+        let mut sm = StateMachine::default();
+        let _ = sm.create_accounts(
+            &[
+                Account { id: 1, ledger: 1, code: 1, ..Account::default() },
+                Account { id: 2, ledger: 1, code: 1, ..Account::default() },
+            ],
+            10,
+        );
+        // Pending stamped 20 with a 1-second timeout.
+        let pending = Transfer { flags: TransferFlags::PENDING, timeout: 1, ..t(1, 2, 50) };
+        let _ = sm.create_transfers(&[pending], 20);
+        let expires_at = 20 + NS_PER_S;
+
+        // A scan is owed immediately (pulse armed at `timestamp_min`); the
+        // first pulse finds nothing due and re-arms at the exact expiry
+        // (upstream `execute_expire_pending_transfers` + `finish`).
+        assert_eq!(sm.pulse_next_timestamp(), TimestampRange::TIMESTAMP_MIN);
+        assert!(sm.pulse_needed(1));
+        let reply = sm.execute(Operation::STATE_MACHINE_PULSE, 21, &[]);
+        assert!(reply.is_empty());
+        assert_eq!(sm.pulse_next_timestamp(), expires_at);
+        assert!(!sm.pulse_needed(expires_at - 1));
+        assert!(sm.pulse_needed(expires_at));
+
+        let reply = sm.execute(Operation::STATE_MACHINE_PULSE, expires_at, &[]);
+        assert!(reply.is_empty());
+
+        assert_eq!(sm.accounts.get(&1).expect("account 1 stored").debits_pending, 0);
+        assert_eq!(sm.accounts.get(&2).expect("account 2 stored").credits_pending, 0);
+        let pending_status = sm.transfers_pending.get(&20).expect("pending status row");
+        assert_eq!(pending_status.status, TransferPendingStatus::Expired);
+        assert_eq!(sm.pulse_next_timestamp(), TimestampRange::TIMESTAMP_MAX);
+        assert!(!sm.pulse_needed(expires_at));
+    }
+
+    /// Posting or voiding a pending re-points the pulse at the next outstanding
+    /// expiry (or parks it at `timestamp_max` when none remain).
+    #[test]
+    fn pulse_next_repoints_when_a_pending_is_posted_or_voided() {
+        let mut sm = StateMachine::default();
+        let _ = sm.create_accounts(
+            &[
+                Account { id: 1, ledger: 1, code: 1, ..Account::default() },
+                Account { id: 2, ledger: 1, code: 1, ..Account::default() },
+            ],
+            10,
+        );
+        // Two pendings, expiring in order: id 1002 (p1) at `20 + 1s`,
+        // id 1003 (p2) at `30 + 2s`. A scan is owed until the next pulse.
+        let p1 = Transfer { id: 1002, flags: TransferFlags::PENDING, timeout: 1, ..t(1, 2, 50) };
+        let p2 = Transfer { id: 1003, flags: TransferFlags::PENDING, timeout: 2, ..t(1, 2, 25) };
+        let _ = sm.create_transfers(&[p1], 20);
+        let _ = sm.create_transfers(&[p2], 30);
+        assert_eq!(sm.pulse_next_timestamp(), TimestampRange::TIMESTAMP_MIN);
+
+        // Posting p1 leaves p2 as the next expiry.
+        let body = sm.create_transfers(&[post_event(1004, u128::MAX)], 40);
+        assert_eq!(reply_status(&body), CreateTransferStatus::Created as u32);
+        assert_eq!(sm.pulse_next_timestamp(), 30 + 2 * NS_PER_S);
+
+        // Voiding p2 parks the pulse at `timestamp_max` (`void_event` targets
+        // `pending_id` 1002, so build the p2 void directly; a void's zero
+        // amount means "full amount", and a void must cover the whole pending).
+        let void = Transfer {
+            id: 1005,
+            pending_id: 1003,
+            amount: 0,
+            flags: TransferFlags::VOID_PENDING_TRANSFER,
+            ..Transfer::default()
+        };
+        let body = sm.create_transfers(&[void], 50);
+        assert_eq!(reply_status(&body), CreateTransferStatus::Created as u32);
+        assert_eq!(sm.pulse_next_timestamp(), TimestampRange::TIMESTAMP_MAX);
+        assert!(!sm.pulse_needed(50));
+    }
+
+    /// A pulse carries no body; `execute` rejects any bytes (upstream
+    /// `Operation.valid` returns `batch.len == 0` for `.pulse`, and the replica
+    /// never sends one).
+    #[test]
+    #[should_panic(expected = "pulse must carry an empty body")]
+    fn execute_pulse_rejects_nonempty_body() {
+        let mut sm = StateMachine::default();
+        let _ = sm.execute(Operation::STATE_MACHINE_PULSE, 1, &[0]);
     }
 
     // ── lookup_accounts / lookup_transfers tests ─────────────────────────

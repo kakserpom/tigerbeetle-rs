@@ -79,6 +79,18 @@ impl Operation {
     /// (`tigerbeetle.zig::Operation`): state-machine operations live at
     /// `vsr_operations_reserved + n` so they never collide with the control
     /// plane. Request and prepare headers carry these ordinals.
+    ///
+    /// Port of `tigerbeetle.zig::Operation.pulse`, the state-machine pulse
+    /// that drives pending-transfer expiry.
+    ///
+    /// DEVIATION: upstream keeps this as `tigerbeetle.zig::Operation.pulse`,
+    /// distinct from vsr.zig's control-plane `pulse = 4` (whose port is
+    /// [`Operation::PULSE`] above); the unified `Operation` newtype needs a
+    /// separate name.
+    #[allow(clippy::identity_op)]
+    pub const STATE_MACHINE_PULSE: Self =
+        Self(tigerbeetle_core::constants::VSR_OPERATIONS_RESERVED + 0);
+    /// Port of `tigerbeetle.zig::Operation.create_accounts`.
     pub const CREATE_ACCOUNTS: Self =
         Self(tigerbeetle_core::constants::VSR_OPERATIONS_RESERVED + 18);
     /// Port of `tigerbeetle.zig::Operation.create_transfers`.
