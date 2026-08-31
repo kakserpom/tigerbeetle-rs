@@ -25,19 +25,21 @@ use tigerbeetle_core::stdx::hash::{hash_inline_u64, hash_inline_u128};
 use tigerbeetle_core::types::{
     Account, AccountFlags, Transfer, TransferFlags, TransferPending, TransferPendingStatus,
 };
-use tigerbeetle_lsm::cache_map::{CacheMap, CacheMapSpec};
+use tigerbeetle_lsm::cache_map::{CacheMap, CacheMapOptions, CacheMapSpec};
 use tigerbeetle_lsm::composite_key::{
     self, CompositeKey, CompositeKey64, CompositeKey128, CompositeKeyUnit, U256,
 };
 use tigerbeetle_lsm::manifest::ManifestLog;
+use tigerbeetle_lsm::scratch_memory::ScratchMemory;
 use tigerbeetle_lsm::set_associative_cache::{Layout, SetAssociativeCacheSpec};
 use tigerbeetle_lsm::table_memory::{self, Usage};
 use tigerbeetle_lsm::tree::ScopeCloseMode;
+use tigerbeetle_lsm::tree::TreeConfig;
 use tigerbeetle_lsm::unique_key::{UniqueKey, UniqueKey128};
 
 use crate::grid::Grid;
 use crate::table::{self, BlockValue, IndexBlocks, TableLayout, TableSpec, TableUsage};
-use crate::tree::{LookupMemoryResult, Tree};
+use crate::tree::{LookupMemoryResult, Options, Tree};
 
 // ---------------------------------------------------------------------------
 // Groove objects-cache specs
@@ -370,7 +372,9 @@ impl BlockValue for TransferPending {
 /// `Operation.create_accounts/create_transfers.event_max(message_body_size_max)`
 /// (`tigerbeetle.zig:853-901`). Accounts and transfers are both 128 bytes, and the event
 /// (request) side binds over the reply bound, so `event_max = message_body_size_max / 128`.
-const GROOVE_VALUE_COUNT_MAX: usize = constants::LSM_COMPACTION_OPS
+/// Maximum values a tree in a groove can hold, mirroring upstream `groove.zig:323-417`
+/// (`lsm_compaction_ops * max(batch_create_accounts, 2*batch_create_transfers)`).
+pub const GROOVE_VALUE_COUNT_MAX: usize = constants::LSM_COMPACTION_OPS
     * (2 * (constants::MESSAGE_BODY_SIZE_MAX / core::mem::size_of::<Account>()));
 
 // ===== Object trees (keyed by u64 timestamp) =====
@@ -1083,6 +1087,43 @@ pub struct AccountGroove {
     objects_cache: AccountObjectsCache,
 }
 
+/// Radix-sort scratch buffers for [`AccountGroove`]'s trees, owned by the forest.
+///
+/// DEVIATION: upstream shares a single untyped byte buffer across all of the forest's
+/// trees (forest.zig:253, sized to the max `value_count_max * size_of(Value)`). This port's
+/// `ScratchMemory<T>` is typed per element (scratch_memory.rs), so safe Rust has one buffer
+/// per distinct tree value type instead. Since compaction is serialized (one tree at a time
+/// per beat) and each tree needs only its own value type's buffer, one buffer per type
+/// suffices; this only costs more memory, not correctness.
+pub struct AccountGrooveScratch {
+    pub objects: ScratchMemory<Account>,
+    pub id: ScratchMemory<UniqueKey128>,
+    pub user_data_128: ScratchMemory<CompositeKey128>,
+    pub composite_key_64: ScratchMemory<CompositeKey64>,
+    pub composite_key_unit: ScratchMemory<CompositeKeyUnit>,
+}
+
+/// Builds fresh scratch buffers for an [`AccountGroove`], each sized to the groove's
+/// maximum tree value count (mirroring upstream's max-over-trees sizing, forest.zig:290-299).
+impl AccountGrooveScratch {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            objects: ScratchMemory::new(GROOVE_VALUE_COUNT_MAX),
+            id: ScratchMemory::new(GROOVE_VALUE_COUNT_MAX),
+            user_data_128: ScratchMemory::new(GROOVE_VALUE_COUNT_MAX),
+            composite_key_64: ScratchMemory::new(GROOVE_VALUE_COUNT_MAX),
+            composite_key_unit: ScratchMemory::new(GROOVE_VALUE_COUNT_MAX),
+        }
+    }
+}
+
+impl Default for AccountGrooveScratch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// The Transfer groove.
 pub struct TransferGroove {
     pub objects: Tree<TransferObjectSpec>,
@@ -1103,11 +1144,71 @@ pub struct TransferGroove {
     objects_cache: TransferObjectsCache,
 }
 
+/// Radix-sort scratch buffers for [`TransferGroove`]'s trees, owned by the forest.
+///
+/// See the DEVIATION note on [`AccountGrooveScratch`] (typed per-type buffers instead of
+/// upstream's single shared untyped buffer).
+pub struct TransferGrooveScratch {
+    pub objects: ScratchMemory<Transfer>,
+    pub id: ScratchMemory<UniqueKey128>,
+    pub composite_key_128: ScratchMemory<CompositeKey128>,
+    pub composite_key_64: ScratchMemory<CompositeKey64>,
+    pub composite_key_unit: ScratchMemory<CompositeKeyUnit>,
+}
+
+/// Builds fresh scratch buffers for a [`TransferGroove`], each sized to the groove's
+/// maximum tree value count (forest.zig:290-299).
+impl TransferGrooveScratch {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            objects: ScratchMemory::new(GROOVE_VALUE_COUNT_MAX),
+            id: ScratchMemory::new(GROOVE_VALUE_COUNT_MAX),
+            composite_key_128: ScratchMemory::new(GROOVE_VALUE_COUNT_MAX),
+            composite_key_64: ScratchMemory::new(GROOVE_VALUE_COUNT_MAX),
+            composite_key_unit: ScratchMemory::new(GROOVE_VALUE_COUNT_MAX),
+        }
+    }
+}
+
+impl Default for TransferGrooveScratch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // AccountGroove operations
 // ---------------------------------------------------------------------------
 
 impl AccountGroove {
+    /// Build a fresh [`AccountGroove`] with all nine trees, sized for
+    /// `batch_value_count_limit` values per beat (forest.zig:290-302).
+    #[must_use]
+    pub fn new(batch_value_count_limit: u32) -> Self {
+        fn tree<S: crate::tree::TreeSpec>(id: u16, name: &'static str, limit: u32) -> Tree<S> {
+            Tree::<S>::new(TreeConfig { id, name }, Options { batch_value_count_limit: limit })
+        }
+        AccountGroove {
+            objects: tree(1, "accounts_objects", batch_value_count_limit),
+            id: tree(2, "accounts_id", batch_value_count_limit),
+            user_data_128: tree(3, "accounts_user_data_128", batch_value_count_limit),
+            user_data_64: tree(4, "accounts_user_data_64", batch_value_count_limit),
+            user_data_32: tree(5, "accounts_user_data_32", batch_value_count_limit),
+            ledger: tree(6, "accounts_ledger", batch_value_count_limit),
+            code: tree(7, "accounts_code", batch_value_count_limit),
+            imported: tree(8, "accounts_imported", batch_value_count_limit),
+            closed: tree(9, "accounts_closed", batch_value_count_limit),
+            objects_cache: AccountObjectsCache::new(CacheMapOptions {
+                cache_value_count_max: 256,
+                stash_value_count_max: constants::LSM_COMPACTION_OPS as u32
+                    * batch_value_count_limit,
+                scope_value_count_max: batch_value_count_limit,
+                name: "accounts_objects",
+            }),
+        }
+    }
+
     pub fn scope_open(&mut self) {
         self.objects.scope_open();
         self.id.scope_open();
@@ -1134,10 +1235,27 @@ impl AccountGroove {
         self.objects_cache.scope_close(mode);
     }
 
-    pub fn compact(&mut self) {
-        // TODO(port): pass ScratchMemory per tree type from forest/compaction layer.
-        // Each tree's compact() needs &mut ScratchMemory<V> — deferred until
-        // the forest manages scratch memory allocation.
+    /// Port of upstream `groove.compact` (groove.zig:1981-2021): sorts each tree's
+    /// mutable table with its radix-sort scratch, and compacts the objects cache on the
+    /// last beat of the bar (mirroring the trees' own mutable-table compaction cadence).
+    ///
+    /// DEVIATION: takes the per-value-type scratch buffers as a parameter instead of
+    /// reading a shared untyped buffer as upstream does (see [`AccountGrooveScratch`]).
+    pub fn compact(&mut self, op: u64, sc: &mut AccountGrooveScratch) {
+        self.objects.compact(&mut sc.objects);
+        self.id.compact(&mut sc.id);
+        self.user_data_128.compact(&mut sc.user_data_128);
+        self.user_data_64.compact(&mut sc.composite_key_64);
+        self.user_data_32.compact(&mut sc.composite_key_64);
+        self.ledger.compact(&mut sc.composite_key_64);
+        self.code.compact(&mut sc.composite_key_64);
+        self.imported.compact(&mut sc.composite_key_unit);
+        self.closed.compact(&mut sc.composite_key_unit);
+
+        let compaction_beat = op % (constants::LSM_COMPACTION_OPS as u64);
+        if compaction_beat == constants::LSM_COMPACTION_OPS as u64 - 1 {
+            self.objects_cache.compact();
+        }
     }
 
     /// Lookup an account by its primary key (id) from the objects cache.
@@ -1381,6 +1499,38 @@ impl AccountGroove {
 // ---------------------------------------------------------------------------
 
 impl TransferGroove {
+    /// Build a fresh [`TransferGroove`] with all fourteen trees, sized for
+    /// `batch_value_count_limit` values per beat (forest.zig:290-302).
+    #[must_use]
+    pub fn new(batch_value_count_limit: u32) -> Self {
+        fn tree<S: crate::tree::TreeSpec>(id: u16, name: &'static str, limit: u32) -> Tree<S> {
+            Tree::<S>::new(TreeConfig { id, name }, Options { batch_value_count_limit: limit })
+        }
+        TransferGroove {
+            objects: tree(10, "transfers_objects", batch_value_count_limit),
+            id: tree(11, "transfers_id", batch_value_count_limit),
+            debit_account_id: tree(12, "transfers_debit_account_id", batch_value_count_limit),
+            credit_account_id: tree(13, "transfers_credit_account_id", batch_value_count_limit),
+            amount: tree(14, "transfers_amount", batch_value_count_limit),
+            pending_id: tree(15, "transfers_pending_id", batch_value_count_limit),
+            user_data_128: tree(16, "transfers_user_data_128", batch_value_count_limit),
+            user_data_64: tree(17, "transfers_user_data_64", batch_value_count_limit),
+            user_data_32: tree(18, "transfers_user_data_32", batch_value_count_limit),
+            ledger: tree(19, "transfers_ledger", batch_value_count_limit),
+            code: tree(20, "transfers_code", batch_value_count_limit),
+            expires_at: tree(21, "transfers_expires_at", batch_value_count_limit),
+            imported: tree(22, "transfers_imported", batch_value_count_limit),
+            closing: tree(23, "transfers_closing", batch_value_count_limit),
+            objects_cache: TransferObjectsCache::new(CacheMapOptions {
+                cache_value_count_max: 256,
+                stash_value_count_max: constants::LSM_COMPACTION_OPS as u32
+                    * batch_value_count_limit,
+                scope_value_count_max: batch_value_count_limit,
+                name: "transfers_objects",
+            }),
+        }
+    }
+
     /// Lookup a transfer by its primary key (id) from the objects cache.
     ///
     /// Mirrors `groove.zig:885-936` (`get(PrimaryKey) ObjectCacheResult`), collapsed to
@@ -1485,8 +1635,28 @@ impl TransferGroove {
         self.objects_cache.scope_close(mode);
     }
 
-    pub fn compact(&mut self) {
-        // TODO(port): pass ScratchMemory per tree type from forest/compaction layer.
+    /// Port of upstream `groove.compact` (groove.zig:1981-2021). See
+    /// [`AccountGroove::compact`].
+    pub fn compact(&mut self, op: u64, sc: &mut TransferGrooveScratch) {
+        self.objects.compact(&mut sc.objects);
+        self.id.compact(&mut sc.id);
+        self.debit_account_id.compact(&mut sc.composite_key_128);
+        self.credit_account_id.compact(&mut sc.composite_key_128);
+        self.amount.compact(&mut sc.composite_key_128);
+        self.pending_id.compact(&mut sc.composite_key_128);
+        self.user_data_128.compact(&mut sc.composite_key_128);
+        self.user_data_64.compact(&mut sc.composite_key_64);
+        self.user_data_32.compact(&mut sc.composite_key_64);
+        self.ledger.compact(&mut sc.composite_key_64);
+        self.code.compact(&mut sc.composite_key_64);
+        self.expires_at.compact(&mut sc.composite_key_64);
+        self.imported.compact(&mut sc.composite_key_unit);
+        self.closing.compact(&mut sc.composite_key_unit);
+
+        let compaction_beat = op % (constants::LSM_COMPACTION_OPS as u64);
+        if compaction_beat == constants::LSM_COMPACTION_OPS as u64 - 1 {
+            self.objects_cache.compact();
+        }
     }
 
     /// Insert a transfer into the object tree and all index trees.
@@ -1740,7 +1910,56 @@ pub struct TransferPendingGroove {
     objects_cache: TransferPendingObjectsCache,
 }
 
+/// Radix-sort scratch buffers for [`TransferPendingGroove`]'s trees, owned by the forest.
+///
+/// See the DEVIATION note on [`AccountGrooveScratch`].
+pub struct TransferPendingGrooveScratch {
+    pub objects: ScratchMemory<TransferPending>,
+    pub status: ScratchMemory<CompositeKey64>,
+}
+
+/// Builds fresh scratch buffers for a [`TransferPendingGroove`], each sized to the groove's
+/// maximum tree value count (forest.zig:290-299).
+impl TransferPendingGrooveScratch {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            objects: ScratchMemory::new(GROOVE_VALUE_COUNT_MAX),
+            status: ScratchMemory::new(GROOVE_VALUE_COUNT_MAX),
+        }
+    }
+}
+
+impl Default for TransferPendingGrooveScratch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TransferPendingGroove {
+    /// Build a fresh [`TransferPendingGroove`] with its two trees, sized for
+    /// `batch_value_count_limit` values per beat (forest.zig:290-302).
+    #[must_use]
+    pub fn new(batch_value_count_limit: u32) -> Self {
+        TransferPendingGroove {
+            objects: Tree::<TransferPendingObjectSpec>::new(
+                TreeConfig { id: 20, name: "transfers_pending_objects" },
+                Options { batch_value_count_limit },
+            ),
+            status: Tree::<TransferPendingStatusSpec>::new(
+                TreeConfig { id: 21, name: "transfers_pending_status" },
+                Options { batch_value_count_limit },
+            ),
+            objects_cache: TransferPendingObjectsCache::new(CacheMapOptions {
+                cache_value_count_max: 256,
+                stash_value_count_max: constants::LSM_COMPACTION_OPS as u32
+                    * batch_value_count_limit,
+                scope_value_count_max: batch_value_count_limit,
+                name: "transfers_pending_objects",
+            }),
+        }
+    }
+
     pub fn scope_open(&mut self) {
         self.objects.scope_open();
         self.status.scope_open();
@@ -1828,6 +2047,18 @@ impl TransferPendingGroove {
             if let Some(v) = new_status {
                 self.status.put(&CompositeKey64 { field: v, timestamp: new.timestamp });
             }
+        }
+    }
+
+    /// Port of upstream `groove.compact` (groove.zig:1981-2021). See
+    /// [`AccountGroove::compact`].
+    pub fn compact(&mut self, op: u64, sc: &mut TransferPendingGrooveScratch) {
+        self.objects.compact(&mut sc.objects);
+        self.status.compact(&mut sc.status);
+
+        let compaction_beat = op % (constants::LSM_COMPACTION_OPS as u64);
+        if compaction_beat == constants::LSM_COMPACTION_OPS as u64 - 1 {
+            self.objects_cache.compact();
         }
     }
 
