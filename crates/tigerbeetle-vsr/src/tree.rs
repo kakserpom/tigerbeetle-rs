@@ -25,7 +25,7 @@ use tigerbeetle_core::constants::{self, VERIFY};
 use tigerbeetle_lsm::manifest::{
     Manifest, ManifestLog as ManifestLogTrait, TableKey as ManifestTableKey, TreeTableInfo,
 };
-use tigerbeetle_lsm::manifest_level::{KeyRange, LevelTableInfo};
+use tigerbeetle_lsm::manifest_level::{KeyRange, LevelTableInfo, ManifestLevel};
 use tigerbeetle_lsm::scratch_memory::ScratchMemory;
 use tigerbeetle_lsm::table_memory::{self, Mutability, TableMemory};
 use tigerbeetle_lsm::tree::{SNAPSHOT_LATEST, ScopeCloseMode, TreeConfig};
@@ -411,6 +411,13 @@ impl<S: TreeSpec> Tree<S> {
     #[must_use]
     pub fn is_opened(&self) -> bool {
         self.compaction_op.is_some()
+    }
+
+    /// Number of visible tables in the manifest across all levels (used to verify that
+    /// `open_table` replay recovered a manifest entry).
+    #[must_use]
+    pub fn manifest_table_count(&self) -> u32 {
+        self.manifest.levels.iter().map(ManifestLevel::table_count_visible).sum()
     }
 
     /// Port of upstream `Tree.compact`.

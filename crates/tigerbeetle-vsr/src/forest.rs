@@ -14,9 +14,15 @@ use crate::groove::{
 };
 use crate::manifest_log::{ManifestLog, Pace};
 use crate::storage::Storage;
+use std::cell::RefCell;
+use std::rc::Rc;
 use tigerbeetle_core::constants::{CONFIG, LSM_GROWTH_FACTOR, LSM_LEVELS};
 use tigerbeetle_lsm::manifest::ManifestLog as ManifestLogTrait;
+use tigerbeetle_lsm::schema::manifest_node as mn;
 use tigerbeetle_lsm::tree::table_count_max_for_tree;
+
+/// Shared buffer for collecting manifest entries during `ManifestLog::open`.
+type SharedTableBuffer = Rc<RefCell<Vec<mn::TableInfo>>>;
 
 /// Number of trees in the forest: 9 (account) + 14 (transfer) + 2 (pending).
 /// Used to size the manifest log's compaction pace (upstream `tree_infos.len`).
@@ -43,6 +49,12 @@ enum ForestProgress {
         /// The op the grooves resume from after this open (upstream passes the checkpoint op
         /// into `open_complete`).
         checkpoint_op: u64,
+        /// Manifest entries replayed during `ManifestLog::open`. The manifest log's
+        /// `open_event` callback pushes here (it cannot reach `self` — the callback runs while
+        /// `manifest_log` is mutably borrowed); `Forest::poll` drains it into the owning trees'
+        /// `open_table` once the open completes, before `open_complete` (upstream
+        /// `manifest_log_open_event`, forest.zig:381).
+        replayed: SharedTableBuffer,
     },
     /// Forest is checkpointing: manifest log flush in progress; user callback fires when done.
     Checkpoint {
@@ -114,8 +126,7 @@ impl Forest {
     /// Begin opening the forest: attach the manifest log to every groove, open the grid and
     /// the manifest log, then drive to completion with [`Forest::poll`].
     ///
-    /// Port of upstream `forest.open` (forest.zig:369). The `open_event` manifest-entry
-    /// routing (replaying each table into its owning tree via `tree.open_table`) is deferred.
+    /// Port of upstream `forest.open` (forest.zig:369).
     ///
     /// # Panics
     /// Panics if an open is already in flight.
@@ -132,11 +143,18 @@ impl Forest {
         self.transfers_pending.open_commence(&mut self.manifest_log);
 
         self.grid.open(storage, references);
-        // TODO(port): src/lsm/forest.zig:381 manifest_log_open_event — route replayed tables
-        // by tree_id into the owning tree's `open_table`.
-        self.manifest_log.open(|_| {}, || {}, &mut self.grid, storage);
+        // Port of upstream `manifest_log_open_event` (forest.zig:381): the manifest log
+        // calls this per replayed entry; we collect them into a shared buffer and route them
+        // by tree_id in `poll` (the callback cannot borrow `self` while `manifest_log` is
+        // being polled, so routing is deferred until the open completes).
+        let replayed = Rc::new(RefCell::new(Vec::new()));
+        let event = {
+            let replayed = replayed.clone();
+            move |table: &mn::TableInfo| replayed.borrow_mut().push(*table)
+        };
+        self.manifest_log.open(event, || {}, &mut self.grid, storage);
 
-        self.progress = Some(ForestProgress::Open { checkpoint_op });
+        self.progress = Some(ForestProgress::Open { checkpoint_op, replayed });
     }
 
     /// Drive the grid and manifest log toward their pending completion.
@@ -166,14 +184,64 @@ impl Forest {
 
         // Open completion: once the manifest log finishes opening, resume each groove.
         if self.manifest_log.is_opened()
-            && let Some(ForestProgress::Open { checkpoint_op }) = self.progress.take()
+            && let Some(ForestProgress::Open { checkpoint_op, replayed }) = self.progress.take()
         {
             // Upstream `manifest_log_open_callback` (forest.zig:402): the manifest log
-            // finished opening, so resume each groove at `checkpoint_op`.
+            // finished opening, so replay each collected entry into its owning tree's
+            // `open_table`, then resume each groove at `checkpoint_op`.
+            let replayed = std::mem::take(&mut *replayed.borrow_mut());
+            for table in &replayed {
+                self.open_replay_table(table);
+            }
+            drop(replayed);
+
             self.manifest_log.init_blocks(&mut self.grid);
             self.accounts.open_complete(checkpoint_op);
             self.transfers.open_complete(checkpoint_op);
             self.transfers_pending.open_complete(checkpoint_op);
+        }
+    }
+
+    /// Route one replayed manifest entry to its owning tree's `open_table`.
+    ///
+    /// Port of upstream `manifest_log_open_event` (forest.zig:381-397): assert the
+    /// tree_id is known, then dispatch by `tree_id` to the specific tree. The routing mirrors
+    /// upstream's `tree_for_id` switch using the canonical upstream tree ids.
+    ///
+    /// # Panics
+    /// Panics if the manifest contains an unknown `tree_id`.
+    fn open_replay_table(&mut self, table: &mn::TableInfo) {
+        // Only the primary-key index trees are replayed as their own tables; the tree ids
+        // below are upstream `tree_ids` (state_machine.zig:45-78).
+        match table.tree_id {
+            // Account groove.
+            1 => self.accounts.id.open_table(table),
+            2 => self.accounts.user_data_128.open_table(table),
+            3 => self.accounts.user_data_64.open_table(table),
+            4 => self.accounts.user_data_32.open_table(table),
+            5 => self.accounts.ledger.open_table(table),
+            6 => self.accounts.code.open_table(table),
+            7 => self.accounts.objects.open_table(table),
+            23 => self.accounts.imported.open_table(table),
+            25 => self.accounts.closed.open_table(table),
+            // Transfer groove.
+            8 => self.transfers.id.open_table(table),
+            9 => self.transfers.debit_account_id.open_table(table),
+            10 => self.transfers.credit_account_id.open_table(table),
+            11 => self.transfers.amount.open_table(table),
+            12 => self.transfers.pending_id.open_table(table),
+            13 => self.transfers.user_data_128.open_table(table),
+            14 => self.transfers.user_data_64.open_table(table),
+            15 => self.transfers.user_data_32.open_table(table),
+            16 => self.transfers.ledger.open_table(table),
+            17 => self.transfers.code.open_table(table),
+            18 => self.transfers.objects.open_table(table),
+            19 => self.transfers.expires_at.open_table(table),
+            24 => self.transfers.imported.open_table(table),
+            26 => self.transfers.closing.open_table(table),
+            // TransferPending groove.
+            20 | 21 => self.transfers_pending.open_table(table),
+            other => panic!("unknown tree_id in manifest: {other}"),
         }
     }
 
@@ -271,6 +339,7 @@ mod tests {
     use crate::multiversion::Release;
     use crate::storage::MemoryStorage;
     use crate::superblock::{DATA_FILE_SIZE_MIN, TrailerReference};
+    use crate::table::TableKey;
     use tigerbeetle_core::checksum::checksum;
     use tigerbeetle_core::constants::{self, BLOCK_SIZE};
     use tigerbeetle_core::types::Account;
@@ -535,5 +604,52 @@ mod tests {
             assert!(polls < 1000, "checkpoint after compact must complete");
         }
         assert!(!forest.manifest_log.checkpoint_references().empty());
+    }
+
+    /// `Forest::open` collects replayed manifest entries into a shared buffer and, once the
+    /// manifest log finishes opening, routes each by `tree_id` into the owning tree's
+    /// `open_table` before `open_complete`. This can only run before open completes, so we
+    /// open without polling (the trees are in the pre-`open_complete` window) and drive the
+    /// routing directly.
+    ///
+    /// The motivating bug was the `tree_id` collision between the Transfer and
+    /// TransferPending grooves at ids 20/21 — routing would have ambiguously dispatched those
+    /// entries. The canonical ids are now globally unique (upstream `tree_ids`,
+    /// state_machine.zig:45-78); we root ids 18 (transfer objects) and 20 (pending objects),
+    /// the former collision pair, and one account tree (7) to span all three grooves. All
+    /// three are u64-timestamp-keyed, so a single key encoding is valid for each.
+    #[test]
+    fn forest_open_replay_routes_by_tree_id() {
+        fn info(address: u64, tree_id: u16) -> mn::TableInfo {
+            let key_min = 1_u64.to_le_bytes_padded();
+            let key_max = 100_u64.to_le_bytes_padded();
+            mn::TableInfo {
+                key_min,
+                key_max,
+                checksum: checksum(&address.to_le_bytes()),
+                address,
+                snapshot_min: 1,
+                snapshot_max: u64::MAX,
+                value_count: 1,
+                tree_id,
+                label: mn::Label { level: 0, event: mn::Event::Insert },
+            }
+        }
+
+        let mut forest = Forest::init(test_superblock(), grid_options(), 32);
+        let mut storage = storage();
+        forest.open(empty_references(), &mut storage, 0);
+
+        forest.open_replay_table(&info(0x3000, 7)); // account objects
+        forest.open_replay_table(&info(0x3001, 18)); // transfer objects
+        forest.open_replay_table(&info(0x3002, 20)); // pending objects
+
+        // Each routed entry landed in exactly its owning tree (no cross-groove ambiguity).
+        assert_eq!(forest.accounts.objects.manifest_table_count(), 1);
+        assert_eq!(forest.accounts.id.manifest_table_count(), 0);
+        assert_eq!(forest.transfers.objects.manifest_table_count(), 1);
+        assert_eq!(forest.transfers.id.manifest_table_count(), 0);
+        assert_eq!(forest.transfers_pending.objects_table_count(), 1);
+        assert_eq!(forest.transfers_pending.status_table_count(), 0);
     }
 }

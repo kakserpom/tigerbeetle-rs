@@ -1190,15 +1190,16 @@ impl AccountGroove {
             Tree::<S>::new(TreeConfig { id, name }, Options { batch_value_count_limit: limit })
         }
         AccountGroove {
-            objects: tree(1, "accounts_objects", batch_value_count_limit),
-            id: tree(2, "accounts_id", batch_value_count_limit),
-            user_data_128: tree(3, "accounts_user_data_128", batch_value_count_limit),
-            user_data_64: tree(4, "accounts_user_data_64", batch_value_count_limit),
-            user_data_32: tree(5, "accounts_user_data_32", batch_value_count_limit),
-            ledger: tree(6, "accounts_ledger", batch_value_count_limit),
-            code: tree(7, "accounts_code", batch_value_count_limit),
-            imported: tree(8, "accounts_imported", batch_value_count_limit),
-            closed: tree(9, "accounts_closed", batch_value_count_limit),
+            // Tree ids mirror upstream `tree_ids.Account` (state_machine.zig:46-56).
+            objects: tree(7, "accounts_objects", batch_value_count_limit),
+            id: tree(1, "accounts_id", batch_value_count_limit),
+            user_data_128: tree(2, "accounts_user_data_128", batch_value_count_limit),
+            user_data_64: tree(3, "accounts_user_data_64", batch_value_count_limit),
+            user_data_32: tree(4, "accounts_user_data_32", batch_value_count_limit),
+            ledger: tree(5, "accounts_ledger", batch_value_count_limit),
+            code: tree(6, "accounts_code", batch_value_count_limit),
+            imported: tree(23, "accounts_imported", batch_value_count_limit),
+            closed: tree(25, "accounts_closed", batch_value_count_limit),
             objects_cache: AccountObjectsCache::new(CacheMapOptions {
                 cache_value_count_max: 256,
                 stash_value_count_max: constants::LSM_COMPACTION_OPS as u32
@@ -1507,20 +1508,21 @@ impl TransferGroove {
             Tree::<S>::new(TreeConfig { id, name }, Options { batch_value_count_limit: limit })
         }
         TransferGroove {
-            objects: tree(10, "transfers_objects", batch_value_count_limit),
-            id: tree(11, "transfers_id", batch_value_count_limit),
-            debit_account_id: tree(12, "transfers_debit_account_id", batch_value_count_limit),
-            credit_account_id: tree(13, "transfers_credit_account_id", batch_value_count_limit),
-            amount: tree(14, "transfers_amount", batch_value_count_limit),
-            pending_id: tree(15, "transfers_pending_id", batch_value_count_limit),
-            user_data_128: tree(16, "transfers_user_data_128", batch_value_count_limit),
-            user_data_64: tree(17, "transfers_user_data_64", batch_value_count_limit),
-            user_data_32: tree(18, "transfers_user_data_32", batch_value_count_limit),
-            ledger: tree(19, "transfers_ledger", batch_value_count_limit),
-            code: tree(20, "transfers_code", batch_value_count_limit),
-            expires_at: tree(21, "transfers_expires_at", batch_value_count_limit),
-            imported: tree(22, "transfers_imported", batch_value_count_limit),
-            closing: tree(23, "transfers_closing", batch_value_count_limit),
+            // Tree ids mirror upstream `tree_ids.Transfer` (state_machine.zig:58-73).
+            objects: tree(18, "transfers_objects", batch_value_count_limit),
+            id: tree(8, "transfers_id", batch_value_count_limit),
+            debit_account_id: tree(9, "transfers_debit_account_id", batch_value_count_limit),
+            credit_account_id: tree(10, "transfers_credit_account_id", batch_value_count_limit),
+            amount: tree(11, "transfers_amount", batch_value_count_limit),
+            pending_id: tree(12, "transfers_pending_id", batch_value_count_limit),
+            user_data_128: tree(13, "transfers_user_data_128", batch_value_count_limit),
+            user_data_64: tree(14, "transfers_user_data_64", batch_value_count_limit),
+            user_data_32: tree(15, "transfers_user_data_32", batch_value_count_limit),
+            ledger: tree(16, "transfers_ledger", batch_value_count_limit),
+            code: tree(17, "transfers_code", batch_value_count_limit),
+            expires_at: tree(19, "transfers_expires_at", batch_value_count_limit),
+            imported: tree(24, "transfers_imported", batch_value_count_limit),
+            closing: tree(26, "transfers_closing", batch_value_count_limit),
             objects_cache: TransferObjectsCache::new(CacheMapOptions {
                 cache_value_count_max: 256,
                 stash_value_count_max: constants::LSM_COMPACTION_OPS as u32
@@ -2067,9 +2069,37 @@ impl TransferPendingGroove {
         self.status.open_commence(manifest_log);
     }
 
+    /// Replay a manifest entry into the owning tree during open.
+    ///
+    /// The forest routes manifest entries by `tree_id`; the pending groove's `objects`
+    /// (upstream `timestamp`) and `status` trees are routed here. See [`Tree::open_table`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the entry's `tree_id` is not 20 or 21, or if `Tree::open_table` rejects it.
+    pub fn open_table(&mut self, table: &tigerbeetle_lsm::schema::manifest_node::TableInfo) {
+        match table.tree_id {
+            20 => self.objects.open_table(table),
+            21 => self.status.open_table(table),
+            other => panic!("tree_id {other} does not belong to the transfers_pending groove"),
+        }
+    }
+
     pub fn open_complete(&mut self, checkpoint_op: u64) {
         self.objects.open_complete(checkpoint_op);
         self.status.open_complete(checkpoint_op);
+    }
+
+    /// Number of visible manifest tables in the pending objects tree.
+    #[must_use]
+    pub fn objects_table_count(&self) -> u32 {
+        self.objects.manifest_table_count()
+    }
+
+    /// Number of visible manifest tables in the pending status tree.
+    #[must_use]
+    pub fn status_table_count(&self) -> u32 {
+        self.status.manifest_table_count()
     }
 }
 
@@ -2506,15 +2536,15 @@ mod tests {
             Tree::<S>::new(TreeConfig { id, name }, Options { batch_value_count_limit: 32 })
         }
         AccountGroove {
-            objects: tree(1, "accounts_objects"),
-            id: tree(2, "accounts_id"),
-            user_data_128: tree(3, "accounts_user_data_128"),
-            user_data_64: tree(4, "accounts_user_data_64"),
-            user_data_32: tree(5, "accounts_user_data_32"),
-            ledger: tree(6, "accounts_ledger"),
-            code: tree(7, "accounts_code"),
-            imported: tree(8, "accounts_imported"),
-            closed: tree(9, "accounts_closed"),
+            objects: tree(7, "accounts_objects"),
+            id: tree(1, "accounts_id"),
+            user_data_128: tree(2, "accounts_user_data_128"),
+            user_data_64: tree(3, "accounts_user_data_64"),
+            user_data_32: tree(4, "accounts_user_data_32"),
+            ledger: tree(5, "accounts_ledger"),
+            code: tree(6, "accounts_code"),
+            imported: tree(23, "accounts_imported"),
+            closed: tree(25, "accounts_closed"),
             objects_cache: new_account_objects_cache(),
         }
     }
@@ -2524,25 +2554,25 @@ mod tests {
             Tree::<S>::new(TreeConfig { id, name }, Options { batch_value_count_limit: 32 })
         }
         TransferGroove {
-            objects: tree(10, "transfers_objects"),
-            id: tree(11, "transfers_id"),
-            debit_account_id: tree(12, "transfers_debit_account_id"),
-            credit_account_id: tree(13, "transfers_credit_account_id"),
-            amount: tree(14, "transfers_amount"),
-            pending_id: tree(15, "transfers_pending_id"),
-            user_data_128: tree(16, "transfers_user_data_128"),
-            user_data_64: tree(17, "transfers_user_data_64"),
-            user_data_32: tree(18, "transfers_user_data_32"),
-            ledger: tree(19, "transfers_ledger"),
-            code: tree(20, "transfers_code"),
-            expires_at: tree(21, "transfers_expires_at"),
-            imported: tree(22, "transfers_imported"),
-            closing: tree(23, "transfers_closing"),
+            objects: tree(18, "transfers_objects"),
+            id: tree(8, "transfers_id"),
+            debit_account_id: tree(9, "transfers_debit_account_id"),
+            credit_account_id: tree(10, "transfers_credit_account_id"),
+            amount: tree(11, "transfers_amount"),
+            pending_id: tree(12, "transfers_pending_id"),
+            user_data_128: tree(13, "transfers_user_data_128"),
+            user_data_64: tree(14, "transfers_user_data_64"),
+            user_data_32: tree(15, "transfers_user_data_32"),
+            ledger: tree(16, "transfers_ledger"),
+            code: tree(17, "transfers_code"),
+            expires_at: tree(19, "transfers_expires_at"),
+            imported: tree(24, "transfers_imported"),
+            closing: tree(26, "transfers_closing"),
             objects_cache: new_transfer_objects_cache(),
         }
     }
 
-    /// Build the account groove's `objects` (tree 1) and `id` (tree 2) tables, seed
+    /// Build the account groove's `objects` (tree 7) and `id` (tree 1) tables, seed
     /// their blocks into `grid` (acquiring 4 addresses), and open both trees.
     fn open_account_lookup_trees(
         grid: &mut Grid,
@@ -2554,18 +2584,18 @@ mod tests {
             (addresses[0], addresses[1], addresses[2], addresses[3]);
 
         let (obj_index_block, obj_value_block, obj_info) =
-            build_table_with::<AccountObjectSpec>(objects, 1, objects_value, objects_index);
+            build_table_with::<AccountObjectSpec>(objects, 7, objects_value, objects_index);
         let obj_checksum = seed_grid_block(grid, objects_index, &obj_index_block);
         seed_grid_block(grid, objects_value, &obj_value_block);
 
         let (id_index_block, id_value_block, id_info) =
-            build_table_with::<UniqueKey128Spec>(ids, 2, id_value, id_index);
+            build_table_with::<UniqueKey128Spec>(ids, 1, id_value, id_index);
         let id_checksum = seed_grid_block(grid, id_index, &id_index_block);
         seed_grid_block(grid, id_value, &id_value_block);
 
         let mut groove = new_account_groove();
-        open_tree(&mut groove.objects, &obj_info, objects_index, obj_checksum, 1);
-        open_tree(&mut groove.id, &id_info, id_index, id_checksum, 2);
+        open_tree(&mut groove.objects, &obj_info, objects_index, obj_checksum, 7);
+        open_tree(&mut groove.id, &id_info, id_index, id_checksum, 1);
         groove
     }
 
@@ -2672,9 +2702,9 @@ mod tests {
             (addresses[0], addresses[1], addresses[2], addresses[3]);
 
         let (obj_index_block, obj_value_block, obj_info) =
-            build_table_with::<AccountObjectSpec>(&accounts(), 1, objects_value, objects_index);
+            build_table_with::<AccountObjectSpec>(&accounts(), 7, objects_value, objects_index);
         let (id_index_block, id_value_block, id_info) =
-            build_table_with::<UniqueKey128Spec>(&IDS, 2, id_value, id_index);
+            build_table_with::<UniqueKey128Spec>(&IDS, 1, id_value, id_index);
 
         let mut groove = new_account_groove();
         open_tree(
@@ -2682,9 +2712,9 @@ mod tests {
             &obj_info,
             objects_index,
             block_checksum(&obj_index_block),
-            1,
+            7,
         );
-        open_tree(&mut groove.id, &id_info, id_index, block_checksum(&id_index_block), 2);
+        open_tree(&mut groove.id, &id_info, id_index, block_checksum(&id_index_block), 1);
 
         // First hop: the id tree's index block is not cached → possible at level 0.
         assert!(matches!(
@@ -2741,17 +2771,17 @@ mod tests {
 
         let (mut grid, addresses) = new_groove_grid(4);
         let (obj_index_block, obj_value_block, obj_info) =
-            build_table_with::<TransferObjectSpec>(&transfers, 10, addresses[0], addresses[1]);
+            build_table_with::<TransferObjectSpec>(&transfers, 18, addresses[0], addresses[1]);
         let obj_checksum = seed_grid_block(&mut grid, addresses[1], &obj_index_block);
         seed_grid_block(&mut grid, addresses[0], &obj_value_block);
         let (id_index_block, id_value_block, id_info) =
-            build_table_with::<UniqueKey128Spec>(&transfer_ids, 11, addresses[2], addresses[3]);
+            build_table_with::<UniqueKey128Spec>(&transfer_ids, 8, addresses[2], addresses[3]);
         let id_checksum = seed_grid_block(&mut grid, addresses[3], &id_index_block);
         seed_grid_block(&mut grid, addresses[2], &id_value_block);
 
         let mut groove = new_transfer_groove();
-        open_tree(&mut groove.objects, &obj_info, addresses[1], obj_checksum, 10);
-        open_tree(&mut groove.id, &id_info, addresses[3], id_checksum, 11);
+        open_tree(&mut groove.objects, &obj_info, addresses[1], obj_checksum, 18);
+        open_tree(&mut groove.id, &id_info, addresses[3], id_checksum, 8);
 
         assert!(matches!(
             groove.lookup(&mut grid, SNAPSHOT_LATEST, 12),
