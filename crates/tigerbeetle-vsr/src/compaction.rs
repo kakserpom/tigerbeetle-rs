@@ -1017,10 +1017,6 @@ mod tests {
             Self(u64::from_le_bytes(key_bytes))
         }
 
-        fn to_u128(self) -> u128 {
-            u128::from(self.0)
-        }
-
         const SENTINEL_KEY: Self = Self(u64::MAX);
     }
 

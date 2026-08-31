@@ -122,7 +122,7 @@ impl TableLayout {
     /// Compute layout from a [`TableSpec`].
     #[must_use]
     #[allow(clippy::cast_possible_truncation)] // Key/Value sizes are ≤32; VALUE_COUNT_MAX fits u32
-    pub fn compute_for<S: TableSpec>() -> Self {
+    pub const fn compute_for<S: TableSpec>() -> Self {
         Self::compute(
             core::mem::size_of::<S::Key>() as u32,
             core::mem::size_of::<S::Value>() as u32,
@@ -190,8 +190,12 @@ pub struct TableInfo<K> {
 /// DEVIATION: upstream stores raw block pointers; this port takes block references
 /// as method parameters to satisfy safe-Rust aliasing rules.
 pub struct TableBuilder {
-    key_min: Option<u128>,
-    key_max: Option<u128>,
+    /// Key range of the finished value blocks as 32-byte padded little-endian
+    /// representations. DEVIATION: upstream stores raw `Key` values; this builder is
+    /// type-erased, and `u128` cannot hold the 256-bit composite keys, so the keys are
+    /// kept in bytes and decoded via [`TableKey`] when compared.
+    key_min: Option<[u8; 32]>,
+    key_max: Option<[u8; 32]>,
     value_block_count: u32,
     value_count: u32,
     value_count_total: u32,
@@ -339,10 +343,11 @@ impl TableBuilder {
 
         let current = self.value_block_count as usize;
 
+        let key_min_bytes = key_min.to_le_bytes_padded();
+        let key_max_bytes = key_max.to_le_bytes_padded();
+
         // Write to the index block.
         {
-            let key_min_bytes = key_min.to_le_bytes_padded();
-            let key_max_bytes = key_max.to_le_bytes_padded();
             let key_size = layout.index.key_size as usize;
 
             let km_offset = layout.index.keys_min_offset as usize + current * key_size;
@@ -362,17 +367,14 @@ impl TableBuilder {
             index_block[cs_offset..cs_offset + 16].copy_from_slice(&header.checksum.to_le_bytes());
         }
 
-        if current == 0 {
-            self.key_min = Some(key_min.to_u128());
-        }
-        self.key_max = Some(key_max.to_u128());
-
-        if current == 0 && used_count == 1 {
-            assert_eq!(self.key_min, self.key_max);
-        } else {
-            assert!(self.key_min < self.key_max);
-        }
-        assert!(key_max < S::SENTINEL_KEY);
+        self.assert_table_key_range::<S>(
+            index_block,
+            &layout.index,
+            layout.index.key_size as usize,
+            &key_min_bytes,
+            &key_max_bytes,
+            used_count,
+        );
 
         if current > 0 {
             // Read previous key_max directly from the index block without going through
@@ -390,6 +392,43 @@ impl TableBuilder {
         self.value_count_total += self.value_count;
         self.value_count = 0;
         self.state = BuilderState::IndexBlock;
+    }
+
+    /// Verify the table-level key-range invariants across the finished value blocks
+    /// (upstream asserts these under `constants.verify`, always on in this port).
+    fn assert_table_key_range<S: TableSpec>(
+        &mut self,
+        index_block: &[u8],
+        index_layout: &schema::TableIndex,
+        key_size: usize,
+        key_min_raw: &[u8; 32],
+        key_max_raw: &[u8; 32],
+        used_count: usize,
+    ) {
+        let current = self.value_block_count as usize;
+        if current == 0 {
+            self.key_min = Some(*key_min_raw);
+        }
+        self.key_max = Some(*key_max_raw);
+
+        if current == 0 && used_count == 1 {
+            assert_eq!(self.key_min, self.key_max);
+        } else {
+            // Table key range: the minimum over all blocks (index entry 0) vs the maximum
+            // over all blocks (the one just finished), decoded to the full key type.
+            // Read entry 0 directly (the index block header isn't written yet, which
+            // `index_layout.key_min()` would validate).
+            let mut table_key_min_raw = [0u8; 32];
+            let km_offset = index_layout.keys_min_offset as usize;
+            table_key_min_raw[..key_size]
+                .copy_from_slice(&index_block[km_offset..km_offset + key_size]);
+            let table_key_min = S::Key::from_le_bytes_padded(&table_key_min_raw);
+            let table_key_max = S::Key::from_le_bytes_padded(key_max_raw);
+            assert!(table_key_min < table_key_max);
+        }
+
+        let key_max = S::Key::from_le_bytes_padded(key_max_raw);
+        assert!(key_max < S::SENTINEL_KEY);
     }
 
     /// Whether the index block is empty (upstream `index_block_empty`).
@@ -495,9 +534,7 @@ impl TableBuilder {
 
         let value_size = core::mem::size_of::<S::Value>();
         let offset = layout.data.values_offset as usize + self.value_count as usize * value_size;
-        let mut buf = [0u8; 32];
-        S::Value::write_bytes(value, &mut buf[..value_size]);
-        value_block[offset..offset + value_size].copy_from_slice(&buf[..value_size]);
+        S::Value::write_bytes(value, &mut value_block[offset..offset + value_size]);
         self.value_count += 1;
     }
 }
@@ -523,9 +560,6 @@ pub trait TableKey: Copy + Ord + Debug {
     /// Decode from a 32-byte padded little-endian representation.
     fn from_le_bytes_padded(bytes: &[u8; 32]) -> Self;
 
-    /// Convert to u128 for storage in builder state (key_min/key_max tracking).
-    fn to_u128(self) -> u128;
-
     /// Sentinel key — must compare greater than all other keys.
     const SENTINEL_KEY: Self;
 }
@@ -543,10 +577,6 @@ impl TableKey for u64 {
         Self::from_le_bytes(key_bytes)
     }
 
-    fn to_u128(self) -> u128 {
-        u128::from(self)
-    }
-
     const SENTINEL_KEY: Self = Self::MAX;
 }
 
@@ -561,10 +591,6 @@ impl TableKey for u128 {
         let mut key_bytes = [0u8; 16];
         key_bytes.copy_from_slice(&bytes[..16]);
         Self::from_le_bytes(key_bytes)
-    }
-
-    fn to_u128(self) -> u128 {
-        self
     }
 
     const SENTINEL_KEY: Self = Self::MAX;
@@ -584,10 +610,6 @@ impl TableKey for tigerbeetle_lsm::composite_key::U256 {
         let mut lo_bytes = [0u8; 8];
         lo_bytes.copy_from_slice(&bytes[16..24]);
         Self::from_parts(u128::from_le_bytes(hi_bytes), u64::from_le_bytes(lo_bytes))
-    }
-
-    fn to_u128(self) -> u128 {
-        self.hi()
     }
 
     const SENTINEL_KEY: Self = Self::MAX;

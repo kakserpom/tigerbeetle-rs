@@ -26,7 +26,7 @@ use tigerbeetle_lsm::table_memory::{self, Usage};
 use tigerbeetle_lsm::tree::ScopeCloseMode;
 use tigerbeetle_lsm::unique_key::{UniqueKey, UniqueKey128};
 
-use crate::table::{BlockValue, TableLayout};
+use crate::table::{self, BlockValue, IndexBlocks, TableLayout, TableSpec, TableUsage};
 use crate::tree::Tree;
 
 // ---------------------------------------------------------------------------
@@ -221,11 +221,18 @@ impl BlockValue for Transfer {
 // `TreeSpec`.  We use unit structs to keep the overhead zero.
 // ---------------------------------------------------------------------------
 
-/// Default `VALUE_COUNT_MAX` for production (mirrors upstream `tree_values_count_max`).
-/// In test-min config (`lsm_compaction_ops = 4`), the upstream derives this from
-/// `message_body_size_max`.  We use a generous but safe upper bound.
-const ACCOUNT_VALUE_COUNT_MAX: usize = constants::LSM_COMPACTION_OPS * 8192;
-const TRANSFER_VALUE_COUNT_MAX: usize = constants::LSM_COMPACTION_OPS * 8192;
+/// Maximum values a tree in a groove can hold, mirroring upstream `groove.zig:323-417`
+/// (`table_value_count_max = lsm_compaction_ops * batch_value_count_max.{field}`).
+/// The largest per-field batch count is the object `timestamp` field
+/// (`state_machine.zig:4827`: `@max(batch_create_accounts, 2 * batch_create_transfers)`),
+/// which bounds every table in the groove (object trees and index trees alike).
+///
+/// `batch_create_accounts`/`batch_create_transfers` are upstream
+/// `Operation.create_accounts/create_transfers.event_max(message_body_size_max)`
+/// (`tigerbeetle.zig:853-901`). Accounts and transfers are both 128 bytes, and the event
+/// (request) side binds over the reply bound, so `event_max = message_body_size_max / 128`.
+const GROOVE_VALUE_COUNT_MAX: usize = constants::LSM_COMPACTION_OPS
+    * (2 * (constants::MESSAGE_BODY_SIZE_MAX / core::mem::size_of::<Account>()));
 
 // ===== Object trees (keyed by u64 timestamp) =====
 
@@ -234,7 +241,7 @@ pub struct AccountObjectSpec;
 impl table_memory::Table for AccountObjectSpec {
     type Key = u64;
     type Value = Account;
-    const VALUE_COUNT_MAX: usize = ACCOUNT_VALUE_COUNT_MAX;
+    const VALUE_COUNT_MAX: usize = GROOVE_VALUE_COUNT_MAX;
     const USAGE: Usage = Usage::General;
 
     fn key_from_value(value: &Account) -> u64 {
@@ -246,19 +253,37 @@ impl table_memory::Table for AccountObjectSpec {
     }
 }
 
-impl crate::tree::TreeSpec for AccountObjectSpec {
-    const LAYOUT: TableLayout = TableLayout::compute(
-        core::mem::size_of::<u64>() as u32,
-        core::mem::size_of::<Account>() as u32,
-        ACCOUNT_VALUE_COUNT_MAX as u32,
-    );
+impl TableSpec for AccountObjectSpec {
+    type Key = u64;
+    type Value = Account;
 
-    fn index_blocks_for_key(_: &[u8], _: u64) -> Option<crate::table::IndexBlocks<u64>> {
-        None
+    fn key_from_value(value: &Account) -> u64 {
+        value.timestamp & !composite_key::TOMBSTONE_BIT
     }
 
-    fn value_block_search(_: &[u8], _: u64) -> Option<Account> {
-        None
+    const SENTINEL_KEY: u64 = u64::MAX;
+
+    fn tombstone(value: &Account) -> bool {
+        value.timestamp & composite_key::TOMBSTONE_BIT != 0
+    }
+
+    fn tombstone_from_key(key: u64) -> Account {
+        Account { timestamp: key | composite_key::TOMBSTONE_BIT, ..Account::default() }
+    }
+
+    const VALUE_COUNT_MAX: usize = GROOVE_VALUE_COUNT_MAX;
+    const USAGE: TableUsage = TableUsage::General;
+}
+
+impl crate::tree::TreeSpec for AccountObjectSpec {
+    const LAYOUT: TableLayout = TableLayout::compute_for::<Self>();
+
+    fn index_blocks_for_key(index_block: &[u8], key: u64) -> Option<IndexBlocks<u64>> {
+        table::index_blocks_for_key::<u64>(index_block, &Self::LAYOUT.index, key)
+    }
+
+    fn value_block_search(value_block: &[u8], key: u64) -> Option<Account> {
+        table::value_block_search::<Self>(value_block, &Self::LAYOUT.data, key)
     }
 
     fn tombstone_from_key(key: u64) -> Account {
@@ -271,7 +296,7 @@ pub struct TransferObjectSpec;
 impl table_memory::Table for TransferObjectSpec {
     type Key = u64;
     type Value = Transfer;
-    const VALUE_COUNT_MAX: usize = TRANSFER_VALUE_COUNT_MAX;
+    const VALUE_COUNT_MAX: usize = GROOVE_VALUE_COUNT_MAX;
     const USAGE: Usage = Usage::General;
 
     fn key_from_value(value: &Transfer) -> u64 {
@@ -283,19 +308,37 @@ impl table_memory::Table for TransferObjectSpec {
     }
 }
 
-impl crate::tree::TreeSpec for TransferObjectSpec {
-    const LAYOUT: TableLayout = TableLayout::compute(
-        core::mem::size_of::<u64>() as u32,
-        core::mem::size_of::<Transfer>() as u32,
-        TRANSFER_VALUE_COUNT_MAX as u32,
-    );
+impl TableSpec for TransferObjectSpec {
+    type Key = u64;
+    type Value = Transfer;
 
-    fn index_blocks_for_key(_: &[u8], _: u64) -> Option<crate::table::IndexBlocks<u64>> {
-        None
+    fn key_from_value(value: &Transfer) -> u64 {
+        value.timestamp & !composite_key::TOMBSTONE_BIT
     }
 
-    fn value_block_search(_: &[u8], _: u64) -> Option<Transfer> {
-        None
+    const SENTINEL_KEY: u64 = u64::MAX;
+
+    fn tombstone(value: &Transfer) -> bool {
+        value.timestamp & composite_key::TOMBSTONE_BIT != 0
+    }
+
+    fn tombstone_from_key(key: u64) -> Transfer {
+        Transfer { timestamp: key | composite_key::TOMBSTONE_BIT, ..Transfer::default() }
+    }
+
+    const VALUE_COUNT_MAX: usize = GROOVE_VALUE_COUNT_MAX;
+    const USAGE: TableUsage = TableUsage::General;
+}
+
+impl crate::tree::TreeSpec for TransferObjectSpec {
+    const LAYOUT: TableLayout = TableLayout::compute_for::<Self>();
+
+    fn index_blocks_for_key(index_block: &[u8], key: u64) -> Option<IndexBlocks<u64>> {
+        table::index_blocks_for_key::<u64>(index_block, &Self::LAYOUT.index, key)
+    }
+
+    fn value_block_search(value_block: &[u8], key: u64) -> Option<Transfer> {
+        table::value_block_search::<Self>(value_block, &Self::LAYOUT.data, key)
     }
 
     fn tombstone_from_key(key: u64) -> Transfer {
@@ -311,7 +354,7 @@ pub struct CompositeKey128Spec;
 impl table_memory::Table for CompositeKey128Spec {
     type Key = U256;
     type Value = CompositeKey128;
-    const VALUE_COUNT_MAX: usize = ACCOUNT_VALUE_COUNT_MAX;
+    const VALUE_COUNT_MAX: usize = GROOVE_VALUE_COUNT_MAX;
     const USAGE: Usage = Usage::SecondaryIndex;
 
     fn key_from_value(value: &CompositeKey128) -> U256 {
@@ -323,19 +366,37 @@ impl table_memory::Table for CompositeKey128Spec {
     }
 }
 
-impl crate::tree::TreeSpec for CompositeKey128Spec {
-    const LAYOUT: TableLayout = TableLayout::compute(
-        core::mem::size_of::<U256>() as u32,
-        core::mem::size_of::<CompositeKey128>() as u32,
-        ACCOUNT_VALUE_COUNT_MAX as u32,
-    );
+impl TableSpec for CompositeKey128Spec {
+    type Key = U256;
+    type Value = CompositeKey128;
 
-    fn index_blocks_for_key(_: &[u8], _: U256) -> Option<crate::table::IndexBlocks<U256>> {
-        None
+    fn key_from_value(value: &CompositeKey128) -> U256 {
+        value.key_from_value()
     }
 
-    fn value_block_search(_: &[u8], _: U256) -> Option<CompositeKey128> {
-        None
+    const SENTINEL_KEY: U256 = U256::MAX;
+
+    fn tombstone(value: &CompositeKey128) -> bool {
+        value.tombstone()
+    }
+
+    fn tombstone_from_key(key: U256) -> CompositeKey128 {
+        CompositeKey128::tombstone_from_key(key)
+    }
+
+    const VALUE_COUNT_MAX: usize = GROOVE_VALUE_COUNT_MAX;
+    const USAGE: TableUsage = TableUsage::SecondaryIndex;
+}
+
+impl crate::tree::TreeSpec for CompositeKey128Spec {
+    const LAYOUT: TableLayout = TableLayout::compute_for::<Self>();
+
+    fn index_blocks_for_key(index_block: &[u8], key: U256) -> Option<IndexBlocks<U256>> {
+        table::index_blocks_for_key::<U256>(index_block, &Self::LAYOUT.index, key)
+    }
+
+    fn value_block_search(value_block: &[u8], key: U256) -> Option<CompositeKey128> {
+        table::value_block_search::<Self>(value_block, &Self::LAYOUT.data, key)
     }
 
     fn tombstone_from_key(key: U256) -> CompositeKey128 {
@@ -349,7 +410,7 @@ pub struct CompositeKey64Spec;
 impl table_memory::Table for CompositeKey64Spec {
     type Key = u128;
     type Value = CompositeKey64;
-    const VALUE_COUNT_MAX: usize = ACCOUNT_VALUE_COUNT_MAX;
+    const VALUE_COUNT_MAX: usize = GROOVE_VALUE_COUNT_MAX;
     const USAGE: Usage = Usage::SecondaryIndex;
 
     fn key_from_value(value: &CompositeKey64) -> u128 {
@@ -361,19 +422,37 @@ impl table_memory::Table for CompositeKey64Spec {
     }
 }
 
-impl crate::tree::TreeSpec for CompositeKey64Spec {
-    const LAYOUT: TableLayout = TableLayout::compute(
-        core::mem::size_of::<u128>() as u32,
-        core::mem::size_of::<CompositeKey64>() as u32,
-        ACCOUNT_VALUE_COUNT_MAX as u32,
-    );
+impl TableSpec for CompositeKey64Spec {
+    type Key = u128;
+    type Value = CompositeKey64;
 
-    fn index_blocks_for_key(_: &[u8], _: u128) -> Option<crate::table::IndexBlocks<u128>> {
-        None
+    fn key_from_value(value: &CompositeKey64) -> u128 {
+        value.key_from_value()
     }
 
-    fn value_block_search(_: &[u8], _: u128) -> Option<CompositeKey64> {
-        None
+    const SENTINEL_KEY: u128 = u128::MAX;
+
+    fn tombstone(value: &CompositeKey64) -> bool {
+        value.tombstone()
+    }
+
+    fn tombstone_from_key(key: u128) -> CompositeKey64 {
+        CompositeKey64::tombstone_from_key(key)
+    }
+
+    const VALUE_COUNT_MAX: usize = GROOVE_VALUE_COUNT_MAX;
+    const USAGE: TableUsage = TableUsage::SecondaryIndex;
+}
+
+impl crate::tree::TreeSpec for CompositeKey64Spec {
+    const LAYOUT: TableLayout = TableLayout::compute_for::<Self>();
+
+    fn index_blocks_for_key(index_block: &[u8], key: u128) -> Option<IndexBlocks<u128>> {
+        table::index_blocks_for_key::<u128>(index_block, &Self::LAYOUT.index, key)
+    }
+
+    fn value_block_search(value_block: &[u8], key: u128) -> Option<CompositeKey64> {
+        table::value_block_search::<Self>(value_block, &Self::LAYOUT.data, key)
     }
 
     fn tombstone_from_key(key: u128) -> CompositeKey64 {
@@ -388,7 +467,7 @@ pub struct CompositeKeyUnitSpec;
 impl table_memory::Table for CompositeKeyUnitSpec {
     type Key = u64;
     type Value = CompositeKeyUnit;
-    const VALUE_COUNT_MAX: usize = ACCOUNT_VALUE_COUNT_MAX;
+    const VALUE_COUNT_MAX: usize = GROOVE_VALUE_COUNT_MAX;
     const USAGE: Usage = Usage::SecondaryIndex;
 
     fn key_from_value(value: &CompositeKeyUnit) -> u64 {
@@ -400,19 +479,37 @@ impl table_memory::Table for CompositeKeyUnitSpec {
     }
 }
 
-impl crate::tree::TreeSpec for CompositeKeyUnitSpec {
-    const LAYOUT: TableLayout = TableLayout::compute(
-        core::mem::size_of::<u64>() as u32,
-        core::mem::size_of::<CompositeKeyUnit>() as u32,
-        ACCOUNT_VALUE_COUNT_MAX as u32,
-    );
+impl TableSpec for CompositeKeyUnitSpec {
+    type Key = u64;
+    type Value = CompositeKeyUnit;
 
-    fn index_blocks_for_key(_: &[u8], _: u64) -> Option<crate::table::IndexBlocks<u64>> {
-        None
+    fn key_from_value(value: &CompositeKeyUnit) -> u64 {
+        value.key_from_value()
     }
 
-    fn value_block_search(_: &[u8], _: u64) -> Option<CompositeKeyUnit> {
-        None
+    const SENTINEL_KEY: u64 = u64::MAX;
+
+    fn tombstone(value: &CompositeKeyUnit) -> bool {
+        value.tombstone()
+    }
+
+    fn tombstone_from_key(key: u64) -> CompositeKeyUnit {
+        CompositeKeyUnit::tombstone_from_key(key)
+    }
+
+    const VALUE_COUNT_MAX: usize = GROOVE_VALUE_COUNT_MAX;
+    const USAGE: TableUsage = TableUsage::SecondaryIndex;
+}
+
+impl crate::tree::TreeSpec for CompositeKeyUnitSpec {
+    const LAYOUT: TableLayout = TableLayout::compute_for::<Self>();
+
+    fn index_blocks_for_key(index_block: &[u8], key: u64) -> Option<IndexBlocks<u64>> {
+        table::index_blocks_for_key::<u64>(index_block, &Self::LAYOUT.index, key)
+    }
+
+    fn value_block_search(value_block: &[u8], key: u64) -> Option<CompositeKeyUnit> {
+        table::value_block_search::<Self>(value_block, &Self::LAYOUT.data, key)
     }
 
     fn tombstone_from_key(key: u64) -> CompositeKeyUnit {
@@ -427,7 +524,7 @@ pub struct UniqueKey128Spec;
 impl table_memory::Table for UniqueKey128Spec {
     type Key = u128;
     type Value = UniqueKey128;
-    const VALUE_COUNT_MAX: usize = ACCOUNT_VALUE_COUNT_MAX;
+    const VALUE_COUNT_MAX: usize = GROOVE_VALUE_COUNT_MAX;
     const USAGE: Usage = Usage::General;
 
     fn key_from_value(value: &UniqueKey128) -> u128 {
@@ -439,19 +536,37 @@ impl table_memory::Table for UniqueKey128Spec {
     }
 }
 
-impl crate::tree::TreeSpec for UniqueKey128Spec {
-    const LAYOUT: TableLayout = TableLayout::compute(
-        core::mem::size_of::<u128>() as u32,
-        core::mem::size_of::<UniqueKey128>() as u32,
-        ACCOUNT_VALUE_COUNT_MAX as u32,
-    );
+impl TableSpec for UniqueKey128Spec {
+    type Key = u128;
+    type Value = UniqueKey128;
 
-    fn index_blocks_for_key(_: &[u8], _: u128) -> Option<crate::table::IndexBlocks<u128>> {
-        None
+    fn key_from_value(value: &UniqueKey128) -> u128 {
+        UniqueKey::key_from_value(value)
     }
 
-    fn value_block_search(_: &[u8], _: u128) -> Option<UniqueKey128> {
-        None
+    const SENTINEL_KEY: u128 = u128::MAX;
+
+    fn tombstone(value: &UniqueKey128) -> bool {
+        UniqueKey::tombstone(value)
+    }
+
+    fn tombstone_from_key(key: u128) -> UniqueKey128 {
+        UniqueKey128::tombstone_from_key(key)
+    }
+
+    const VALUE_COUNT_MAX: usize = GROOVE_VALUE_COUNT_MAX;
+    const USAGE: TableUsage = TableUsage::General;
+}
+
+impl crate::tree::TreeSpec for UniqueKey128Spec {
+    const LAYOUT: TableLayout = TableLayout::compute_for::<Self>();
+
+    fn index_blocks_for_key(index_block: &[u8], key: u128) -> Option<IndexBlocks<u128>> {
+        table::index_blocks_for_key::<u128>(index_block, &Self::LAYOUT.index, key)
+    }
+
+    fn value_block_search(value_block: &[u8], key: u128) -> Option<UniqueKey128> {
+        table::value_block_search::<Self>(value_block, &Self::LAYOUT.data, key)
     }
 
     fn tombstone_from_key(key: u128) -> UniqueKey128 {
@@ -1244,5 +1359,291 @@ impl TransferPendingGroove {
 
     pub fn open_complete(&mut self, _checkpoint_op: u64) {
         // TODO(port): forward to trees
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Write-path / read-path block accessor tests
+//
+// These build real index+value blocks with `TableBuilder` (via the concrete
+// `TableSpec` impls above) and exercise the delegated `TreeSpec` accessors that
+// `Tree::lookup_from_levels_cache` depends on, mirroring upstream table.zig's
+// `assert_index_blocks_for_key` / `value_block_search` tests.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+    use crate::multiversion::Release;
+    use crate::table::{DataFinishOptions, IndexFinishOptions, TableBuilder, TableInfo};
+    use crate::tree::TreeSpec;
+
+    /// Build a single-value-block table from strictly key-sorted values.
+    fn build_table<S: TableSpec>(values: &[S::Value]) -> (Vec<u8>, Vec<u8>, TableInfo<S::Key>) {
+        let layout = TableLayout::compute_for::<S>();
+        let mut index_block = vec![0u8; constants::BLOCK_SIZE];
+        let mut value_block = vec![0u8; constants::BLOCK_SIZE];
+
+        let mut builder = TableBuilder::new();
+        builder.set_index_block(&mut index_block);
+        builder.set_value_block(&mut value_block);
+        for value in values {
+            builder.insert_value::<S>(value, &mut value_block, &layout);
+        }
+
+        builder.value_block_finish::<S>(
+            &mut value_block,
+            &mut index_block,
+            &layout,
+            DataFinishOptions {
+                cluster: 0,
+                release: Release::MINIMUM,
+                address: 1,
+                snapshot_min: 1,
+                tree_id: 1,
+            },
+        );
+
+        let info = builder.index_block_finish::<S::Key>(
+            &mut index_block,
+            &layout,
+            IndexFinishOptions {
+                cluster: 0,
+                release: Release::MINIMUM,
+                address: 2,
+                snapshot_min: 1,
+                tree_id: 1,
+            },
+        );
+
+        (index_block, value_block, info)
+    }
+
+    /// Build a multi-value-block table from strictly key-sorted values, returning the
+    /// index block and one value block per finished data block (in address order).
+    fn build_multi_block_table<S: TableSpec>(
+        values: &[S::Value],
+    ) -> (Vec<u8>, Vec<Vec<u8>>, TableInfo<S::Key>) {
+        let layout = TableLayout::compute_for::<S>();
+        let mut index_block = vec![0u8; constants::BLOCK_SIZE];
+        let mut value_block = vec![0u8; constants::BLOCK_SIZE];
+        let mut value_blocks: Vec<Vec<u8>> = Vec::new();
+
+        let mut builder = TableBuilder::new();
+        builder.set_index_block(&mut index_block);
+
+        let mut address = 0u64;
+        let mut start = 0;
+        while start < values.len() {
+            let end = (start + layout.block_value_count_max as usize).min(values.len());
+
+            builder.set_value_block(&mut value_block);
+            for value in &values[start..end] {
+                builder.insert_value::<S>(value, &mut value_block, &layout);
+            }
+
+            address += 1;
+            builder.value_block_finish::<S>(
+                &mut value_block,
+                &mut index_block,
+                &layout,
+                DataFinishOptions {
+                    cluster: 0,
+                    release: Release::MINIMUM,
+                    address,
+                    snapshot_min: 1,
+                    tree_id: 1,
+                },
+            );
+            value_blocks.push(value_block.clone());
+
+            start = end;
+        }
+
+        address += 1;
+        let info = builder.index_block_finish::<S::Key>(
+            &mut index_block,
+            &layout,
+            IndexFinishOptions {
+                cluster: 0,
+                release: Release::MINIMUM,
+                address,
+                snapshot_min: 1,
+                tree_id: 1,
+            },
+        );
+
+        (index_block, value_blocks, info)
+    }
+
+    #[test]
+    fn account_object_tree_block_search() {
+        let accounts = [
+            Account { timestamp: 1, id: 101, ..Account::default() },
+            Account { timestamp: 3, id: 103, ..Account::default() },
+        ];
+        let (index_block, value_block, info) = build_table::<AccountObjectSpec>(&accounts);
+        assert_eq!(info.key_min, 1);
+        assert_eq!(info.key_max, 3);
+        assert_eq!(info.value_count, 2);
+
+        // Present key routes to the value block and resolves:
+        let blocks = AccountObjectSpec::index_blocks_for_key(&index_block, 1).unwrap();
+        assert_eq!(blocks.value_block_address, 1);
+        let value = AccountObjectSpec::value_block_search(&value_block, 1).unwrap();
+        assert_eq!(value.timestamp, 1);
+        assert_eq!(value.id, 101);
+
+        // Absent key inside the table's key range: index routes, value search misses:
+        assert!(AccountObjectSpec::index_blocks_for_key(&index_block, 2).is_some());
+        assert!(AccountObjectSpec::value_block_search(&value_block, 2).is_none());
+    }
+
+    #[test]
+    fn account_object_tree_block_search_tombstone() {
+        let accounts = [
+            Account { timestamp: 1, id: 101, ..Account::default() },
+            <AccountObjectSpec as TreeSpec>::tombstone_from_key(2),
+            Account { timestamp: 3, id: 103, ..Account::default() },
+        ];
+        let (index_block, value_block, info) = build_table::<AccountObjectSpec>(&accounts);
+        assert_eq!(info.key_min, 1);
+        assert_eq!(info.key_max, 3);
+
+        let tombstone = AccountObjectSpec::value_block_search(&value_block, 2).unwrap();
+        assert!(<AccountObjectSpec as TableSpec>::tombstone(&tombstone));
+        assert_eq!(<AccountObjectSpec as TableSpec>::key_from_value(&tombstone), 2);
+
+        let blocks = AccountObjectSpec::index_blocks_for_key(&index_block, 2).unwrap();
+        assert_eq!(blocks.value_block_address, 1);
+    }
+
+    #[test]
+    fn transfer_object_tree_block_search() {
+        let transfers = [
+            Transfer { timestamp: 7, id: 700, ..Transfer::default() },
+            Transfer { timestamp: 9, id: 900, ..Transfer::default() },
+        ];
+        let (index_block, value_block, info) = build_table::<TransferObjectSpec>(&transfers);
+        assert_eq!(info.key_min, 7);
+        assert_eq!(info.key_max, 9);
+        assert_eq!(info.value_count, 2);
+
+        let value = TransferObjectSpec::value_block_search(&value_block, 9).unwrap();
+        assert_eq!(value.id, 900);
+        assert!(TransferObjectSpec::value_block_search(&value_block, 8).is_none());
+
+        let blocks = TransferObjectSpec::index_blocks_for_key(&index_block, 7).unwrap();
+        assert_eq!(blocks.value_block_address, 1);
+    }
+
+    #[test]
+    fn unique_key_tree_block_search() {
+        let entries = [
+            UniqueKey128 { field: 5, timestamp: 100, padding: 0 },
+            UniqueKey128 { field: 6, timestamp: 200, padding: 0 },
+            UniqueKey128::tombstone_from_key(7),
+        ];
+        let (index_block, value_block, info) = build_table::<UniqueKey128Spec>(&entries);
+        assert_eq!(info.key_min, 5);
+        assert_eq!(info.key_max, 7);
+        assert_eq!(info.value_count, 3);
+
+        let found = UniqueKey128Spec::value_block_search(&value_block, 6).unwrap();
+        assert_eq!(found.timestamp, 200);
+
+        // Tombstone entry resolves to a value reported as a tombstone:
+        let tombstone = UniqueKey128Spec::value_block_search(&value_block, 7).unwrap();
+        assert!(<UniqueKey128Spec as TableSpec>::tombstone(&tombstone));
+
+        // Key beyond the table's key range:
+        assert!(UniqueKey128Spec::value_block_search(&value_block, 8).is_none());
+
+        let blocks = UniqueKey128Spec::index_blocks_for_key(&index_block, 6).unwrap();
+        assert_eq!(blocks.value_block_address, 1);
+    }
+
+    #[test]
+    fn composite_key64_and_unit_tree_block_search() {
+        let entries64 = [
+            CompositeKey64 { field: 3, timestamp: 10 },
+            CompositeKey64 { field: 3, timestamp: 20 },
+            CompositeKey64 { field: 4, timestamp: 30 },
+        ];
+        let (index_block, value_block, info) = build_table::<CompositeKey64Spec>(&entries64);
+        assert_eq!(info.key_min, u128::from(3_u64) << 64 | u128::from(10_u64));
+        assert_eq!(info.key_max, u128::from(4_u64) << 64 | u128::from(30_u64));
+
+        let key20 = u128::from(3_u64) << 64 | u128::from(20_u64);
+        let found = CompositeKey64Spec::value_block_search(&value_block, key20).unwrap();
+        assert_eq!(found.timestamp, 20);
+        let blocks64 = CompositeKey64Spec::index_blocks_for_key(&index_block, key20).unwrap();
+        assert_eq!(blocks64.value_block_address, 1);
+
+        // Absent key between present keys:
+        let key15 = u128::from(3_u64) << 64 | u128::from(15_u64);
+        assert!(CompositeKey64Spec::value_block_search(&value_block, key15).is_none());
+
+        let units = [
+            CompositeKeyUnit { field: (), timestamp: 10 },
+            CompositeKeyUnit { field: (), timestamp: 20 },
+            CompositeKeyUnit::tombstone_from_key(25),
+        ];
+        let (index_unit, value_unit, info_unit) = build_table::<CompositeKeyUnitSpec>(&units);
+        assert_eq!(info_unit.key_min, 10);
+        assert_eq!(info_unit.key_max, 25);
+
+        let found_unit = CompositeKeyUnitSpec::value_block_search(&value_unit, 10).unwrap();
+        assert_eq!(found_unit.timestamp, 10);
+        assert!(CompositeKeyUnitSpec::value_block_search(&value_unit, 15).is_none());
+
+        let tombstone = CompositeKeyUnitSpec::value_block_search(&value_unit, 25).unwrap();
+        assert!(<CompositeKeyUnitSpec as TableSpec>::tombstone(&tombstone));
+        let blocks_unit = CompositeKeyUnitSpec::index_blocks_for_key(&index_unit, 20).unwrap();
+        assert_eq!(blocks_unit.value_block_address, 1);
+    }
+
+    #[test]
+    fn composite_key128_multiblock_index_routing() {
+        // 32-byte values → 120 per block. 239 entries (ts 1..=119, 122..=241) force a
+        // second value block and leave a gap at ts=120/121 for in-range misses:
+        let first_field = 1_000u128;
+        let entries: Vec<CompositeKey128> = (1_u64..=119)
+            .chain(122..=241)
+            .map(|ts| CompositeKey128 { field: first_field, timestamp: ts, padding: 0 })
+            .collect();
+        let (index_block, value_blocks, info) =
+            build_multi_block_table::<CompositeKey128Spec>(&entries);
+        assert_eq!(value_blocks.len(), 2);
+        assert_eq!(info.key_min, U256::from_parts(first_field, 1));
+        assert_eq!(info.key_max, U256::from_parts(first_field, 241));
+        assert_eq!(info.value_count, 239);
+
+        // ts=60 lives in the first value block:
+        let key60 = U256::from_parts(first_field, 60);
+        let blocks60 = CompositeKey128Spec::index_blocks_for_key(&index_block, key60).unwrap();
+        assert_eq!(blocks60.value_block_address, 1);
+        assert_eq!(blocks60.value_block_key_min, U256::from_parts(first_field, 1));
+        let found60 = CompositeKey128Spec::value_block_search(&value_blocks[0], key60).unwrap();
+        assert_eq!(found60.timestamp, 60);
+
+        // ts=121 falls in the gap inside the first block's range (block 1 holds
+        // ts 1..=119 plus 122): the index routes to block 1, then the value search
+        // misses — matching upstream's behavior for a missing key inside a block.
+        let key121 = U256::from_parts(first_field, 121);
+        let blocks121 = CompositeKey128Spec::index_blocks_for_key(&index_block, key121).unwrap();
+        assert_eq!(blocks121.value_block_address, 1);
+        assert!(CompositeKey128Spec::value_block_search(&value_blocks[0], key121).is_none());
+
+        // ts=241 lives in the second block:
+        let key241 = U256::from_parts(first_field, 241);
+        let blocks241 = CompositeKey128Spec::index_blocks_for_key(&index_block, key241).unwrap();
+        assert_eq!(blocks241.value_block_address, 2);
+        assert_eq!(blocks241.value_block_key_min, U256::from_parts(first_field, 123));
+        assert_eq!(blocks241.value_block_key_max, key241);
+        let found241 = CompositeKey128Spec::value_block_search(&value_blocks[1], key241).unwrap();
+        assert_eq!(found241.timestamp, 241);
     }
 }
