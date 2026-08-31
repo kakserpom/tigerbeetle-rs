@@ -846,4 +846,112 @@ mod tests {
 
         assert_eq!(forest_b.accounts.objects.manifest_table_count(), 2);
     }
+
+    /// A real vsr `Compaction` (level_b = 1) is driven through the forest's own grid +
+    /// manifest log for a move-table compaction. Seeding level 0 to its compaction
+    /// threshold makes `compaction_table(0)` select a table whose level-1 overlap is empty,
+    /// so `half_bar_complete` records a single MoveToLevelB manifest entry through the
+    /// LSM-trait buffering seam (the previous slice). Checkpointing flushes it durable, and a
+    /// reopened forest replays the moved table into level 1 — proving the compaction's
+    /// manifest append survives restart (upstream `Compaction`, vsr/compaction.zig).
+    #[test]
+    fn forest_move_table_compaction_flushed_durably() {
+        use crate::compaction::Compaction;
+        use crate::groove::AccountObjectSpec;
+        use tigerbeetle_lsm::manifest::TreeTableInfo;
+
+        let mut forest = Forest::init(test_superblock(), grid_options(), 32);
+        let mut storage = storage();
+        open_forest(&mut forest, &mut storage);
+
+        // Acquire 4 addresses and mark them acquired so the seeded level-0 tables read as real
+        // disk tables to the free set (`!free_set_is_free`), then forfeit the reservation so
+        // the grid checkpoint's `count_reservations() == 0` assert holds.
+        let reservation = forest.grid.reserve(4);
+        let addresses: Vec<u64> = (0..4).map(|_| forest.grid.acquire(reservation)).collect();
+        forest.grid.forfeit(reservation);
+
+        // Seed level 0 to its compaction threshold (`table_count_max_for_level(4, 0) == 4`).
+        for &address in &addresses {
+            let wire = manifest_info_u64(address, 7);
+            let table = TreeTableInfo::<u64>::decode(&wire, 7);
+            forest.accounts.objects.manifest_mut().insert_table(
+                &mut forest.manifest_log,
+                0,
+                &table,
+            );
+        }
+        assert_eq!(forest.accounts.objects.manifest_table_count(), 4);
+
+        // Drive the level-0 → level-1 move-table compaction (op aligned to HALF_BAR_BEAT_COUNT).
+        let mut comp = Compaction::<AccountObjectSpec>::new(
+            core::ptr::addr_of_mut!(forest.accounts.objects),
+            core::ptr::addr_of_mut!(forest.grid),
+            1,
+        );
+        let quota = comp.half_bar_commence(8, &forest.accounts.objects, &forest.grid);
+        assert_eq!(quota, 0, "move-table compaction has no quota to process");
+        comp.half_bar_complete(
+            &mut forest.accounts.objects,
+            &forest.grid,
+            &mut forest.manifest_log,
+        );
+
+        // The selected table moved to level 1; the other three remain at level 0.
+        assert_eq!(forest.accounts.objects.manifest_table_count(), 4);
+        assert_eq!(forest.accounts.objects.manifest_ref().levels[1].table_count_visible(), 1);
+        assert_eq!(forest.accounts.objects.manifest_ref().levels[0].table_count_visible(), 3);
+
+        // Checkpoint makes the manifest (4 inserts + 1 move) durable.
+        let done = std::rc::Rc::new(std::cell::Cell::new(false));
+        forest.checkpoint(
+            {
+                let done = done.clone();
+                move || done.set(true)
+            },
+            &mut storage,
+        );
+        let mut polls = 0;
+        while !done.get() {
+            forest.poll(&mut storage);
+            polls += 1;
+            assert!(polls < 1000, "checkpoint must complete");
+        }
+
+        let manifest_refs = forest.manifest_log.checkpoint_references();
+        let grid_refs = forest.grid.free_set_checkpoint_references();
+
+        let highest_address = grid_refs
+            .blocks_acquired
+            .last_block_address
+            .max(grid_refs.blocks_released.last_block_address);
+        let reopen_view = SuperBlockView {
+            storage_size: DATA_FILE_SIZE_MIN as u64 + highest_address * BLOCK_SIZE as u64,
+            manifest_block_count: manifest_refs.block_count,
+            manifest_oldest_address: manifest_refs.oldest_address,
+            manifest_oldest_checksum: manifest_refs.oldest_checksum,
+            manifest_newest_address: manifest_refs.newest_address,
+            manifest_newest_checksum: manifest_refs.newest_checksum,
+            ..test_superblock()
+        };
+
+        // Reopen over the same storage: all five entries replay, the move landing at level 1.
+        let mut forest_b = Forest::init(reopen_view, grid_options(), 32);
+        forest_b.open(grid_refs, &mut storage, 0);
+        let mut b_done = false;
+        for _ in 0..1000 {
+            forest_b.poll(&mut storage);
+            if forest_b.progress.is_none() && forest_b.accounts.objects.is_opened() {
+                b_done = true;
+                break;
+            }
+        }
+        assert!(b_done, "reopen must complete");
+
+        // The manifest log dedupes each table to its latest state on open, so the moved
+        // table replays once (at level 1); the other three at level 0 — 4 tables total.
+        assert_eq!(forest_b.accounts.objects.manifest_table_count(), 4);
+        assert_eq!(forest_b.accounts.objects.manifest_ref().levels[1].table_count_visible(), 1);
+        assert_eq!(forest_b.accounts.objects.manifest_ref().levels[0].table_count_visible(), 3);
+    }
 }
