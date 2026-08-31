@@ -230,6 +230,12 @@ pub struct ManifestLog {
     table_extents: HashMap<u64, TableExtent>,
     tables_removed: HashSet<u64>,
 
+    /// Grid reservation covering the entire manifest ring buffer. Acquired lazily at
+    /// [`init_blocks`](Self::init_blocks) (after open) and held for the log's lifetime;
+    /// each open block gets an address from it (upstream `grid_reservation`,
+    /// manifest_log.zig:148 / 166-168 / 691).
+    grid_reservation: Option<Reservation>,
+
     pace: Pace,
     forest_table_count_max: u32,
     #[allow(dead_code)] // used by upstream logging; TODO(port): add logging framework
@@ -261,6 +267,7 @@ impl ManifestLog {
             entry_count: 0,
             table_extents: HashMap::with_capacity(pace.tables_max as usize + 1),
             tables_removed: HashSet::with_capacity(pace.tables_max as usize),
+            grid_reservation: None,
             pace,
             superblock,
             replica_index,
@@ -269,16 +276,21 @@ impl ManifestLog {
         }
     }
 
-    /// Pre-allocate the ring-buffer block slots via the grid.
+    /// Mark the manifest ring buffer as ready for appends.
+    ///
+    /// Upstream pre-allocates the whole `blocks_count` ring buffer at init and reserves that
+    /// many grid blocks (manifest_log.zig `init`/`grid_reservation`). This port acquires one
+    /// block location per open block on demand in [`acquire_block`](Self::acquire_block) but
+    /// still reserves the full ring's worth of grid addresses up front here, so address
+    /// availability is guaranteed for the entire lifecycle (upstream reserves `blocks_count`).
     ///
     /// # Panics
     ///
-    /// Panics if blocks have already been allocated.
+    /// Panics if called more than once, or if blocks have already been allocated.
     pub fn init_blocks(&mut self, grid: &mut Grid) {
         assert!(self.blocks.is_empty());
-        for _ in 0..self.pace.blocks_count() {
-            self.blocks.push(grid.get_block());
-        }
+        assert!(self.grid_reservation.is_none());
+        self.grid_reservation = Some(grid.reserve(self.pace.blocks_count() as usize));
     }
 
     /// Release all grid blocks held by this manifest log.
@@ -491,12 +503,8 @@ impl ManifestLog {
         assert!(table.address > 0);
 
         if self.entry_count == 0 {
-            assert_eq!(self.blocks.len(), self.blocks_closed as usize);
-            // DEVIATION: upstream calls grid.acquire(reservation) to get a fresh address.
-            // We pre-allocate all blocks via get_block() in init_blocks().
-            // The block location is already in self.blocks — just advance.
-            // The block's address is set in acquire_block (see acquire_block_with_grid).
-            self.acquire_block();
+            // Start a fresh open block.
+            self.acquire_block(grid);
         }
 
         let entry_count_max_u32 = mn::ENTRY_COUNT_MAX as u32;
@@ -559,30 +567,52 @@ impl ManifestLog {
     // Block lifecycle
     // -----------------------------------------------------------------------
 
-    /// Advance the blocks ring-buffer tail to make room for a new open block.
-    /// DEVIATION: upstream acquires a fresh grid address and initializes the
-    /// block header here. We defer address acquisition to
-    /// [`acquire_block_with_grid`] because we need a grid reference.
-    fn acquire_block(&mut self) {
+    /// Acquire a fresh block location + address to serve as the next open block.
+    ///
+    /// Mirrors upstream `acquire_block` (manifest_log.zig:878-907): eagerly acquire a grid
+    /// address from the reservation and initialize the block header so `close_block` and the
+    /// append path can read the address back out of it.
+    ///
+    /// The `blocks` deque holds only the in-use block locations: closed-but-unflushed blocks
+    /// in `blocks[0..blocks_closed]`, plus the current open block at the tail when
+    /// `entry_count > 0`. A block is acquired from the grid here on demand and released
+    /// back to the grid's stash by [`flush`](Self::flush)/`on_grid_event` after it is written.
+    ///
+    /// DEVIATION: upstream pre-allocates the whole `blocks_count` ring buffer at `init`,
+    /// reserving that many grid blocks up front. This port reserves the same count at
+    /// [`init_blocks`](Self::init_blocks) but acquires one block location per open block on
+    /// demand, because the Rust `Grid` cannot be stored inside `ManifestLog` (safe-Rust
+    /// aliasing) — it is threaded per call — and the `blocks.remove(0)` release pattern below
+    /// expects a growing/shrinking deque.
+    fn acquire_block(&mut self, grid: &mut Grid) {
         assert_eq!(self.entry_count, 0);
         assert_eq!(self.log_block_checksums.len(), self.log_block_addresses.len());
         assert_eq!(self.blocks.len(), self.blocks_closed as usize);
-        // The blocks Vec is pre-sized to blocks_count. We've been using
-        // blocks_closed as the "committed" count and entry_count>0 means one
-        // extra is "open". When entry_count == 0 and we need a new block, we
-        // push a placeholder that acquire_block_with_grid will initialize.
-        // But we can't push because the Vec is already at capacity.
-        //
-        // DEVIATION: In upstream, the ring buffer has capacity blocks_count and
-        // starts with count=0. advance_tail increments count. Here we start with
-        // all blocks_count entries in the Vec and "use" them by advancing
-        // blocks_closed + entry_count. This works because:
-        // - blocks.len() == blocks_count always
-        // - blocks[0..blocks_closed] are closed (flushed or pending flush)
-        // - blocks[blocks_closed] is the open block (if entry_count > 0)
-        //
-        // So when entry_count == 0 and we need a new block, we don't need to
-        // do anything — the block at blocks[blocks_closed] is already available.
+
+        // Bounded by the ring-buffer sizing that upstream guarantees via `blocks_count()`.
+        assert!(self.blocks.len() < self.pace.blocks_count() as usize);
+
+        let location = grid.get_block();
+        let address = grid.acquire(self.grid_reservation.unwrap_or_else(|| {
+            unreachable!("grid reservation must be set by init_blocks before any append")
+        }));
+
+        let mut header = message_header::Block::default();
+        header.cluster = self.superblock.cluster;
+        header.address = address;
+        // The real size is fixed up by `close_block`; a valid (> HEADER size) placeholder
+        // satisfies `header_from_block`'s structural asserts during the open block's appends.
+        header.size = tigerbeetle_core::constants::BLOCK_SIZE as u32;
+        header.block_type_ordinal = BlockType::Manifest as u8;
+        header.release = self.superblock.release;
+
+        {
+            let block = grid.block_mut(location);
+            block[..message_header::SIZE]
+                .copy_from_slice(&message_header::TypedHeader::to_wire(&header));
+        }
+
+        self.blocks.push(location);
     }
 
     fn close_block(&mut self, grid: &mut Grid) {
@@ -867,6 +897,16 @@ impl ManifestLog {
 
         self.pending_callback = Some(Box::new(callback));
         self.flush(grid, storage);
+
+        // When there are zero blocks to flush, `flush` sets
+        // `Flushing { writes_pending: 0 }` but no `WriteDone` event fires, so
+        // `pending_callback` would never be consumed. Fire it immediately,
+        // mirroring the zero-blocks early-return in `compact` (line 721).
+        if self.blocks_closed == 0
+            && let Some(mut cb) = self.pending_callback.take()
+        {
+            cb();
+        }
     }
 
     /// Return the manifest references to persist into the superblock checkpoint.
