@@ -26,8 +26,9 @@ use tigerbeetle_lsm::table_memory::{self, Usage};
 use tigerbeetle_lsm::tree::ScopeCloseMode;
 use tigerbeetle_lsm::unique_key::{UniqueKey, UniqueKey128};
 
+use crate::grid::Grid;
 use crate::table::{self, BlockValue, IndexBlocks, TableLayout, TableSpec, TableUsage};
-use crate::tree::Tree;
+use crate::tree::{LookupMemoryResult, Tree};
 
 // ---------------------------------------------------------------------------
 // BlockValue impls for composite / unique key value types
@@ -861,6 +862,42 @@ impl AccountGroove {
         self.id_map.get(&id)
     }
 
+    /// Resolve an account by its primary key (id) from the tree levels.
+    ///
+    /// Mirrors upstream's prefetch-by-unique-key resolution (groove.zig:1704-1732):
+    /// look up the primary-key tree (`id`) for the account's timestamp, then resolve the
+    /// object tree (`objects`) by that timestamp. Both hops go through
+    /// `Tree::lookup_from_levels_cache`, so a block missing from the grid cache at either
+    /// hop yields `Possible` (deferred to the async read phase).
+    ///
+    /// DEVIATION: upstream keeps orphaned primary keys (`timestamp == 0`) in a separate
+    /// map via `insert_orphaned_object`; sans-IO an orphan resolves to `Negative` and
+    /// orphaned-key tracking is deferred to the forest layer.
+    ///
+    /// # Panics
+    /// Panics if the primary-key tree returns an entry whose key does not match `id`
+    /// (a corrupted index invariant violation).
+    #[must_use]
+    pub fn lookup(
+        &mut self,
+        grid: &mut Grid,
+        snapshot: u64,
+        id: u128,
+    ) -> LookupMemoryResult<Account> {
+        let unique = match self.id.lookup_from_levels_cache(grid, snapshot, id) {
+            LookupMemoryResult::Positive(unique) => unique,
+            LookupMemoryResult::Negative => return LookupMemoryResult::Negative,
+            LookupMemoryResult::Possible { level } => {
+                return LookupMemoryResult::Possible { level };
+            }
+        };
+        assert_eq!(unique.field, id);
+        if unique.timestamp == 0 {
+            return LookupMemoryResult::Negative;
+        }
+        self.objects.lookup_from_levels_cache(grid, snapshot, unique.timestamp)
+    }
+
     /// Insert an object into the object tree and all index trees.
     ///
     /// # Panics
@@ -1038,6 +1075,42 @@ impl TransferGroove {
     #[must_use]
     pub fn get(&self, id: u128) -> Option<&Transfer> {
         self.id_map.get(&id)
+    }
+
+    /// Resolve a transfer by its primary key (id) from the tree levels.
+    ///
+    /// Mirrors upstream's prefetch-by-unique-key resolution (groove.zig:1704-1732):
+    /// look up the primary-key tree (`id`) for the transfer's timestamp, then resolve the
+    /// object tree (`objects`) by that timestamp. Both hops go through
+    /// `Tree::lookup_from_levels_cache`, so a block missing from the grid cache at either
+    /// hop yields `Possible` (deferred to the async read phase).
+    ///
+    /// DEVIATION: upstream keeps orphaned primary keys (`timestamp == 0`) in a separate
+    /// map via `insert_orphaned_object`; sans-IO an orphan resolves to `Negative` and
+    /// orphaned-key tracking is deferred to the forest layer.
+    ///
+    /// # Panics
+    /// Panics if the primary-key tree returns an entry whose key does not match `id`
+    /// (a corrupted index invariant violation).
+    #[must_use]
+    pub fn lookup(
+        &mut self,
+        grid: &mut Grid,
+        snapshot: u64,
+        id: u128,
+    ) -> LookupMemoryResult<Transfer> {
+        let unique = match self.id.lookup_from_levels_cache(grid, snapshot, id) {
+            LookupMemoryResult::Positive(unique) => unique,
+            LookupMemoryResult::Negative => return LookupMemoryResult::Negative,
+            LookupMemoryResult::Possible { level } => {
+                return LookupMemoryResult::Possible { level };
+            }
+        };
+        assert_eq!(unique.field, id);
+        if unique.timestamp == 0 {
+            return LookupMemoryResult::Negative;
+        }
+        self.objects.lookup_from_levels_cache(grid, snapshot, unique.timestamp)
     }
 
     pub fn scope_open(&mut self) {
@@ -1382,6 +1455,16 @@ mod tests {
 
     /// Build a single-value-block table from strictly key-sorted values.
     fn build_table<S: TableSpec>(values: &[S::Value]) -> (Vec<u8>, Vec<u8>, TableInfo<S::Key>) {
+        build_table_with::<S>(values, 1, 1, 2)
+    }
+
+    /// Like [`build_table`], but for an arbitrary tree id and block addresses.
+    fn build_table_with<S: TableSpec>(
+        values: &[S::Value],
+        tree_id: u16,
+        value_address: u64,
+        index_address: u64,
+    ) -> (Vec<u8>, Vec<u8>, TableInfo<S::Key>) {
         let layout = TableLayout::compute_for::<S>();
         let mut index_block = vec![0u8; constants::BLOCK_SIZE];
         let mut value_block = vec![0u8; constants::BLOCK_SIZE];
@@ -1400,9 +1483,9 @@ mod tests {
             DataFinishOptions {
                 cluster: 0,
                 release: Release::MINIMUM,
-                address: 1,
+                address: value_address,
                 snapshot_min: 1,
-                tree_id: 1,
+                tree_id,
             },
         );
 
@@ -1412,9 +1495,9 @@ mod tests {
             IndexFinishOptions {
                 cluster: 0,
                 release: Release::MINIMUM,
-                address: 2,
+                address: index_address,
                 snapshot_min: 1,
-                tree_id: 1,
+                tree_id,
             },
         );
 
@@ -1645,5 +1728,354 @@ mod tests {
         assert_eq!(blocks241.value_block_key_max, key241);
         let found241 = CompositeKey128Spec::value_block_search(&value_blocks[1], key241).unwrap();
         assert_eq!(found241.timestamp, 241);
+    }
+
+    // ------------------------------------------------------------------
+    // Groove-level primary lookup: `AccountGroove::lookup` / `TransferGroove::lookup`
+    // over real `TableBuilder` tables served from the grid cache. Exercises the
+    // prefetch-by-unique-key two-hop resolution (id tree → timestamp, then objects
+    // tree → object) end to end, sans-IO.
+    // ------------------------------------------------------------------
+
+    use crate::grid::{Grid, GridOptions};
+    use crate::table::TableKey as VsrTableKey;
+    use crate::tree::{Options, Tree};
+    use tigerbeetle_lsm::free_set::SHARD_BITS;
+    use tigerbeetle_lsm::schema::manifest_node::{self, Event, Label};
+    use tigerbeetle_lsm::tree::{SNAPSHOT_LATEST, TreeConfig};
+
+    const FREE_SET_BLOCKS: usize = 2 * SHARD_BITS;
+
+    /// Acquire `blocks` fresh addresses from the grid.
+    fn acquire_addresses(grid: &mut Grid, blocks: usize) -> Vec<u64> {
+        let reservation = grid.reserve(blocks);
+        (0..blocks).map(|_| grid.acquire(reservation)).collect()
+    }
+
+    /// A grid with `blocks` acquired addresses.
+    fn new_groove_grid(blocks: usize) -> (Grid, Vec<u64>) {
+        let mut grid = Grid::new(GridOptions {
+            cache_blocks_count: 64,
+            stash_blocks_count: 12,
+            read_iops_max: 2,
+            write_iops_max: 2,
+            free_set_blocks_count: Some(FREE_SET_BLOCKS),
+            free_set_blocks_capacity: None,
+        });
+        let addresses = acquire_addresses(&mut grid, blocks);
+        (grid, addresses)
+    }
+
+    /// Header checksum of a finished builder block, without touching the grid.
+    fn block_checksum(block: &[u8]) -> u128 {
+        crate::schema::header_from_block(block).checksum
+    }
+
+    /// Copy a finished block into the grid cache and return its header checksum.
+    fn seed_grid_block(grid: &mut Grid, address: u64, block: &[u8]) -> u128 {
+        assert!(!grid.free_set_is_free(address));
+        let location = grid.get_block();
+        grid.block_mut(location).copy_from_slice(block);
+        let checksum = crate::schema::header_from_block(grid.block(location)).checksum;
+        grid.cache_upsert(address, location);
+        checksum
+    }
+
+    /// A manifest log that never opens — `Tree::open_table` bypasses logging entirely.
+    struct NeverOpenedLog;
+
+    impl ManifestLog for NeverOpenedLog {
+        fn is_opened(&self) -> bool {
+            false
+        }
+
+        fn append(&mut self, _entry: &manifest_node::TableInfo) {
+            unreachable!("open_table bypasses the manifest log")
+        }
+    }
+
+    /// Replay a built table directly into a tree's manifest level 0.
+    fn open_tree<S: crate::tree::TreeSpec>(
+        tree: &mut Tree<S>,
+        info: &TableInfo<S::Key>,
+        index_address: u64,
+        index_checksum: u128,
+        tree_id: u16,
+    ) {
+        tree.open_commence(&NeverOpenedLog);
+        tree.open_table(&manifest_node::TableInfo {
+            key_min: <S::Key as VsrTableKey>::to_le_bytes_padded(info.key_min),
+            key_max: <S::Key as VsrTableKey>::to_le_bytes_padded(info.key_max),
+            checksum: index_checksum,
+            address: index_address,
+            snapshot_min: 1,
+            snapshot_max: SNAPSHOT_LATEST,
+            value_count: info.value_count,
+            tree_id,
+            label: Label { level: 0, event: Event::Insert },
+        });
+        tree.open_complete(0);
+    }
+
+    fn new_account_groove() -> AccountGroove {
+        fn tree<S: crate::tree::TreeSpec>(id: u16, name: &'static str) -> Tree<S> {
+            Tree::<S>::new(TreeConfig { id, name }, Options { batch_value_count_limit: 32 })
+        }
+        AccountGroove {
+            objects: tree(1, "accounts_objects"),
+            id: tree(2, "accounts_id"),
+            user_data_128: tree(3, "accounts_user_data_128"),
+            user_data_64: tree(4, "accounts_user_data_64"),
+            user_data_32: tree(5, "accounts_user_data_32"),
+            ledger: tree(6, "accounts_ledger"),
+            code: tree(7, "accounts_code"),
+            imported: tree(8, "accounts_imported"),
+            closed: tree(9, "accounts_closed"),
+            id_map: HashMap::new(),
+        }
+    }
+
+    fn new_transfer_groove() -> TransferGroove {
+        fn tree<S: crate::tree::TreeSpec>(id: u16, name: &'static str) -> Tree<S> {
+            Tree::<S>::new(TreeConfig { id, name }, Options { batch_value_count_limit: 32 })
+        }
+        TransferGroove {
+            objects: tree(10, "transfers_objects"),
+            id: tree(11, "transfers_id"),
+            debit_account_id: tree(12, "transfers_debit_account_id"),
+            credit_account_id: tree(13, "transfers_credit_account_id"),
+            amount: tree(14, "transfers_amount"),
+            pending_id: tree(15, "transfers_pending_id"),
+            user_data_128: tree(16, "transfers_user_data_128"),
+            user_data_64: tree(17, "transfers_user_data_64"),
+            user_data_32: tree(18, "transfers_user_data_32"),
+            ledger: tree(19, "transfers_ledger"),
+            code: tree(20, "transfers_code"),
+            expires_at: tree(21, "transfers_expires_at"),
+            imported: tree(22, "transfers_imported"),
+            closing: tree(23, "transfers_closing"),
+            id_map: HashMap::new(),
+        }
+    }
+
+    /// Build the account groove's `objects` (tree 1) and `id` (tree 2) tables, seed
+    /// their blocks into `grid` (acquiring 4 addresses), and open both trees.
+    fn open_account_lookup_trees(
+        grid: &mut Grid,
+        objects: &[Account],
+        ids: &[UniqueKey128],
+    ) -> AccountGroove {
+        let addresses = acquire_addresses(grid, 4);
+        let (objects_value, objects_index, id_value, id_index) =
+            (addresses[0], addresses[1], addresses[2], addresses[3]);
+
+        let (obj_index_block, obj_value_block, obj_info) =
+            build_table_with::<AccountObjectSpec>(objects, 1, objects_value, objects_index);
+        let obj_checksum = seed_grid_block(grid, objects_index, &obj_index_block);
+        seed_grid_block(grid, objects_value, &obj_value_block);
+
+        let (id_index_block, id_value_block, id_info) =
+            build_table_with::<UniqueKey128Spec>(ids, 2, id_value, id_index);
+        let id_checksum = seed_grid_block(grid, id_index, &id_index_block);
+        seed_grid_block(grid, id_value, &id_value_block);
+
+        let mut groove = new_account_groove();
+        open_tree(&mut groove.objects, &obj_info, objects_index, obj_checksum, 1);
+        open_tree(&mut groove.id, &id_info, id_index, id_checksum, 2);
+        groove
+    }
+
+    fn accounts() -> [Account; 3] {
+        [
+            Account { timestamp: 1, id: 101, ..Account::default() },
+            Account { timestamp: 2, id: 102, ..Account::default() },
+            Account { timestamp: 3, id: 103, ..Account::default() },
+        ]
+    }
+
+    const IDS: [UniqueKey128; 3] = [
+        UniqueKey128 { field: 101, timestamp: 1, padding: 0 },
+        UniqueKey128 { field: 102, timestamp: 2, padding: 0 },
+        UniqueKey128 { field: 103, timestamp: 3, padding: 0 },
+    ];
+
+    #[test]
+    fn groove_lookup_primary_hit_and_miss() {
+        let (mut grid, _) = new_groove_grid(4);
+        let mut groove = open_account_lookup_trees(&mut grid, &accounts(), &IDS);
+
+        // Present id resolves through both hops:
+        let result = groove.lookup(&mut grid, SNAPSHOT_LATEST, 101);
+        assert!(matches!(
+            result,
+            LookupMemoryResult::Positive(Account { id: 101, timestamp: 1, .. })
+        ));
+
+        // Unknown id (outside the id tree's key range) → negative:
+        assert!(matches!(
+            groove.lookup(&mut grid, SNAPSHOT_LATEST, 999),
+            LookupMemoryResult::Negative
+        ));
+    }
+
+    #[test]
+    fn groove_lookup_primary_object_tree_miss() {
+        // The id tree resolves timestamps that the objects tree does not hold
+        // (a gap inside the id tree's range, plus a present id pointing at a
+        // missing object timestamp) → the second hop resolves to negative.
+        let id_entries = [
+            UniqueKey128 { field: 101, timestamp: 1, padding: 0 },
+            UniqueKey128 { field: 103, timestamp: 3, padding: 0 }, // gap at id 102
+            UniqueKey128 { field: 201, timestamp: 99, padding: 0 }, // no object@99
+        ];
+        let (mut grid, _) = new_groove_grid(4);
+        let mut groove = open_account_lookup_trees(&mut grid, &accounts(), &id_entries);
+
+        // In-range gap in the id tree:
+        assert!(matches!(
+            groove.lookup(&mut grid, SNAPSHOT_LATEST, 102),
+            LookupMemoryResult::Negative
+        ));
+
+        // Present id (201) whose timestamp (99) has no object → negative:
+        assert!(matches!(
+            groove.lookup(&mut grid, SNAPSHOT_LATEST, 201),
+            LookupMemoryResult::Negative
+        ));
+    }
+
+    #[test]
+    fn groove_lookup_primary_tombstone() {
+        // A tombstone in the unique-key tree short-circuits before the objects hop.
+        let id_entries = [
+            UniqueKey128 { field: 101, timestamp: 1, padding: 0 },
+            UniqueKey128::tombstone_from_key(102),
+            UniqueKey128 { field: 103, timestamp: 3, padding: 0 },
+        ];
+        let (mut grid, _) = new_groove_grid(4);
+        let mut groove = open_account_lookup_trees(&mut grid, &accounts(), &id_entries);
+
+        assert!(matches!(
+            groove.lookup(&mut grid, SNAPSHOT_LATEST, 102),
+            LookupMemoryResult::Negative
+        ));
+    }
+
+    #[test]
+    fn groove_lookup_primary_orphan() {
+        // An orphaned primary key (timestamp == 0) resolves to negative sans-IO;
+        // upstream tracks it via `insert_orphaned_object` (deferred).
+        let id_entries = [
+            UniqueKey128 { field: 101, timestamp: 1, padding: 0 },
+            UniqueKey128 { field: 103, timestamp: 3, padding: 0 },
+            UniqueKey128 { field: 301, timestamp: 0, padding: 0 },
+        ];
+        let (mut grid, _) = new_groove_grid(4);
+        let mut groove = open_account_lookup_trees(&mut grid, &accounts(), &id_entries);
+
+        assert!(matches!(
+            groove.lookup(&mut grid, SNAPSHOT_LATEST, 301),
+            LookupMemoryResult::Negative
+        ));
+    }
+
+    #[test]
+    fn groove_lookup_primary_possible() {
+        // Build both tables but seed them progressively: the same lookup walks
+        // Possible{level:0} → Possible{level:0} → Positive as blocks arrive.
+        let (mut grid, addresses) = new_groove_grid(4);
+        let (objects_value, objects_index, id_value, id_index) =
+            (addresses[0], addresses[1], addresses[2], addresses[3]);
+
+        let (obj_index_block, obj_value_block, obj_info) =
+            build_table_with::<AccountObjectSpec>(&accounts(), 1, objects_value, objects_index);
+        let (id_index_block, id_value_block, id_info) =
+            build_table_with::<UniqueKey128Spec>(&IDS, 2, id_value, id_index);
+
+        let mut groove = new_account_groove();
+        open_tree(
+            &mut groove.objects,
+            &obj_info,
+            objects_index,
+            block_checksum(&obj_index_block),
+            1,
+        );
+        open_tree(&mut groove.id, &id_info, id_index, block_checksum(&id_index_block), 2);
+
+        // First hop: the id tree's index block is not cached → possible at level 0.
+        assert!(matches!(
+            groove.lookup(&mut grid, SNAPSHOT_LATEST, 101),
+            LookupMemoryResult::Possible { level: 0 }
+        ));
+
+        // Seed only the id tree: the id hop resolves, but the objects tree's index
+        // block is still missing → possible at level 0 again.
+        seed_grid_block(&mut grid, id_index, &id_index_block);
+        seed_grid_block(&mut grid, id_value, &id_value_block);
+        assert!(matches!(
+            groove.lookup(&mut grid, SNAPSHOT_LATEST, 101),
+            LookupMemoryResult::Possible { level: 0 }
+        ));
+
+        // Seed the objects tree: both hops resolve in cache.
+        seed_grid_block(&mut grid, objects_index, &obj_index_block);
+        seed_grid_block(&mut grid, objects_value, &obj_value_block);
+        assert!(matches!(
+            groove.lookup(&mut grid, SNAPSHOT_LATEST, 101),
+            LookupMemoryResult::Positive(Account { id: 101, timestamp: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn transfer_groove_lookup_primary() {
+        let transfers = [
+            Transfer {
+                timestamp: 1,
+                id: 11,
+                debit_account_id: 1,
+                credit_account_id: 2,
+                amount: 100,
+                ledger: 1,
+                code: 1,
+                ..Transfer::default()
+            },
+            Transfer {
+                timestamp: 2,
+                id: 12,
+                debit_account_id: 1,
+                credit_account_id: 2,
+                amount: 50,
+                ledger: 1,
+                code: 1,
+                ..Transfer::default()
+            },
+        ];
+        let transfer_ids = [
+            UniqueKey128 { field: 11, timestamp: 1, padding: 0 },
+            UniqueKey128 { field: 12, timestamp: 2, padding: 0 },
+        ];
+
+        let (mut grid, addresses) = new_groove_grid(4);
+        let (obj_index_block, obj_value_block, obj_info) =
+            build_table_with::<TransferObjectSpec>(&transfers, 10, addresses[0], addresses[1]);
+        let obj_checksum = seed_grid_block(&mut grid, addresses[1], &obj_index_block);
+        seed_grid_block(&mut grid, addresses[0], &obj_value_block);
+        let (id_index_block, id_value_block, id_info) =
+            build_table_with::<UniqueKey128Spec>(&transfer_ids, 11, addresses[2], addresses[3]);
+        let id_checksum = seed_grid_block(&mut grid, addresses[3], &id_index_block);
+        seed_grid_block(&mut grid, addresses[2], &id_value_block);
+
+        let mut groove = new_transfer_groove();
+        open_tree(&mut groove.objects, &obj_info, addresses[1], obj_checksum, 10);
+        open_tree(&mut groove.id, &id_info, addresses[3], id_checksum, 11);
+
+        assert!(matches!(
+            groove.lookup(&mut grid, SNAPSHOT_LATEST, 12),
+            LookupMemoryResult::Positive(Transfer { id: 12, timestamp: 2, amount: 50, .. })
+        ));
+        assert!(matches!(
+            groove.lookup(&mut grid, SNAPSHOT_LATEST, 13),
+            LookupMemoryResult::Negative
+        ));
     }
 }
