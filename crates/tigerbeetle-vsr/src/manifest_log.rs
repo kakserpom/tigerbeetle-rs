@@ -227,6 +227,14 @@ pub struct ManifestLog {
     blocks_closed: u8,
     entry_count: u32,
 
+    /// Table entries recorded through the LSM `ManifestLog` trait seam but not yet
+    /// materialized into physical log blocks. The trait's `append` cannot thread
+    /// `&mut Grid` (needed to open a block), so the forest defers materialization to
+    /// [`flush_pending_appends`](Self::flush_pending_appends), which it calls at
+    /// [`Forest::checkpoint`](crate::forest::Forest::checkpoint) where the grid is
+    /// available — see the DEVIATION on the trait impl.
+    pending_appends: VecDeque<TableInfo>,
+
     table_extents: HashMap<u64, TableExtent>,
     tables_removed: HashSet<u64>,
 
@@ -265,6 +273,7 @@ impl ManifestLog {
             blocks: Vec::with_capacity(blocks_count),
             blocks_closed: 0,
             entry_count: 0,
+            pending_appends: VecDeque::new(),
             table_extents: HashMap::with_capacity(pace.tables_max as usize + 1),
             tables_removed: HashSet::with_capacity(pace.tables_max as usize),
             grid_reservation: None,
@@ -528,6 +537,23 @@ impl ManifestLog {
         }
 
         self.append_internal(table, grid);
+    }
+
+    /// Materialize any table entries buffered through the LSM `ManifestLog` trait seam into
+    /// physical log blocks, via the inherent grid-bearing [`append`](Self::append).
+    ///
+    /// The forest calls this from [`Forest::checkpoint`](crate::forest::Forest::checkpoint)
+    /// before the manifest flush, so a compacted tree's `TableInfo`s recorded through the
+    /// trait land in the durable manifest.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the log is not opened.
+    pub fn flush_pending_appends(&mut self, grid: &mut Grid) {
+        assert!(self.opened);
+        while let Some(entry) = self.pending_appends.pop_front() {
+            self.append(&entry, grid);
+        }
     }
 
     fn append_internal(&mut self, table: &TableInfo, grid: &mut Grid) {
@@ -1041,22 +1067,22 @@ impl ManifestLog {
 /// (`lsm/manifest.rs`), so grooves and trees can attach it during [`Forest::open`].
 ///
 /// The LSM trait's `append(&mut self, &WireTableInfo)` cannot carry a `&mut Grid`, while a
-/// physical append must write blocks through the grid. Tree compaction to a manifest isn't
-/// wired to a physical log yet (I/O dispatch deferred, see AGENTS), so this adapter's
-/// `append` is a documented stub; the grid-bearing physical path remains the inherent
-/// [`ManifestLog::append`].
+/// physical append must write blocks through the grid. DEVIATION: this adapter buffers the
+/// entry into `pending_appends`, and the forest materializes it into physical blocks at
+/// `checkpoint` via [`flush_pending_appends`](Self::flush_pending_appends) (where the grid
+/// is available) — the sans-IO answer to threading the grid through the trait seam. The
+/// grid-bearing inherent [`ManifestLog::append`] remains the physical write path.
 impl tigerbeetle_lsm::manifest::ManifestLog for ManifestLog {
     fn is_opened(&self) -> bool {
         self.opened
     }
 
-    /// DEVIATION: the LSM trait cannot thread `&mut Grid`, and physical block appends are
-    /// deferred. Trees don't append to a physical manifest log during compaction in this
-    /// port yet, so this is unreachable for now.
-    ///
-    /// TODO(port): thread the grid so compaction can append physical manifest blocks.
-    fn append(&mut self, _entry: &TableInfo) {
-        unreachable!("ManifestLog::append (LSM trait) is deferred pending grid threading");
+    fn append(&mut self, entry: &TableInfo) {
+        // DEVIATION: the LSM trait cannot thread `&mut Grid`, and a physical append must
+        // open log blocks through the grid. The grid-less forest/tree layers record entries
+        // here, and the forest materializes them into physical blocks at checkpoint via
+        // `flush_pending_appends` (where the grid is available).
+        self.pending_appends.push_back(*entry);
     }
 }
 

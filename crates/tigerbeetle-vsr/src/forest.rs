@@ -348,6 +348,12 @@ impl Forest {
             callback: Box::new(callback),
         });
 
+        // Materialize any table entries buffered through the LSM `ManifestLog` trait seam
+        // (recorded without a grid) into physical log blocks — this needs the grid, which is
+        // only available here. Then the manifest log checkpoint closes the open block and
+        // flushes durably.
+        self.manifest_log.flush_pending_appends(&mut self.grid);
+
         // The manifest log checkpoint closes any open block, asserts all blocks
         // are closed, then flushes (writes) them. The completion callback marks
         // the `done` flag; it fires either synchronously (zero blocks, here) or
@@ -772,6 +778,72 @@ mod tests {
         assert!(b_done, "reopen must complete");
 
         // Both entries replayed into the account object tree (tree 7) on reopen.
+        assert_eq!(forest_b.accounts.objects.manifest_table_count(), 2);
+    }
+
+    /// The LSM `ManifestLog` trait seam (the grid-less `append(&entry)` used by grooves and
+    /// trees) is buffered, then materialized into physical blocks at `checkpoint` and thus
+    /// survives a reopen replay — the sans-IO answer to threading the grid through the trait.
+    #[test]
+    fn forest_lsm_trait_append_flushed_at_checkpoint() {
+        let mut forest_a = Forest::init(test_superblock(), grid_options(), 32);
+        let mut storage = storage();
+        open_forest(&mut forest_a, &mut storage);
+
+        // Invoke the LSM trait `append` (the grid-less two-arg form) explicitly via UFCS: the
+        // inherent `append` also takes 2 args plus a `&mut Grid`, so method syntax is ambiguous.
+        // Entries buffer in `pending_appends` rather than opening a physical block.
+        ManifestLogTrait::append(&mut forest_a.manifest_log, &manifest_info_u64(0x4000, 7));
+        ManifestLogTrait::append(&mut forest_a.manifest_log, &manifest_info_u64(0x4001, 7));
+
+        let a_done = std::rc::Rc::new(std::cell::Cell::new(false));
+        forest_a.checkpoint(
+            {
+                let a_done = a_done.clone();
+                move || a_done.set(true)
+            },
+            &mut storage,
+        );
+        let mut polls = 0;
+        while !a_done.get() {
+            forest_a.poll(&mut storage);
+            polls += 1;
+            assert!(polls < 1000, "checkpoint must complete");
+        }
+
+        let manifest_refs = forest_a.manifest_log.checkpoint_references();
+        assert_eq!(manifest_refs.block_count, 1);
+        let grid_refs = forest_a.grid.free_set_checkpoint_references();
+        assert!(!grid_refs.blocks_acquired.empty(), "free set must encode the manifest blocks");
+
+        let highest_address = grid_refs
+            .blocks_acquired
+            .last_block_address
+            .max(grid_refs.blocks_released.last_block_address);
+        let storage_size = DATA_FILE_SIZE_MIN as u64 + highest_address * BLOCK_SIZE as u64;
+
+        let reopen_view = SuperBlockView {
+            storage_size,
+            manifest_block_count: manifest_refs.block_count,
+            manifest_oldest_address: manifest_refs.oldest_address,
+            manifest_oldest_checksum: manifest_refs.oldest_checksum,
+            manifest_newest_address: manifest_refs.newest_address,
+            manifest_newest_checksum: manifest_refs.newest_checksum,
+            ..test_superblock()
+        };
+
+        let mut forest_b = Forest::init(reopen_view, grid_options(), 32);
+        forest_b.open(grid_refs, &mut storage, 0);
+        let mut b_done = false;
+        for _ in 0..1000 {
+            forest_b.poll(&mut storage);
+            if forest_b.progress.is_none() && forest_b.accounts.objects.is_opened() {
+                b_done = true;
+                break;
+            }
+        }
+        assert!(b_done, "reopen must complete");
+
         assert_eq!(forest_b.accounts.objects.manifest_table_count(), 2);
     }
 }
