@@ -965,6 +965,29 @@ impl ManifestLog {
     }
 }
 
+/// Adapts the physical [`ManifestLog`] to the LSM layer's [`ManifestLog`] trait seam
+/// (`lsm/manifest.rs`), so grooves and trees can attach it during [`Forest::open`].
+///
+/// The LSM trait's `append(&mut self, &WireTableInfo)` cannot carry a `&mut Grid`, while a
+/// physical append must write blocks through the grid. Tree compaction to a manifest isn't
+/// wired to a physical log yet (I/O dispatch deferred, see AGENTS), so this adapter's
+/// `append` is a documented stub; the grid-bearing physical path remains the inherent
+/// [`ManifestLog::append`].
+impl tigerbeetle_lsm::manifest::ManifestLog for ManifestLog {
+    fn is_opened(&self) -> bool {
+        self.opened
+    }
+
+    /// DEVIATION: the LSM trait cannot thread `&mut Grid`, and physical block appends are
+    /// deferred. Trees don't append to a physical manifest log during compaction in this
+    /// port yet, so this is unreachable for now.
+    ///
+    /// TODO(port): thread the grid so compaction can append physical manifest blocks.
+    fn append(&mut self, _entry: &TableInfo) {
+        unreachable!("ManifestLog::append (LSM trait) is deferred pending grid threading");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------

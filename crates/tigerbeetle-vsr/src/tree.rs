@@ -407,6 +407,12 @@ impl<S: TreeSpec> Tree<S> {
         );
     }
 
+    /// Whether this tree has been opened (its `open_complete` has set `compaction_op`).
+    #[must_use]
+    pub fn is_opened(&self) -> bool {
+        self.compaction_op.is_some()
+    }
+
     /// Port of upstream `Tree.compact`.
     ///
     /// Spreads sort+deduplication work between beats, to avoid a latency spike at the end of
