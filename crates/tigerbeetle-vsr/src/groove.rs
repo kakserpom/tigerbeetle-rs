@@ -10,12 +10,16 @@
 //! DEVIATION: upstream's prefetch pipeline (~480 lines) is deferred to the async I/O phase.
 //! For now `prefetch_setup`, `prefetch_enqueue`, and `prefetch` are stubs.
 
+//! DEVIATION: upstream's `ObjectsCache` is a SetAssociativeCache with a HashMap stash
+//! below it. The port keeps only the stash layer (see `objects_cache.rs`); groove `get`
+//! therefore has no tombstone/orphaned-key surface, collapsing upstream's
+//! `ObjectCacheResult` to `Option<&Object>`.
+
 #![allow(
     clippy::cast_possible_truncation,
     reason = "size_of::<T>() as u32 in const LAYOUT; upstream uses comptime"
 )]
 
-use std::collections::HashMap;
 use tigerbeetle_core::constants;
 use tigerbeetle_core::types::{Account, AccountFlags, Transfer, TransferFlags, TransferPending};
 use tigerbeetle_lsm::composite_key::{
@@ -27,6 +31,7 @@ use tigerbeetle_lsm::tree::ScopeCloseMode;
 use tigerbeetle_lsm::unique_key::{UniqueKey, UniqueKey128};
 
 use crate::grid::Grid;
+use crate::objects_cache::ObjectsCache;
 use crate::table::{self, BlockValue, IndexBlocks, TableLayout, TableSpec, TableUsage};
 use crate::tree::{LookupMemoryResult, Tree};
 
@@ -797,8 +802,12 @@ pub struct AccountGroove {
     pub code: Tree<CompositeKey64Spec>,
     pub imported: Tree<CompositeKeyUnitSpec>,
     pub closed: Tree<CompositeKeyUnitSpec>,
-    /// Primary-key index (id → Account) — temporary stand-in for ObjectsCache.
-    id_map: HashMap<u128, Account>,
+    /// Per-session objects cache, keyed by the account's primary key (id).
+    ///
+    /// DEVIATION: upstream's cache is the `SetAssociativeCache` + stash pair; sans-IO the
+    /// stash alone is kept (see `objects_cache.rs`). Invariant with the object tree holds
+    /// (groove.zig:725-728): anything visible in-session lives here first.
+    objects_cache: ObjectsCache<u128, Account>,
 }
 
 /// The Transfer groove.
@@ -817,8 +826,8 @@ pub struct TransferGroove {
     pub expires_at: Tree<CompositeKey64Spec>,
     pub imported: Tree<CompositeKeyUnitSpec>,
     pub closing: Tree<CompositeKeyUnitSpec>,
-    /// Primary-key index (id → Transfer) — temporary stand-in for ObjectsCache.
-    id_map: HashMap<u128, Transfer>,
+    /// Per-session objects cache, keyed by the transfer's primary key (id).
+    objects_cache: ObjectsCache<u128, Transfer>,
 }
 
 // ---------------------------------------------------------------------------
@@ -836,6 +845,7 @@ impl AccountGroove {
         self.code.scope_open();
         self.imported.scope_open();
         self.closed.scope_open();
+        self.objects_cache.scope_open();
     }
 
     pub fn scope_close(&mut self, mode: ScopeCloseMode) {
@@ -848,6 +858,7 @@ impl AccountGroove {
         self.code.scope_close(mode);
         self.imported.scope_close(mode);
         self.closed.scope_close(mode);
+        self.objects_cache.scope_close(mode);
     }
 
     pub fn compact(&mut self) {
@@ -856,10 +867,14 @@ impl AccountGroove {
         // the forest manages scratch memory allocation.
     }
 
-    /// Lookup an account by its primary key (id).
+    /// Lookup an account by its primary key (id) from the objects cache.
+    ///
+    /// Mirrors `groove.zig:885-936` (`get(PrimaryKey) ObjectCacheResult`), collapsed to
+    /// `Option`: the ported stash has no tombstones and orphans are resolved to `Negative`
+    /// by [`AccountGroove::lookup`] instead of being cached.
     #[must_use]
     pub fn get(&self, id: u128) -> Option<&Account> {
-        self.id_map.get(&id)
+        self.objects_cache.get(&id)
     }
 
     /// Resolve an account by its primary key (id) from the tree levels.
@@ -908,7 +923,7 @@ impl AccountGroove {
 
         self.objects.put(object);
         self.objects.key_range_update(object.timestamp);
-        self.id_map.insert(object.id, *object);
+        self.objects_cache.upsert(*object);
 
         // id (unique key)
         self.id.put(&UniqueKey128 { field: object.id, timestamp: object.timestamp, padding: 0 });
@@ -1038,7 +1053,7 @@ impl AccountGroove {
 
         // Overwrite the object tree entry.
         self.objects.put(new);
-        self.id_map.insert(new.id, *new);
+        self.objects_cache.upsert(*new);
     }
 
     pub fn open_commence(&mut self, manifest_log: &mut impl ManifestLog) {
@@ -1071,10 +1086,14 @@ impl AccountGroove {
 // ---------------------------------------------------------------------------
 
 impl TransferGroove {
-    /// Lookup a transfer by its primary key (id).
+    /// Lookup a transfer by its primary key (id) from the objects cache.
+    ///
+    /// Mirrors `groove.zig:885-936` (`get(PrimaryKey) ObjectCacheResult`), collapsed to
+    /// `Option`: the ported stash has no tombstones and orphans are resolved to `Negative`
+    /// by [`TransferGroove::lookup`] instead of being cached.
     #[must_use]
     pub fn get(&self, id: u128) -> Option<&Transfer> {
-        self.id_map.get(&id)
+        self.objects_cache.get(&id)
     }
 
     /// Resolve a transfer by its primary key (id) from the tree levels.
@@ -1128,6 +1147,7 @@ impl TransferGroove {
         self.expires_at.scope_open();
         self.imported.scope_open();
         self.closing.scope_open();
+        self.objects_cache.scope_open();
     }
 
     pub fn scope_close(&mut self, mode: ScopeCloseMode) {
@@ -1145,6 +1165,7 @@ impl TransferGroove {
         self.expires_at.scope_close(mode);
         self.imported.scope_close(mode);
         self.closing.scope_close(mode);
+        self.objects_cache.scope_close(mode);
     }
 
     pub fn compact(&mut self) {
@@ -1161,7 +1182,7 @@ impl TransferGroove {
 
         self.objects.put(object);
         self.objects.key_range_update(object.timestamp);
-        self.id_map.insert(object.id, *object);
+        self.objects_cache.upsert(*object);
 
         // id (unique key)
         self.id.put(&UniqueKey128 { field: object.id, timestamp: object.timestamp, padding: 0 });
@@ -1346,7 +1367,7 @@ impl TransferGroove {
 
         // Overwrite the object tree entry.
         self.objects.put(new);
-        self.id_map.insert(new.id, *new);
+        self.objects_cache.upsert(*new);
     }
 
     pub fn open_commence(&mut self, manifest_log: &mut impl ManifestLog) {
@@ -1393,37 +1414,39 @@ impl TransferGroove {
 /// Upstream: `src/state_machine.zig:470` (`transfers_pending` groove config).
 ///
 /// DEVIATION: The full tree-based implementation (object tree + status index tree)
-/// is deferred until `TreeSpec` is implemented for `TransferPending`. For now,
-/// a `HashMap<u64, TransferPending>` provides the primary-key lookup needed by
+/// is deferred until `TreeSpec` is implemented for `TransferPending`. For now, the
+/// objects cache provides the primary-key lookup needed by
 /// `post_or_void_pending_transfer`.
 pub struct TransferPendingGroove {
-    /// Primary-key lookup (temporary stand-in for ObjectsCache + object tree).
-    id_map: HashMap<u64, TransferPending>,
+    /// Per-session objects cache, keyed by the pending transfer's timestamp.
+    objects_cache: ObjectsCache<u64, TransferPending>,
 }
 
 impl TransferPendingGroove {
     pub fn scope_open(&mut self) {
         // TODO(port): forward to object tree + status index tree
+        self.objects_cache.scope_open();
     }
 
-    pub fn scope_close(&mut self, _mode: ScopeCloseMode) {
+    pub fn scope_close(&mut self, mode: ScopeCloseMode) {
         // TODO(port): forward to object tree + status index tree
+        self.objects_cache.scope_close(mode);
     }
 
     /// Lookup a `TransferPending` record by its primary key (timestamp).
     #[must_use]
     pub fn get(&self, timestamp: u64) -> Option<&TransferPending> {
-        self.id_map.get(&timestamp)
+        self.objects_cache.get(&timestamp)
     }
 
     /// Insert a pending transfer record.
     pub fn insert(&mut self, object: &TransferPending) {
-        self.id_map.insert(object.timestamp, *object);
+        self.objects_cache.upsert(*object);
     }
 
     /// Update the status of an existing pending transfer record.
     pub fn update(&mut self, new: &TransferPending) {
-        self.id_map.insert(new.timestamp, *new);
+        self.objects_cache.upsert(*new);
     }
 
     pub fn open_commence(&mut self, _manifest_log: &mut impl ManifestLog) {
@@ -1452,6 +1475,7 @@ mod tests {
     use crate::multiversion::Release;
     use crate::table::{DataFinishOptions, IndexFinishOptions, TableBuilder, TableInfo};
     use crate::tree::TreeSpec;
+    use tigerbeetle_core::types::TransferPendingStatus;
 
     /// Build a single-value-block table from strictly key-sorted values.
     fn build_table<S: TableSpec>(values: &[S::Value]) -> (Vec<u8>, Vec<u8>, TableInfo<S::Key>) {
@@ -1831,7 +1855,7 @@ mod tests {
             code: tree(7, "accounts_code"),
             imported: tree(8, "accounts_imported"),
             closed: tree(9, "accounts_closed"),
-            id_map: HashMap::new(),
+            objects_cache: ObjectsCache::default(),
         }
     }
 
@@ -1854,7 +1878,7 @@ mod tests {
             expires_at: tree(21, "transfers_expires_at"),
             imported: tree(22, "transfers_imported"),
             closing: tree(23, "transfers_closing"),
-            id_map: HashMap::new(),
+            objects_cache: ObjectsCache::default(),
         }
     }
 
@@ -2077,5 +2101,110 @@ mod tests {
             groove.lookup(&mut grid, SNAPSHOT_LATEST, 13),
             LookupMemoryResult::Negative
         ));
+    }
+
+    // ------------------------------------------------------------------
+    // Objects cache wiring: `AccountGroove::get`/`insert`/`update` serve the
+    // per-session cache, and `scope_close(.discard)` rolls it back alongside the
+    // trees (upstream's objects_cache invariant, groove.zig:725-728).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn account_groove_objects_cache_hit_and_update() {
+        let mut groove = new_account_groove();
+
+        let mut account = Account { timestamp: 1, id: 101, ..Account::default() };
+        groove.insert(&account);
+        assert_eq!(groove.get(101), Some(&account));
+
+        account.user_data_128 = 7;
+        groove.update(&Account { timestamp: 1, id: 101, ..Account::default() }, &account);
+        assert_eq!(groove.get(101), Some(&account));
+        assert!(groove.get(999).is_none());
+    }
+
+    #[test]
+    fn account_groove_objects_cache_scope_discard() {
+        let mut groove = new_account_groove();
+        groove.insert(&Account { timestamp: 1, id: 101, ..Account::default() });
+
+        groove.scope_open();
+        // Update of a pre-scope account:
+        groove.update(
+            &Account { timestamp: 1, id: 101, ..Account::default() },
+            &Account { timestamp: 1, id: 101, user_data_128: 7, ..Account::default() },
+        );
+        // Insert of a brand-new account:
+        groove.insert(&Account { timestamp: 2, id: 102, ..Account::default() });
+        assert_eq!(groove.get(101).map(|a| a.user_data_128), Some(7));
+        assert!(groove.get(102).is_some());
+
+        groove.scope_close(ScopeCloseMode::Discard);
+
+        assert_eq!(groove.get(101), Some(&Account { timestamp: 1, id: 101, ..Account::default() }));
+        assert!(groove.get(102).is_none());
+    }
+
+    #[test]
+    fn account_groove_objects_cache_scope_persist() {
+        let mut groove = new_account_groove();
+
+        groove.scope_open();
+        groove.insert(&Account { timestamp: 1, id: 101, ..Account::default() });
+        groove.scope_close(ScopeCloseMode::Persist);
+
+        assert!(groove.get(101).is_some());
+    }
+
+    #[test]
+    fn transfer_groove_objects_cache_scope_discard() {
+        let mut groove = new_transfer_groove();
+        let pending = Transfer {
+            timestamp: 1,
+            id: 11,
+            debit_account_id: 1,
+            credit_account_id: 2,
+            amount: 100,
+            ledger: 1,
+            code: 1,
+            flags: TransferFlags::PENDING,
+            ..Transfer::default()
+        };
+        groove.insert(&pending);
+
+        groove.scope_open();
+        groove.insert(&Transfer { timestamp: 2, id: 12, ..Transfer::default() });
+        groove.scope_close(ScopeCloseMode::Discard);
+
+        assert_eq!(groove.get(11), Some(&pending));
+        assert!(groove.get(12).is_none());
+    }
+
+    #[test]
+    fn pending_groove_objects_cache_scope_discard() {
+        let mut groove = TransferPendingGroove { objects_cache: ObjectsCache::default() };
+
+        let mut pending = TransferPending {
+            timestamp: 1,
+            status: TransferPendingStatus::Pending,
+            padding: [0; 7],
+        };
+        groove.insert(&pending);
+        assert_eq!(groove.get(1), Some(&pending));
+
+        groove.scope_open();
+        pending.status = TransferPendingStatus::Posted;
+        groove.update(&pending);
+        assert_eq!(groove.get(1).map(|p| p.status), Some(TransferPendingStatus::Posted));
+        groove.scope_close(ScopeCloseMode::Discard);
+
+        assert_eq!(
+            groove.get(1),
+            Some(&TransferPending {
+                timestamp: 1,
+                status: TransferPendingStatus::Pending,
+                padding: [0; 7]
+            })
+        );
     }
 }
