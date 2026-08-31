@@ -800,4 +800,334 @@ mod tests {
         let tree = Tree::<TestSpec>::new(config, options);
         assert_eq!(tree.block_value_count_max(), 128);
     }
+
+    // ------------------------------------------------------------------
+    // Tree read path: `lookup_from_levels_cache` over a table built with
+    // the real `TableBuilder`, stored in the manifest, served from the Grid
+    // cache. Touches the whole read seam: manifest `LookupIterator` →
+    // index block routing (`index_blocks_for_key`) → value block search.
+    // ------------------------------------------------------------------
+
+    use crate::grid::{Grid, GridOptions};
+    use crate::multiversion::Release;
+    use crate::table::{
+        self as table, DataFinishOptions, IndexFinishOptions, TableBuilder, TableInfo, TableUsage,
+    };
+    use tigerbeetle_lsm::free_set::SHARD_BITS as FREE_SET_SHARD_BITS;
+    use tigerbeetle_lsm::schema::manifest_node::TableInfo as WireTableInfo;
+
+    const TOMBSTONE_BIT: u64 = 1_u64 << 63;
+    const FREE_SET_BLOCKS: usize = 2 * FREE_SET_SHARD_BITS;
+
+    /// An object-style spec (16-byte values, u64 keys) using the REAL layout
+    /// computation and block search, mirroring the groove specs.
+    struct TestObjectSpec;
+
+    impl table_memory::Table for TestObjectSpec {
+        type Key = TestKey;
+        type Value = TestValue;
+
+        const VALUE_COUNT_MAX: usize = 128;
+        const USAGE: Usage = Usage::General;
+
+        fn key_from_value(value: &Self::Value) -> Self::Key {
+            TestKey(value.key.0 & !TOMBSTONE_BIT)
+        }
+
+        fn tombstone(value: &Self::Value) -> bool {
+            value.key.0 & TOMBSTONE_BIT != 0
+        }
+    }
+
+    impl crate::table::TableSpec for TestObjectSpec {
+        type Key = TestKey;
+        type Value = TestValue;
+
+        fn key_from_value(value: &Self::Value) -> Self::Key {
+            TestKey(value.key.0 & !TOMBSTONE_BIT)
+        }
+
+        const SENTINEL_KEY: Self::Key = TestKey(u64::MAX);
+
+        fn tombstone(value: &Self::Value) -> bool {
+            value.key.0 & TOMBSTONE_BIT != 0
+        }
+
+        fn tombstone_from_key(key: Self::Key) -> Self::Value {
+            TestValue { key: TestKey(key.0 | TOMBSTONE_BIT), data: 0 }
+        }
+
+        const VALUE_COUNT_MAX: usize = 128;
+        const USAGE: TableUsage = TableUsage::General;
+    }
+
+    impl TreeSpec for TestObjectSpec {
+        const LAYOUT: TableLayout = TableLayout::compute_for::<Self>();
+
+        fn index_blocks_for_key(
+            index_block: &[u8],
+            key: Self::Key,
+        ) -> Option<IndexBlocks<Self::Key>> {
+            table::index_blocks_for_key::<Self::Key>(index_block, &Self::LAYOUT.index, key)
+        }
+
+        fn value_block_search(value_block: &[u8], key: Self::Key) -> Option<Self::Value> {
+            table::value_block_search::<Self>(value_block, &Self::LAYOUT.data, key)
+        }
+
+        fn tombstone_from_key(key: Self::Key) -> Self::Value {
+            TestValue { key: TestKey(key.0 | TOMBSTONE_BIT), data: 0 }
+        }
+    }
+
+    struct TestTreeLog {
+        opened: bool,
+        #[allow(dead_code)]
+        entries: Vec<WireTableInfo>,
+    }
+
+    impl TestTreeLog {
+        fn new() -> Self {
+            Self { opened: false, entries: Vec::new() }
+        }
+
+        fn open(&mut self) {
+            self.opened = true;
+        }
+    }
+
+    impl ManifestLogTrait for TestTreeLog {
+        fn is_opened(&self) -> bool {
+            self.opened
+        }
+
+        fn append(&mut self, entry: &WireTableInfo) {
+            assert!(self.opened);
+            self.entries.push(*entry);
+        }
+    }
+
+    /// A grid with `blocks` acquired addresses (value block first, then index block).
+    fn new_object_grid(blocks: usize) -> (Grid, Vec<u64>) {
+        let mut grid = Grid::new(GridOptions {
+            cache_blocks_count: 64,
+            stash_blocks_count: 12,
+            read_iops_max: 2,
+            write_iops_max: 2,
+            free_set_blocks_count: Some(FREE_SET_BLOCKS),
+            free_set_blocks_capacity: None,
+        });
+        let reservation = grid.reserve(blocks);
+        let addresses = (0..blocks).map(|_| grid.acquire(reservation)).collect();
+        (grid, addresses)
+    }
+
+    /// Build a single-value-block table (values must be strictly key-sorted).
+    fn build_object_table(
+        values: &[TestValue],
+        value_address: u64,
+        index_address: u64,
+    ) -> (Vec<u8>, Vec<u8>, TableInfo<TestKey>) {
+        let layout = TableLayout::compute_for::<TestObjectSpec>();
+        let mut index_block = vec![0u8; constants::BLOCK_SIZE];
+        let mut value_block = vec![0u8; constants::BLOCK_SIZE];
+
+        let mut builder = TableBuilder::new();
+        builder.set_index_block(&mut index_block);
+        builder.set_value_block(&mut value_block);
+        for value in values {
+            builder.insert_value::<TestObjectSpec>(value, &mut value_block, &layout);
+        }
+        builder.value_block_finish::<TestObjectSpec>(
+            &mut value_block,
+            &mut index_block,
+            &layout,
+            DataFinishOptions {
+                cluster: 0,
+                release: Release::MINIMUM,
+                address: value_address,
+                snapshot_min: 1,
+                tree_id: 1,
+            },
+        );
+        let info = builder.index_block_finish::<TestKey>(
+            &mut index_block,
+            &layout,
+            IndexFinishOptions {
+                cluster: 0,
+                release: Release::MINIMUM,
+                address: index_address,
+                snapshot_min: 1,
+                tree_id: 1,
+            },
+        );
+        (index_block, value_block, info)
+    }
+
+    /// Copy a finished block into the grid cache and return its header checksum.
+    fn seed_grid_block(grid: &mut Grid, address: u64, block: &[u8]) -> u128 {
+        assert!(!grid.free_set_is_free(address));
+        let location = grid.get_block();
+        grid.block_mut(location).copy_from_slice(block);
+        let checksum = crate::schema::header_from_block(grid.block(location)).checksum;
+        grid.cache_upsert(address, location);
+        checksum
+    }
+
+    fn object_tree_table_info(
+        info: &TableInfo<TestKey>,
+        index_address: u64,
+        index_checksum: u128,
+        snapshot_max: u64,
+    ) -> TreeTableInfo<TestKey> {
+        TreeTableInfo {
+            checksum: index_checksum,
+            address: index_address,
+            snapshot_min: 1,
+            snapshot_max,
+            key_min: info.key_min,
+            key_max: info.key_max,
+            value_count: info.value_count,
+        }
+    }
+
+    fn new_object_tree() -> (Tree<TestObjectSpec>, TestTreeLog) {
+        let mut tree = Tree::<TestObjectSpec>::new(
+            TreeConfig { id: 1, name: "object" },
+            Options { batch_value_count_limit: 32 },
+        );
+        let mut log = TestTreeLog::new();
+        tree.open_commence(&log);
+        log.open();
+        (tree, log)
+    }
+
+    const OBJECT_VALUES: [TestValue; 3] = [
+        TestValue { key: TestKey(3), data: 30 },
+        TestValue { key: TestKey(5), data: 50 },
+        TestValue { key: TestKey(9), data: 90 },
+    ];
+
+    #[test]
+    fn tree_lookup_from_levels_cache_hit_and_miss() {
+        let (mut grid, addresses) = new_object_grid(2);
+        let (value_address, index_address) = (addresses[0], addresses[1]);
+        let (index_block, value_block, info) =
+            build_object_table(&OBJECT_VALUES, value_address, index_address);
+        let index_checksum = seed_grid_block(&mut grid, index_address, &index_block);
+        seed_grid_block(&mut grid, value_address, &value_block);
+
+        let (mut tree, mut log) = new_object_tree();
+        let table = object_tree_table_info(&info, index_address, index_checksum, SNAPSHOT_LATEST);
+        tree.manifest_mut().insert_table(&mut log, 0, &table);
+
+        // Present key resolves from the value block:
+        let result = tree.lookup_from_levels_cache(&mut grid, SNAPSHOT_LATEST, TestKey(5));
+        assert!(matches!(
+            result,
+            LookupMemoryResult::Positive(TestValue { key: TestKey(5), data: 50 })
+        ));
+
+        // Absent key inside the table's key range: index routes, value search misses:
+        assert!(matches!(
+            tree.lookup_from_levels_cache(&mut grid, SNAPSHOT_LATEST, TestKey(7)),
+            LookupMemoryResult::Negative
+        ));
+
+        // Key below the table's range:
+        assert!(matches!(
+            tree.lookup_from_levels_cache(&mut grid, SNAPSHOT_LATEST, TestKey(1)),
+            LookupMemoryResult::Negative
+        ));
+    }
+
+    #[test]
+    fn tree_lookup_from_levels_cache_tombstone() {
+        let (mut grid, addresses) = new_object_grid(2);
+        let (value_address, index_address) = (addresses[0], addresses[1]);
+        let values = [
+            OBJECT_VALUES[0],
+            TestValue { key: TestKey(5 | TOMBSTONE_BIT), data: 0 },
+            OBJECT_VALUES[2],
+        ];
+        let (index_block, value_block, info) =
+            build_object_table(&values, value_address, index_address);
+        let index_checksum = seed_grid_block(&mut grid, index_address, &index_block);
+        seed_grid_block(&mut grid, value_address, &value_block);
+
+        let (mut tree, mut log) = new_object_tree();
+        let table = object_tree_table_info(&info, index_address, index_checksum, SNAPSHOT_LATEST);
+        tree.manifest_mut().insert_table(&mut log, 0, &table);
+
+        // A tombstone for key 5 resolves to Negative:
+        assert!(matches!(
+            tree.lookup_from_levels_cache(&mut grid, SNAPSHOT_LATEST, TestKey(5)),
+            LookupMemoryResult::Negative
+        ));
+    }
+
+    #[test]
+    fn tree_lookup_from_levels_cache_possible() {
+        let (mut grid, addresses) = new_object_grid(2);
+        let (value_address, index_address) = (addresses[0], addresses[1]);
+        let (index_block, _value_block, info) =
+            build_object_table(&OBJECT_VALUES, value_address, index_address);
+        let index_checksum = seed_grid_block(&mut grid, index_address, &index_block);
+
+        let (mut tree, mut log) = new_object_tree();
+        let table = object_tree_table_info(&info, index_address, index_checksum, SNAPSHOT_LATEST);
+        tree.manifest_mut().insert_table(&mut log, 0, &table);
+
+        // Index block cached, value block missing → possible (needs an async read):
+        assert!(matches!(
+            tree.lookup_from_levels_cache(&mut grid, SNAPSHOT_LATEST, TestKey(5)),
+            LookupMemoryResult::Possible { level: 0 }
+        ));
+
+        // Nothing cached at all → possible at level 0:
+        let (mut empty_grid, _) = new_object_grid(2);
+        assert!(matches!(
+            tree.lookup_from_levels_cache(&mut empty_grid, SNAPSHOT_LATEST, TestKey(5)),
+            LookupMemoryResult::Possible { level: 0 }
+        ));
+    }
+
+    #[test]
+    fn tree_lookup_from_levels_cache_prefers_lower_level() {
+        // Two tables covering the same key range: the level-0 table holds the newer
+        // value and must win over the level-1 table.
+        let (mut grid, addresses) = new_object_grid(4);
+        let [value_a, index_a, value_b, index_b] =
+            [addresses[0], addresses[1], addresses[2], addresses[3]];
+        let newer_values = [
+            TestValue { key: TestKey(5), data: 50 },
+            TestValue { key: TestKey(7), data: 70 },
+            TestValue { key: TestKey(9), data: 90 },
+        ];
+        let older_values = [
+            TestValue { key: TestKey(5), data: 51 },
+            TestValue { key: TestKey(7), data: 71 },
+            TestValue { key: TestKey(9), data: 91 },
+        ];
+        let (a_index_buf, a_value_buf, info_a) =
+            build_object_table(&newer_values, value_a, index_a);
+        let (b_index_buf, b_value_buf, info_b) =
+            build_object_table(&older_values, value_b, index_b);
+        let checksum_a = seed_grid_block(&mut grid, index_a, &a_index_buf);
+        seed_grid_block(&mut grid, value_a, &a_value_buf);
+        let checksum_b = seed_grid_block(&mut grid, index_b, &b_index_buf);
+        seed_grid_block(&mut grid, value_b, &b_value_buf);
+
+        let (mut tree, mut log) = new_object_tree();
+        let table_a = object_tree_table_info(&info_a, index_a, checksum_a, SNAPSHOT_LATEST);
+        let table_b = object_tree_table_info(&info_b, index_b, checksum_b, SNAPSHOT_LATEST);
+        tree.manifest_mut().insert_table(&mut log, 0, &table_a);
+        tree.manifest_mut().insert_table(&mut log, 1, &table_b);
+
+        let result = tree.lookup_from_levels_cache(&mut grid, SNAPSHOT_LATEST, TestKey(5));
+        assert!(matches!(
+            result,
+            LookupMemoryResult::Positive(TestValue { key: TestKey(5), data: 50 })
+        ));
+    }
 }
