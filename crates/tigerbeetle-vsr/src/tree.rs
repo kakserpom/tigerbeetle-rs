@@ -802,6 +802,151 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // Tree write path: `put` → `compact` (sort suffix) →
+    // `swap_mutable_and_immutable` (absorb/compact) → served from the
+    // immutable table on the next `lookup_from_levels_cache`.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn tree_compact_sorts_and_dedups_the_mutable_suffix() {
+        let mut tree = Tree::<TestObjectSpec>::new(
+            TreeConfig { id: 1, name: "object" },
+            Options { batch_value_count_limit: 32 },
+        );
+        let mut scratch = ScratchMemory::<TestValue>::new(64);
+
+        // Out-of-order puts create multiple runs; a duplicate key resolves to the
+        // value of the latest put.
+        tree.put(&TestValue { key: TestKey(5), data: 50 });
+        tree.put(&TestValue { key: TestKey(3), data: 30 });
+        tree.put(&TestValue { key: TestKey(9), data: 90 });
+        tree.put(&TestValue { key: TestKey(9), data: 91 });
+        tree.compact(&mut scratch);
+
+        let values = tree.table_mutable.values_used();
+        assert_eq!(
+            values,
+            &[
+                TestValue { key: TestKey(3), data: 30 },
+                TestValue { key: TestKey(5), data: 50 },
+                TestValue { key: TestKey(9), data: 91 },
+            ]
+        );
+        assert_eq!(tree.table_mutable.count(), 3);
+    }
+
+    #[test]
+    fn tree_swap_mutable_and_immutable_compacts_when_immutable_flushed() {
+        // A freshly-initialized tree has an empty, "flushed" immutable table, so the
+        // first swap takes the compact path (mutable becomes the new immutable).
+        let (mut tree, _log) = new_object_tree();
+        let mut scratch = ScratchMemory::<TestValue>::new(64);
+
+        tree.put(&TestValue { key: TestKey(3), data: 30 });
+        tree.put(&TestValue { key: TestKey(5), data: 50 });
+        tree.compact(&mut scratch);
+        tree.swap_mutable_and_immutable(1, &mut scratch);
+
+        assert_eq!(tree.table_mutable.count(), 0);
+        assert_eq!(tree.table_immutable.count(), 2);
+        assert!(matches!(
+            tree.table_immutable.mutability(),
+            Mutability::Immutable(state) if !state.flushed
+        ));
+
+        // The immutable table now serves lookups without any grid traffic:
+        let (mut grid, _) = new_object_grid(1);
+        assert!(matches!(
+            tree.lookup_from_levels_cache(&mut grid, SNAPSHOT_LATEST, TestKey(3)),
+            LookupMemoryResult::Positive(TestValue { key: TestKey(3), data: 30 })
+        ));
+        assert!(matches!(
+            tree.lookup_from_levels_cache(&mut grid, SNAPSHOT_LATEST, TestKey(5)),
+            LookupMemoryResult::Positive(TestValue { key: TestKey(5), data: 50 })
+        ));
+        assert!(matches!(
+            tree.lookup_from_levels_cache(&mut grid, SNAPSHOT_LATEST, TestKey(7)),
+            LookupMemoryResult::Negative
+        ));
+    }
+
+    #[test]
+    fn tree_swap_mutable_and_immutable_absorbs_when_immutable_unflushed() {
+        let (mut tree, _log) = new_object_tree();
+        let mut scratch = ScratchMemory::<TestValue>::new(64);
+
+        tree.put(&TestValue { key: TestKey(3), data: 30 });
+        tree.put(&TestValue { key: TestKey(5), data: 50 });
+        tree.compact(&mut scratch);
+        tree.swap_mutable_and_immutable(1, &mut scratch);
+        assert!(matches!(
+            tree.table_immutable.mutability(),
+            Mutability::Immutable(state) if !state.flushed
+        ));
+
+        // The immutable table is unflushed → the second swap absorbs instead of compacting.
+        tree.put(&TestValue { key: TestKey(7), data: 70 });
+        tree.compact(&mut scratch);
+        tree.swap_mutable_and_immutable(2, &mut scratch);
+
+        assert_eq!(tree.table_mutable.count(), 0);
+        assert_eq!(tree.table_immutable.count(), 3);
+
+        let (mut grid, _) = new_object_grid(1);
+        for (key, data) in [(3_u64, 30_u64), (5, 50), (7, 70)] {
+            let result = tree.lookup_from_levels_cache(&mut grid, SNAPSHOT_LATEST, TestKey(key));
+            assert!(matches!(
+                result,
+                LookupMemoryResult::Positive(TestValue { key: TestKey(k), data: d })
+                    if k == key && d == data
+            ));
+        }
+    }
+
+    #[test]
+    fn tree_swap_mutable_and_immutable_latest_version_wins() {
+        let (mut tree, _log) = new_object_tree();
+        let mut scratch = ScratchMemory::<TestValue>::new(64);
+
+        // First version is served from the immutable table...
+        tree.put(&TestValue { key: TestKey(5), data: 50 });
+        tree.compact(&mut scratch);
+        tree.swap_mutable_and_immutable(1, &mut scratch);
+
+        // ...until a later swap folds in a newer version of the same key.
+        tree.put(&TestValue { key: TestKey(5), data: 55 });
+        tree.compact(&mut scratch);
+        tree.swap_mutable_and_immutable(2, &mut scratch);
+
+        let (mut grid, _) = new_object_grid(1);
+        assert!(matches!(
+            tree.lookup_from_levels_cache(&mut grid, SNAPSHOT_LATEST, TestKey(5)),
+            LookupMemoryResult::Positive(TestValue { key: TestKey(5), data: 55 })
+        ));
+    }
+
+    #[test]
+    fn tree_swap_mutable_and_immutable_tombstone_resolves_negative() {
+        let (mut tree, _log) = new_object_tree();
+        let mut scratch = ScratchMemory::<TestValue>::new(64);
+
+        tree.put(&TestValue { key: TestKey(3), data: 30 });
+        tree.remove(&TestValue { key: TestKey(5), data: 50 });
+        tree.compact(&mut scratch);
+        tree.swap_mutable_and_immutable(1, &mut scratch);
+
+        let (mut grid, _) = new_object_grid(1);
+        assert!(matches!(
+            tree.lookup_from_levels_cache(&mut grid, SNAPSHOT_LATEST, TestKey(3)),
+            LookupMemoryResult::Positive(TestValue { key: TestKey(3), data: 30 })
+        ));
+        assert!(matches!(
+            tree.lookup_from_levels_cache(&mut grid, SNAPSHOT_LATEST, TestKey(5)),
+            LookupMemoryResult::Negative
+        ));
+    }
+
+    // ------------------------------------------------------------------
     // Tree read path: `lookup_from_levels_cache` over a table built with
     // the real `TableBuilder`, stored in the manifest, served from the Grid
     // cache. Touches the whole read seam: manifest `LookupIterator` →
@@ -815,6 +960,7 @@ mod tests {
     };
     use tigerbeetle_lsm::free_set::SHARD_BITS as FREE_SET_SHARD_BITS;
     use tigerbeetle_lsm::schema::manifest_node::TableInfo as WireTableInfo;
+    use tigerbeetle_lsm::scratch_memory::ScratchMemory;
 
     const TOMBSTONE_BIT: u64 = 1_u64 << 63;
     const FREE_SET_BLOCKS: usize = 2 * FREE_SET_SHARD_BITS;
