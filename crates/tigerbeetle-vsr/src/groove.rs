@@ -10,10 +10,10 @@
 //! DEVIATION: upstream's prefetch pipeline (~480 lines) is deferred to the async I/O phase.
 //! For now `prefetch_setup`, `prefetch_enqueue`, and `prefetch` are stubs.
 
-//! DEVIATION: upstream's `ObjectsCache` is a SetAssociativeCache with a HashMap stash
-//! below it. The port keeps only the stash layer (see `objects_cache.rs`); groove `get`
-//! therefore has no tombstone/orphaned-key surface, collapsing upstream's
-//! `ObjectCacheResult` to `Option<&Object>`.
+//! DEVIATION: upstream's `ObjectsCache` is the full `CacheMapType` (a SetAssociativeCache
+//! on top of a HashMap stash). This port uses the same `tigerbeetle_lsm::cache_map::CacheMap`
+//! for the groove objects cache. The `remove()`/tombstone path is only reachable under
+//! `constants.verify` (unit tests/fuzzers), mirroring upstream.
 
 #![allow(
     clippy::cast_possible_truncation,
@@ -21,19 +21,122 @@
 )]
 
 use tigerbeetle_core::constants;
+use tigerbeetle_core::stdx::hash::{hash_inline_u64, hash_inline_u128};
 use tigerbeetle_core::types::{Account, AccountFlags, Transfer, TransferFlags, TransferPending};
+use tigerbeetle_lsm::cache_map::{CacheMap, CacheMapSpec};
 use tigerbeetle_lsm::composite_key::{
     self, CompositeKey, CompositeKey64, CompositeKey128, CompositeKeyUnit, U256,
 };
 use tigerbeetle_lsm::manifest::ManifestLog;
+use tigerbeetle_lsm::set_associative_cache::{Layout, SetAssociativeCacheSpec};
 use tigerbeetle_lsm::table_memory::{self, Usage};
 use tigerbeetle_lsm::tree::ScopeCloseMode;
 use tigerbeetle_lsm::unique_key::{UniqueKey, UniqueKey128};
 
 use crate::grid::Grid;
-use crate::objects_cache::ObjectsCache;
 use crate::table::{self, BlockValue, IndexBlocks, TableLayout, TableSpec, TableUsage};
 use crate::tree::{LookupMemoryResult, Tree};
+
+// ---------------------------------------------------------------------------
+// Groove objects-cache specs
+// ---------------------------------------------------------------------------
+//
+// Each groove carries a `CacheMap` (upstream `CacheMapType`) keyed by the object's primary
+// key and valu-typed as the object itself. The tombstones, `key_from_value`, and `hash`
+// mirror upstream `Groove.ObjectsCacheHelpers` (`groove.zig:536-566`): a tombstone is an
+// object whose `timestamp` high bit (`composite_key::TOMBSTONE_BIT`) is set.
+
+/// Objects-cache spec for the [`Account`] groove (primary key: `id`).
+pub struct AccountObjectsCacheSpec;
+
+impl Layout for AccountObjectsCacheSpec {}
+
+impl SetAssociativeCacheSpec for AccountObjectsCacheSpec {
+    type Key = u128;
+    type Value = Account;
+
+    fn key_from_value(value: &Account) -> u128 {
+        value.id
+    }
+
+    fn hash(key: u128) -> u64 {
+        hash_inline_u128(key)
+    }
+}
+
+impl CacheMapSpec for AccountObjectsCacheSpec {
+    fn tombstone_from_key(key: u128) -> Account {
+        Account { id: key, timestamp: composite_key::TOMBSTONE_BIT, ..Account::default() }
+    }
+
+    fn tombstone(value: &Account) -> bool {
+        value.timestamp & composite_key::TOMBSTONE_BIT != 0
+    }
+}
+
+/// Objects-cache spec for the [`Transfer`] groove (primary key: `id`).
+pub struct TransferObjectsCacheSpec;
+
+impl Layout for TransferObjectsCacheSpec {}
+
+impl SetAssociativeCacheSpec for TransferObjectsCacheSpec {
+    type Key = u128;
+    type Value = Transfer;
+
+    fn key_from_value(value: &Transfer) -> u128 {
+        value.id
+    }
+
+    fn hash(key: u128) -> u64 {
+        hash_inline_u128(key)
+    }
+}
+
+impl CacheMapSpec for TransferObjectsCacheSpec {
+    fn tombstone_from_key(key: u128) -> Transfer {
+        Transfer { id: key, timestamp: composite_key::TOMBSTONE_BIT, ..Transfer::default() }
+    }
+
+    fn tombstone(value: &Transfer) -> bool {
+        value.timestamp & composite_key::TOMBSTONE_BIT != 0
+    }
+}
+
+/// Objects-cache spec for the [`TransferPending`] groove (primary key: `timestamp`).
+pub struct TransferPendingObjectsCacheSpec;
+
+impl Layout for TransferPendingObjectsCacheSpec {}
+
+impl SetAssociativeCacheSpec for TransferPendingObjectsCacheSpec {
+    type Key = u64;
+    type Value = TransferPending;
+
+    fn key_from_value(value: &TransferPending) -> u64 {
+        value.timestamp & !composite_key::TOMBSTONE_BIT
+    }
+
+    fn hash(key: u64) -> u64 {
+        hash_inline_u64(key)
+    }
+}
+
+impl CacheMapSpec for TransferPendingObjectsCacheSpec {
+    fn tombstone_from_key(key: u64) -> TransferPending {
+        assert_eq!(key & composite_key::TOMBSTONE_BIT, 0);
+        TransferPending {
+            timestamp: key | composite_key::TOMBSTONE_BIT,
+            ..TransferPending::default()
+        }
+    }
+
+    fn tombstone(value: &TransferPending) -> bool {
+        value.timestamp & composite_key::TOMBSTONE_BIT != 0
+    }
+}
+
+pub type AccountObjectsCache = CacheMap<AccountObjectsCacheSpec>;
+pub type TransferObjectsCache = CacheMap<TransferObjectsCacheSpec>;
+pub type TransferPendingObjectsCache = CacheMap<TransferPendingObjectsCacheSpec>;
 
 // ---------------------------------------------------------------------------
 // BlockValue impls for composite / unique key value types
@@ -804,10 +907,9 @@ pub struct AccountGroove {
     pub closed: Tree<CompositeKeyUnitSpec>,
     /// Per-session objects cache, keyed by the account's primary key (id).
     ///
-    /// DEVIATION: upstream's cache is the `SetAssociativeCache` + stash pair; sans-IO the
-    /// stash alone is kept (see `objects_cache.rs`). Invariant with the object tree holds
-    /// (groove.zig:725-728): anything visible in-session lives here first.
-    objects_cache: ObjectsCache<u128, Account>,
+    /// Invariant with the object tree holds (groove.zig:725-728): anything visible
+    /// in-session lives here first.
+    objects_cache: AccountObjectsCache,
 }
 
 /// The Transfer groove.
@@ -827,7 +929,7 @@ pub struct TransferGroove {
     pub imported: Tree<CompositeKeyUnitSpec>,
     pub closing: Tree<CompositeKeyUnitSpec>,
     /// Per-session objects cache, keyed by the transfer's primary key (id).
-    objects_cache: ObjectsCache<u128, Transfer>,
+    objects_cache: TransferObjectsCache,
 }
 
 // ---------------------------------------------------------------------------
@@ -870,11 +972,11 @@ impl AccountGroove {
     /// Lookup an account by its primary key (id) from the objects cache.
     ///
     /// Mirrors `groove.zig:885-936` (`get(PrimaryKey) ObjectCacheResult`), collapsed to
-    /// `Option`: the ported stash has no tombstones and orphans are resolved to `Negative`
-    /// by [`AccountGroove::lookup`] instead of being cached.
+    /// `Option`: tombstones and orphans are resolved to `Negative` by
+    /// [`AccountGroove::lookup`] instead of being surfaced here.
     #[must_use]
-    pub fn get(&self, id: u128) -> Option<&Account> {
-        self.objects_cache.get(&id)
+    pub fn get(&mut self, id: u128) -> Option<&Account> {
+        self.objects_cache.get(id)
     }
 
     /// Resolve an account by its primary key (id) from the tree levels.
@@ -923,7 +1025,7 @@ impl AccountGroove {
 
         self.objects.put(object);
         self.objects.key_range_update(object.timestamp);
-        self.objects_cache.upsert(*object);
+        self.objects_cache.upsert(object);
 
         // id (unique key)
         self.id.put(&UniqueKey128 { field: object.id, timestamp: object.timestamp, padding: 0 });
@@ -1053,7 +1155,7 @@ impl AccountGroove {
 
         // Overwrite the object tree entry.
         self.objects.put(new);
-        self.objects_cache.upsert(*new);
+        self.objects_cache.upsert(new);
     }
 
     pub fn open_commence(&mut self, manifest_log: &mut impl ManifestLog) {
@@ -1089,11 +1191,11 @@ impl TransferGroove {
     /// Lookup a transfer by its primary key (id) from the objects cache.
     ///
     /// Mirrors `groove.zig:885-936` (`get(PrimaryKey) ObjectCacheResult`), collapsed to
-    /// `Option`: the ported stash has no tombstones and orphans are resolved to `Negative`
-    /// by [`TransferGroove::lookup`] instead of being cached.
+    /// `Option`: tombstones and orphans are resolved to `Negative` by
+    /// [`TransferGroove::lookup`] instead of being surfaced here.
     #[must_use]
-    pub fn get(&self, id: u128) -> Option<&Transfer> {
-        self.objects_cache.get(&id)
+    pub fn get(&mut self, id: u128) -> Option<&Transfer> {
+        self.objects_cache.get(id)
     }
 
     /// Resolve a transfer by its primary key (id) from the tree levels.
@@ -1182,7 +1284,7 @@ impl TransferGroove {
 
         self.objects.put(object);
         self.objects.key_range_update(object.timestamp);
-        self.objects_cache.upsert(*object);
+        self.objects_cache.upsert(object);
 
         // id (unique key)
         self.id.put(&UniqueKey128 { field: object.id, timestamp: object.timestamp, padding: 0 });
@@ -1367,7 +1469,7 @@ impl TransferGroove {
 
         // Overwrite the object tree entry.
         self.objects.put(new);
-        self.objects_cache.upsert(*new);
+        self.objects_cache.upsert(new);
     }
 
     pub fn open_commence(&mut self, manifest_log: &mut impl ManifestLog) {
@@ -1419,7 +1521,7 @@ impl TransferGroove {
 /// `post_or_void_pending_transfer`.
 pub struct TransferPendingGroove {
     /// Per-session objects cache, keyed by the pending transfer's timestamp.
-    objects_cache: ObjectsCache<u64, TransferPending>,
+    objects_cache: TransferPendingObjectsCache,
 }
 
 impl TransferPendingGroove {
@@ -1435,18 +1537,18 @@ impl TransferPendingGroove {
 
     /// Lookup a `TransferPending` record by its primary key (timestamp).
     #[must_use]
-    pub fn get(&self, timestamp: u64) -> Option<&TransferPending> {
-        self.objects_cache.get(&timestamp)
+    pub fn get(&mut self, timestamp: u64) -> Option<&TransferPending> {
+        self.objects_cache.get(timestamp)
     }
 
     /// Insert a pending transfer record.
     pub fn insert(&mut self, object: &TransferPending) {
-        self.objects_cache.upsert(*object);
+        self.objects_cache.upsert(object);
     }
 
     /// Update the status of an existing pending transfer record.
     pub fn update(&mut self, new: &TransferPending) {
-        self.objects_cache.upsert(*new);
+        self.objects_cache.upsert(new);
     }
 
     pub fn open_commence(&mut self, _manifest_log: &mut impl ManifestLog) {
@@ -1476,6 +1578,7 @@ mod tests {
     use crate::table::{DataFinishOptions, IndexFinishOptions, TableBuilder, TableInfo};
     use crate::tree::TreeSpec;
     use tigerbeetle_core::types::TransferPendingStatus;
+    use tigerbeetle_lsm::cache_map::{CacheMapOptions, GetOrTombstone};
 
     /// Build a single-value-block table from strictly key-sorted values.
     fn build_table<S: TableSpec>(values: &[S::Value]) -> (Vec<u8>, Vec<u8>, TableInfo<S::Key>) {
@@ -1841,6 +1944,36 @@ mod tests {
         tree.open_complete(0);
     }
 
+    fn new_account_objects_cache() -> AccountObjectsCache {
+        // Sizing mirrors upstream groove.zig:766-780: cache_entries_max from config;
+        // stash sized for lsm_compaction_ops * (batch_value_count_limit + prefetch);
+        // scope sized for a single beat's batch_value_count_limit.
+        AccountObjectsCache::new(CacheMapOptions {
+            cache_value_count_max: 256,
+            stash_value_count_max: constants::LSM_COMPACTION_OPS as u32 * 32,
+            scope_value_count_max: 32,
+            name: "accounts_objects",
+        })
+    }
+
+    fn new_transfer_objects_cache() -> TransferObjectsCache {
+        TransferObjectsCache::new(CacheMapOptions {
+            cache_value_count_max: 256,
+            stash_value_count_max: constants::LSM_COMPACTION_OPS as u32 * 32,
+            scope_value_count_max: 32,
+            name: "transfers_objects",
+        })
+    }
+
+    fn new_transfer_pending_objects_cache() -> TransferPendingObjectsCache {
+        TransferPendingObjectsCache::new(CacheMapOptions {
+            cache_value_count_max: 256,
+            stash_value_count_max: constants::LSM_COMPACTION_OPS as u32 * 32,
+            scope_value_count_max: 32,
+            name: "transfers_pending_objects",
+        })
+    }
+
     fn new_account_groove() -> AccountGroove {
         fn tree<S: crate::tree::TreeSpec>(id: u16, name: &'static str) -> Tree<S> {
             Tree::<S>::new(TreeConfig { id, name }, Options { batch_value_count_limit: 32 })
@@ -1855,7 +1988,7 @@ mod tests {
             code: tree(7, "accounts_code"),
             imported: tree(8, "accounts_imported"),
             closed: tree(9, "accounts_closed"),
-            objects_cache: ObjectsCache::default(),
+            objects_cache: new_account_objects_cache(),
         }
     }
 
@@ -1878,7 +2011,7 @@ mod tests {
             expires_at: tree(21, "transfers_expires_at"),
             imported: tree(22, "transfers_imported"),
             closing: tree(23, "transfers_closing"),
-            objects_cache: ObjectsCache::default(),
+            objects_cache: new_transfer_objects_cache(),
         }
     }
 
@@ -2182,7 +2315,8 @@ mod tests {
 
     #[test]
     fn pending_groove_objects_cache_scope_discard() {
-        let mut groove = TransferPendingGroove { objects_cache: ObjectsCache::default() };
+        let mut groove =
+            TransferPendingGroove { objects_cache: new_transfer_pending_objects_cache() };
 
         let mut pending = TransferPending {
             timestamp: 1,
@@ -2206,5 +2340,70 @@ mod tests {
                 padding: [0; 7]
             })
         );
+    }
+
+    #[test]
+    fn account_objects_cache_cache_tier_evicts_to_stash() {
+        // The set-associative cache tier absorbs lookups; when it overflows, evicted
+        // entries flow to the stash so nothing inserted is ever lost (cache_map.zig:11-17).
+        const N: u32 = 300;
+        let mut cache = new_account_objects_cache();
+        for i in 1..=N {
+            cache.upsert(&Account {
+                id: u128::from(i),
+                timestamp: u64::from(i),
+                ..Account::default()
+            });
+        }
+
+        // The cache tier can hold at most cache_value_count_max entries.
+        assert!(cache.cache_entries() <= cache.cache_entries_max());
+        assert_eq!(cache.cache_entries_max(), 256);
+
+        // Every inserted key still resolves, even the ones evicted into the stash.
+        for i in 1..=N {
+            assert_eq!(cache.get(u128::from(i)).map(|a| a.timestamp), Some(u64::from(i)));
+        }
+        // Keys that were never inserted still miss.
+        assert!(cache.get(0).is_none());
+        assert!(cache.get(u128::from(N) + 1).is_none());
+    }
+
+    #[test]
+    fn account_objects_cache_tombstone_hides_deleted_key() {
+        let mut cache = new_account_objects_cache();
+        cache.upsert(&Account { id: 7, timestamp: 1, ..Account::default() });
+        assert!(cache.has(7));
+
+        // `remove` is only reachable under `constants.verify` (unit tests/fuzzers).
+        cache.remove(7);
+        assert!(!cache.has(7));
+        assert!(cache.get(7).is_none());
+        assert!(matches!(cache.get_or_tombstone(7), GetOrTombstone::Tombstone));
+
+        // Re-inserting resurrects the key.
+        cache.upsert(&Account { id: 7, timestamp: 2, ..Account::default() });
+        assert_eq!(cache.get(7).map(|a| a.timestamp), Some(2));
+    }
+
+    #[test]
+    fn transfer_pending_objects_cache_tombstone() {
+        // The timestamp-keyed spec masks the tombstone bit out of timestamps.
+        let mut cache = new_transfer_pending_objects_cache();
+        let pending = TransferPending {
+            timestamp: 5,
+            status: TransferPendingStatus::Pending,
+            padding: [0; 7],
+        };
+        cache.upsert(&pending);
+        assert!(cache.has(5));
+
+        cache.remove(5);
+        assert_eq!(cache.get(5), None);
+        assert!(matches!(cache.get_or_tombstone(5), GetOrTombstone::Tombstone));
+
+        cache.reset();
+        assert!(!cache.has(5));
+        assert!(matches!(cache.get_or_tombstone(5), GetOrTombstone::NotFound));
     }
 }

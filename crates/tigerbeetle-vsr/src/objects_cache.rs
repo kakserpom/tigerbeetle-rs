@@ -6,9 +6,13 @@
 //! Upstream's CacheMap is a SetAssociativeCache with a HashMap stash below it.
 //! The stash carries the *guarantee* that holds within a commit: every object
 //! that was prefetched, plus every object inserted in-session, is present for
-//! the batch's reads to see. This port keeps only that stash layer — there is
-//! no tree/immutable-table backing to absorb lookups sans-IO, so the
-//! associative cache on top would cache nothing.
+//! the batch's reads to see.
+//!
+//! DEVIATION: the grooves themselves now use the full `tigerbeetle_lsm::cache_map::CacheMap`
+//! (see `groove.rs`). This type remains only as the *standalone* batch-scoped holder used by
+//! `state_machine.rs`'s execute path (a stash-only stand-in for reading through the groove
+//! cache, which is deferred to prefetch integration). It will be deleted once the execute
+//! path reads through the grooves' `CacheMap` directly.
 //!
 //! Scopes implement chain semantics: `scope_open` starts a scope,
 //! `scope_close(.persist)` commits it, and `scope_close(.discard)` replays a

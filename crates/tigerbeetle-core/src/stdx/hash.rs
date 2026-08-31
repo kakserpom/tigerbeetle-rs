@@ -114,11 +114,17 @@ pub fn hash_inline_u64(value: u64) -> u64 {
     low_level_hash(0, &value.to_le_bytes())
 }
 
+/// Upstream `hash_inline(value)` specialized to `u128` (object-cache primary keys).
+#[must_use]
+pub fn hash_inline_u128(value: u128) -> u64 {
+    low_level_hash(0, &value.to_le_bytes())
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-    use super::{hash_inline_u64, low_level_hash};
+    use super::{hash_inline_u64, hash_inline_u128, low_level_hash};
 
     /// Upstream test vectors from `src/stdx/testing/low_level_hash_vectors.zig`
     /// (originally Abseil's `low_level_hash_test.cc`): `(seed, expected_hash, base64_input)`.
@@ -729,6 +735,13 @@ mod tests {
     fn hash_inline_u64_matches_low_level_hash_of_le_bytes() {
         for value in [0u64, 1, 42, u64::MAX, 0xdead_beef_cafe_f00d] {
             assert_eq!(hash_inline_u64(value), low_level_hash(0, &value.to_le_bytes()));
+        }
+    }
+
+    #[test]
+    fn hash_inline_u128_matches_low_level_hash_of_le_bytes() {
+        for value in [0u128, 1, 42, u128::MAX, 0xdead_beef_cafe_f00d_0123_4567_89ab_cdef] {
+            assert_eq!(hash_inline_u128(value), low_level_hash(0, &value.to_le_bytes()));
         }
     }
 }
