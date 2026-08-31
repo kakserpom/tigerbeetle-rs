@@ -293,6 +293,33 @@ impl ManifestLog {
         self.grid_reservation = Some(grid.reserve(self.pace.blocks_count() as usize));
     }
 
+    /// Temporarily release the manifest log's long-lived grid reservation so the owning
+    /// forest can run `Grid::checkpoint` (upstream's grid checkout asserts that no
+    /// reservations are outstanding). Already-`acquire`d block addresses are committed to the
+    /// free set regardless of reservations, so no block is lost; the reservation only reserves
+    /// *capacity*, which `reserve_grid_blocks` restores afterwards.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no grid reservation is currently held.
+    pub fn forfeit_grid_reservation(&mut self, grid: &mut Grid) {
+        let reservation = self
+            .grid_reservation
+            .take()
+            .unwrap_or_else(|| unreachable!("grid reservation must be set by init_blocks"));
+        grid.forfeit(reservation);
+    }
+
+    /// Re-reserve the manifest ring's grid capacity after `Grid::checkpoint`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a reservation is already held or the ring's block count no longer fits.
+    pub fn reserve_grid_blocks(&mut self, grid: &mut Grid) {
+        assert!(self.grid_reservation.is_none());
+        self.grid_reservation = Some(grid.reserve(self.pace.blocks_count() as usize));
+    }
+
     /// Release all grid blocks held by this manifest log.
     pub fn deinit(&mut self, grid: &mut Grid) {
         for &loc in &self.blocks {

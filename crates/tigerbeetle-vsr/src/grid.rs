@@ -1315,6 +1315,14 @@ impl Grid {
         self.events.drain(..).collect()
     }
 
+    /// True while `Grid::checkpoint` has been started but not yet completed
+    /// (its completion clears `self.callback`). Used by the forest to sequence the
+    /// manifest flush and the free-set checkpoint during a single `Forest::checkpoint`.
+    #[must_use]
+    pub fn is_checkpoint_in_flight(&self) -> bool {
+        matches!(self.callback, Some(GridCallback::Checkpoint))
+    }
+
     /// Attach the superblock working-state snapshot used by `open`/`checkpoint`
     /// (DEVIATION: upstream reaches into `grid.superblock.working.*`; see
     /// [`SuperBlockView`]).

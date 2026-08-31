@@ -56,13 +56,21 @@ enum ForestProgress {
         /// `manifest_log_open_event`, forest.zig:381).
         replayed: SharedTableBuffer,
     },
-    /// Forest is checkpointing: manifest log flush in progress; user callback fires when done.
+    /// Forest is checkpointing: the manifest log flush, then the grid free-set checkpoint,
+    /// are sequenced in `Forest::poll`; the user callback fires only once both complete.
     Checkpoint {
         /// Set by the manifest log's flush-completion callback. `Forest::poll` reads this to
         /// know the flush is done (the completion callback itself runs while `manifest_log` is
         /// mutably borrowed, so it cannot touch `self.progress`).
         done: std::rc::Rc<std::cell::Cell<bool>>,
-        /// User callback invoked once the manifest log flush completes.
+        /// Whether `Grid::checkpoint` has been kicked off (only once the manifest flush is
+        /// done, so the encoded free set includes every manifest block).
+        grid_started: bool,
+        /// Whether the manifest log's grid reservation was forfeited to let the grid's own
+        /// checkpoint run (`Grid::checkpoint` asserts zero outstanding reservations); it is
+        /// restored once the grid checkpoint completes.
+        reservation_released: bool,
+        /// User callback invoked once the manifest flush and the grid checkpoint both complete.
         callback: Box<dyn FnMut()>,
     },
 }
@@ -167,14 +175,34 @@ impl Forest {
         self.grid.poll(storage);
         self.manifest_log.poll(&mut self.grid, storage);
 
-        // Checkpoint completion: the manifest log's flush-completion callback marks
-        // `done`; only then fire the user callback. (For the zero-block case the flag is
-        // already set before the first `poll`, handled by the explicit `poll` in
-        // `Forest::checkpoint`.)
-        if matches!(
-            &self.progress,
-            Some(ForestProgress::Checkpoint { done, .. }) if done.get()
-        ) {
+        // Checkpoint completion: sequence the manifest flush, then the grid free-set
+        // checkpoint, then finish. The manifest log's flush-completion callback marks
+        // `done`; only after that do we forfeit the manifest log's grid reservation (the grid
+        // checkpoint asserts zero outstanding reservations) and start `Grid::checkpoint`, so
+        // the encoded free set includes every manifest block. When the grid checkpoint is no
+        // longer in flight we restore the reservation and fire the user callback.
+        let mut complete = false;
+        if let Some(ForestProgress::Checkpoint { done, grid_started, reservation_released, .. }) =
+            &mut self.progress
+            && done.get()
+        {
+            if !*grid_started {
+                self.manifest_log.forfeit_grid_reservation(&mut self.grid);
+                *reservation_released = true;
+                // The free set only encodes once the previous checkpoint is durable
+                // (upstream `Grid.checkpoint_durable` before `Grid.checkpoint`).
+                self.grid.checkpoint_durable();
+                self.grid.checkpoint(storage);
+                *grid_started = true;
+            } else if !self.grid.is_checkpoint_in_flight() {
+                if *reservation_released {
+                    self.manifest_log.reserve_grid_blocks(&mut self.grid);
+                }
+                complete = true;
+            }
+        }
+
+        if complete {
             let Some(ForestProgress::Checkpoint { mut callback, .. }) = self.progress.take() else {
                 unreachable!("progress was just matched");
             };
@@ -183,7 +211,11 @@ impl Forest {
         }
 
         // Open completion: once the manifest log finishes opening, resume each groove.
+        // Guard on the variant *before* `take()`, which unconditionally clears `progress`
+        // (a `Checkpoint` must not be swallowed by this branch — it completes in its own
+        // block above).
         if self.manifest_log.is_opened()
+            && matches!(self.progress, Some(ForestProgress::Open { .. }))
             && let Some(ForestProgress::Open { checkpoint_op, replayed }) = self.progress.take()
         {
             // Upstream `manifest_log_open_callback` (forest.zig:402): the manifest log
@@ -279,18 +311,22 @@ impl Forest {
         self.manifest_log.compact(callback, op, &mut self.grid, storage);
     }
 
-    /// Flush all pending manifest log blocks durably to storage.
+    /// Flush all pending manifest log blocks durably to storage and checkpoint the grid's
+    /// free set (so the references below capture every manifest block).
     ///
-    /// Port of upstream `forest.checkpoint` (forest.zig:798). The user callback fires once
-    /// the manifest log's flush completes (all `WriteDone` events processed by `poll`).
+    /// Port of upstream `forest.checkpoint` (forest.zig:798) plus the grid free-set
+    /// checkpoint a replica drives alongside it. Sequence in `Forest::poll`: the manifest log
+    /// flush completes first (all `WriteDone` events processed), then the manifest log's grid
+    /// reservation is forfeited (the grid checkpoint asserts zero outstanding reservations),
+    /// `Grid::checkpoint` runs, and finally the reservation is restored. The user callback
+    /// fires once both complete.
     ///
-    /// After the callback fires, [`checkpoint_references`](ManifestLog::checkpoint_references)
-    /// returns the manifest block checksums/addresses to persist into the superblock
-    /// checkpoint trailer.
+    /// After the callback fires, [`references`](Self::references) returns the manifest block
+    /// checksums/addresses and the free-set trailer references to persist into the superblock
+    /// checkpoint trailer — the reopen inputs for a later [`open`](Self::open).
     ///
-    /// For zero-block manifests (no entries appended since last checkpoint/open), the
-    /// callback fires synchronously before `checkpoint` returns. For non-zero blocks,
-    /// the callback fires on a subsequent [`poll`] call.
+    /// For both zero-block manifests and a free set with nothing to encode, the phases still
+    /// run through `poll`; the caller drives [`poll`](Self::poll) until the callback fires.
     ///
     /// # Panics
     ///
@@ -305,8 +341,12 @@ impl Forest {
         // needs per-tree compaction state tracking.
 
         let done = std::rc::Rc::new(std::cell::Cell::new(false));
-        self.progress =
-            Some(ForestProgress::Checkpoint { done: done.clone(), callback: Box::new(callback) });
+        self.progress = Some(ForestProgress::Checkpoint {
+            done: done.clone(),
+            grid_started: false,
+            reservation_released: false,
+            callback: Box::new(callback),
+        });
 
         // The manifest log checkpoint closes any open block, asserts all blocks
         // are closed, then flushes (writes) them. The completion callback marks
@@ -557,8 +597,8 @@ mod tests {
         assert!(refs.newest_address > 0);
     }
 
-    /// A checkpoint on a manifest with no pending entries fires its callback
-    /// synchronously (zero blocks to flush). The references are empty/default.
+    /// A checkpoint on a manifest with no pending entries and an unpopulated free set still
+    /// sequences both phases; the references are empty/default.
     #[test]
     fn forest_checkpoint_empty_log() {
         let mut forest = Forest::init(test_superblock(), grid_options(), 32);
@@ -574,8 +614,14 @@ mod tests {
             &mut storage,
         );
 
-        // Zero blocks → callback fires synchronously inside Forest::checkpoint's poll.
-        assert!(checkpointed.get());
+        // The callback fires only after the (empty) manifest flush and the free-set
+        // checkpoint both traverse `poll`.
+        let mut polls = 0;
+        while !checkpointed.get() {
+            forest.poll(&mut storage);
+            polls += 1;
+            assert!(polls < 1000, "checkpoint must complete");
+        }
         assert!(forest.progress.is_none());
         assert!(forest.manifest_log.checkpoint_references().empty());
     }
@@ -656,5 +702,76 @@ mod tests {
         assert_eq!(forest.transfers.id.manifest_table_count(), 0);
         assert_eq!(forest.transfers_pending.objects_table_count(), 1);
         assert_eq!(forest.transfers_pending.status_table_count(), 0);
+    }
+
+    /// A full restart seam: forest A appends manifest entries, checkpoints (making the
+    /// manifest blocks durable AND encoding the grid free set that contains them), and a
+    /// fresh forest B over the same storage reopens from the recovered free-set refs plus the
+    /// manifest refs on its superblock view, replaying the entries into the owning trees.
+    #[test]
+    fn forest_open_recovers_manifest_from_durable_blocks() {
+        let mut forest_a = Forest::init(test_superblock(), grid_options(), 32);
+        let mut storage = storage();
+        open_forest(&mut forest_a, &mut storage);
+
+        // u64-keyed (account object) entries, so they survive `TreeTableInfo::decode` on reopen.
+        forest_a.manifest_log.append(&manifest_info_u64(0x1000, 7), &mut forest_a.grid);
+        forest_a.manifest_log.append(&manifest_info_u64(0x1001, 7), &mut forest_a.grid);
+
+        let a_done = std::rc::Rc::new(std::cell::Cell::new(false));
+        forest_a.checkpoint(
+            {
+                let a_done = a_done.clone();
+                move || a_done.set(true)
+            },
+            &mut storage,
+        );
+        let mut polls = 0;
+        while !a_done.get() {
+            forest_a.poll(&mut storage);
+            polls += 1;
+            assert!(polls < 1000, "checkpoint must complete");
+        }
+
+        // Capture the restart references forest A produced.
+        let manifest_refs = forest_a.manifest_log.checkpoint_references();
+        assert_eq!(manifest_refs.block_count, 1);
+        let grid_refs = forest_a.grid.free_set_checkpoint_references();
+        assert!(!grid_refs.blocks_acquired.empty(), "free set must encode the manifest blocks");
+
+        // The recovered free set lives above the initial zone, so the reopened view's
+        // storage size must cover the highest recorded address (as the superblock records it).
+        let highest_address = grid_refs
+            .blocks_acquired
+            .last_block_address
+            .max(grid_refs.blocks_released.last_block_address);
+        let storage_size = DATA_FILE_SIZE_MIN as u64 + highest_address * BLOCK_SIZE as u64;
+
+        // Carry the manifest refs on the reopen superblock view.
+        let reopen_view = SuperBlockView {
+            storage_size,
+            manifest_block_count: manifest_refs.block_count,
+            manifest_oldest_address: manifest_refs.oldest_address,
+            manifest_oldest_checksum: manifest_refs.oldest_checksum,
+            manifest_newest_address: manifest_refs.newest_address,
+            manifest_newest_checksum: manifest_refs.newest_checksum,
+            ..test_superblock()
+        };
+
+        // Fresh forest over the same storage, reopened with the recovered free set.
+        let mut forest_b = Forest::init(reopen_view, grid_options(), 32);
+        forest_b.open(grid_refs, &mut storage, 0);
+        let mut b_done = false;
+        for _ in 0..1000 {
+            forest_b.poll(&mut storage);
+            if forest_b.progress.is_none() && forest_b.accounts.objects.is_opened() {
+                b_done = true;
+                break;
+            }
+        }
+        assert!(b_done, "reopen must complete");
+
+        // Both entries replayed into the account object tree (tree 7) on reopen.
+        assert_eq!(forest_b.accounts.objects.manifest_table_count(), 2);
     }
 }
