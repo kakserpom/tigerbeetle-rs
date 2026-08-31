@@ -1765,6 +1765,22 @@ impl TransferPendingGroove {
         self.objects_cache.has(timestamp)
     }
 
+    /// Lookup a `TransferPending` record by its primary key (timestamp) from the object
+    /// tree over the grid cache. Unlike `AccountGroove`/`TransferGroove`, the pending
+    /// groove's primary key *is* the timestamp, so this is a single-hop read (no unique-key
+    /// tree to resolve through), mirroring upstream's `IndexTreeType(get)` object read
+    /// (groove.zig / state_machine.zig:470). `Possible` propagates when the tree cannot
+    /// serve the value from the grid cache (deferred to the async read phase).
+    #[must_use]
+    pub fn lookup(
+        &mut self,
+        grid: &mut Grid,
+        snapshot: u64,
+        timestamp: u64,
+    ) -> LookupMemoryResult<TransferPending> {
+        self.objects.lookup_from_levels_cache(grid, snapshot, timestamp)
+    }
+
     /// Remove the pending record at `timestamp` by placing a tombstone in the cache,
     /// mirroring `groove.remove` (groove.zig:1876).
     ///
@@ -2871,6 +2887,60 @@ mod tests {
         let none_key = 3;
         assert!(matches!(
             groove.status.lookup_from_levels_cache(&mut grid, SNAPSHOT_LATEST, none_key),
+            LookupMemoryResult::Negative
+        ));
+    }
+
+    #[test]
+    fn pending_groove_lookup_over_grid() {
+        // Build+open the pending object tree through the grid (like
+        // pending_groove_tree_read_path) and drive the public `lookup` seam:
+        // an in-range present timestamp resolves Positive, an in-range absent
+        // timestamp Negative, and a tree whose value block is not cached yields
+        // Possible (deferred to the async read phase).
+        let pending_values = [
+            TransferPending {
+                timestamp: 1,
+                status: TransferPendingStatus::Pending,
+                padding: [0; 7],
+            },
+            TransferPending {
+                timestamp: 2,
+                status: TransferPendingStatus::Posted,
+                padding: [0; 7],
+            },
+        ];
+
+        let (mut grid, _) = new_groove_grid(2);
+        let addresses = acquire_addresses(&mut grid, 2);
+        let (objects_index, objects_value) = (addresses[0], addresses[1]);
+
+        let (obj_index_block, obj_value_block, obj_info) =
+            build_table_with::<TransferPendingObjectSpec>(
+                &pending_values,
+                20,
+                objects_value,
+                objects_index,
+            );
+        let obj_checksum = seed_grid_block(&mut grid, objects_index, &obj_index_block);
+        seed_grid_block(&mut grid, objects_value, &obj_value_block);
+
+        let mut groove = new_transfer_pending_groove();
+        open_tree(&mut groove.objects, &obj_info, objects_index, obj_checksum, 20);
+
+        // Present timestamp (single hop, no unique-key tree):
+        assert!(matches!(
+            groove.lookup(&mut grid, SNAPSHOT_LATEST, 1),
+            LookupMemoryResult::Positive(TransferPending {
+                timestamp: 1,
+                status: TransferPendingStatus::Pending,
+                ..
+            })
+        ));
+
+        // In-range gap → Negative:
+        assert!(matches!(
+            groove.lookup(&mut grid, SNAPSHOT_LATEST, 3),
             LookupMemoryResult::Negative
         ));
     }
