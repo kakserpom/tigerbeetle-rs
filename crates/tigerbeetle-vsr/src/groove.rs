@@ -22,7 +22,9 @@
 
 use tigerbeetle_core::constants;
 use tigerbeetle_core::stdx::hash::{hash_inline_u64, hash_inline_u128};
-use tigerbeetle_core::types::{Account, AccountFlags, Transfer, TransferFlags, TransferPending};
+use tigerbeetle_core::types::{
+    Account, AccountFlags, Transfer, TransferFlags, TransferPending, TransferPendingStatus,
+};
 use tigerbeetle_lsm::cache_map::{CacheMap, CacheMapSpec};
 use tigerbeetle_lsm::composite_key::{
     self, CompositeKey, CompositeKey64, CompositeKey128, CompositeKeyUnit, U256,
@@ -323,6 +325,34 @@ impl BlockValue for Transfer {
     }
 }
 
+impl BlockValue for TransferPending {
+    fn write_bytes(&self, buf: &mut [u8]) {
+        assert!(buf.len() >= 16);
+        buf[..8].copy_from_slice(&self.timestamp.to_le_bytes());
+        buf[8] = self.status as u8;
+        buf[9..16].copy_from_slice(&self.padding);
+    }
+
+    fn from_bytes(bytes: &[u8]) -> Self {
+        Self {
+            timestamp: read_u64(bytes, 0),
+            status: match bytes[8] {
+                0 => TransferPendingStatus::None,
+                1 => TransferPendingStatus::Pending,
+                2 => TransferPendingStatus::Posted,
+                3 => TransferPendingStatus::Voided,
+                4 => TransferPendingStatus::Expired,
+                _ => panic!("invalid TransferPendingStatus byte {}", bytes[8]),
+            },
+            padding: {
+                let mut padding = [0u8; 7];
+                padding.copy_from_slice(&bytes[9..16]);
+                padding
+            },
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tree spec types
 //
@@ -452,6 +482,147 @@ impl crate::tree::TreeSpec for TransferObjectSpec {
 
     fn tombstone_from_key(key: u64) -> Transfer {
         Transfer { timestamp: key | composite_key::TOMBSTONE_BIT, ..Transfer::default() }
+    }
+}
+
+// ===== TransfersPending object tree (keyed by u64 timestamp) =====
+
+pub struct TransferPendingObjectSpec;
+
+impl table_memory::Table for TransferPendingObjectSpec {
+    type Key = u64;
+    type Value = TransferPending;
+    const VALUE_COUNT_MAX: usize = GROOVE_VALUE_COUNT_MAX;
+    const USAGE: Usage = Usage::General;
+
+    fn key_from_value(value: &TransferPending) -> u64 {
+        value.timestamp & !composite_key::TOMBSTONE_BIT
+    }
+
+    fn tombstone(value: &TransferPending) -> bool {
+        value.timestamp & composite_key::TOMBSTONE_BIT != 0
+    }
+}
+
+impl TableSpec for TransferPendingObjectSpec {
+    type Key = u64;
+    type Value = TransferPending;
+
+    fn key_from_value(value: &TransferPending) -> u64 {
+        value.timestamp & !composite_key::TOMBSTONE_BIT
+    }
+
+    const SENTINEL_KEY: u64 = u64::MAX;
+
+    fn tombstone(value: &TransferPending) -> bool {
+        value.timestamp & composite_key::TOMBSTONE_BIT != 0
+    }
+
+    fn tombstone_from_key(key: u64) -> TransferPending {
+        TransferPending {
+            timestamp: key | composite_key::TOMBSTONE_BIT,
+            status: TransferPendingStatus::None,
+            padding: [0; 7],
+        }
+    }
+
+    const VALUE_COUNT_MAX: usize = GROOVE_VALUE_COUNT_MAX;
+    const USAGE: TableUsage = TableUsage::General;
+}
+
+impl crate::tree::TreeSpec for TransferPendingObjectSpec {
+    const LAYOUT: TableLayout = TableLayout::compute_for::<Self>();
+
+    fn index_blocks_for_key(index_block: &[u8], key: u64) -> Option<IndexBlocks<u64>> {
+        table::index_blocks_for_key::<u64>(index_block, &Self::LAYOUT.index, key)
+    }
+
+    fn value_block_search(value_block: &[u8], key: u64) -> Option<TransferPending> {
+        table::value_block_search::<Self>(value_block, &Self::LAYOUT.data, key)
+    }
+
+    fn tombstone_from_key(key: u64) -> TransferPending {
+        TransferPending {
+            timestamp: key | composite_key::TOMBSTONE_BIT,
+            status: TransferPendingStatus::None,
+            padding: [0; 7],
+        }
+    }
+}
+
+// ===== TransfersPending status index (CompositeKey64: field = status as u64) =====
+//
+// Upstream indexes the optional `status` field via `CompositeKey(IndexType(enum))` where
+// `IndexType(TransferPendingStatus)` is `u64` (status is an 8-bit enum). An entry is only
+// produced when the status is non-zero (`index_from_object` returns null for `None`,
+// groove.zig:488-521).
+
+pub struct TransferPendingStatusSpec;
+
+impl table_memory::Table for TransferPendingStatusSpec {
+    type Key = u128;
+    type Value = CompositeKey64;
+    const VALUE_COUNT_MAX: usize = GROOVE_VALUE_COUNT_MAX;
+    const USAGE: Usage = Usage::SecondaryIndex;
+
+    fn key_from_value(value: &CompositeKey64) -> u128 {
+        value.key_from_value()
+    }
+
+    fn tombstone(value: &CompositeKey64) -> bool {
+        value.tombstone()
+    }
+}
+
+impl TableSpec for TransferPendingStatusSpec {
+    type Key = u128;
+    type Value = CompositeKey64;
+
+    fn key_from_value(value: &CompositeKey64) -> u128 {
+        value.key_from_value()
+    }
+
+    const SENTINEL_KEY: u128 = u128::MAX;
+
+    fn tombstone(value: &CompositeKey64) -> bool {
+        value.tombstone()
+    }
+
+    fn tombstone_from_key(key: u128) -> CompositeKey64 {
+        CompositeKey64::tombstone_from_key(key)
+    }
+
+    const VALUE_COUNT_MAX: usize = GROOVE_VALUE_COUNT_MAX;
+    const USAGE: TableUsage = TableUsage::SecondaryIndex;
+}
+
+impl crate::tree::TreeSpec for TransferPendingStatusSpec {
+    const LAYOUT: TableLayout = TableLayout::compute_for::<Self>();
+
+    fn index_blocks_for_key(index_block: &[u8], key: u128) -> Option<IndexBlocks<u128>> {
+        table::index_blocks_for_key::<u128>(index_block, &Self::LAYOUT.index, key)
+    }
+
+    fn value_block_search(value_block: &[u8], key: u128) -> Option<CompositeKey64> {
+        table::value_block_search::<Self>(value_block, &Self::LAYOUT.data, key)
+    }
+
+    fn tombstone_from_key(key: u128) -> CompositeKey64 {
+        CompositeKey64::tombstone_from_key(key)
+    }
+}
+
+/// Optional `status` index for `TransferPending`. Returns `None` for a record with
+/// status `None` (zero), mirroring upstream's optional index behaviour (groove.zig:488-521).
+pub struct TransferPendingStatusIndex;
+impl IndexExtractor<TransferPending> for TransferPendingStatusIndex {
+    type IndexPrefix = u64;
+    fn index_from_object(object: &TransferPending) -> Option<u64> {
+        if object.status == TransferPendingStatus::None {
+            None
+        } else {
+            Some(u64::from(object.status as u8))
+        }
     }
 }
 
@@ -1557,25 +1728,28 @@ impl TransferGroove {
 
 /// Grove for tracking pending transfer statuses.
 ///
-/// Upstream: `src/state_machine.zig:470` (`transfers_pending` groove config).
-///
-/// DEVIATION: The full tree-based implementation (object tree + status index tree)
-/// is deferred until `TreeSpec` is implemented for `TransferPending`. For now, the
-/// objects cache provides the primary-key lookup needed by
-/// `post_or_void_pending_transfer`.
+/// Upstream: `src/state_machine.zig:470` (`transfers_pending` groove config). Mirrors it with
+/// an object tree (`TransferPending`, tree id 20) plus the optional `status` index tree
+/// (`CompositeKey64`, tree id 21), and the per-session objects cache keyed by timestamp.
 pub struct TransferPendingGroove {
+    /// Object tree, keyed by the pending transfer's timestamp.
+    objects: Tree<TransferPendingObjectSpec>,
+    /// Optional `status` index (field = status as u64, keyed by (status, timestamp)).
+    status: Tree<TransferPendingStatusSpec>,
     /// Per-session objects cache, keyed by the pending transfer's timestamp.
     objects_cache: TransferPendingObjectsCache,
 }
 
 impl TransferPendingGroove {
     pub fn scope_open(&mut self) {
-        // TODO(port): forward to object tree + status index tree
+        self.objects.scope_open();
+        self.status.scope_open();
         self.objects_cache.scope_open();
     }
 
     pub fn scope_close(&mut self, mode: ScopeCloseMode) {
-        // TODO(port): forward to object tree + status index tree
+        self.objects.scope_close(mode);
+        self.status.scope_close(mode);
         self.objects_cache.scope_close(mode);
     }
 
@@ -1600,22 +1774,55 @@ impl TransferPendingGroove {
         self.objects_cache.remove(timestamp);
     }
 
-    /// Insert a pending transfer record.
+    /// Insert a pending transfer record into the object tree, status index and cache.
+    ///
+    /// # Panics
+    /// Panics if the timestamp is zero or the tombstone bit is set.
     pub fn insert(&mut self, object: &TransferPending) {
+        assert!(object.timestamp != 0);
+        assert_eq!(object.timestamp & composite_key::TOMBSTONE_BIT, 0);
+
+        self.objects.put(object);
+        self.objects.key_range_update(object.timestamp);
         self.objects_cache.upsert(object);
+
+        if let Some(v) = TransferPendingStatusIndex::index_from_object(object) {
+            self.status.put(&CompositeKey64 { field: v, timestamp: object.timestamp });
+        }
     }
 
-    /// Update the status of an existing pending transfer record.
-    pub fn update(&mut self, new: &TransferPending) {
+    /// Update an existing pending transfer record.
+    ///
+    /// Diffs `old` and `new` for the status index and overwrites the object tree + cache
+    /// unconditionally.
+    ///
+    /// # Panics
+    /// Panics if the timestamps differ.
+    pub fn update(&mut self, old: &TransferPending, new: &TransferPending) {
+        assert_eq!(old.timestamp, new.timestamp);
+        self.objects.put(new);
         self.objects_cache.upsert(new);
+
+        let old_status = TransferPendingStatusIndex::index_from_object(old);
+        let new_status = TransferPendingStatusIndex::index_from_object(new);
+        if old_status != new_status {
+            if let Some(v) = old_status {
+                self.status.remove(&CompositeKey64 { field: v, timestamp: new.timestamp });
+            }
+            if let Some(v) = new_status {
+                self.status.put(&CompositeKey64 { field: v, timestamp: new.timestamp });
+            }
+        }
     }
 
-    pub fn open_commence(&mut self, _manifest_log: &mut impl ManifestLog) {
-        // TODO(port): forward to trees
+    pub fn open_commence(&mut self, manifest_log: &mut impl ManifestLog) {
+        self.objects.open_commence(manifest_log);
+        self.status.open_commence(manifest_log);
     }
 
-    pub fn open_complete(&mut self, _checkpoint_op: u64) {
-        // TODO(port): forward to trees
+    pub fn open_complete(&mut self, checkpoint_op: u64) {
+        self.objects.open_complete(checkpoint_op);
+        self.status.open_complete(checkpoint_op);
     }
 }
 
@@ -2033,6 +2240,20 @@ mod tests {
         })
     }
 
+    fn new_transfer_pending_groove() -> TransferPendingGroove {
+        TransferPendingGroove {
+            objects: Tree::<TransferPendingObjectSpec>::new(
+                TreeConfig { id: 20, name: "transfers_pending_objects" },
+                Options { batch_value_count_limit: 32 },
+            ),
+            status: Tree::<TransferPendingStatusSpec>::new(
+                TreeConfig { id: 21, name: "transfers_pending_status" },
+                Options { batch_value_count_limit: 32 },
+            ),
+            objects_cache: new_transfer_pending_objects_cache(),
+        }
+    }
+
     fn new_account_groove() -> AccountGroove {
         fn tree<S: crate::tree::TreeSpec>(id: u16, name: &'static str) -> Tree<S> {
             Tree::<S>::new(TreeConfig { id, name }, Options { batch_value_count_limit: 32 })
@@ -2374,20 +2595,23 @@ mod tests {
 
     #[test]
     fn pending_groove_objects_cache_scope_discard() {
-        let mut groove =
-            TransferPendingGroove { objects_cache: new_transfer_pending_objects_cache() };
+        let mut groove = new_transfer_pending_groove();
 
-        let mut pending = TransferPending {
+        let old = TransferPending {
             timestamp: 1,
             status: TransferPendingStatus::Pending,
             padding: [0; 7],
         };
-        groove.insert(&pending);
-        assert_eq!(groove.get(1), Some(&pending));
+        groove.insert(&old);
+        assert_eq!(groove.get(1), Some(&old));
 
         groove.scope_open();
-        pending.status = TransferPendingStatus::Posted;
-        groove.update(&pending);
+        let new = TransferPending {
+            timestamp: 1,
+            status: TransferPendingStatus::Posted,
+            padding: [0; 7],
+        };
+        groove.update(&old, &new);
         assert_eq!(groove.get(1).map(|p| p.status), Some(TransferPendingStatus::Posted));
         groove.scope_close(ScopeCloseMode::Discard);
 
@@ -2532,8 +2756,7 @@ mod tests {
 
     #[test]
     fn pending_groove_remove_tombstones_then_resurrect() {
-        let mut groove =
-            TransferPendingGroove { objects_cache: new_transfer_pending_objects_cache() };
+        let mut groove = new_transfer_pending_groove();
         let pending = TransferPending {
             timestamp: 5,
             status: TransferPendingStatus::Pending,
@@ -2549,5 +2772,106 @@ mod tests {
         groove.insert(&pending);
         assert!(groove.has(5));
         assert_eq!(groove.get(5), Some(&pending));
+    }
+
+    #[test]
+    fn transfer_pending_block_value_round_trip() {
+        // state_machine.zig:92-102: { timestamp: u64 @0, status: u8 @8, padding: [7]u8 @9 }
+        for status in [
+            TransferPendingStatus::None,
+            TransferPendingStatus::Pending,
+            TransferPendingStatus::Posted,
+            TransferPendingStatus::Voided,
+            TransferPendingStatus::Expired,
+        ] {
+            let value =
+                TransferPending { timestamp: 0x0123_4567_89ab_cdef, status, padding: [0xaa; 7] };
+            let mut buf = [0u8; 16];
+            value.write_bytes(&mut buf);
+            let read_back = TransferPending::from_bytes(&buf);
+            assert_eq!(read_back, value);
+        }
+    }
+
+    #[test]
+    fn pending_groove_tree_read_path() {
+        // Prove the pending groove's object tree (TransferPendingObjectSpec) and status
+        // index tree (TransferPendingStatusSpec) are written and read faithfully through
+        // a grid, mirroring open_account_lookup_trees. index_from_object drops status
+        // None (0), so it must not appear in the status tree.
+        let pending_values = [
+            TransferPending {
+                timestamp: 1,
+                status: TransferPendingStatus::Pending,
+                padding: [0; 7],
+            },
+            TransferPending {
+                timestamp: 2,
+                status: TransferPendingStatus::Posted,
+                padding: [0; 7],
+            },
+            TransferPending { timestamp: 3, status: TransferPendingStatus::None, padding: [0; 7] },
+        ];
+        let status_values =
+            [CompositeKey64 { field: 1, timestamp: 1 }, CompositeKey64 { field: 2, timestamp: 2 }];
+
+        let (mut grid, _) = new_groove_grid(6);
+        let addresses = acquire_addresses(&mut grid, 6);
+        let (objects_index, objects_value, status_index, status_value) =
+            (addresses[0], addresses[1], addresses[2], addresses[3]);
+
+        let (obj_index_block, obj_value_block, obj_info) =
+            build_table_with::<TransferPendingObjectSpec>(
+                &pending_values,
+                20,
+                objects_value,
+                objects_index,
+            );
+        let obj_checksum = seed_grid_block(&mut grid, objects_index, &obj_index_block);
+        seed_grid_block(&mut grid, objects_value, &obj_value_block);
+
+        let (st_index_block, st_value_block, st_info) = build_table_with::<TransferPendingStatusSpec>(
+            &status_values,
+            21,
+            status_value,
+            status_index,
+        );
+        let st_checksum = seed_grid_block(&mut grid, status_index, &st_index_block);
+        seed_grid_block(&mut grid, status_value, &st_value_block);
+
+        let mut groove = new_transfer_pending_groove();
+        open_tree(&mut groove.objects, &obj_info, objects_index, obj_checksum, 20);
+        open_tree(&mut groove.status, &st_info, status_index, st_checksum, 21);
+
+        // Object tree reads by timestamp:
+        assert!(matches!(
+            groove.objects.lookup_from_levels_cache(&mut grid, SNAPSHOT_LATEST, 1),
+            LookupMemoryResult::Positive(TransferPending {
+                timestamp: 1,
+                status: TransferPendingStatus::Pending,
+                ..
+            })
+        ));
+        assert!(matches!(
+            groove.objects.lookup_from_levels_cache(&mut grid, SNAPSHOT_LATEST, 3),
+            LookupMemoryResult::Positive(TransferPending {
+                timestamp: 3,
+                status: TransferPendingStatus::None,
+                ..
+            })
+        ));
+
+        // Status index tree reads by composite (status << 64 | timestamp):
+        let pending_key = (1u128 << 64) | 1;
+        assert!(matches!(
+            groove.status.lookup_from_levels_cache(&mut grid, SNAPSHOT_LATEST, pending_key),
+            LookupMemoryResult::Positive(CompositeKey64 { field: 1, timestamp: 1 })
+        ));
+        // Status None (0) is not indexed (index_from_object returns None):
+        let none_key = 3;
+        assert!(matches!(
+            groove.status.lookup_from_levels_cache(&mut grid, SNAPSHOT_LATEST, none_key),
+            LookupMemoryResult::Negative
+        ));
     }
 }
