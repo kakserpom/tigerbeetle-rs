@@ -979,6 +979,28 @@ impl AccountGroove {
         self.objects_cache.get(id)
     }
 
+    /// Whether the objects cache holds a live (non-tombstoned) entry for `id`.
+    ///
+    /// Mirrors upstream `objects_cache.has` (groove.zig:1020, 1107, 1330).
+    #[must_use]
+    pub fn has(&mut self, id: u128) -> bool {
+        self.objects_cache.has(id)
+    }
+
+    /// Remove `id` from the primary-key view by placing a tombstone in the cache.
+    ///
+    /// Mirrors `groove.remove` (groove.zig:1876-1920).
+    ///
+    /// DEVIATION: upstream also removes the object and each populated index entry
+    /// from the underlying trees; sans-forest only the cache tombstone is surfaced,
+    /// which is what makes `get`/`has` report the key as absent in-session.
+    ///
+    /// # Panics
+    /// Panics unless built with `verify`, or when `id` is absent from the cache.
+    pub fn remove(&mut self, id: u128) {
+        self.objects_cache.remove(id);
+    }
+
     /// Resolve an account by its primary key (id) from the tree levels.
     ///
     /// Mirrors upstream's prefetch-by-unique-key resolution (groove.zig:1704-1732):
@@ -1196,6 +1218,28 @@ impl TransferGroove {
     #[must_use]
     pub fn get(&mut self, id: u128) -> Option<&Transfer> {
         self.objects_cache.get(id)
+    }
+
+    /// Whether the objects cache holds a live (non-tombstoned) entry for `id`.
+    ///
+    /// Mirrors upstream `objects_cache.has` (groove.zig:1020, 1107, 1330).
+    #[must_use]
+    pub fn has(&mut self, id: u128) -> bool {
+        self.objects_cache.has(id)
+    }
+
+    /// Remove `id` from the primary-key view by placing a tombstone in the cache.
+    ///
+    /// Mirrors `groove.remove` (groove.zig:1876-1920).
+    ///
+    /// DEVIATION: upstream also removes the object and each populated index entry
+    /// from the underlying trees; sans-forest only the cache tombstone is surfaced,
+    /// which is what makes `get`/`has` report the key as absent in-session.
+    ///
+    /// # Panics
+    /// Panics unless built with `verify`, or when `id` is absent from the cache.
+    pub fn remove(&mut self, id: u128) {
+        self.objects_cache.remove(id);
     }
 
     /// Resolve a transfer by its primary key (id) from the tree levels.
@@ -1539,6 +1583,21 @@ impl TransferPendingGroove {
     #[must_use]
     pub fn get(&mut self, timestamp: u64) -> Option<&TransferPending> {
         self.objects_cache.get(timestamp)
+    }
+
+    /// Whether the objects cache holds a live (non-tombstoned) entry for the timestamp.
+    #[must_use]
+    pub fn has(&mut self, timestamp: u64) -> bool {
+        self.objects_cache.has(timestamp)
+    }
+
+    /// Remove the pending record at `timestamp` by placing a tombstone in the cache,
+    /// mirroring `groove.remove` (groove.zig:1876).
+    ///
+    /// # Panics
+    /// Panics unless built with `verify`, or when `timestamp` is absent from the cache.
+    pub fn remove(&mut self, timestamp: u64) {
+        self.objects_cache.remove(timestamp);
     }
 
     /// Insert a pending transfer record.
@@ -2405,5 +2464,90 @@ mod tests {
         cache.reset();
         assert!(!cache.has(5));
         assert!(matches!(cache.get_or_tombstone(5), GetOrTombstone::NotFound));
+    }
+
+    // ------------------------------------------------------------------
+    // Groove-level cache behavior: `has`/`remove` surface (tombstones) and
+    // SAC-tier overflow, proven through the grooves rather than the raw cache.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn account_groove_remove_tombstones_then_resurrect() {
+        let mut groove = new_account_groove();
+        groove.insert(&Account { timestamp: 1, id: 101, ..Account::default() });
+        assert!(groove.has(101));
+        assert!(groove.get(101).is_some());
+
+        // Removing tombstoned the key in-session: `has`/`get` both report absent.
+        groove.remove(101);
+        assert!(!groove.has(101));
+        assert!(groove.get(101).is_none());
+
+        // Re-inserting resurrects the key with the newest value.
+        groove.insert(&Account { timestamp: 2, id: 101, ..Account::default() });
+        assert!(groove.has(101));
+        assert_eq!(groove.get(101).map(|a| a.timestamp), Some(2));
+    }
+
+    #[test]
+    fn transfer_groove_remove_tombstones_then_resurrect() {
+        let mut groove = new_transfer_groove();
+        let transfer = Transfer {
+            timestamp: 1,
+            id: 11,
+            debit_account_id: 1,
+            credit_account_id: 2,
+            amount: 100,
+            ledger: 1,
+            code: 1,
+            ..Transfer::default()
+        };
+        groove.insert(&transfer);
+        assert!(groove.has(11));
+
+        groove.remove(11);
+        assert!(!groove.has(11));
+        assert!(groove.get(11).is_none());
+
+        groove.insert(&transfer);
+        assert!(groove.has(11));
+    }
+
+    #[test]
+    fn account_groove_remove_scope_discard_restores_value() {
+        // A `remove` inside a scope is recorded in the rollback log; discarding the
+        // scope must restore the pre-scope value (tombstone rolled back).
+        let mut groove = new_account_groove();
+        groove.insert(&Account { timestamp: 1, id: 101, ..Account::default() });
+
+        groove.scope_open();
+        groove.remove(101);
+        assert!(!groove.has(101));
+
+        groove.scope_close(ScopeCloseMode::Discard);
+
+        assert!(groove.has(101));
+        assert_eq!(groove.get(101), Some(&Account { timestamp: 1, id: 101, ..Account::default() }));
+    }
+
+    #[test]
+    fn pending_groove_remove_tombstones_then_resurrect() {
+        let mut groove =
+            TransferPendingGroove { objects_cache: new_transfer_pending_objects_cache() };
+        let pending = TransferPending {
+            timestamp: 5,
+            status: TransferPendingStatus::Pending,
+            padding: [0; 7],
+        };
+        groove.insert(&pending);
+        assert!(groove.has(5));
+
+        groove.remove(5);
+        assert!(!groove.has(5));
+        assert!(groove.get(5).is_none());
+
+        groove.insert(&pending);
+        assert!(groove.has(5));
+        assert_eq!(groove.get(5), Some(&pending));
     }
 }
