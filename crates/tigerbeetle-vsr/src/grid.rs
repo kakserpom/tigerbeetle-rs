@@ -225,6 +225,11 @@ pub struct SuperBlockView {
     /// When open reaches this block, it stops reading.
     pub manifest_oldest_address: u64,
     pub manifest_oldest_checksum: u128,
+    /// The newest (most recently appended) manifest block in the chain at the
+    /// last checkpoint. `manifest_log.open` starts its linked-list recovery here
+    /// and walks back towards the oldest block.
+    pub manifest_newest_address: u64,
+    pub manifest_newest_checksum: u128,
     /// Whether the given op has already been compacted (upstream `op_compacted`).
     pub op_compacted: bool,
 }
@@ -2668,6 +2673,8 @@ mod tests {
             manifest_block_count: 0,
             manifest_oldest_address: 0,
             manifest_oldest_checksum: 0,
+            manifest_newest_address: 0,
+            manifest_newest_checksum: 0,
             op_compacted: false,
         });
         grid.open(&mut storage, empty_references());
@@ -2700,6 +2707,8 @@ mod tests {
             manifest_block_count: 0,
             manifest_oldest_address: 0,
             manifest_oldest_checksum: 0,
+            manifest_newest_address: 0,
+            manifest_newest_checksum: 0,
             op_compacted: false,
         });
         assert!(
@@ -2731,6 +2740,8 @@ mod tests {
             manifest_block_count: 0,
             manifest_oldest_address: 0,
             manifest_oldest_checksum: 0,
+            manifest_newest_address: 0,
+            manifest_newest_checksum: 0,
             op_compacted: false,
         });
         grid.open(&mut storage, empty_references());
@@ -2775,6 +2786,8 @@ mod tests {
             manifest_block_count: 0,
             manifest_oldest_address: 0,
             manifest_oldest_checksum: 0,
+            manifest_newest_address: 0,
+            manifest_newest_checksum: 0,
             op_compacted: false,
         });
         reopened.open(&mut storage, references);
@@ -2865,6 +2878,8 @@ mod tests {
             manifest_block_count: 0,
             manifest_oldest_address: 0,
             manifest_oldest_checksum: 0,
+            manifest_newest_address: 0,
+            manifest_newest_checksum: 0,
             op_compacted: false,
         });
         grid.open(&mut storage, empty_references());
@@ -2916,6 +2931,8 @@ mod tests {
             manifest_block_count: 0,
             manifest_oldest_address: 0,
             manifest_oldest_checksum: 0,
+            manifest_newest_address: 0,
+            manifest_newest_checksum: 0,
             op_compacted: false,
         });
         reopened.open(&mut storage, references);

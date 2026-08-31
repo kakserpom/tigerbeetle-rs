@@ -395,6 +395,8 @@ mod tests {
             manifest_block_count: 0,
             manifest_oldest_address: 0,
             manifest_oldest_checksum: 0,
+            manifest_newest_address: 0,
+            manifest_newest_checksum: 0,
             op_compacted: false,
         }
     }
@@ -488,6 +490,25 @@ mod tests {
             snapshot_min: 1,
             snapshot_max: u64::MAX,
             value_count: 16,
+            tree_id,
+            label: Label { level: 0, event: Event::Insert },
+        }
+    }
+
+    /// A manifest-node `TableInfo` whose key bytes are a valid u64 (properly zero-padded),
+    /// so it can be replayed through `TreeTableInfo::decode` on reopen. Mirrors the local
+    /// `info` helper in `forest_open_replay_routes_by_tree_id`.
+    fn manifest_info_u64(address: u64, tree_id: u16) -> manifest_node::TableInfo {
+        let key_min = 1_u64.to_le_bytes_padded();
+        let key_max = 100_u64.to_le_bytes_padded();
+        manifest_node::TableInfo {
+            key_min,
+            key_max,
+            checksum: checksum(&address.to_le_bytes()),
+            address,
+            snapshot_min: 1,
+            snapshot_max: u64::MAX,
+            value_count: 1,
             tree_id,
             label: Label { level: 0, event: Event::Insert },
         }
@@ -620,29 +641,13 @@ mod tests {
     /// three are u64-timestamp-keyed, so a single key encoding is valid for each.
     #[test]
     fn forest_open_replay_routes_by_tree_id() {
-        fn info(address: u64, tree_id: u16) -> mn::TableInfo {
-            let key_min = 1_u64.to_le_bytes_padded();
-            let key_max = 100_u64.to_le_bytes_padded();
-            mn::TableInfo {
-                key_min,
-                key_max,
-                checksum: checksum(&address.to_le_bytes()),
-                address,
-                snapshot_min: 1,
-                snapshot_max: u64::MAX,
-                value_count: 1,
-                tree_id,
-                label: mn::Label { level: 0, event: mn::Event::Insert },
-            }
-        }
-
         let mut forest = Forest::init(test_superblock(), grid_options(), 32);
         let mut storage = storage();
         forest.open(empty_references(), &mut storage, 0);
 
-        forest.open_replay_table(&info(0x3000, 7)); // account objects
-        forest.open_replay_table(&info(0x3001, 18)); // transfer objects
-        forest.open_replay_table(&info(0x3002, 20)); // pending objects
+        forest.open_replay_table(&manifest_info_u64(0x3000, 7)); // account objects
+        forest.open_replay_table(&manifest_info_u64(0x3001, 18)); // transfer objects
+        forest.open_replay_table(&manifest_info_u64(0x3002, 20)); // pending objects
 
         // Each routed entry landed in exactly its owning tree (no cross-groove ambiguity).
         assert_eq!(forest.accounts.objects.manifest_table_count(), 1);

@@ -355,6 +355,11 @@ impl ManifestLog {
         if refs.empty() {
             self.phase = ManifestLogPhase::OpenPendingDone;
         } else {
+            // `open_read_block` asserts it is called while reading, so prime the phase
+            // (mirrors upstream `open` setting `reading = true` before the first read).
+            // The token is a placeholder: `open_read_block` immediately replaces it with
+            // the grid's real read token before any read is issued.
+            self.phase = ManifestLogPhase::OpenReading { read_token: 0 };
             self.open_read_block(
                 BlockReference { checksum: refs.newest_checksum, address: refs.newest_address },
                 grid,
@@ -1054,8 +1059,8 @@ fn superblock_refs(view: &SuperBlockView) -> ManifestReferences {
     ManifestReferences {
         oldest_checksum: view.manifest_oldest_checksum,
         oldest_address: view.manifest_oldest_address,
-        newest_checksum: 0,
-        newest_address: 0,
+        newest_checksum: view.manifest_newest_checksum,
+        newest_address: view.manifest_newest_address,
         block_count: view.manifest_block_count,
     }
 }
@@ -1079,6 +1084,8 @@ mod tests {
             manifest_block_count: 0,
             manifest_oldest_address: 0,
             manifest_oldest_checksum: 0,
+            manifest_newest_address: 0,
+            manifest_newest_checksum: 0,
             op_compacted: false,
         }
     }
