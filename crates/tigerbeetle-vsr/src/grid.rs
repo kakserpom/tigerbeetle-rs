@@ -742,6 +742,24 @@ impl Grid {
         &mut self.blocks[location as usize]
     }
 
+    /// Mutable contents of two distinct blocks (used by the table builder, which writes the
+    /// value and index blocks together during a value-block finish).
+    ///
+    /// # Panics
+    /// Asserts the locations differ.
+    pub fn blocks_mut2(&mut self, a: u32, b: u32) -> (&mut [u8], &mut [u8]) {
+        assert_ne!(a, b);
+        let low = u64::from(a.min(b)) as usize;
+        let high = u64::from(a.max(b)) as usize;
+        let (low_slice, high_slice) = self.blocks[low..=high].split_at_mut(high - low);
+        // `high_slice` is the single block at index `high`.
+        if a < b {
+            (low_slice[0].as_mut_slice(), high_slice[0].as_mut_slice())
+        } else {
+            (high_slice[0].as_mut_slice(), low_slice[0].as_mut_slice())
+        }
+    }
+
     /// Abort if there are not enough free blocks to fill the reservation
     /// (upstream aborts via `vsr.fatal(.storage_size_would_exceed_limit)`).
     ///
@@ -1333,6 +1351,16 @@ impl Grid {
     pub fn attach_superblock_view(&mut self, view: SuperBlockView) {
         assert!(self.callback.is_none());
         self.view = Some(view);
+    }
+
+    /// The attached superblock working-state snapshot (upstream reads it via
+    /// `grid.superblock.working.*`; compaction uses it for output block headers).
+    ///
+    /// # Panics
+    /// Panics if no view has been attached.
+    #[must_use]
+    pub fn superblock_view(&self) -> SuperBlockView {
+        self.view_attached()
     }
 
     /// The free set (opened by [`Grid::open`], mutated by [`Grid::checkpoint`] et al).

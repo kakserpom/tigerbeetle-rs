@@ -28,13 +28,19 @@
 use core::cmp::Ordering;
 
 use tigerbeetle_core::constants;
-use tigerbeetle_lsm::compaction::{COMPACTION_TABLES_INPUT_MAX, COMPACTION_TABLES_OUTPUT_MAX};
+use tigerbeetle_lsm::compaction::{
+    COMPACTION_TABLES_INPUT_MAX, COMPACTION_TABLES_OUTPUT_MAX, snapshot_min_for_table_output,
+};
+use tigerbeetle_lsm::direction::Direction;
+use tigerbeetle_lsm::free_set::Reservation;
 use tigerbeetle_lsm::manifest::{CompactionRange, TableInfoReference, TreeTableInfo};
 use tigerbeetle_lsm::table_memory::{
     ImmutableTableIterator, Mutability, Table as TableTrait, Usage,
 };
 
-use crate::grid::Grid;
+use crate::grid::{Event, Grid};
+use crate::storage::Storage;
+use crate::table::{BuilderState, DataFinishOptions, IndexFinishOptions, TableBuilder};
 use crate::tree::TreeSpec;
 
 // ---------------------------------------------------------------------------
@@ -482,7 +488,10 @@ pub fn values_merge<S: TableTrait>(
 /// Phase 1: struct fields, init, reset, assert_between_bars, idle, block_queues_empty_input,
 ///          and pure merge/copy functions.
 /// Phase 2: half_bar_commence, half_bar_complete, beat_commence (lifecycle stubs).
-/// Phase 3: ResourcePool, I/O dispatch, read/write callbacks.
+/// Phase 3: I/O dispatch. Implemented so far: the sans-IO `dispatch` loop for the
+///          immutable (L0) source with no level-B overlap — output index/value blocks written
+///          through the grid. Remaining: level-B and disk level-A block reads (grid read +
+///          block iteration), plus the forest's per-half-bar beat pacing.
 pub struct Compaction<S: TreeSpec> {
     // Globally scoped fields (survive across bars):
     #[allow(dead_code)] // used in Phase 2/3 (lifecycle + I/O dispatch)
@@ -509,11 +518,13 @@ pub struct Compaction<S: TreeSpec> {
     /// `BoundedArray` doesn't support the mutable slice indexing needed by `half_bar_complete`.
     pub manifest_entries: Vec<ManifestEntry<S::Key>>,
 
-    // Table builder fields — placeholder until TableBuilder is ported:
-    // upstream: table_builder: Table.Builder,
-    // upstream: table_builder_index_block: ?*ResourcePool.Block,
-    // upstream: table_builder_value_block: ?*ResourcePool.Block,
-    pub table_builder_value_count: u32,
+    /// Output table builder (upstream `table_builder`).
+    ///
+    /// DEVIATION: upstream stores raw `*Block` pointers from a `ResourcePool`; this port has no
+    /// ResourcePool, so the two in-flight output blocks are tracked as grid block locations.
+    pub table_builder: TableBuilder,
+    pub table_builder_index_block: Option<u32>,
+    pub table_builder_value_block: Option<u32>,
 
     pub level_a_immutable_stage: LevelAImmutableStage,
 
@@ -547,7 +558,9 @@ impl<S: TreeSpec> Compaction<S> {
             level_a_position: Position::default(),
             level_b_position: Position::default(),
             manifest_entries: Vec::new(),
-            table_builder_value_count: 0,
+            table_builder: TableBuilder::new(),
+            table_builder_index_block: None,
+            table_builder_value_block: None,
             level_a_immutable_stage: LevelAImmutableStage::Ready,
             pool_is_active: false,
             callback_is_set: false,
@@ -568,7 +581,9 @@ impl<S: TreeSpec> Compaction<S> {
         self.level_a_position = Position::default();
         self.level_b_position = Position::default();
         self.manifest_entries.clear();
-        self.table_builder_value_count = 0;
+        self.table_builder = TableBuilder::new();
+        self.table_builder_index_block = None;
+        self.table_builder_value_block = None;
         self.level_a_immutable_stage = LevelAImmutableStage::Ready;
         self.pool_is_active = false;
         self.callback_is_set = false;
@@ -580,11 +595,9 @@ impl<S: TreeSpec> Compaction<S> {
         assert_eq!(self.stage, Stage::Inactive);
         assert!(self.is_idle());
         assert!(self.block_queues_empty_input());
-        // upstream also asserts:
-        // - table_builder.state == .no_blocks
-        // - table_builder_value_block == null
-        // - table_builder_index_block == null
-        // - manifest_entries.empty()
+        assert_eq!(self.table_builder.state(), crate::table::BuilderState::NoBlocks);
+        assert!(self.table_builder_index_block.is_none());
+        assert!(self.table_builder_value_block.is_none());
         assert!(self.manifest_entries.is_empty());
     }
 
@@ -627,6 +640,496 @@ impl<S: TreeSpec> Compaction<S> {
         self.quotas.beat_done = 0;
         assert!(self.quotas.beat <= self.quotas.half_bar);
     }
+
+    // -----------------------------------------------------------------------
+    // I/O dispatch (sans-IO synchronous port of compaction_dispatch)
+    // -----------------------------------------------------------------------
+
+    /// Reserve enough grid blocks for this compaction's output for one beat
+    /// (port of `forest.compact_trees_reserve_grid_blocks`, single compaction).
+    ///
+    /// The returned [`Reservation`] must be used for every [`Self::dispatch`] of the
+    /// beat and forfeited (via [`Grid::forfeit`]) at the end of the half-bar.
+    ///
+    /// # Panics
+    /// Panics on overflow or if the grid cannot cover the reservation (upstream
+    /// aborts the process).
+    #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+    pub fn reserve_output_blocks(&mut self, grid: &mut Grid) -> Reservation {
+        // The +1 covers a partially-finished output block from the previous beat,
+        // plus the up-to-one-block overshoot of the pacing.
+        let beat_value_blocks =
+            self.quotas.beat.div_ceil(u64::from(S::LAYOUT.block_value_count_max)) + 1;
+        // Index blocks fit `value_block_count_max` address entries each.
+        let beat_index_blocks =
+            beat_value_blocks.div_ceil(u64::from(S::LAYOUT.value_block_count_max));
+
+        // One carried-over index block and one carried-over value block.
+        let total = 1 + 1 + beat_value_blocks + beat_index_blocks;
+
+        grid.reserve(total as usize)
+    }
+
+    /// Run the current beat to completion (upstream `compaction_dispatch` + `merge` +
+    /// `write_value_block` + `write_index_block` + `beat_complete`).
+    ///
+    /// Sans-I/O: all grid reads/writes complete synchronously via `storage`, so the
+    /// dispatch loop runs to quota exhaustion before returning.
+    ///
+    /// # Slice-1 restriction
+    /// Handles only the immutable (L0) source with no level-B overlap.
+    /// Block allocation uses the grid stash directly (no ResourcePool).
+    ///
+    /// # Reservation
+    /// The caller must acquire the grid reservation (via [`Grid::reserve`]) after
+    /// [`Self::beat_commence`] and pass it in. The caller is responsible for
+    /// forfeiting the reservation at the end of the half-bar.
+    #[allow(clippy::missing_panics_doc, clippy::too_many_lines)]
+    pub fn dispatch(
+        &mut self,
+        storage: &mut dyn Storage,
+        tree: &crate::tree::Tree<S>,
+        grid: &mut Grid,
+        reservation: Reservation,
+    ) where
+        S: crate::table::TableSpec,
+    {
+        assert!(matches!(self.table_info_a, Some(TableInfoA::Immutable)));
+        assert!(
+            self.range_b.as_ref().is_some_and(|r| r.tables.tables.empty()),
+            "slice 1: level-B input blocks not yet ported"
+        );
+        assert_eq!(self.level_a_position, Position::default());
+        assert_eq!(self.level_b_position, Position::default());
+        assert!(matches!(self.level_a_immutable_stage, LevelAImmutableStage::Ready));
+        assert_eq!(self.table_builder.state(), BuilderState::NoBlocks);
+        assert!(!self.quotas.beat_exhausted());
+
+        self.stage = Stage::Beat;
+
+        loop {
+            if self.quotas.beat_exhausted() {
+                self.flush_pending_writes(storage, tree, grid, reservation);
+
+                let flush_pending = match self.table_builder.state() {
+                    BuilderState::IndexAndValueBlock => {
+                        self.quotas.half_bar_exhausted()
+                            || self.table_builder.value_block_full(&S::LAYOUT)
+                    }
+                    BuilderState::IndexBlock => {
+                        self.quotas.half_bar_exhausted()
+                            || self.table_builder.index_block_full(&S::LAYOUT)
+                    }
+                    BuilderState::NoBlocks => false,
+                };
+
+                assert!(!flush_pending, "sans-IO: writes complete synchronously");
+                self.beat_complete();
+                return;
+            }
+
+            // Allocate blocks for the table builder first to avoid deadlocks.
+            if self.table_builder.state() == BuilderState::NoBlocks {
+                assert!(self.table_builder_index_block.is_none());
+                let location = grid.get_block();
+                grid.block_mut(location).fill(0);
+                self.table_builder.set_index_block(grid.block_mut(location));
+                self.table_builder_index_block = Some(location);
+            }
+
+            if self.table_builder.state() == BuilderState::IndexBlock {
+                assert!(self.table_builder_value_block.is_none());
+                let location = grid.get_block();
+                grid.block_mut(location).fill(0);
+                self.table_builder.set_value_block(grid.block_mut(location));
+                self.table_builder_value_block = Some(location);
+            }
+
+            // Slice 1: level A is immutable, level B is empty (no reads).
+            let a_ready = matches!(self.level_a_immutable_stage, LevelAImmutableStage::Ready);
+            let a_exhausted =
+                matches!(self.level_a_immutable_stage, LevelAImmutableStage::Exhausted);
+            let b_ready = false;
+            let b_exhausted = true;
+
+            assert!(!a_exhausted || !b_exhausted);
+            assert!(!self.quotas.beat_exhausted());
+            assert!(!self.quotas.half_bar_exhausted());
+
+            if matches!(self.table_builder.state(), BuilderState::IndexAndValueBlock)
+                && (a_exhausted || a_ready)
+                && (b_exhausted || b_ready)
+                && !self.table_builder.value_block_full(&S::LAYOUT)
+            {
+                self.merge_step(storage, tree, grid);
+            }
+
+            self.flush_pending_writes(storage, tree, grid, reservation);
+        }
+    }
+
+    /// Merge one step from the input to the output table builder (upstream `merge` +
+    /// `merge_immutable` + `merge_callback` + `merge_advance_position`).
+    ///
+    /// Ported for the immutable A / empty B path only.
+    #[allow(clippy::too_many_lines)]
+    fn merge_step(
+        &mut self,
+        _storage: &mut dyn Storage,
+        tree: &crate::tree::Tree<S>,
+        grid: &mut Grid,
+    ) where
+        S: crate::table::TableSpec,
+    {
+        assert!(!matches!(self.level_a_immutable_stage, LevelAImmutableStage::Exhausted));
+        assert_eq!(self.table_builder.state(), BuilderState::IndexAndValueBlock);
+
+        if self.level_a_immutable_stage == LevelAImmutableStage::Ready {
+            self.level_a_immutable_stage = LevelAImmutableStage::Merge;
+        } else {
+            assert_eq!(self.level_a_immutable_stage, LevelAImmutableStage::Merge);
+        }
+
+        let mut iterator = ImmutableTableIterator::new(
+            tree.table_immutable_ref().iterator_context(),
+            None,
+            Direction::Ascending,
+        );
+
+        // Advance the freshly created iterator to the saved position.
+        // DEVIATION: upstream stores the iterator inline in the compaction union
+        // and persists it across merges; we re-create and fast-forward.
+        for _ in 0..self.level_a_position.value {
+            assert!(iterator.pop().is_some(), "position ahead of the immutable table length");
+        }
+
+        let budget_immutable = S::LAYOUT.data.value_count_max.min(iterator.count_remaining());
+        let space_left = S::LAYOUT.data.value_count_max - self.table_builder.value_count();
+
+        let Some(value_location) = self.table_builder_value_block else {
+            unreachable!("value block required for merge")
+        };
+        let block = grid.block_mut(value_location);
+
+        let MergeResult { consumed_a, consumed_b, dropped, produced: _produced } =
+            if self.drop_tombstones {
+                // Immutable + B empty + drop tombstones (level 0 with no overlap).
+                let remaining_before = iterator.count_remaining();
+                let dropped_before = iterator.count_dropped();
+                let mut index_source: u32 = 0;
+                let mut index_target: u32 = 0;
+
+                while index_source < budget_immutable && index_target < space_left {
+                    let Some(value_in) = iterator.pop() else {
+                        break;
+                    };
+                    index_source += 1;
+                    if <S as TableTrait>::tombstone(&value_in) {
+                        assert!(<S as TableTrait>::USAGE != Usage::SecondaryIndex);
+                        continue;
+                    }
+                    self.table_builder.insert_block_value(&value_in, block, &S::LAYOUT);
+                    index_target += 1;
+                }
+
+                let consumed_iterator = remaining_before - iterator.count_remaining();
+                let dropped_iterator = iterator.count_dropped() - dropped_before;
+
+                MergeResult {
+                    consumed_a: consumed_iterator,
+                    consumed_b: 0,
+                    dropped: dropped_iterator + (index_source - index_target),
+                    produced: index_target,
+                }
+            } else {
+                // Immutable + B empty, no tombstone drop.
+                let remaining_before = iterator.count_remaining();
+                let dropped_before = iterator.count_dropped();
+                let mut index_target: u32 = 0;
+
+                while index_target < budget_immutable && index_target < space_left {
+                    let Some(value_in) = iterator.pop() else {
+                        break;
+                    };
+                    self.table_builder.insert_block_value(&value_in, block, &S::LAYOUT);
+                    index_target += 1;
+                }
+
+                let consumed_a = remaining_before - iterator.count_remaining();
+                let dropped = iterator.count_dropped() - dropped_before;
+
+                // Invariant mirroring upstream values_copy_immutable accounting.
+                assert!(
+                    index_target + dropped == (remaining_before - iterator.count_remaining()),
+                    "produced + internal_drops must equal total pops"
+                );
+
+                MergeResult { consumed_a, consumed_b: 0, dropped, produced: index_target }
+            };
+
+        // Advance positions (port of merge_callback bookkeeping).
+        self.level_a_position.value += consumed_a;
+        self.level_b_position.value += consumed_b;
+        // table_builder.value_count already advanced by insert_value calls above.
+
+        assert!(
+            self.level_a_position.value <= <S as TableTrait>::VALUE_COUNT_MAX as u32,
+            "immutable position overflow"
+        );
+        assert!(
+            self.table_builder.value_count() <= S::LAYOUT.data.value_count_max,
+            "builder value_count overflow"
+        );
+
+        let consumed_ab = consumed_a + consumed_b;
+        self.quotas.half_bar_done += u64::from(consumed_ab);
+        self.quotas.beat_done += u64::from(consumed_ab);
+        assert!(self.quotas.half_bar_done <= self.quotas.half_bar);
+        self.counters.dropped += u64::from(dropped);
+
+        self.merge_advance_position();
+    }
+
+    /// Advance level-A/B positions after a merge step (upstream `merge_advance_position`).
+    ///
+    /// Handles immutable table carry-over (Ready ↔ Exhausted) and disk-block index/value
+    /// advancement (only immutable path ported so far).
+    fn merge_advance_position(&mut self)
+    where
+        S: crate::table::TableSpec,
+    {
+        if matches!(self.table_info_a, Some(TableInfoA::Immutable)) {
+            if self.level_a_immutable_stage == LevelAImmutableStage::Merge {
+                if self.level_a_position.value == <S as TableTrait>::VALUE_COUNT_MAX as u32 {
+                    self.level_a_position.value_block += 1;
+                    assert_eq!(self.level_a_position.value_block, 1);
+                    self.level_a_position.value = 0;
+                    self.level_a_immutable_stage = LevelAImmutableStage::Exhausted;
+                } else {
+                    self.level_a_immutable_stage = LevelAImmutableStage::Ready;
+                }
+            } else {
+                assert!(matches!(self.level_a_immutable_stage, LevelAImmutableStage::Exhausted));
+            }
+        } else {
+            unreachable!("disk level-A not yet ported (slice 1 is immutable only)");
+        }
+
+        // Level B: no-op — empty in slice 1.
+        assert_eq!(self.level_b_position, Position::default());
+    }
+
+    /// Write a completed value block through the grid (upstream `write_value_block`).
+    ///
+    /// Acquires an address, finishes the value block header, enqueues the write,
+    /// polls the grid, and hands back the fresh block returned by the write
+    /// completion (must be unref'd).
+    fn write_value_block(
+        &mut self,
+        storage: &mut dyn Storage,
+        tree: &crate::tree::Tree<S>,
+        grid: &mut Grid,
+        reservation: Reservation,
+    ) where
+        S: crate::table::TableSpec,
+    {
+        let Some(value_location) = self.table_builder_value_block else {
+            unreachable!("value block required for write")
+        };
+        let Some(index_location) = self.table_builder_index_block else {
+            unreachable!("index block required for value block finish")
+        };
+
+        let address = grid.acquire(reservation);
+        let view = grid.superblock_view();
+
+        // Upstream increments counters.out by value_count *before* the write is
+        // submitted (the block is logically committed to the output).
+        self.counters.out += u64::from(self.table_builder.value_count());
+
+        assert!(grid.block_references(value_location) > 0);
+
+        // Borrow both blocks simultaneously; blocks_mut2 guarantees disjointness.
+        let (value_block, index_block) = grid.blocks_mut2(value_location, index_location);
+        self.table_builder.value_block_finish::<S>(
+            value_block,
+            index_block,
+            &S::LAYOUT,
+            DataFinishOptions {
+                cluster: view.cluster,
+                release: view.release,
+                address,
+                snapshot_min: snapshot_min_for_table_output(self.op_min),
+                tree_id: tree.config_ref().id,
+            },
+        );
+
+        assert_eq!(self.table_builder.state(), BuilderState::IndexBlock);
+        self.table_builder_value_block = None;
+
+        // Enqueue the write (grid.create_block consumes the caller's location ref).
+        let token = grid.create_block(storage, address, value_location);
+        grid.poll(storage);
+        let fresh_location = Self::take_write_done_event(grid, token, address);
+        grid.block_unref(fresh_location);
+    }
+
+    /// Write a completed index block through the grid (upstream `write_index_block`).
+    ///
+    /// The resulting [`TreeTableInfo`] is queued in [`Self::manifest_entries`] for
+    /// insertion into the manifest during [`Self::half_bar_complete`].
+    fn write_index_block(
+        &mut self,
+        storage: &mut dyn Storage,
+        tree: &crate::tree::Tree<S>,
+        grid: &mut Grid,
+        reservation: Reservation,
+    ) where
+        S: crate::table::TableSpec,
+    {
+        let Some(index_location) = self.table_builder_index_block else {
+            unreachable!("index block required for write")
+        };
+
+        let address = grid.acquire(reservation);
+        let view = grid.superblock_view();
+
+        let table_info = self.table_builder.index_block_finish::<<S as TableTrait>::Key>(
+            grid.block_mut(index_location),
+            &S::LAYOUT,
+            IndexFinishOptions {
+                cluster: view.cluster,
+                release: view.release,
+                address,
+                snapshot_min: snapshot_min_for_table_output(self.op_min),
+                tree_id: tree.config_ref().id,
+            },
+        );
+
+        assert_eq!(self.table_builder.state(), BuilderState::NoBlocks);
+        assert!(self.table_builder_value_block.is_none());
+        self.table_builder_index_block = None;
+
+        // Queue the manifest entry before dispatching the write (matches upstream
+        // ordering; sans-IO makes the order inconsequential).
+        self.manifest_entries.push(ManifestEntry {
+            operation: ManifestEntryOperation::InsertToLevelB,
+            table: TreeTableInfo {
+                checksum: table_info.checksum,
+                address: table_info.address,
+                snapshot_min: table_info.snapshot_min,
+                snapshot_max: table_info.snapshot_max,
+                key_min: table_info.key_min,
+                key_max: table_info.key_max,
+                value_count: table_info.value_count,
+            },
+        });
+
+        let token = grid.create_block(storage, address, index_location);
+        grid.poll(storage);
+        let fresh_location = Self::take_write_done_event(grid, token, address);
+        grid.block_unref(fresh_location);
+    }
+
+    /// Flush a full or half-bar-complete value and/or index block pair
+    /// (upstream `flush_table_builder_blocks`).
+    ///
+    /// Flush order: value block first (the index block accumulates the value
+    /// block's key range and address during value block finish), then index
+    /// block.
+    #[allow(clippy::missing_panics_doc)]
+    fn flush_pending_writes(
+        &mut self,
+        storage: &mut dyn Storage,
+        tree: &crate::tree::Tree<S>,
+        grid: &mut Grid,
+        reservation: Reservation,
+    ) where
+        S: crate::table::TableSpec,
+    {
+        // Value block: write when full or half-bar exhausted.
+        if matches!(self.table_builder.state(), BuilderState::IndexAndValueBlock)
+            && (self.table_builder.value_block_full(&S::LAYOUT) || self.quotas.half_bar_exhausted())
+        {
+            if self.table_builder.value_block_empty() {
+                // Zero values this beat; release the empty block.
+                assert!(self.quotas.half_bar_exhausted());
+                self.table_builder.release_empty_value_block();
+                let Some(value_location) = self.table_builder_value_block.take() else {
+                    unreachable!("value block set for finish")
+                };
+                grid.block_unref(value_location);
+            } else {
+                self.write_value_block(storage, tree, grid, reservation);
+            }
+        }
+
+        // Index block: write when full or half-bar exhausted.
+        if matches!(self.table_builder.state(), BuilderState::IndexBlock)
+            && (self.table_builder.index_block_full(&S::LAYOUT) || self.quotas.half_bar_exhausted())
+        {
+            if self.table_builder.index_block_empty() {
+                // Only possible when half-bar exhausted with zero values this beat.
+                assert!(self.quotas.half_bar_exhausted());
+                self.table_builder.release_empty_index_block();
+                let Some(index_location) = self.table_builder_index_block.take() else {
+                    unreachable!("index block set for finish")
+                };
+                grid.block_unref(index_location);
+            } else {
+                self.write_index_block(storage, tree, grid, reservation);
+            }
+        }
+    }
+
+    /// Drain events and return the fresh location from a matching `WriteDone`.
+    ///
+    /// # Panics
+    /// Panics if no matching `WriteDone` event is present.
+    fn take_write_done_event(grid: &mut Grid, expected_token: u32, expected_address: u64) -> u32 {
+        let mut result = None;
+        for event in grid.take_events() {
+            if let Event::WriteDone { token, address, fresh_location } = event {
+                assert!(result.is_none(), "unexpected multiple WriteDone events");
+                assert_eq!(token, expected_token, "write token mismatch");
+                assert_eq!(address, expected_address, "write address mismatch");
+                result = Some(fresh_location);
+            }
+        }
+        let Some(fresh_location) = result else {
+            unreachable!("expected a WriteDone event from the grid")
+        };
+        fresh_location
+    }
+
+    /// Complete the current beat (upstream `beat_complete`): verify the builder and
+    /// positions are consistent, then return to the paused stage with the beat quota
+    /// exhausted.
+    #[allow(clippy::missing_panics_doc)]
+    fn beat_complete(&mut self) {
+        assert_eq!(self.stage, Stage::Beat);
+        assert_eq!(self.table_builder.state(), BuilderState::NoBlocks);
+        assert!(self.table_builder_index_block.is_none());
+        assert!(self.table_builder_value_block.is_none());
+
+        if matches!(self.table_info_a, Some(TableInfoA::Immutable)) {
+            assert!(
+                !matches!(self.level_a_immutable_stage, LevelAImmutableStage::Merge),
+                "cannot end a beat mid-merge"
+            );
+        }
+
+        if self.quotas.half_bar_exhausted() {
+            assert_eq!(self.counters.out, self.counters.in_ - self.counters.dropped);
+        }
+
+        self.stage = Stage::Paused;
+        self.pool_is_active = false;
+        self.callback_is_set = false;
+        assert!(self.is_idle());
+    }
+
+    // -----------------------------------------------------------------------
 
     /// Plan a compaction half-bar: select input tables, compute quota, handle move-table
     /// optimization (upstream `half_bar_commence`).
@@ -793,7 +1296,11 @@ impl<S: TreeSpec> Compaction<S> {
         assert_eq!(self.stage, Stage::Paused);
         assert!(self.counters.consistent());
         assert!(self.quotas.half_bar_exhausted());
-        // TODO(port): assert table_builder state == .no_blocks (Phase 3)
+        assert_eq!(
+            self.table_builder.state(),
+            crate::table::BuilderState::NoBlocks,
+            "output table must be fully written by the end of the half-bar"
+        );
 
         // Reset compaction to inactive, keeping only the globally scoped fields.
         let grid_ptr = self.grid;
@@ -931,7 +1438,9 @@ impl<S: TreeSpec> Compaction<S> {
         self.level_a_position = Position::default();
         self.level_b_position = Position::default();
         self.manifest_entries.clear();
-        self.table_builder_value_count = 0;
+        self.table_builder = TableBuilder::new();
+        self.table_builder_index_block = None;
+        self.table_builder_value_block = None;
         self.level_a_immutable_stage = LevelAImmutableStage::Ready;
         self.pool_is_active = false;
         self.callback_is_set = false;
@@ -959,8 +1468,15 @@ mod tests {
     use tigerbeetle_lsm::table_memory::{self as tm, MergeContext, Table};
     use tigerbeetle_lsm::tree::TreeConfig;
 
-    use crate::grid::{Grid, GridOptions};
+    use crate::Zone;
+    use crate::grid::{Grid, GridOptions, SuperBlockView};
+    use crate::multiversion::Release;
+    use crate::storage::MemoryStorage;
     use crate::tree::{Options as TreeOptions, Tree};
+    use tigerbeetle_core::constants::{self, BLOCK_SIZE};
+    use tigerbeetle_lsm::manifest::ManifestLog;
+    use tigerbeetle_lsm::schema::manifest_node::TableInfo as WireTableInfo;
+    use tigerbeetle_lsm::scratch_memory::ScratchMemory;
 
     fn new_test_grid() -> Grid {
         Grid::new(GridOptions {
@@ -971,6 +1487,37 @@ mod tests {
             free_set_blocks_count: Some(4096),
             free_set_blocks_capacity: None,
         })
+    }
+
+    /// Grid for the I/O dispatch tests: enough stash for the output table's index and
+    /// value blocks plus a fresh stash block per in-flight write, and ≥1 write iops so
+    /// `create_block` reaches the storage (write_iops_max = 0 would queue forever).
+    fn new_dispatch_grid() -> (Grid, MemoryStorage) {
+        let mut grid = Grid::new(GridOptions {
+            cache_blocks_count: 4096,
+            stash_blocks_count: 16,
+            read_iops_max: 1,
+            write_iops_max: 2,
+            free_set_blocks_count: Some(4096),
+            free_set_blocks_capacity: None,
+        });
+        grid.attach_superblock_view(SuperBlockView {
+            cluster: 0xDEAD_BEEF_u128,
+            release: Release { value: 3 },
+            storage_size: Zone::Grid.start(),
+            manifest_block_count: 0,
+            manifest_oldest_address: 0,
+            manifest_oldest_checksum: 0,
+            manifest_newest_address: 0,
+            manifest_newest_checksum: 0,
+            op_compacted: false,
+        });
+
+        // The output blocks are written to storage; size the grid zone generously.
+        let storage_size =
+            Zone::Grid.start() + 4096 * (BLOCK_SIZE as u64) + constants::SECTOR_SIZE as u64;
+        let storage = MemoryStorage::new(storage_size);
+        (grid, storage)
     }
 
     fn new_test_tree() -> Tree<TestSpec> {
@@ -1088,33 +1635,33 @@ mod tests {
         }
     }
 
+    impl crate::table::TableSpec for TestSpec {
+        type Key = TestKey;
+        type Value = TestValue;
+
+        fn key_from_value(value: &Self::Value) -> Self::Key {
+            value.key
+        }
+
+        const SENTINEL_KEY: Self::Key = TestKey(u64::MAX);
+
+        fn tombstone(value: &Self::Value) -> bool {
+            value.key.0 == u64::MAX && value.data == 0
+        }
+
+        fn tombstone_from_key(key: Self::Key) -> Self::Value {
+            TestValue { key, data: 0 }
+        }
+
+        const VALUE_COUNT_MAX: usize = 128;
+        const USAGE: crate::table::TableUsage = crate::table::TableUsage::General;
+    }
+
     impl crate::tree::TreeSpec for TestSpec {
-        const LAYOUT: TableLayout = TableLayout {
-            block_value_count_max: 128,
-            value_block_count_max: 1,
-            index: crate::schema::TableIndex {
-                key_size: 8,
-                value_block_count_max: 1,
-                size: 184,
-                value_checksums_offset: 128,
-                value_checksums_size: 32,
-                keys_min_offset: 160,
-                keys_max_offset: 168,
-                keys_size: 8,
-                value_addresses_offset: 176,
-                value_addresses_size: 8,
-                padding_offset: 184,
-                padding_size: 3912,
-            },
-            data: crate::schema::TableValue {
-                value_size: 16,
-                value_count_max: 128,
-                values_offset: 128,
-                values_size: 2048,
-                padding_offset: 2176,
-                padding_size: 1920,
-            },
-        };
+        // DEVIATION-safe: compute() derives offsets from HEADER_SIZE like the comptime
+        // layout in upstream, so the hand-written tree.rs test layout (which uses the
+        // 128-byte upstream header) is avoided here where blocks are actually written.
+        const LAYOUT: TableLayout = TableLayout::compute(8, 16, 128);
 
         fn index_blocks_for_key(
             _: &[u8],
@@ -1510,5 +2057,114 @@ mod tests {
 
         compaction.beat_commence(3);
         assert_eq!((compaction.quotas.beat, compaction.quotas.beat_done), (0, 0));
+    }
+
+    // -- I/O dispatch tests --
+
+    /// Minimal, viable manifest log backing for `half_bar_complete`.
+    struct MockLog {
+        entries: Vec<WireTableInfo>,
+        opened: bool,
+    }
+
+    impl MockLog {
+        /// A log that is *not* yet opened; `Manifest::open_commence` requires that.
+        fn new_unopened() -> Self {
+            Self { entries: Vec::new(), opened: false }
+        }
+
+        fn open(&mut self) {
+            self.opened = true;
+        }
+    }
+
+    impl ManifestLog for MockLog {
+        fn is_opened(&self) -> bool {
+            self.opened
+        }
+
+        fn append(&mut self, entry: &WireTableInfo) {
+            assert!(self.opened);
+            self.entries.push(*entry);
+        }
+    }
+
+    #[test]
+    fn dispatch_l0_flush_immutable_drop_tombstones_writes_table() {
+        let mut tree = new_test_tree();
+        // Seed 5 values: keys 1..5 with one tombstone at key u64::MAX.
+        for key in 1..=5_u64 {
+            tree.put(&TestValue { key: TestKey(key), data: key * 10 });
+        }
+        tree.put(&TestValue { key: TestKey(u64::MAX), data: 0 }); // tombstone
+        tree.compact(&mut ScratchMemory::<TestValue>::new(128));
+        tree.swap_mutable_and_immutable(1, &mut ScratchMemory::<TestValue>::new(128));
+        assert_eq!(tree.table_immutable_ref().count(), 6);
+
+        let (mut grid, mut storage) = new_dispatch_grid();
+
+        let mut compaction = Compaction::<TestSpec>::new(
+            core::ptr::addr_of_mut!(tree),
+            core::ptr::addr_of_mut!(grid),
+            0,
+        );
+
+        let values_count = u64::from(tree.table_immutable_ref().count());
+        let quota_half_bar = compaction.half_bar_commence(8, &tree, &grid);
+        assert_eq!(quota_half_bar, values_count);
+
+        // Empty level 0 → drop_tombstones on.
+        assert!(compaction.drop_tombstones);
+        assert!(compaction.range_b.as_ref().is_some_and(|r| r.tables.tables.empty()));
+
+        compaction.beat_commence(values_count);
+        let reservation = compaction.reserve_output_blocks(&mut grid);
+
+        compaction.dispatch(&mut storage, &tree, &mut grid, reservation);
+
+        // Single beat consumed the whole (small) immutable table.
+        assert_eq!(compaction.quotas.beat_done, values_count);
+        assert_eq!(compaction.quotas.half_bar_done, values_count);
+        assert_eq!(compaction.counters.in_, values_count);
+        assert_eq!(compaction.counters.dropped, 1); // exactly the tombstone dropped
+        assert_eq!(compaction.counters.out, values_count - 1);
+        assert!(compaction.counters.consistent());
+        assert_eq!(compaction.stage, Stage::Paused);
+        assert!(compaction.quotas.beat_exhausted());
+        assert!(compaction.quotas.half_bar_exhausted());
+        assert_eq!(compaction.table_builder.state(), BuilderState::NoBlocks);
+
+        // One output table queued for level 0.
+        assert_eq!(compaction.manifest_entries.len(), 1);
+        let entry = &compaction.manifest_entries[0];
+        assert_eq!(entry.operation, ManifestEntryOperation::InsertToLevelB);
+        assert_eq!(entry.table.value_count, (values_count - 1) as u32);
+        // The tombstone key (u64::MAX) is excluded from the output range.
+        assert_ne!(entry.table.key_min, TestKey(u64::MAX));
+        assert_ne!(entry.table.key_max, TestKey(u64::MAX));
+
+        // The output blocks were written: the address is acquired (not free/released) and
+        // the value block is cached.
+        let address = entry.table.address;
+        assert!(address > 0);
+        assert!(!grid.free_set_is_free(address));
+        assert!(!grid.free_set_is_released(address));
+        assert!(grid.cached_location(address).is_some());
+
+        // half_bar_complete persists the output table & flushes the immutable.
+        let mut log = MockLog::new_unopened();
+        tree.manifest_mut().open_commence(&log);
+        log.open();
+        compaction.half_bar_complete(&mut tree, &grid, &mut log);
+        assert_eq!(compaction.stage, Stage::Inactive);
+        assert!(compaction.manifest_entries.is_empty());
+        assert!(!log.entries.is_empty());
+        assert_eq!(tree.manifest_ref().levels[0].table_count_visible(), 1);
+        assert!(matches!(
+            tree.table_immutable_ref().mutability(),
+            Mutability::Immutable(state) if state.flushed
+        ));
+
+        grid.forfeit(reservation);
     }
 }

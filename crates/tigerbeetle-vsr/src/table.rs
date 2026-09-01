@@ -142,8 +142,10 @@ impl TableLayout {
 // ---------------------------------------------------------------------------
 
 /// State of the [`TableBuilder`].
+///
+/// Exposed for compaction (upstream reads `table_builder.state` directly).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BuilderState {
+pub enum BuilderState {
     /// No blocks set.
     NoBlocks,
     /// Index block is set, waiting for value block.
@@ -229,6 +231,18 @@ impl TableBuilder {
         self.state = BuilderState::IndexBlock;
     }
 
+    /// Current builder state (upstream `table_builder.state`).
+    #[must_use]
+    pub fn state(&self) -> BuilderState {
+        self.state
+    }
+
+    /// Number of values in the current value block (upstream `value_count`).
+    #[must_use]
+    pub const fn value_count(&self) -> u32 {
+        self.value_count
+    }
+
     /// Set the value block for the current value block. Must be called after
     /// [`set_index_block`](Self::set_index_block) or after finishing a value block.
     ///
@@ -257,6 +271,28 @@ impl TableBuilder {
         assert_eq!(self.state, BuilderState::IndexAndValueBlock);
         assert!(self.value_count <= layout.data.value_count_max);
         self.value_count == layout.data.value_count_max
+    }
+
+    /// Transition from `IndexAndValueBlock` to `IndexBlock` after an empty value
+    /// block is released without being written (upstream `block_release` path for
+    /// empty value blocks in `flush_table_builder_blocks`).
+    ///
+    /// # Panics
+    /// Panics if the builder is not in `IndexAndValueBlock` state.
+    pub fn release_empty_value_block(&mut self) {
+        assert_eq!(self.state, BuilderState::IndexAndValueBlock);
+        self.state = BuilderState::IndexBlock;
+    }
+
+    /// Transition from `IndexBlock` to `NoBlocks` after an empty index block is
+    /// released without being written (upstream `block_release` path for empty
+    /// index blocks in `flush_table_builder_blocks`).
+    ///
+    /// # Panics
+    /// Panics if the builder is not in `IndexBlock` state.
+    pub fn release_empty_index_block(&mut self) {
+        assert_eq!(self.state, BuilderState::IndexBlock);
+        self.state = BuilderState::NoBlocks;
     }
 
     /// Finish the current value block: write the header, update the index block,
@@ -535,6 +571,30 @@ impl TableBuilder {
         let value_size = core::mem::size_of::<S::Value>();
         let offset = layout.data.values_offset as usize + self.value_count as usize * value_size;
         S::Value::write_bytes(value, &mut value_block[offset..offset + value_size]);
+        self.value_count += 1;
+    }
+
+    /// Insert a value provided as a [`BlockValue`] into the current value block.
+    ///
+    /// Same dispatch as [`Self::insert_value`] but bound on [`BlockValue`], so callers
+    /// that only have the `table_memory::Table::Value` (which is `BlockValue`) can use
+    /// it without a `TableSpec` bound (compaction is generic over `TreeSpec`).
+    ///
+    /// # Panics
+    /// Panics if the builder is not in `IndexAndValueBlock` state or the value block
+    /// is full.
+    pub fn insert_block_value<V: BlockValue>(
+        &mut self,
+        value: &V,
+        value_block: &mut [u8],
+        layout: &TableLayout,
+    ) {
+        assert_eq!(self.state, BuilderState::IndexAndValueBlock);
+        assert!(!self.value_block_full(layout));
+
+        let value_size = core::mem::size_of::<V>();
+        let offset = layout.data.values_offset as usize + self.value_count as usize * value_size;
+        V::write_bytes(value, &mut value_block[offset..offset + value_size]);
         self.value_count += 1;
     }
 }
