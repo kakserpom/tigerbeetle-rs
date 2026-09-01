@@ -247,3 +247,147 @@ pub mod manifest_node {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::METADATA_SIZE;
+    use super::manifest_node::{self, Event, TableInfo};
+
+    /// Fully-populated `TableInfo` with distinct bytes in every field to catch any
+    /// offset/ordering slip in the wire codecs.
+    fn test_table_info() -> TableInfo {
+        let key_min = [
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+            25, 26, 27, 28, 29, 30, 31, 32,
+        ];
+        let key_max = [
+            33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54,
+            55, 56, 57, 58, 59, 60, 61, 62, 63, 64,
+        ];
+        TableInfo {
+            key_min,
+            key_max,
+            checksum: 0xdead_beef_cafe_babe_feed_f00d_0123_4567,
+            address: 0x0010_0020_0030_0040,
+            snapshot_min: 0x1122_3344_5566_7788,
+            snapshot_max: 0x9988_7766_5544_3322,
+            value_count: 1234,
+            tree_id: 0xBEEF,
+            label: manifest_node::Label { level: 63, event: Event::Update },
+        }
+    }
+
+    #[test]
+    fn metadata_round_trip() {
+        let metadata = manifest_node::Metadata {
+            previous_manifest_block_checksum: 0x0123_4567_89ab_cdef_fedc_ba98_7654_3210,
+            previous_manifest_block_address: 0xdead_beef_cafe_babe,
+            entry_count: 4096,
+        };
+
+        let wire = metadata.to_wire();
+        assert_eq!(wire.len(), METADATA_SIZE);
+        let decoded = manifest_node::Metadata::from_wire(&wire);
+        assert_eq!(decoded, metadata);
+    }
+
+    #[test]
+    fn metadata_wire_layout() {
+        let metadata = manifest_node::Metadata {
+            previous_manifest_block_checksum: 0x0123_4567_89ab_cdef_fedc_ba98_7654_3210,
+            previous_manifest_block_address: 0xdead_beef_cafe_babe,
+            entry_count: 0x0102_0304,
+        };
+        let wire = metadata.to_wire();
+
+        // prev_checksum(16) at offset 0, prev_padding(16) zeroed at 16,
+        // prev_address(8) at 32, entry_count(4) at 40, reserved[52] zeroed at 44.
+        assert_eq!(&wire[0..16], &metadata.previous_manifest_block_checksum.to_le_bytes());
+        assert_eq!(&wire[16..32], &[0_u8; 16]);
+        assert_eq!(&wire[32..40], &metadata.previous_manifest_block_address.to_le_bytes());
+        assert_eq!(&wire[40..44], &metadata.entry_count.to_le_bytes());
+        assert_eq!(&wire[44..METADATA_SIZE], &[0_u8; METADATA_SIZE - 44]);
+    }
+
+    #[test]
+    #[should_panic(expected = "reserved area must be zeroed")]
+    fn metadata_from_wire_panics_on_nonzero_reserved() {
+        let mut wire = [0_u8; METADATA_SIZE];
+        wire[50] = 1; // inside reserved
+        let _ = manifest_node::Metadata::from_wire(&wire);
+    }
+
+    #[test]
+    #[should_panic(expected = "left == right")]
+    fn metadata_from_wire_panics_on_nonzero_padding() {
+        let mut wire = [0_u8; METADATA_SIZE];
+        wire[20] = 1; // inside prev_checksum padding
+        let _ = manifest_node::Metadata::from_wire(&wire);
+    }
+
+    #[test]
+    fn label_packing_all_events_and_levels() {
+        for level in [0_u8, 1, 31, 62, 63] {
+            for event in [Event::Reserved, Event::Insert, Event::Update, Event::Remove] {
+                let label = manifest_node::Label { level, event };
+                let packed = label.to_u8();
+                assert_eq!(packed & 0b0011_1111, level, "low 6 bits hold the level");
+                assert_eq!(packed >> 6, event as u8, "high 2 bits hold the event");
+                assert_eq!(manifest_node::Label::from_u8(packed), label);
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "self.level <= 0b0011_1111")]
+    fn label_to_u8_rejects_level_above_63() {
+        let _ = manifest_node::Label { level: 64, event: Event::Insert }.to_u8();
+    }
+
+    #[test]
+    fn table_info_round_trip() {
+        let info = test_table_info();
+        let wire = info.to_wire();
+        assert_eq!(wire.len(), TableInfo::SIZE);
+        assert_eq!(TableInfo::SIZE, manifest_node::ENTRY_SIZE);
+        assert_eq!(TableInfo::from_wire(&wire), info);
+    }
+
+    #[test]
+    fn table_info_wire_layout() {
+        let wire = test_table_info().to_wire();
+
+        // key_min(32) at 0, key_max(32) at 32, checksum(16) at 64 (+padding 16 zeroed at 80),
+        // address(8) at 96, snapshot_min(8) at 104, snapshot_max(8) at 112,
+        // value_count(4) at 120, tree_id(2) at 124, label(1) at 126, reserved(1) at 127.
+        assert_eq!(&wire[0..32], &test_table_info().key_min);
+        assert_eq!(&wire[32..64], &test_table_info().key_max);
+        assert_eq!(&wire[64..80], &0xdead_beef_cafe_babe_feed_f00d_0123_4567u128.to_le_bytes());
+        assert_eq!(&wire[80..96], &[0_u8; 16]);
+        assert_eq!(&wire[96..104], &0x0010_0020_0030_0040u64.to_le_bytes());
+        assert_eq!(&wire[104..112], &0x1122_3344_5566_7788u64.to_le_bytes());
+        assert_eq!(&wire[112..120], &0x9988_7766_5544_3322u64.to_le_bytes());
+        assert_eq!(&wire[120..124], &1234_u32.to_le_bytes());
+        assert_eq!(&wire[124..126], &0xBEEF_u16.to_le_bytes());
+        assert_eq!(wire[126], manifest_node::Label { level: 63, event: Event::Update }.to_u8());
+        assert_eq!(wire[127], 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "left == right")]
+    fn table_info_from_wire_panics_on_nonzero_checksum_padding() {
+        let mut wire = test_table_info().to_wire();
+        wire[90] = 1; // checksum padding
+        let _ = TableInfo::from_wire(&wire);
+    }
+
+    #[test]
+    #[should_panic(expected = "left == right")]
+    fn table_info_from_wire_panics_on_nonzero_reserved() {
+        let mut wire = test_table_info().to_wire();
+        wire[127] = 1; // reserved
+        let _ = TableInfo::from_wire(&wire);
+    }
+}
