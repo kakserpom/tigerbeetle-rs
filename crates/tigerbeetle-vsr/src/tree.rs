@@ -22,6 +22,7 @@
 #![allow(clippy::cast_sign_loss)]
 
 use tigerbeetle_core::constants::{self, VERIFY};
+use tigerbeetle_lsm::compaction::{compaction_op_min, snapshot_min_for_table_output};
 use tigerbeetle_lsm::manifest::{
     Manifest, ManifestLog as ManifestLogTrait, TableKey as ManifestTableKey, TreeTableInfo,
 };
@@ -30,7 +31,9 @@ use tigerbeetle_lsm::scratch_memory::ScratchMemory;
 use tigerbeetle_lsm::table_memory::{self, Mutability, TableMemory};
 use tigerbeetle_lsm::tree::{SNAPSHOT_LATEST, ScopeCloseMode, TreeConfig};
 
+use crate::compaction::Compaction;
 use crate::grid::Grid;
+use crate::storage::Storage;
 use crate::table::{BlockValue, IndexBlocks, TableKey as VsrTableKey, TableLayout};
 
 /// Generic parameters for a tree's table schema (upstream `TreeTable` comptime param).
@@ -86,28 +89,6 @@ enum CachedValueSearch<V: Copy> {
     BlockNotInCache,
 }
 
-/// Stub for `CompactionType(Tree, Storage)` — replaced when `compaction.zig` is ported.
-///
-/// Upstream Compaction is ~2388 lines with deep I/O integration. This stub satisfies
-/// Tree's structural needs only.
-struct Compaction {
-    #[allow(dead_code)]
-    level_b: u8,
-}
-
-impl Compaction {
-    fn new(level_b: u8) -> Self {
-        assert!((level_b as usize) < constants::LSM_LEVELS as usize);
-        Self { level_b }
-    }
-
-    #[allow(clippy::unused_self)]
-    fn reset(&mut self) {}
-
-    #[allow(clippy::unused_self)]
-    fn assert_between_bars(&self) {}
-}
-
 /// An LSM tree: `TreeType(TreeTable, Storage)` in upstream.
 ///
 /// Generic over [`TreeSpec`] which provides the table schema and block-level operations.
@@ -121,9 +102,13 @@ pub struct Tree<S: TreeSpec> {
 
     manifest: Manifest<S::Key>,
 
+    /// The grid this tree's compactions write through. Set by [`Self::attach_grid`]; the
+    /// tree is constructed before a grid exists, so it cannot own one up front.
+    grid_pointer: *mut Grid,
+
     /// One compaction per level. + 1 for immutable→L0 is cancelled by −1 since the last
     /// level doesn't compact to anything.
-    compactions: [Compaction; constants::LSM_LEVELS as usize],
+    compactions: [Compaction<S>; constants::LSM_LEVELS as usize],
 
     /// While a compaction is running, this is the op of the last `compact()`.
     /// While no compaction is running, this is the op of the last `compact()` to complete.
@@ -161,18 +146,47 @@ impl<S: TreeSpec> Tree<S> {
             value_count_limit,
         );
         let manifest = Manifest::new(config);
-        let compactions = core::array::from_fn(|i| Compaction::new(i as u8));
 
-        Self {
+        // The compactions hold `*mut Tree<S>` back-references, which cannot be taken until
+        // the tree struct is fully constructed — so build the struct with a placeholder array
+        // and then point each compaction at this tree. The grid pointer is attached later via
+        // `attach_grid` (upstream constructs Tree with a `*Grid` in hand; here the forest owns
+        // the grid and the tree is built standalone in tests).
+        let mut tree = Self {
             config,
             options,
             table_mutable,
             table_immutable,
             manifest,
-            compactions,
+            grid_pointer: core::ptr::null_mut(),
+            compactions: core::array::from_fn(|_| {
+                Compaction::new(core::ptr::null_mut(), core::ptr::null_mut(), 0)
+            }),
             compaction_op: None,
             active_scope: None,
             key_range: None,
+        };
+        let tree_ptr = core::ptr::addr_of_mut!(tree);
+        tree.compactions =
+            core::array::from_fn(|i| Compaction::new(tree_ptr, core::ptr::null_mut(), i as u8));
+        tree
+    }
+
+    /// Attach the grid this tree's compactions write output through.
+    ///
+    /// DEVIATION: upstream constructs each `Tree` with a `*Grid` in hand (the forest owns the
+    /// grid) and `TreeType.init` threads it into every `Compaction`. Here the tree is built
+    /// standalone in tests, so the grid is attached after construction; the compactions resolve
+    /// the grid through this pointer (their stored `*mut Grid` is only used for lifecycle
+    /// bookkeeping — the dispatch/half-bar methods take `grid` as a parameter).
+    ///
+    /// # Panics
+    /// Panics if a grid was already attached.
+    pub fn attach_grid(&mut self, grid: *mut Grid) {
+        assert!(self.grid_pointer.is_null(), "grid already attached");
+        self.grid_pointer = grid;
+        for compaction in &mut self.compactions {
+            compaction.set_grid(grid);
         }
     }
 
@@ -429,6 +443,82 @@ impl<S: TreeSpec> Tree<S> {
     pub fn compact(&mut self, radix_buffer: &mut ScratchMemory<S::Value>) {
         // TODO(port): grid.trace.start/stop — tracer not yet ported.
         self.table_mutable.sort_suffix(radix_buffer);
+    }
+
+    /// Drive the level-0 (immutable-flush) compaction for one op/beat, mirroring
+    /// upstream `forest.compact(op)` → `compact_trees_start` + `compact_finish`
+    /// (forest.zig:417-765) restricted to the L0 immutable path.
+    ///
+    /// The `compactions[0]` instance is advanced through the bar cadence:
+    /// - on the first beat and the half-bar beat, `half_bar_commence(op)` starts a
+    ///   new half-bar (immutable → level-0) compaction;
+    /// - the compaction is then drained across beats via `beat_commence` +
+    ///   `reserve_output_blocks` + `dispatch` until its half-bar quota is exhausted;
+    /// - on the last half-bar beat and the last beat, `half_bar_complete` applies its
+    ///   manifest updates and flushes the immutable table;
+    /// - on the last beat of the bar, the mutable suffix is swapped into the immutable
+    ///   table at the output snapshot_min.
+    ///
+    /// DEVIATION: upstream reserves one grid block reservation per beat for the whole
+    /// forest (`forest.compact_trees_reserve_grid_blocks`); this port holds a per-tree,
+    /// per-dispatch reservation through the synchronous `dispatch` and forfeits it
+    /// immediately, since there is no `ResourcePool`.
+    ///
+    /// # Panics
+    /// Panics if the compaction or table state is inconsistent (upstream asserts).
+    #[allow(clippy::missing_panics_doc)]
+    pub fn compact_level0(
+        &mut self,
+        op: u64,
+        grid: &mut Grid,
+        storage: &mut dyn Storage,
+        log: &mut impl ManifestLogTrait,
+        scratch: &mut ScratchMemory<<S as table_memory::Table>::Value>,
+    ) where
+        S: crate::table::TableSpec,
+    {
+        let compaction_beat = op % (constants::LSM_COMPACTION_OPS as u64);
+        let half_bar = (constants::LSM_COMPACTION_OPS as u64) / 2;
+        let first_beat = compaction_beat == 0;
+        let half_beat = compaction_beat == half_bar;
+        let last_half_beat = compaction_beat == half_bar - 1;
+        let last_beat = compaction_beat == (constants::LSM_COMPACTION_OPS as u64) - 1;
+
+        // The driver below passes `self` (the tree) to compaction methods that also need
+        // `&mut` access to the compaction. Since the compaction is a field of the tree, those
+        // borrows would alias. Detach the compaction into a local and reattach it after the
+        // cadence; the pointer/grid/level_b fields are preserved inside it (rebuilt cheaply in
+        // the placeholder). This is sound: the detached `compaction` and `self` no longer share
+        // any borrow, and no other code reads `self.compactions[0]` during the call.
+        let level_b = self.compactions[0].level_b;
+        let mut compaction = core::mem::replace(
+            &mut self.compactions[0],
+            Compaction::new(core::ptr::null_mut(), core::ptr::null_mut(), level_b),
+        );
+
+        if first_beat || half_beat {
+            compaction.half_bar_commence(op, self, grid);
+        }
+
+        // Drain the level-0 compaction to (or near) its half-bar quota this beat.
+        while !compaction.quotas.half_bar_exhausted() {
+            let remaining = compaction.quotas.half_bar - compaction.quotas.half_bar_done;
+            compaction.beat_commence(remaining);
+            let reservation = compaction.reserve_output_blocks(grid);
+            compaction.dispatch(storage, self, grid, reservation);
+            grid.forfeit(reservation);
+        }
+
+        if last_beat || last_half_beat {
+            compaction.half_bar_complete(self, grid, log);
+        }
+
+        self.compactions[0] = compaction;
+
+        if last_beat {
+            let snapshot_min = snapshot_min_for_table_output(compaction_op_min(op));
+            self.swap_mutable_and_immutable(snapshot_min, scratch);
+        }
     }
 
     /// Called after the last beat of a full compaction bar, by the compaction instance.

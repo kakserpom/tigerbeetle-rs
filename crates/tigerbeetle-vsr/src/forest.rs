@@ -389,7 +389,9 @@ mod tests {
     use tigerbeetle_core::checksum::checksum;
     use tigerbeetle_core::constants::{self, BLOCK_SIZE};
     use tigerbeetle_core::types::Account;
+    use tigerbeetle_lsm::compaction;
     use tigerbeetle_lsm::schema::manifest_node::{self, Event, Label};
+    use tigerbeetle_lsm::table_memory::Mutability;
 
     const CACHE_BLOCKS_COUNT: usize = 256;
     const READ_IOPS_MAX: usize = 2;
@@ -451,6 +453,12 @@ mod tests {
         MemoryStorage::new(Zone::Grid.start() + 64 * BLOCK_SIZE as u64)
     }
 
+    /// A storage whose grid zone covers the forest grid's free-set capacity, so L0-flush
+    /// dispatch writes (which address any free block) land in bounds.
+    fn large_storage() -> MemoryStorage {
+        MemoryStorage::new(Zone::Grid.start() + FREE_SET_BLOCKS as u64 * BLOCK_SIZE as u64)
+    }
+
     /// `Forest::compact` drives each groove's `compact` with its scratch buffers,
     /// sorting + deduping the account object mutable table's suffix.
     ///
@@ -484,6 +492,62 @@ mod tests {
         for op in 0..(constants::LSM_COMPACTION_OPS as u64) {
             forest.compact(op);
         }
+    }
+
+    /// Drive `Tree::compact_level0` (the L0 immutable-flush driver) across a full
+    /// compaction bar on the account object tree, using the forest's real grid, storage,
+    /// manifest log, and scratch. Puts values into the mutable table, pops them into an
+    /// *unflushed* immutable table via a prior swap, then runs the driver for one bar.
+    ///
+    /// This is the end-to-end seam the compact dispatch machinery was built for: the
+    /// 8-op bar paces `half_bar_commence` (first beat / half beat), drains the immutable
+    /// source through the grid via `dispatch`, `half_bar_complete` (last-half / last beat)
+    /// inserts the real output table into the manifest, and the last beat swaps
+    /// mutable→immutable.
+    #[test]
+    fn tree_compact_level0_driver_flushes_immutable_to_l0() {
+        // The grid's free set holds `matrix_free_set_blocks` addresses (a few thousand), far
+        // more than the 64 blocks of the default `storage()`. Size the grid zone to cover the
+        // free-set capacity so the L0 flush's dispatched writes land in bounds.
+        let mut forest = Forest::init(test_superblock(), grid_options(), 32);
+        let mut storage = large_storage();
+        open_forest(&mut forest, &mut storage);
+
+        // Seed an *unflushed* immutable table of 2 accounts. Same as the hand-filled
+        // flush test: put → compact → swap leaves the immutable unflushed with count 2.
+        forest.accounts.objects.put(&Account { id: 3, timestamp: 3, ..Account::default() });
+        forest.accounts.objects.put(&Account { id: 5, timestamp: 5, ..Account::default() });
+        forest.accounts.objects.compact(&mut forest.accounts_scratch.objects);
+        forest.accounts.objects.swap_mutable_and_immutable(1, &mut forest.accounts_scratch.objects);
+        assert_eq!(forest.accounts.objects.table_immutable_ref().count(), 2);
+
+        // Run a full bar. The driver is keyed off op modulo LSM_COMPACTION_OPS; the first
+        // valid half-bar begins at op = HALF_BAR_BEAT_COUNT (commence asserts op aligns to it),
+        // so start the steady-state bar at op 8 (8..16 is one full bar).
+        let bar_ops = constants::LSM_COMPACTION_OPS as u64;
+        let bar_start = compaction::HALF_BAR_BEAT_COUNT as u64 * 2;
+        for op in bar_start..bar_start + bar_ops {
+            forest.accounts.objects.compact_level0(
+                op,
+                &mut forest.grid,
+                &mut storage,
+                &mut forest.manifest_log,
+                &mut forest.accounts_scratch.objects,
+            );
+        }
+
+        // The immutable source flushed to a real level-0 table.
+        assert!(forest.accounts.objects.manifest_table_count() >= 1);
+        assert_eq!(
+            forest.accounts.objects.manifest_ref().levels[0].table_count_visible(),
+            1,
+            "the flushed L0 table should be visible"
+        );
+        // The immutable table is marked flushed after the L0 flush, and the mutable table
+        // was absorbed (count drained back to 0) on the last beat.
+        let mutability = forest.accounts.objects.table_immutable_ref().mutability();
+        assert!(matches!(mutability, Mutability::Immutable(state) if state.flushed));
+        assert_eq!(forest.accounts.objects.table_immutable_ref().count(), 0);
     }
 
     /// `Forest::open` attaches the manifest log to every groove and, once the manifest log

@@ -567,6 +567,16 @@ impl<S: TreeSpec> Compaction<S> {
         }
     }
 
+    /// Attach the grid this compaction writes output through.
+    ///
+    /// DEVIATION: upstream constructs the ``Compaction`` with a `*Grid` in hand; this port's
+    /// `Tree` is built standalone and attaches the (forest-owned) grid later via
+    /// [`crate::tree::Tree::attach_grid`]. The stored pointer is only used for lifecycle
+    /// bookkeeping — the dispatch/half-bar methods receive `grid` as a parameter.
+    pub fn set_grid(&mut self, grid: *mut Grid) {
+        self.grid = grid;
+    }
+
     /// Port of upstream `Compaction.reset`.
     pub fn reset(&mut self) {
         // TODO(port): grid.trace.cancel(.compact_beat) — tracer not yet ported.
