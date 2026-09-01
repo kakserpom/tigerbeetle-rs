@@ -112,3 +112,101 @@ impl Default for Message {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::{MESSAGE_SIZE_MAX, Message};
+    use crate::command::Command;
+    use crate::message_header::{Ping, Prepare, SIZE, SIZE_U32, TypedHeader};
+
+    #[test]
+    fn new_message_is_zeroed_and_correctly_sized() {
+        let message = Message::new();
+        assert_eq!(message.buffer().len(), MESSAGE_SIZE_MAX);
+        assert_eq!(message.frame().len(), SIZE);
+        assert!(message.buffer().iter().all(|&byte| byte == 0));
+
+        let default = Message::default();
+        assert_eq!(default.size_raw(), 0);
+    }
+
+    /// `size_raw` must read the `Header.size` field at its wire offset 96, independently of
+    /// command validity. Upstream: `@offsetOf(vsr.Header, "size") == 96`.
+    #[test]
+    fn size_raw_reads_size_field_at_offset_96() {
+        let mut message = Message::new();
+
+        let mut ping = Ping::default();
+        ping.set_size(1000);
+        message.set_header(&ping);
+        assert_eq!(message.size_raw(), 1000);
+        assert_eq!(message.buffer()[96..100], 1000u32.to_le_bytes());
+        assert_eq!(message.frame()[96..100], 1000u32.to_le_bytes());
+    }
+
+    #[test]
+    fn header_round_trip_and_command_rejection() {
+        let mut message = Message::new();
+
+        let mut ping = Ping::default();
+        ping.set_size(SIZE_U32 + 3);
+        ping.checkpoint_op = 42;
+        ping.set_checksum_body(&[1, 2, 3]);
+        ping.set_checksum();
+
+        message.set_header(&ping);
+        assert_eq!(message.header::<Ping>(), Some(ping));
+
+        // A different command's header type must reject the frame.
+        assert_eq!(message.header::<Prepare>(), None);
+
+        // The base-frame view is reachable and consistent.
+        let frame = message.header::<Ping>().unwrap().frame();
+        assert_eq!(frame.command, Command::Ping);
+        assert_eq!(frame.size, SIZE_U32 + 3);
+
+        // Checksums computed through the typed header survive the buffer round trip.
+        let decoded = message.header::<Ping>().unwrap();
+        assert!(decoded.valid_checksum());
+        assert!(decoded.valid_checksum_body(&[1, 2, 3]));
+        assert!(!decoded.valid_checksum_body(&[1, 2, 4]));
+    }
+
+    #[test]
+    fn body_used_matches_size_field() {
+        let mut message = Message::new();
+
+        let mut ping = Ping::default();
+        ping.set_size(SIZE_U32 + 3);
+        message.set_header(&ping);
+        message.set_body(&[1, 2, 3]);
+        assert_eq!(message.body_used(), &[1, 2, 3]);
+
+        // An empty body: size == bare header.
+        let mut ping = Ping::default();
+        ping.set_size(SIZE_U32);
+        message.set_header(&ping);
+        message.set_body(&[]);
+        assert_eq!(message.body_used(), &[] as &[u8]);
+    }
+
+    #[test]
+    #[should_panic(expected = "size >= HEADER_SIZE")]
+    fn body_used_panics_when_size_below_bare_header() {
+        let mut message = Message::new();
+        let mut ping = Ping::default();
+        ping.set_size(SIZE_U32 - 1);
+        message.set_header(&ping);
+        let _ = message.body_used();
+    }
+
+    #[test]
+    #[should_panic(expected = "end <= self.buffer.len()")]
+    fn set_body_panics_on_overflow() {
+        let mut message = Message::new();
+        let too_big = vec![0_u8; MESSAGE_SIZE_MAX];
+        message.set_body(&too_big);
+    }
+}
