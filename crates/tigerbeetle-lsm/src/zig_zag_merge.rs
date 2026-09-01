@@ -167,10 +167,20 @@ impl<'a, S: ZigZagMergeSpec> ZigZagMergeIterator<'a, S> {
                 tour_total += 1;
                 tour_pending += 1;
             } else {
-                match self.gallop_key(tour_index, candidate)? {
+                match self.gallop_key(tour_index, candidate) {
+                    // The stream needs I/O to refill: record it as pending and keep touring
+                    // the remaining streams so the candidate is pinned before we give up.
+                    // (Upstream `catch |err| switch { error.Pending => { ...; continue; } }`.)
+                    Err(Pending) => {
+                        assert!(!pending[index]);
+                        pending[index] = true;
+                        pending_count += 1;
+                        tour_total += 1;
+                        tour_pending += 1;
+                    }
                     // An empty stream short-circuits the entire thing.
-                    None => return Ok(None),
-                    Some(key) => {
+                    Ok(None) => return Ok(None),
+                    Ok(Some(key)) => {
                         if self.direction.cmp_lt(&candidate, &key) {
                             // The stream is strictly ahead, restart a tour with a new
                             // candidate.
@@ -493,5 +503,131 @@ mod tests {
     fn zig_zag_merge_fuzz() {
         let mut prng = Prng::from_seed(42);
         TestContext::<32>::fuzz(&mut prng, 256);
+    }
+
+    // -- Pending (async refill) tests --
+    //
+    // Upstream's production contexts (e.g. the compaction `levels_b`) return `error.Pending`
+    // from `stream_peek` when the underlying stream needs I/O to refill. The iterator must
+    // then keep touring the *settled* streams to pin the candidate, probe the pending streams
+    // toward it, and only then surface `Pending` so the caller can issue the I/O.
+
+    /// Context whose streams pend against a caller-controlled mask; probing is recorded so
+    /// tests can observe the candidate used to advance pending streams.
+    struct PendShared {
+        streams: Vec<Vec<u128>>,
+        cursor: Vec<usize>,
+        pend: Vec<bool>,
+        probe_log: Vec<(u32, u128)>,
+    }
+
+    /// DEVIATION (test-only): state lives behind `Rc<RefCell>` so the test can flip the
+    /// pending mask between `pop` calls while the iterator borrows the context.
+    struct TestPendContext<const STREAMS_MAX: usize> {
+        shared: std::rc::Rc<std::cell::RefCell<PendShared>>,
+    }
+
+    impl<const STREAMS_MAX: usize> TestPendContext<STREAMS_MAX> {
+        fn new(streams: Vec<Vec<u128>>) -> Self {
+            let count = streams.len();
+            Self {
+                shared: std::rc::Rc::new(std::cell::RefCell::new(PendShared {
+                    streams,
+                    cursor: vec![0; count],
+                    pend: vec![false; count],
+                    probe_log: Vec::new(),
+                })),
+            }
+        }
+    }
+
+    impl<const STREAMS_MAX: usize> ZigZagMergeSpec for TestPendContext<STREAMS_MAX> {
+        type Context = Self;
+        type Key = u128;
+        type Value = u128;
+
+        const STREAMS_MAX: usize = STREAMS_MAX;
+        const KEY_MAX: u128 = u128::MAX;
+        const KEY_MIN: u128 = 0;
+
+        fn key_from_value(value: &Self::Value) -> Self::Key {
+            *value
+        }
+
+        fn stream_peek(
+            context: &mut Self,
+            stream_index: u32,
+        ) -> Result<Option<Self::Key>, Pending> {
+            let index = stream_index as usize;
+            let shared = context.shared.borrow();
+            if shared.pend[index] {
+                return Err(Pending);
+            }
+            let stream = &shared.streams[index];
+            if shared.cursor[index] >= stream.len() {
+                return Ok(None);
+            }
+            Ok(Some(stream[shared.cursor[index]]))
+        }
+
+        fn stream_pop(context: &mut Self, stream_index: u32) -> Self::Value {
+            let index = stream_index as usize;
+            let mut shared = context.shared.borrow_mut();
+            let value = shared.streams[index][shared.cursor[index]];
+            shared.cursor[index] += 1;
+            value
+        }
+
+        fn stream_probe(context: &mut Self, stream_index: u32, probe_key: Self::Key) {
+            let index = stream_index as usize;
+            let mut shared = context.shared.borrow_mut();
+            shared.probe_log.push((stream_index, probe_key));
+            let advance = shared.streams[index]
+                .iter()
+                .skip(shared.cursor[index])
+                .take_while(|&&key| key < probe_key)
+                .count();
+            shared.cursor[index] += advance;
+        }
+    }
+
+    #[test]
+    fn zig_zag_merge_pending_surfaces_after_pinning_candidate() {
+        type Context = TestPendContext<32>;
+
+        let mut context = Context::new(vec![vec![2, 4, 6], vec![4, 5, 6, 7, 8], vec![4, 6, 8]]);
+        let shared = std::rc::Rc::clone(&context.shared);
+        let mut it = ZigZagMergeIterator::<Context>::new(&mut context, 3, Direction::Ascending);
+
+        // Stream 0 needs I/O to refill.
+        shared.borrow_mut().pend[0] = true;
+        assert_eq!(it.pop(), Err(Pending));
+        // The settled streams (1, 2) share key 4: the pending stream must be probed toward it,
+        // and stream 0's cursor must have advanced past 2.
+        assert_eq!(shared.borrow().probe_log, vec![(0, 4)]);
+        assert_eq!(shared.borrow().cursor[0], 1);
+
+        // I/O completes; the merge resumes and yields the full intersection {4, 6}.
+        shared.borrow_mut().pend[0] = false;
+        let mut actual = Vec::new();
+        while let Ok(Some(value)) = it.pop() {
+            actual.push(value);
+        }
+        assert_eq!(actual, vec![4, 6]);
+    }
+
+    #[test]
+    fn zig_zag_merge_pending_all_streams_short_circuits() {
+        type Context = TestPendContext<32>;
+
+        let mut context = Context::new(vec![vec![1, 2], vec![1, 2], vec![1, 2]]);
+        let shared = std::rc::Rc::clone(&context.shared);
+        shared.borrow_mut().pend.fill(true);
+        let mut it = ZigZagMergeIterator::<Context>::new(&mut context, 3, Direction::Ascending);
+
+        // With every stream pending there is no candidate to pin, so we surface `Pending`
+        // immediately without probing.
+        assert_eq!(it.pop(), Err(Pending));
+        assert!(shared.borrow().probe_log.is_empty());
     }
 }
