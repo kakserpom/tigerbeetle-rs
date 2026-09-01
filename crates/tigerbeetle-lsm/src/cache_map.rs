@@ -548,4 +548,135 @@ mod tests {
         assert!(cache_map.get(4).is_none());
         assert!(matches!(cache_map.get_or_tombstone(4), GetOrTombstone::Tombstone));
     }
+
+    /// CacheMap with no backing set-associative cache: everything lives in the stash.
+    fn new_stash_only_map() -> CacheMap<TestTable> {
+        CacheMap::<TestTable>::new(CacheMapOptions {
+            cache_value_count_max: 0,
+            scope_value_count_max: 32,
+            stash_value_count_max: 32,
+            name: "test map",
+        })
+    }
+
+    fn new_cached_map(stash_value_count_max: u32) -> CacheMap<TestTable> {
+        CacheMap::<TestTable>::new(CacheMapOptions {
+            cache_value_count_max: u32::try_from(
+                CacheMap::<TestTable>::cache_value_count_max_multiple(),
+            )
+            .unwrap(),
+            scope_value_count_max: stash_value_count_max + 64,
+            stash_value_count_max,
+            name: "test map",
+        })
+    }
+
+    #[test]
+    fn cache_map_stash_only_no_backing_cache() {
+        let mut cache_map = new_stash_only_map();
+
+        // No cache: `cache_entries` is 0 and capacity is 0.
+        assert_eq!(cache_map.cache_entries(), 0);
+        assert_eq!(cache_map.cache_entries_max(), 0);
+        assert!(!cache_map.has(1));
+        assert!(matches!(cache_map.get_or_tombstone(1), GetOrTombstone::NotFound));
+
+        // Reads and writes operate entirely on the stash.
+        cache_map.upsert(&TestValue::new(1, 10));
+        assert!(cache_map.has(1));
+        assert_eq!(*cache_map.get(1).unwrap(), TestValue::new(1, 10));
+        assert!(matches!(cache_map.get_or_tombstone(1), GetOrTombstone::Found(_)));
+
+        // Removing leaves a tombstone in the stash.
+        cache_map.remove(1);
+        assert!(!cache_map.has(1));
+        assert!(cache_map.get(1).is_none());
+        assert!(matches!(cache_map.get_or_tombstone(1), GetOrTombstone::Tombstone));
+
+        // `compact` clears the stash (there is no cache to persist).
+        cache_map.compact();
+        assert!(matches!(cache_map.get_or_tombstone(1), GetOrTombstone::NotFound));
+
+        // `reset` clears the stash.
+        cache_map.upsert(&TestValue::new(2, 20));
+        assert!(cache_map.has(2));
+        cache_map.reset();
+        assert!(!cache_map.has(2));
+        assert!(matches!(cache_map.get_or_tombstone(2), GetOrTombstone::NotFound));
+    }
+
+    #[test]
+    fn cache_map_eviction_overflows_to_stash() {
+        let mut cache_map = new_cached_map(512);
+
+        // The cache holds `cache_value_count_max_multiple()` = 256 slots; inserting more
+        // distinct keys than that forces CLOCK evictions, and the evicted old versions move
+        // into the stash (capacity 512, so nothing is dropped).
+        let entries = 264;
+        for key in 0..entries {
+            cache_map.upsert(&TestValue::new(key, key));
+        }
+
+        // Every key is still visible through the cache-or-stash hierarchy.
+        for key in 0..entries {
+            assert_eq!(
+                *cache_map.get(key).unwrap(),
+                TestValue::new(key, key),
+                "key {key} lost after eviction"
+            );
+            assert!(matches!(cache_map.get_or_tombstone(key), GetOrTombstone::Found(_)));
+        }
+
+        // The on-cache residency never exceeds the configured maximum.
+        assert!(u64::from(entries) > cache_map.cache_entries_max());
+        assert!(cache_map.cache_entries() <= cache_map.cache_entries_max());
+
+        // A never-inserted key still reports NotFound.
+        assert!(matches!(cache_map.get_or_tombstone(entries + 500), GetOrTombstone::NotFound));
+    }
+
+    #[test]
+    fn cache_map_compact_preserves_resident_entries() {
+        let mut cache_map = new_cached_map(32);
+
+        // Few entries: all resident in the cache, none evicted to the stash.
+        for key in 1..=4 {
+            cache_map.upsert(&TestValue::new(key, key));
+        }
+        assert_eq!(cache_map.cache_entries(), 4);
+
+        cache_map.compact();
+
+        // `compact` clears the stash but must not drop cache-resident entries.
+        assert_eq!(cache_map.cache_entries(), 4);
+        for key in 1..=4 {
+            assert_eq!(*cache_map.get(key).unwrap(), TestValue::new(key, key));
+        }
+    }
+
+    #[test]
+    fn cache_map_scope_rollback_update_then_remove() {
+        let mut cache_map = new_stash_only_map();
+
+        // Baseline: key 1 = value A.
+        cache_map.upsert(&TestValue::new(1, 1));
+
+        // Within the scope: update to B (rollback action Restore(A)), then remove
+        // (rollback action Restore(B)). Discarding must replay both and land back on A.
+        cache_map.scope_open();
+        cache_map.upsert(&TestValue::new(1, 11));
+        cache_map.remove(1);
+        cache_map.scope_close(ScopeCloseMode::Discard);
+
+        assert_eq!(*cache_map.get(1).unwrap(), TestValue::new(1, 1));
+
+        // Persisting the same sequence lands on the removed state.
+        cache_map.scope_open();
+        cache_map.upsert(&TestValue::new(1, 11));
+        cache_map.remove(1);
+        cache_map.scope_close(ScopeCloseMode::Persist);
+
+        assert!(!cache_map.has(1));
+        assert!(matches!(cache_map.get_or_tombstone(1), GetOrTombstone::Tombstone));
+    }
 }
