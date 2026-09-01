@@ -700,4 +700,203 @@ mod tests {
         // Both remotes report the same constant RTT (300ms), so the median is exactly 300ms:
         assert_eq!(clock.round_trip_time_median_ns(), Some(300 * NS_PER_MS));
     }
+
+    #[test]
+    fn new_rejects_invalid_options() {
+        let time =
+            SharedTimeSim::new(TimeSim::new(NS_PER_S / 2, OffsetType::Linear, NS_PER_MS as i64, 0));
+        let invalid = [
+            ClockOptions { replica_count: 0, replica: 0, quorum: 0 },
+            ClockOptions { replica_count: 3, replica: 3, quorum: 2 },
+            ClockOptions { replica_count: 3, replica: 0, quorum: 0 },
+            ClockOptions { replica_count: 3, replica: 0, quorum: 4 },
+            ClockOptions { replica_count: 3, replica: 0, quorum: 1 },
+        ];
+        for options in invalid {
+            let t = time.clone();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = Clock::new(Box::new(t), options);
+            }));
+            assert!(result.is_err(), "invalid clock options must panic");
+        }
+
+        // A single-replica cluster is legal and disables synchronization.
+        let clock =
+            Clock::new(Box::new(time), ClockOptions { replica_count: 1, replica: 0, quorum: 1 });
+        assert!(clock.synchronization_disabled);
+    }
+
+    #[test]
+    fn learn_rejects_bad_samples() {
+        let time =
+            SharedTimeSim::new(TimeSim::new(NS_PER_S / 2, OffsetType::Linear, NS_PER_MS as i64, 0));
+        let shared_time = time.clone();
+        let mut clock =
+            Clock::new(Box::new(time), ClockOptions { replica_count: 3, replica: 0, quorum: 2 });
+        let baseline_samples = clock.window.samples;
+
+        // A reading that goes backwards (m0 > m2) is rejected outright.
+        clock.learn(1, 10, 0, 5);
+        assert_eq!(clock.window.samples, baseline_samples);
+        assert!(clock.window.sources[1].is_none());
+
+        // Learning from ourselves is an invariant violation.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            clock.learn(0, 5, 0, 10);
+        }));
+        assert!(result.is_err(), "learning from self must panic");
+
+        // A sample that spans more than the synchronization window max is too stale.
+        shared_time.with_mut(|t| t.tick());
+        let now = clock.monotonic().ns;
+        clock.learn(1, now - NS_PER_MS, now as i64, now + 2 * WINDOW_MAX);
+        assert_eq!(clock.window.samples, baseline_samples);
+        assert!(clock.window.sources[1].is_none());
+    }
+
+    #[test]
+    fn learn_rejects_sample_from_before_window_reset() {
+        let time =
+            SharedTimeSim::new(TimeSim::new(NS_PER_S / 2, OffsetType::Linear, NS_PER_MS as i64, 0));
+        let shared_time = time.clone();
+        let mut clock =
+            Clock::new(Box::new(time), ClockOptions { replica_count: 3, replica: 0, quorum: 2 });
+
+        // 41 ticks × 500ms = 20.5s, past `WINDOW_MAX`: the next synchronize() expires the window
+        // and resets its monotonic start, so no prior ping can count towards it.
+        for _ in 0..41 {
+            shared_time.with_mut(|t| t.tick());
+        }
+        let expired_window_monotonic = clock.window.monotonic;
+        clock.synchronize();
+        assert!(clock.window.monotonic > expired_window_monotonic);
+
+        // A pong whose ping predates the window reset is rejected (m0 < window.monotonic).
+        let m2 = clock.monotonic().ns;
+        let m0 = m2 - NS_PER_S;
+        clock.learn(1, m0, (m2 - 2 * NS_PER_MS) as i64, m2);
+        assert_eq!(clock.window.samples, 1);
+        assert!(clock.window.sources[1].is_none());
+    }
+
+    #[test]
+    fn realtime_synchronized_disabled_and_unsynchronized() {
+        // Single-replica cluster: synchronization is disabled and realtime is served directly.
+        let time =
+            SharedTimeSim::new(TimeSim::new(NS_PER_S / 2, OffsetType::Linear, NS_PER_MS as i64, 0));
+        let mut clock =
+            Clock::new(Box::new(time), ClockOptions { replica_count: 1, replica: 0, quorum: 1 });
+        assert!(clock.synchronization_disabled);
+        assert_eq!(clock.realtime_synchronized(), Some(clock.realtime()));
+
+        // Multi-replica cluster before the first successful synchronization: None.
+        let time =
+            SharedTimeSim::new(TimeSim::new(NS_PER_S / 2, OffsetType::Linear, NS_PER_MS as i64, 0));
+        let mut clock =
+            Clock::new(Box::new(time), ClockOptions { replica_count: 3, replica: 0, quorum: 2 });
+        assert!(!clock.synchronization_disabled);
+        assert!(clock.realtime_synchronized().is_none());
+    }
+
+    #[test]
+    fn tick_disabled_cluster_advances_time_only() {
+        let time =
+            SharedTimeSim::new(TimeSim::new(NS_PER_S / 2, OffsetType::Linear, NS_PER_MS as i64, 0));
+        let mut clock =
+            Clock::new(Box::new(time), ClockOptions { replica_count: 1, replica: 0, quorum: 1 });
+        let before = clock.monotonic().ns;
+        clock.tick();
+        assert_eq!(clock.monotonic().ns, before + NS_PER_S / 2);
+        assert!(clock.window.synchronized.is_none());
+    }
+
+    #[test]
+    fn minimum_one_way_delay_keeps_fastest_or_newest() {
+        let fast = Some(Sample { clock_offset: 10, one_way_delay: 100 });
+        let slow = Some(Sample { clock_offset: 20, one_way_delay: 300 });
+
+        // Empty slots forward the existing sample of the other kind.
+        let keep = minimum_one_way_delay(None, slow);
+        assert!(keep.is_some_and(|s| s.clock_offset == 20 && s.one_way_delay == 300));
+        let keep = minimum_one_way_delay(slow, None);
+        assert!(keep.is_some_and(|s| s.clock_offset == 20 && s.one_way_delay == 300));
+
+        // The slower existing sample is replaced by the faster one.
+        let keep = minimum_one_way_delay(slow, fast);
+        assert!(keep.is_some_and(|s| s.clock_offset == 10 && s.one_way_delay == 100));
+
+        // A tie keeps the incoming (newer, higher offset) sample.
+        let tie_new = Some(Sample { clock_offset: 30, one_way_delay: 100 });
+        let keep = minimum_one_way_delay(fast, tie_new);
+        assert!(keep.is_some_and(|s| s.clock_offset == 30 && s.one_way_delay == 100));
+
+        // The faster existing sample is retained over the slower incoming one.
+        let keep = minimum_one_way_delay(fast, slow);
+        assert!(keep.is_some_and(|s| s.clock_offset == 10 && s.one_way_delay == 100));
+    }
+
+    #[test]
+    fn estimate_asymmetric_delay_identifies_forward_and_reverse_delays() {
+        let time =
+            SharedTimeSim::new(TimeSim::new(NS_PER_S / 2, OffsetType::Linear, NS_PER_MS as i64, 0));
+        let mut clock =
+            Clock::new(Box::new(time), ClockOptions { replica_count: 3, replica: 0, quorum: 2 });
+
+        // No prior epoch sample for this replica: no correction available.
+        assert_eq!(clock.estimate_asymmetric_delay(1, 200 * NS_PER_MS, 0), 0);
+
+        // Seed the epoch with a baseline (self-consistent, 100ms one-way delay).
+        clock.epoch.sources[1] = Some(Sample { clock_offset: 0, one_way_delay: 100 * NS_PER_MS });
+
+        // Not slower than the baseline: no correction.
+        assert_eq!(clock.estimate_asymmetric_delay(1, 80 * NS_PER_MS, 0), 0);
+        assert_eq!(clock.estimate_asymmetric_delay(1, 100 * NS_PER_MS, 0), 0);
+
+        // Slower and offset still within the error margin: no correction.
+        assert_eq!(clock.estimate_asymmetric_delay(1, 300 * NS_PER_MS, 5 * NS_PER_MS as i64), 0);
+
+        // Slower and offset ahead of baseline: the extra delay is on the forward path.
+        assert_eq!(
+            clock.estimate_asymmetric_delay(1, 300 * NS_PER_MS, 200 * NS_PER_MS as i64),
+            -(200 * NS_PER_MS as i64)
+        );
+
+        // Slower and offset behind baseline: the extra delay is on the reverse path.
+        assert_eq!(
+            clock.estimate_asymmetric_delay(1, 300 * NS_PER_MS, -(200 * NS_PER_MS as i64)),
+            200 * NS_PER_MS as i64
+        );
+
+        // A replica with no baseline keeps correcting from its own epoch sample: source 2 has no
+        // sample, so a wild offset yields no correction.
+        assert_eq!(clock.estimate_asymmetric_delay(2, 300 * NS_PER_MS, 200 * NS_PER_MS as i64), 0);
+    }
+
+    #[test]
+    fn round_trip_time_median_detail() {
+        let time =
+            SharedTimeSim::new(TimeSim::new(NS_PER_S / 2, OffsetType::Linear, NS_PER_MS as i64, 0));
+        let shared_time = time.clone();
+        let mut clock =
+            Clock::new(Box::new(time), ClockOptions { replica_count: 3, replica: 0, quorum: 2 });
+
+        shared_time.with_mut(|t| t.tick());
+        let now = clock.monotonic().ns;
+
+        // A single remote source is below the quorum of 2.
+        clock.learn(1, now - 100 * NS_PER_MS, now as i64 - 50 * NS_PER_MS as i64, now);
+        assert_eq!(clock.round_trip_time_median_ns(), None);
+
+        // A second source at 300ms RTT: median over {50ms, 150ms} one-way → 300ms RTT.
+        clock.learn(2, now - 300 * NS_PER_MS, now as i64 - 150 * NS_PER_MS as i64, now);
+        assert_eq!(clock.round_trip_time_median_ns(), Some(300 * NS_PER_MS));
+
+        // Relearning replica 2 at a lower RTT (200ms) refines its one-way delay downward.
+        clock.learn(2, now - 200 * NS_PER_MS, now as i64 - 100 * NS_PER_MS as i64, now);
+        assert_eq!(clock.round_trip_time_median_ns(), Some(200 * NS_PER_MS));
+
+        // A higher RTT for the same replica is ignored (minimum one-way delay retained).
+        clock.learn(2, now - 400 * NS_PER_MS, now as i64 - 200 * NS_PER_MS as i64, now);
+        assert_eq!(clock.round_trip_time_median_ns(), Some(200 * NS_PER_MS));
+    }
 }
