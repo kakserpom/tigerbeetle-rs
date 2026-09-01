@@ -954,8 +954,9 @@ mod tests {
 
     use super::*;
     use crate::table::{BlockValue, TableKey as VsrTableKey, TableLayout};
+    use tigerbeetle_lsm::direction::Direction;
     use tigerbeetle_lsm::manifest::TableKey as ManifestTableKey;
-    use tigerbeetle_lsm::table_memory::{self as tm, Table};
+    use tigerbeetle_lsm::table_memory::{self as tm, MergeContext, Table};
     use tigerbeetle_lsm::tree::TreeConfig;
 
     use crate::grid::{Grid, GridOptions};
@@ -1239,6 +1240,98 @@ mod tests {
         let r = values_merge::<TestSpec>(&mut target, &a, &b, true);
         assert_eq!(r.produced, 1);
         assert_eq!(target[0], b[0]);
+    }
+
+    // -- Immutable-table merge/copy tests --
+    //
+    // The `_immutable` variants operate on an `ImmutableTableIterator` (level A's in-memory
+    // table) instead of a plain slice; these feed the L0-flush dispatch path.
+
+    /// Builds a single-run ascending `ImmutableTableIterator` over `values`.
+    fn immutable_iterator(values: &[TestValue]) -> ImmutableTableIterator<'_, TestSpec> {
+        let context =
+            MergeContext::<TestSpec> { streams: [values; tm::SORTED_RUNS_MAX], streams_count: 1 };
+        ImmutableTableIterator::new(context, None, Direction::Ascending)
+    }
+
+    #[test]
+    fn values_copy_immutable_respects_budget() {
+        let source = [
+            TestValue { key: TestKey(1), data: 10 },
+            TestValue { key: TestKey(2), data: 20 },
+            TestValue { key: TestKey(3), data: 30 },
+        ];
+        let mut target = [TestValue::default(); 4];
+        let mut iterator = immutable_iterator(&source);
+        let copied = values_copy_immutable::<TestSpec>(&mut target, &mut iterator, 2);
+        assert_eq!(copied, 2);
+        assert_eq!(target[0], source[0]);
+        assert_eq!(target[1], source[1]);
+        assert_eq!(iterator.count_remaining(), 1);
+    }
+
+    #[test]
+    fn copy_drop_tombstones_immutable_drops() {
+        let tombstone = TestValue { key: TestKey(u64::MAX), data: 0 };
+        let source = [
+            TestValue { key: TestKey(1), data: 10 },
+            tombstone,
+            TestValue { key: TestKey(3), data: 30 },
+        ];
+        let mut target = [TestValue::default(); 3];
+        let mut iterator = immutable_iterator(&source);
+        let r = values_copy_drop_tombstones_immutable::<TestSpec>(&mut target, &mut iterator, 8);
+        assert_eq!(r.consumed, 3);
+        assert_eq!(r.dropped, 1);
+        assert_eq!(r.produced, 2);
+        assert_eq!(target[0], source[0]);
+        assert_eq!(target[1], source[2]);
+    }
+
+    #[test]
+    fn merge_immutable_a_wins_and_interleaves() {
+        // Merge only processes values while BOTH sources have data; remaining A values are
+        // handled by the caller (the immutable tail).
+        let a =
+            [TestValue { key: TestKey(1), data: 100 }, TestValue { key: TestKey(3), data: 300 }];
+        let b = [TestValue { key: TestKey(2), data: 20 }, TestValue { key: TestKey(4), data: 40 }];
+        let mut target = [TestValue::default(); 4];
+        let mut iterator_a = immutable_iterator(&a);
+        let r = values_merge_immutable::<TestSpec>(&mut target, &mut iterator_a, &b, false, 8);
+        assert_eq!(r.produced, 3);
+        assert_eq!(r.consumed_a, 2);
+        assert_eq!(r.consumed_b, 1);
+        assert_eq!(target[0], a[0]); // key 1 from a
+        assert_eq!(target[1], b[0]); // key 2 from b
+        assert_eq!(target[2], a[1]); // key 3 from a
+    }
+
+    #[test]
+    fn merge_immutable_equal_key_a_wins() {
+        let a = [TestValue { key: TestKey(1), data: 100 }];
+        let b = [TestValue { key: TestKey(1), data: 200 }];
+        let mut target = [TestValue::default(); 4];
+        let mut iterator_a = immutable_iterator(&a);
+        let r = values_merge_immutable::<TestSpec>(&mut target, &mut iterator_a, &b, false, 8);
+        // Equal keys collapse: both consumed, only A's value emitted.
+        assert_eq!(r.produced, 1);
+        assert_eq!(r.consumed_a, 1);
+        assert_eq!(r.consumed_b, 1);
+        assert_eq!(target[0], a[0]);
+    }
+
+    #[test]
+    fn merge_immutable_equal_key_drops_tombstone() {
+        // A tombstone (key MAX) colliding with a real B value collapses into a drop.
+        let a = [TestValue { key: TestKey(u64::MAX), data: 0 }]; // tombstone
+        let b = [TestValue { key: TestKey(u64::MAX), data: 200 }];
+        let mut target = [TestValue::default(); 4];
+        let mut iterator_a = immutable_iterator(&a);
+        let r = values_merge_immutable::<TestSpec>(&mut target, &mut iterator_a, &b, true, 8);
+        assert_eq!(r.produced, 0);
+        assert_eq!(r.consumed_a, 1);
+        assert_eq!(r.consumed_b, 1);
+        assert_eq!(r.dropped, 2);
     }
 
     // -- Compaction lifecycle tests --
