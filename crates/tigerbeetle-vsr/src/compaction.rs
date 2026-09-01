@@ -1275,4 +1275,60 @@ mod tests {
         );
         compaction.assert_between_bars(); // Should not panic
     }
+
+    #[test]
+    fn beat_commence_caps_beat_by_remaining_half_bar_quota() {
+        let mut tree = new_test_tree();
+        let mut grid = new_test_grid();
+
+        let mut compaction = Compaction::<TestSpec>::new(
+            core::ptr::addr_of_mut!(tree),
+            core::ptr::addr_of_mut!(grid),
+            0,
+        );
+        // Ready for a half-bar: paused stage, a 10-value quota, nothing consumed yet.
+        compaction.stage = Stage::Paused;
+        compaction.quotas = Quotas { beat: 0, beat_done: 0, half_bar: 10, half_bar_done: 0 };
+        assert!(compaction.is_idle());
+
+        // The first beat is capped by the caller's values_count.
+        compaction.beat_commence(6);
+        assert_eq!((compaction.quotas.beat, compaction.quotas.beat_done), (6, 0));
+
+        // Complete the beat (advance cumulative half-bar progress); the next beat is capped by
+        // the *remaining* half-bar quota (10 − 6 = 4) rather than the 6 requested.
+        compaction.quotas.beat_done = 6;
+        compaction.quotas.half_bar_done = 6;
+        assert!(compaction.is_idle());
+        compaction.beat_commence(6);
+        assert_eq!((compaction.quotas.beat, compaction.quotas.beat_done), (4, 0));
+
+        // Complete the final beat; a zero-value beat is allowed once the half-bar is exhausted.
+        compaction.quotas.beat_done = 4;
+        compaction.quotas.half_bar_done = 10;
+        assert!(compaction.is_idle());
+        compaction.beat_commence(0);
+        assert_eq!((compaction.quotas.beat, compaction.quotas.beat_done), (0, 0));
+    }
+
+    #[test]
+    fn beat_commence_move_table_requires_half_bar_exhausted() {
+        let mut tree = new_test_tree();
+        let mut grid = new_test_grid();
+
+        let mut compaction = Compaction::<TestSpec>::new(
+            core::ptr::addr_of_mut!(tree),
+            core::ptr::addr_of_mut!(grid),
+            1,
+        );
+        // A move-table compaction consumes its whole quota up front, so commence must observe
+        // the half-bar already exhausted; the resulting beat quota is zero.
+        compaction.stage = Stage::Paused;
+        compaction.move_table = true;
+        compaction.quotas = Quotas { beat: 0, beat_done: 0, half_bar: 3, half_bar_done: 3 };
+        assert!(compaction.is_idle());
+
+        compaction.beat_commence(3);
+        assert_eq!((compaction.quotas.beat, compaction.quotas.beat_done), (0, 0));
+    }
 }
