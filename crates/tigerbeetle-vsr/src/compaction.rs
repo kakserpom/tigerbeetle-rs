@@ -1248,9 +1248,9 @@ mod tests {
     // table) instead of a plain slice; these feed the L0-flush dispatch path.
 
     /// Builds a single-run ascending `ImmutableTableIterator` over `values`.
-    fn immutable_iterator(values: &[TestValue]) -> ImmutableTableIterator<'_, TestSpec> {
+    fn immutable_iterator<S: TableTrait>(values: &[S::Value]) -> ImmutableTableIterator<'_, S> {
         let context =
-            MergeContext::<TestSpec> { streams: [values; tm::SORTED_RUNS_MAX], streams_count: 1 };
+            MergeContext::<S> { streams: [values; tm::SORTED_RUNS_MAX], streams_count: 1 };
         ImmutableTableIterator::new(context, None, Direction::Ascending)
     }
 
@@ -1332,6 +1332,93 @@ mod tests {
         assert_eq!(r.consumed_a, 1);
         assert_eq!(r.consumed_b, 1);
         assert_eq!(r.dropped, 2);
+    }
+
+    // -- Secondary-index merge tests --
+    //
+    // A secondary index never "drops" tombstones by filtering; instead matching put/remove
+    // pairs at the same key cancel each other (upstream asserts the pair is exactly one put and
+    // one remove). These branches are unreachable through the General-usage `TestSpec`.
+
+    struct TestSecondarySpec;
+
+    impl Table for TestSecondarySpec {
+        type Key = TestKey;
+        type Value = TestValue;
+        const VALUE_COUNT_MAX: usize = 128;
+        const USAGE: tm::Usage = tm::Usage::SecondaryIndex;
+
+        fn key_from_value(value: &Self::Value) -> Self::Key {
+            value.key
+        }
+
+        fn tombstone(value: &Self::Value) -> bool {
+            value.data == u64::MAX
+        }
+    }
+
+    #[test]
+    fn merge_secondary_index_cancels_put_remove_pair() {
+        let a = [TestValue { key: TestKey(5), data: 100 }]; // put
+        let b = [TestValue { key: TestKey(5), data: u64::MAX }]; // remove
+        let mut target = [TestValue::default(); 4];
+        let r = values_merge::<TestSecondarySpec>(&mut target, &a, &b, false);
+        // The pair is consumed and cancels: neither value is produced.
+        assert_eq!(r.produced, 0);
+        assert_eq!(r.consumed_a, 1);
+        assert_eq!(r.consumed_b, 1);
+        assert_eq!(r.dropped, 2);
+        assert_eq!(r.produced, r.consumed_a + r.consumed_b - r.dropped);
+    }
+
+    #[test]
+    fn merge_secondary_index_cancels_remove_put_pair() {
+        let a = [TestValue { key: TestKey(5), data: u64::MAX }]; // remove
+        let b = [TestValue { key: TestKey(5), data: 100 }]; // put
+        let mut target = [TestValue::default(); 4];
+        let r = values_merge::<TestSecondarySpec>(&mut target, &a, &b, false);
+        assert_eq!(r.produced, 0);
+        assert_eq!(r.consumed_a, 1);
+        assert_eq!(r.consumed_b, 1);
+        assert_eq!(r.dropped, 2);
+    }
+
+    #[test]
+    fn merge_secondary_index_two_puts_panic() {
+        // Two non-tombstone values at the same key violate the cancel-pair invariant.
+        let a = [TestValue { key: TestKey(5), data: 100 }];
+        let b = [TestValue { key: TestKey(5), data: 200 }];
+        let mut target = [TestValue::default(); 4];
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            values_merge::<TestSecondarySpec>(&mut target, &a, &b, false);
+        }))
+        .expect_err("two puts at equal key must panic");
+    }
+
+    #[test]
+    fn merge_immutable_secondary_index_cancels_put_remove_pair() {
+        let a = [TestValue { key: TestKey(5), data: 100 }]; // put
+        let b = [TestValue { key: TestKey(5), data: u64::MAX }]; // remove
+        let mut target = [TestValue::default(); 4];
+        let mut iterator_a = immutable_iterator(&a);
+        let r =
+            values_merge_immutable::<TestSecondarySpec>(&mut target, &mut iterator_a, &b, false, 8);
+        assert_eq!(r.produced, 0);
+        assert_eq!(r.consumed_a, 1);
+        assert_eq!(r.consumed_b, 1);
+        assert_eq!(r.dropped, 2);
+    }
+
+    #[test]
+    fn copy_drop_tombstones_secondary_index_panics() {
+        // Tombstone-dropping copy is only legal for General usage.
+        let tombstone = TestValue { key: TestKey(5), data: u64::MAX };
+        let source = [TestValue { key: TestKey(1), data: 10 }, tombstone];
+        let mut target = [TestValue::default(); 2];
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            values_copy_drop_tombstones::<TestSecondarySpec>(&mut target, &source);
+        }))
+        .expect_err("tombstone drop on a secondary index must panic");
     }
 
     // -- Compaction lifecycle tests --
