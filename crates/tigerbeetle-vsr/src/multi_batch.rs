@@ -458,8 +458,8 @@ mod tests {
     #![allow(clippy::expect_used)]
 
     use super::{
-        BATCH_COUNT_MAX, MultiBatchDecoder, MultiBatchEncoder, multi_batch_count_max, read_u16,
-        trailer_total_size,
+        BATCH_COUNT_MAX, MultiBatchDecoder, MultiBatchEncoder, POSTAMBLE_SIZE, TRAILER_ITEM_SIZE,
+        multi_batch_count_max, read_u16, trailer_total_size,
     };
     use tigerbeetle_core::constants::HEADER_SIZE;
     use tigerbeetle_core::stdx::prng::{Prng, ratio};
@@ -640,6 +640,98 @@ mod tests {
             Err(super::MultiBatchInvalid)
         ));
         buffer[postamble_at..bytes_written].copy_from_slice(&(batch_count - 1).to_le_bytes());
+        assert!(matches!(
+            MultiBatchDecoder::new(&buffer[..bytes_written], element_size),
+            Err(super::MultiBatchInvalid)
+        ));
+    }
+
+    /// Zero-sized elements: batches add nothing to the payload, only to the trailer. The
+    /// encoder's `writable()` yields an empty slice and `add(0)` records the batch; `finish()`
+    /// writes exactly the trailer (no payload), and a decoder round-trips it back.
+    #[test]
+    fn batch_zero_sized_elements() {
+        let batch_count = 5_u16;
+        let element_size = 0;
+        let buffer_size = trailer_total_size(element_size, batch_count) as usize;
+        let mut buffer = vec![0xFF_u8; buffer_size];
+
+        let mut encoder = MultiBatchEncoder::new(&mut buffer, element_size);
+        for _ in 0..batch_count {
+            let slice = encoder.writable().expect("zero-size batches always fit");
+            assert!(slice.is_empty());
+            encoder.add(0);
+        }
+        let bytes_written = encoder.finish();
+        assert_eq!(bytes_written, trailer_total_size(element_size, batch_count) as usize);
+        assert_eq!(encoder.batch_count(), batch_count as usize);
+
+        let mut decoder =
+            MultiBatchDecoder::new(&buffer[..bytes_written], element_size).expect("roundtrip");
+        assert_eq!(decoder.batch_count(), batch_count);
+        for _ in 0..batch_count {
+            let batch = decoder.pop().expect("a zero-element batch pops as empty");
+            assert!(batch.is_empty());
+        }
+        assert_eq!(decoder.pop(), None);
+    }
+
+    /// Single-byte elements: an odd payload size requires one byte of `0xFF` padding between
+    /// the payload and the trailer (`trailer_padding_size = payload_size % 2` in the decoder,
+    /// `padding = buffer_index % 2` in `finish()`). Exercises the `element_size == 1`
+    /// byte-padding branch that `element_size == 128` never hits.
+    #[test]
+    fn batch_single_byte_element_round_trip_and_odd_payload() {
+        let element_size = 1;
+        let buffer_size = 64;
+        let mut buffer = vec![0xFF_u8; buffer_size];
+
+        let mut encoder = MultiBatchEncoder::new(&mut buffer, element_size);
+        // Two batches with a total of 3 single-byte elements => odd payload that pads.
+        let batches: &[&[u8]] = &[&[1, 2], &[3]];
+        for batch in batches {
+            let slice = encoder.writable().expect("buffer holds a single byte");
+            slice[..batch.len()].copy_from_slice(batch);
+            encoder.add(batch.len());
+        }
+        let bytes_written = encoder.finish();
+        assert_eq!(encoder.batch_count(), 2);
+
+        // Payload of 3 bytes + 1 padding byte + trailer, so the written size is even.
+        assert!(bytes_written.is_multiple_of(TRAILER_ITEM_SIZE));
+
+        let mut decoder =
+            MultiBatchDecoder::new(&buffer[..bytes_written], element_size).expect("roundtrip");
+        assert_eq!(decoder.batch_count(), 2);
+        assert_eq!(decoder.pop(), Some(&[1, 2][..]));
+        assert_eq!(decoder.pop(), Some(&[3][..]));
+        assert_eq!(decoder.pop(), None);
+    }
+
+    /// A corrupt trailer item (batch element count) makes the total inconsistent with the
+    /// payload and must be rejected — the sum-check branch the `batch_invalid_format` test
+    /// reaches only indirectly.
+    #[test]
+    fn batch_corrupted_trailer_item_rejected() {
+        let element_size = 128;
+        let buffer_size = (1 << 20) - HEADER_SIZE;
+        let mut buffer = vec![0xFF_u8; buffer_size];
+
+        let batch_count = 3;
+        let mut encoder = MultiBatchEncoder::new(&mut buffer, element_size);
+        for _ in 0..batch_count {
+            let slice = encoder.writable().expect("space reserved");
+            slice[..2].copy_from_slice(&[0x5A; 2]);
+            encoder.add(2 * element_size as usize);
+        }
+        let bytes_written = encoder.finish();
+        assert!(MultiBatchDecoder::new(&buffer[..bytes_written], element_size).is_ok());
+
+        // Corrupt the element count of the LAST trailer item, which sits directly before the
+        // postamble, so the recorded total no longer matches the payload.
+        let corrupt_at = bytes_written - POSTAMBLE_SIZE - TRAILER_ITEM_SIZE;
+        let original = read_u16(&buffer[corrupt_at..corrupt_at + 2]);
+        buffer[corrupt_at..corrupt_at + 2].copy_from_slice(&original.wrapping_add(1).to_le_bytes());
         assert!(matches!(
             MultiBatchDecoder::new(&buffer[..bytes_written], element_size),
             Err(super::MultiBatchInvalid)
