@@ -749,4 +749,85 @@ mod tests {
         }));
         assert!(result.is_err());
     }
+
+    // -- Aggregate helpers (untested canonical/max/filter paths) --
+
+    #[test]
+    fn log_view_max_takes_max_and_panics_on_empty_or_invariant() {
+        let h = chain(0, 4, 3, 1); // log_view 3
+        let jvs = vec![
+            Some(joined_view(0, 5, 3, 4, 1, 0, 0, 0, jv_headers(&h, 4, 1))),
+            Some(joined_view(1, 5, 3, 2, 1, 0, 0, 0, jv_headers(&h, 2, 1))),
+            Some(joined_view(2, 5, 1, 3, 1, 0, 0, 0, jv_headers(&chain(0, 3, 1, 1), 3, 1))),
+        ];
+        assert_eq!(log_view_max(&jvs), 3);
+
+        // An empty quorum has no max.
+        let empty: Vec<Option<JoinedView>> = vec![None, None];
+        assert!(std::panic::catch_unwind(|| log_view_max(&empty)).is_err());
+
+        // log_view must stay below the JV's own `view` (protocol invariant).
+        let bad =
+            vec![Some(joined_view(0, 4, 5, 3, 1, 0, 0, 0, jv_headers(&chain(0, 3, 4, 1), 3, 1)))];
+        assert!(std::panic::catch_unwind(|| log_view_max(&bad)).is_err());
+    }
+
+    #[test]
+    fn canonical_split_selects_max_log_view_quorum() {
+        let h = chain(0, 4, 3, 1); // log_view 3
+        let jvs = vec![
+            Some(joined_view(0, 5, 3, 4, 1, 0, 0, 0, jv_headers(&h, 4, 1))),
+            Some(joined_view(1, 5, 3, 3, 1, 0, 0, 0, jv_headers(&h, 3, 1))),
+            Some(joined_view(2, 5, 1, 2, 1, 0, 0, 0, jv_headers(&chain(0, 2, 1, 1), 2, 1))),
+            None,
+        ];
+
+        let canonical = jvs_canonical(&jvs);
+        assert_eq!(canonical.len(), 2);
+        assert!(canonical.iter().all(|jv| jv.header.log_view == 3));
+        assert_eq!(jvs_with_log_view(&jvs, 3).len(), 2);
+
+        let uncanonical = jvs_uncanonical(&jvs);
+        assert_eq!(uncanonical.len(), 1);
+        assert_eq!(uncanonical[0].header.log_view, 1);
+
+        // op_max_canonical only looks at the canonical (max log_view) JVs.
+        assert_eq!(op_max_canonical(&jvs), 4);
+
+        // No canonical JVs to maximize over.
+        let none: Vec<Option<JoinedView>> = vec![None, None];
+        assert!(std::panic::catch_unwind(|| op_max_canonical(&none)).is_err());
+    }
+
+    #[test]
+    fn jvs_all_rejects_misplaced_replica_slots() {
+        // The JV body is indexed by replica slot; a JV whose header names a
+        // different replica would corrupt the quorum accounting.
+        let h = chain(0, 2, 1, 1);
+        let misplaced = vec![None, Some(joined_view(0, 3, 1, 2, 1, 0, 0, 0, jv_headers(&h, 2, 1)))];
+        let result = std::panic::catch_unwind(|| jvs_canonical(&misplaced));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn op_checkpoint_max_and_timestamp_max_aggregate() {
+        let h = chain(0, 10, 1, 1); // log_view 1
+
+        let mut body0 = jv_headers(&h, 5, 2);
+        body0[0].timestamp = 1_000;
+        let jv0 = joined_view(0, 3, 1, 5, 3, 2, 0, 0, body0);
+
+        let mut body1 = jv_headers(&h, 10, 2);
+        body1[0].timestamp = 42;
+        let jv1 = joined_view(1, 3, 1, 10, 9, 7, 0, 0, body1);
+
+        let jvs: Vec<Option<JoinedView>> = vec![Some(jv0), Some(jv1)];
+        assert_eq!(op_checkpoint_max(&jvs), 7);
+        assert_eq!(timestamp_max(&jvs), 1_000);
+
+        // Both helpers panic on an empty quorum.
+        let empty: Vec<Option<JoinedView>> = vec![None];
+        assert!(std::panic::catch_unwind(|| op_checkpoint_max(&empty)).is_err());
+        assert!(std::panic::catch_unwind(|| timestamp_max(&empty)).is_err());
+    }
 }
