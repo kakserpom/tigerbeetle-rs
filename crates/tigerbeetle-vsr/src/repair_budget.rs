@@ -512,14 +512,14 @@ fn replica_index_u8(replica_index: usize) -> u8 {
 // budget lifecycle until the replica-level tests exercise them end-to-end.
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::{
         REPLICA_BLOCKS_REQUESTED_MAX, RepairBudgetGrid, RepairBudgetJournal, RepairBudgetOptions,
     };
     use crate::BlockReference;
     use tigerbeetle_core::constants::{GRID_REPAIR_REQUEST_MAX, REPLICAS_MAX};
-    use tigerbeetle_core::stdx::prng::Prng;
+    use tigerbeetle_core::stdx::prng::{Prng, ratio};
     use tigerbeetle_core::stdx::{Duration, Instant};
 
     #[test]
@@ -641,6 +641,127 @@ mod tests {
             budget.budget_available(first),
             u32::try_from(REPLICA_BLOCKS_REQUESTED_MAX).unwrap_or(u32::MAX)
         );
+    }
+
+    #[test]
+    fn repair_budget_journal_experiment_spreads_across_replicas() {
+        let mut prng = Prng::from_seed(45);
+        let now = Instant { ns: 0 };
+
+        let mut budget =
+            RepairBudgetJournal::new(RepairBudgetOptions { replica_index: 0, replica_count: 4 });
+        // Force the "experiment" branch of `decrement` (reservoir-sampled random replica) for
+        // every request. The default 1/10 ratio makes this path hard to hit deterministically;
+        // `chance` on a 1/1 ratio always returns true for any seed.
+        budget.experiment_chance = ratio(1, 1);
+
+        // Exhaust the whole budget and record which remote replica each op went to.
+        let mut selected = Vec::new();
+        for op in 1..=6 {
+            let replica = budget
+                .decrement(op, now, &mut prng)
+                .unwrap_or_else(|| panic!("op {op} must be granted while budget remains"));
+            assert_ne!(replica, 0, "requests must never go to self");
+            selected.push(replica);
+        }
+        assert_eq!(budget.available, 0);
+        assert_eq!(budget.decrement(7, now, &mut prng), None);
+
+        // Experiments are random: the reservoir must not systematically pick the same replica
+        // (replica 1 has the best latency among the equally-initialized remotes).
+        let mut distinct = Vec::new();
+        for &replica in &selected {
+            if !distinct.contains(&replica) {
+                distinct.push(replica);
+            }
+        }
+        assert!(distinct.len() > 1, "forced experiments must spread requests: {selected:?}");
+    }
+
+    #[test]
+    fn repair_budget_journal_prefers_min_latency_without_experimenting() {
+        let mut prng = Prng::from_seed(46);
+        let now = Instant { ns: 0 };
+
+        let mut budget =
+            RepairBudgetJournal::new(RepairBudgetOptions { replica_index: 0, replica_count: 4 });
+        // With experiments disabled, `decrement` always picks the lowest-latency replica.
+        budget.experiment_chance = ratio(0, 1);
+
+        // All remotes start at 1ms; the first in iteration order (replica 1) wins the tie.
+        let replica = budget
+            .decrement(100, now, &mut prng)
+            .expect("an unloaded budget must grant the first op");
+        assert_eq!(replica, 1);
+
+        // A delayed response refines that replica's repair latency toward 3ms...
+        budget.increment(100, now.add(Duration::ms(3)));
+        assert_eq!(
+            budget.replicas_repair_latency[usize::from(replica)],
+            Duration { ns: 1_400_000 } // (1ms * 4 + 3ms) / 5
+        );
+
+        // ...so the next request goes to a still-1ms remote instead of the now-slower one.
+        let next = budget
+            .decrement(101, now, &mut prng)
+            .expect("an unloaded budget must grant the second op");
+        assert_ne!(next, 1, "the penalized replica must not be preferred");
+    }
+
+    #[test]
+    fn repair_budget_grid_suppresses_recent_cross_replica_duplicate() {
+        let now = Instant { ns: 0 };
+
+        let mut budget =
+            RepairBudgetGrid::new(RepairBudgetOptions { replica_index: 0, replica_count: 3 });
+        let block = BlockReference { checksum: 1, address: 100 };
+
+        // Request the block from replica 1.
+        assert!(budget.decrement(block, 1, now));
+        assert_eq!(budget.budget_available(1), u32::from(GRID_REPAIR_REQUEST_MAX));
+
+        // An immediate duplicate request -- even directed at a different replica -- is
+        // suppressed while the block is still queued to any replica within the retry window,
+        // without consuming that replica's budget.
+        assert!(!budget.decrement(block, 2, now.add(Duration::ms(99))));
+        assert_eq!(
+            budget.budget_available(2),
+            u32::try_from(REPLICA_BLOCKS_REQUESTED_MAX).unwrap_or(u32::MAX)
+        );
+
+        // Once the retry window elapses the block may be re-requested elsewhere.
+        assert!(budget.decrement(block, 2, now.add(Duration::ms(101))));
+        assert_eq!(budget.budget_available(2), u32::from(GRID_REPAIR_REQUEST_MAX));
+    }
+
+    #[test]
+    fn repair_budget_grid_next_destination_none_when_all_saturated() {
+        let mut prng = Prng::from_seed(48);
+        let now = Instant { ns: 0 };
+
+        let mut budget =
+            RepairBudgetGrid::new(RepairBudgetOptions { replica_index: 0, replica_count: 3 });
+        assert!(budget.next_destination(&mut prng).is_some());
+
+        // Fill every remote replica with a full get_blocks worth of inflight requests.
+        // Blocks are distinct per replica -- a duplicate would be suppressed by the
+        // cross-replica retry-window check rather than consuming budget.
+        for replica in 1..3 {
+            for i in 0..GRID_REPAIR_REQUEST_MAX {
+                let offset = u64::from(replica) * 1_000 + u64::from(i);
+                let block = BlockReference { checksum: u128::from(offset), address: offset + 1 };
+                assert!(budget.decrement(block, replica, now));
+            }
+            assert!(
+                budget.budget_available(replica) < u32::from(GRID_REPAIR_REQUEST_MAX),
+                "replica {replica} must no longer admit a full get_blocks"
+            );
+        }
+
+        // The +1 headroom per replica still allows incremental repairs, but no replica has room
+        // for a full get_blocks, so there is no valid destination at all.
+        assert!(budget.available > 0);
+        assert_eq!(budget.next_destination(&mut prng), None);
     }
 
     fn block_of(i: u16) -> BlockReference {
