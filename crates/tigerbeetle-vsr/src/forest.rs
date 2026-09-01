@@ -1093,4 +1093,180 @@ mod tests {
         assert_eq!(forest_b.accounts.objects.manifest_table_count(), 1);
         assert_eq!(forest_b.accounts.objects.manifest_ref().levels[0].table_count_visible(), 1);
     }
+
+    /// Drive the *non-move* `TableInfoA::Disk` branch of `Compaction::half_bar_complete`
+    /// (level 0→1 merge with a non-empty level-1 overlap): the selected level-0 input table and
+    /// its overlapping level-1 tables are updated to an invisible snapshot_max, the merged
+    /// output is inserted at level 1, and `remove_invisible_tables` runs at BOTH consulted
+    /// levels (the `level_b > 0` branch the move-table and L0-flush tests skipped). Flushed
+    /// durably and replayed on reopen.
+    ///
+    /// Like the L0-flush test, the deferred dispatch (Phase 3) would populate
+    /// `manifest_entries`/`counters`/`quotas` by merging; here we hand-set them to the merged
+    /// values and drive `half_bar_complete`'s manifest orchestration end-to-end.
+    #[test]
+    #[allow(clippy::too_many_lines)] // full setup + checkpoint + reopen scaffolding
+    fn forest_disk_merge_half_bar_complete_updates_inputs_inserts_output() {
+        use crate::compaction::{
+            Compaction, CompactionCounters, ManifestEntry, ManifestEntryOperation, TableInfoA,
+        };
+        use crate::groove::AccountObjectSpec;
+        use tigerbeetle_lsm::manifest::TreeTableInfo;
+
+        let mut forest = Forest::init(test_superblock(), grid_options(), 32);
+        let mut storage = storage();
+        open_forest(&mut forest, &mut storage);
+
+        // Seed level 0 to its compaction threshold (`table_count_max_for_level(4, 0) == 4`) with
+        // tiled u64-keyed tables, plus a single level-1 table whose range covers them all, so a
+        // non-empty overlap forces a real merge (not a move) of the least-overlap level-0 table.
+        let reservation = forest.grid.reserve(6);
+        let addresses: Vec<u64> = (0..6).map(|_| forest.grid.acquire(reservation)).collect();
+        forest.grid.forfeit(reservation);
+
+        let level_0_ranges: [(u64, u64); 4] = [(1, 100), (101, 200), (201, 300), (301, 400)];
+        for (i, &(lo, hi)) in level_0_ranges.iter().enumerate() {
+            let wire = manifest_node::TableInfo {
+                key_min: lo.to_le_bytes_padded(),
+                key_max: hi.to_le_bytes_padded(),
+                checksum: checksum(&addresses[i].to_le_bytes()),
+                address: addresses[i],
+                snapshot_min: 1,
+                snapshot_max: u64::MAX,
+                value_count: 1,
+                tree_id: 7,
+                label: Label { level: 0, event: Event::Insert },
+            };
+            let table = TreeTableInfo::<u64>::decode(&wire, 7);
+            forest.accounts.objects.manifest_mut().insert_table(
+                &mut forest.manifest_log,
+                0,
+                &table,
+            );
+        }
+        let level_1_addr = addresses[4];
+        let level_1_wire = manifest_node::TableInfo {
+            key_min: 1_u64.to_le_bytes_padded(),
+            key_max: 400_u64.to_le_bytes_padded(),
+            checksum: checksum(&level_1_addr.to_le_bytes()),
+            address: level_1_addr,
+            snapshot_min: 1,
+            snapshot_max: u64::MAX,
+            value_count: 1,
+            tree_id: 7,
+            label: Label { level: 0, event: Event::Insert },
+        };
+        let level_1 = TreeTableInfo::<u64>::decode(&level_1_wire, 7);
+        forest.accounts.objects.manifest_mut().insert_table(&mut forest.manifest_log, 1, &level_1);
+        assert_eq!(forest.accounts.objects.manifest_table_count(), 5);
+
+        // Drive a level 0→1 merge compaction (level_b=1, level_a=0).
+        let mut comp = Compaction::<AccountObjectSpec>::new(
+            core::ptr::addr_of_mut!(forest.accounts.objects),
+            core::ptr::addr_of_mut!(forest.grid),
+            1,
+        );
+        let quota = comp.half_bar_commence(8, &forest.accounts.objects, &forest.grid);
+        // table_a value_count 1 + range_b value_count 1.
+        assert_eq!(quota, 2);
+        assert!(!comp.move_table, "a non-empty level-1 overlap forces a merge, not a move");
+
+        // Collect the input-table addresses the (deferred) dispatch would have read then
+        // released: the selected table_a plus every overlapping range_b table.
+        let (Some(TableInfoA::Disk(table_a_ref)), Some(range_b)) =
+            (&comp.table_info_a, &comp.range_b)
+        else {
+            unreachable!("level_b > 0 selected a disk table_a with a non-empty range_b")
+        };
+        let mut released_inputs = vec![table_a_ref.table_info.address];
+        for table in range_b.tables.tables.slice() {
+            released_inputs.push(table.table_info.address);
+        }
+
+        // Simulate the deferred dispatch (Phase 3): the merged output holds the single
+        // surviving value; the range_b table's value is dropped (shadowed/tombstoned).
+        let output = TreeTableInfo::<u64> {
+            checksum: checksum(&addresses[5].to_le_bytes()),
+            address: addresses[5],
+            snapshot_min: 1,
+            snapshot_max: u64::MAX,
+            key_min: 1,
+            key_max: 400,
+            value_count: 1,
+        };
+        comp.manifest_entries.push(ManifestEntry {
+            operation: ManifestEntryOperation::InsertToLevelB,
+            table: output,
+        });
+        comp.counters = CompactionCounters { in_: quota, dropped: 1, out: 1 };
+        comp.quotas.half_bar_done = comp.quotas.half_bar;
+
+        // The dispatch released the read input blocks; `half_bar_complete` asserts both the
+        // table_a and range_b inputs are released (they were acquired during commence).
+        forest.grid.release(&released_inputs);
+
+        comp.half_bar_complete(
+            &mut forest.accounts.objects,
+            &forest.grid,
+            &mut forest.manifest_log,
+        );
+
+        // table_a (level 0) + the level-1 range table are updated to an invisible snapshot_max
+        // (= 9) and removed by `remove_invisible_tables`; the output lands at level 1.
+        assert_eq!(forest.accounts.objects.manifest_table_count(), 4);
+        assert_eq!(forest.accounts.objects.manifest_ref().levels[0].table_count_visible(), 3);
+        assert_eq!(forest.accounts.objects.manifest_ref().levels[1].table_count_visible(), 1);
+
+        // Checkpoint makes the manifest (inserts/updates/removes) durable.
+        let done = std::rc::Rc::new(std::cell::Cell::new(false));
+        forest.checkpoint(
+            {
+                let done = done.clone();
+                move || done.set(true)
+            },
+            &mut storage,
+        );
+        let mut polls = 0;
+        while !done.get() {
+            forest.poll(&mut storage);
+            polls += 1;
+            assert!(polls < 1000, "checkpoint must complete");
+        }
+
+        let manifest_refs = forest.manifest_log.checkpoint_references();
+        let grid_refs = forest.grid.free_set_checkpoint_references();
+
+        let highest_address = grid_refs
+            .blocks_acquired
+            .last_block_address
+            .max(grid_refs.blocks_released.last_block_address);
+        let reopen_view = SuperBlockView {
+            storage_size: DATA_FILE_SIZE_MIN as u64 + highest_address * BLOCK_SIZE as u64,
+            manifest_block_count: manifest_refs.block_count,
+            manifest_oldest_address: manifest_refs.oldest_address,
+            manifest_oldest_checksum: manifest_refs.oldest_checksum,
+            manifest_newest_address: manifest_refs.newest_address,
+            manifest_newest_checksum: manifest_refs.newest_checksum,
+            ..test_superblock()
+        };
+
+        // Reopen over the same storage: the compaction inputs replay their trailing Remove
+        // events (so they do not reappear), the other three level-0 tables and the output
+        // replay at level 0 / level 1 respectively.
+        let mut forest_b = Forest::init(reopen_view, grid_options(), 32);
+        forest_b.open(grid_refs, &mut storage, 0);
+        let mut b_done = false;
+        for _ in 0..1000 {
+            forest_b.poll(&mut storage);
+            if forest_b.progress.is_none() && forest_b.accounts.objects.is_opened() {
+                b_done = true;
+                break;
+            }
+        }
+        assert!(b_done, "reopen must complete");
+
+        assert_eq!(forest_b.accounts.objects.manifest_table_count(), 4);
+        assert_eq!(forest_b.accounts.objects.manifest_ref().levels[0].table_count_visible(), 3);
+        assert_eq!(forest_b.accounts.objects.manifest_ref().levels[1].table_count_visible(), 1);
+    }
 }
