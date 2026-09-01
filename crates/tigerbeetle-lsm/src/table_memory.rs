@@ -1280,4 +1280,149 @@ mod tests {
         assert_eq!(iterator.pop().map(|value| value.key), Some(8));
         assert_eq!(iterator.pop().map(|value| value.key), None);
     }
+
+    /// `absorb` must pre-sort a multi-run (out-of-order) immutable into a single run before
+    /// merging the mutable values in, keeping the newest version of each key.
+    #[test]
+    fn absorb_presorts_multi_run_immutable_into_one_run() {
+        let mut radix_buffer = ScratchMemory::<TValue>::new(16);
+
+        let mut table_immutable = create_table_immutable();
+        let mut table_mutable = create_table_mutable();
+
+        // Two runs: [2,4] then [1,3]. `compact` preserves both runs, leaving the immutable
+        // out of order (`sorted() == false`), which exercises the pre-sort branch in `absorb`.
+        table_mutable.put(&v(2, 0, false));
+        table_mutable.put(&v(4, 0, false));
+        table_mutable.sort_suffix(&mut radix_buffer); // Already sorted; no-op.
+        table_mutable.put(&v(1, 1, false));
+        table_mutable.put(&v(3, 1, false));
+        table_mutable.sort_suffix(&mut radix_buffer);
+
+        table_immutable.compact(&mut table_mutable, 7);
+        assert_eq!(table_immutable.count(), 4);
+        assert_eq!(table_immutable.value_context.run_tracker.count(), 2);
+        assert!(!table_immutable.sorted());
+
+        table_mutable.put(&v(2, 2, false));
+        table_mutable.put(&v(5, 0, false));
+        table_mutable.sort_suffix(&mut radix_buffer);
+
+        table_immutable.absorb(&mut table_mutable, 7, &mut radix_buffer);
+
+        assert_eq!(table_mutable.count(), 0);
+        assert_eq!(table_immutable.count(), 6);
+        assert_eq!(table_immutable.value_context.run_tracker.count(), 2);
+        assert!(!table_immutable.sorted());
+        assert_eq!(table_immutable.key_min(), 1);
+        assert_eq!(table_immutable.key_max(), 5);
+
+        let Some(value_2) = table_immutable.get(2) else {
+            panic!("key 2 present");
+        };
+        assert_eq!(*value_2, v(2, 2, false));
+        let Some(value_1) = table_immutable.get(1) else {
+            panic!("key 1 present");
+        };
+        assert_eq!(*value_1, v(1, 1, false));
+        let Some(value_5) = table_immutable.get(5) else {
+            panic!("key 5 present");
+        };
+        assert_eq!(*value_5, v(5, 0, false));
+        assert!(table_immutable.get(6).is_none());
+
+        let context = table_immutable.iterator_context();
+        let mut iterator =
+            ImmutableTableIterator::<GeneralTable>::new(context, None, Direction::Ascending);
+        let mut merged: Vec<TValue> = Vec::new();
+        while let Some(value) = iterator.pop() {
+            merged.push(value);
+        }
+        assert_eq!(
+            merged,
+            vec![v(1, 1, false), v(2, 2, false), v(3, 1, false), v(4, 0, false), v(5, 0, false)]
+        );
+    }
+
+    /// The immutable iterator must honor `Direction::Descending` and still resolve duplicate
+    /// keys to the newest version (across runs), including with an `end_key` limit.
+    #[test]
+    fn immutable_iterator_descending_newest_wins() {
+        let mut radix_buffer = ScratchMemory::<TValue>::new(16);
+
+        let mut table_immutable = create_table_immutable();
+        let mut table_mutable = create_table_mutable();
+
+        // Two runs sharing key 3: [2,3,5] and [3,4].
+        table_mutable.put(&v(2, 0, false));
+        table_mutable.put(&v(3, 0, false));
+        table_mutable.put(&v(5, 0, false));
+        table_mutable.sort_suffix(&mut radix_buffer);
+        table_mutable.put(&v(3, 1, false));
+        table_mutable.put(&v(4, 0, false));
+        table_mutable.sort_suffix(&mut radix_buffer);
+        table_immutable.compact(&mut table_mutable, 0);
+
+        let context = table_immutable.iterator_context();
+        let mut iterator =
+            ImmutableTableIterator::<GeneralTable>::new(context, None, Direction::Descending);
+        let mut merged: Vec<TValue> = Vec::new();
+        while let Some(value) = iterator.pop() {
+            merged.push(value);
+        }
+        assert_eq!(merged, vec![v(5, 0, false), v(4, 0, false), v(3, 1, false), v(2, 0, false)]);
+
+        let context = table_immutable.iterator_context();
+        let mut iterator =
+            ImmutableTableIterator::<GeneralTable>::new(context, Some(3), Direction::Descending);
+        let mut merged: Vec<TValue> = Vec::new();
+        while let Some(value) = iterator.pop() {
+            merged.push(value);
+        }
+        assert_eq!(merged, vec![v(5, 0, false), v(4, 0, false), v(3, 1, false)]);
+    }
+
+    /// `finalize`/`set_flushed` drive the immutable `flushed` flag, `snapshot_min` is retained,
+    /// and `absorb` of an empty mutable table is a no-op.
+    #[test]
+    fn set_flushed_and_snapshot_min_lifecycle() {
+        let mut radix_buffer = ScratchMemory::<TValue>::new(16);
+
+        let mut table_immutable = create_table_immutable();
+        let mut table_mutable = create_table_mutable();
+
+        table_mutable.put(&v(1, 0, false));
+        table_mutable.sort(&mut radix_buffer);
+        table_immutable.compact(&mut table_mutable, 9);
+
+        let Mutability::Immutable(state) = table_immutable.mutability else {
+            unreachable!("compact finalizes as immutable");
+        };
+        assert!(!state.flushed);
+        assert_eq!(state.snapshot_min, 9);
+
+        table_immutable.set_flushed();
+        let Mutability::Immutable(state) = table_immutable.mutability else {
+            unreachable!("still immutable");
+        };
+        assert!(state.flushed);
+        assert_eq!(state.snapshot_min, 9);
+
+        // An empty immutable table is already flushed, and absorbs are no-ops.
+        let mut empty_mutable = create_table_mutable();
+        let mut empty_immutable = create_table_immutable();
+        empty_immutable.compact(&mut empty_mutable, 5);
+        let Mutability::Immutable(state) = empty_immutable.mutability else {
+            unreachable!("compact finalizes as immutable");
+        };
+        assert!(state.flushed);
+        assert_eq!(state.snapshot_min, 5);
+
+        empty_immutable.absorb(&mut empty_mutable, 5, &mut radix_buffer);
+        assert_eq!(empty_immutable.count(), 0);
+        let Mutability::Immutable(state) = empty_immutable.mutability else {
+            unreachable!("absorb leaves the table immutable");
+        };
+        assert!(state.flushed);
+    }
 }
