@@ -527,4 +527,99 @@ mod tests {
         sessions.put(100, &reply(10, 500));
         assert_eq!(sessions.evictee(), 11);
     }
+
+    /// `evictee` scans the slot array (not the HashMap), so its choice must not depend on
+    /// `HashMap` iteration order. Insert the clients with *decreasing* commit numbers so the
+    /// map's internal bucket order disagrees with any slot-based ordering, and verify the
+    /// oldest commit still wins.
+    #[test]
+    fn evictee_is_independent_of_hashmap_iteration_order() {
+        let mut sessions = ClientSessions::new();
+        // Insert in reverse (newest-first) so slot order and hash order differ.
+        for index in (0..CLIENTS).rev() {
+            let commit = u64::try_from(index).unwrap_or(u64::MAX) + 100;
+            let client = u128::try_from(index).unwrap_or(u128::MAX) + 1000;
+            let header = reply(client, commit);
+            sessions.put(commit, &header);
+        }
+        assert_eq!(sessions.count(), CLIENTS);
+
+        // The entry with the smallest commit (client 1000, commit 100) is evicted.
+        assert_eq!(sessions.evictee(), 1000);
+    }
+
+    /// `get_mut` returns the same entry as `get` and allows mutating the header (e.g. to bump
+    /// the reply) while keeping the slot/client/session consistent.
+    #[test]
+    fn get_mut_returns_the_same_entry() {
+        let mut sessions = ClientSessions::new();
+        sessions.put(7, &reply(1000, 9));
+
+        {
+            let entry = sessions.get_mut(1000).expect("entry");
+            assert_eq!(entry.session, 7);
+            entry.header = reply(1000, 10);
+        }
+        assert_eq!(sessions.get(1000).expect("entry").header.commit, 10);
+
+        // Reading the same key through `get` after mutation yields the updated header:
+        assert_eq!(sessions.get(1000).expect("entry").header.commit, 10);
+        assert_eq!(sessions.get_mut(2000), None);
+    }
+
+    /// `reset` zeroes every slot and clears the by-client index, putting the table back to its
+    /// fresh state without deallocating. A later `decode` from a fresh table is therefore legal.
+    #[test]
+    fn reset_returns_to_fresh_state_and_allows_decode() {
+        let mut sessions = ClientSessions::new();
+        sessions.put(7, &reply(1000, 9));
+        sessions.put(8, &reply(2000, 10));
+        assert_eq!(sessions.count(), 2);
+
+        sessions.reset();
+        assert_eq!(sessions.count(), 0);
+        assert_eq!(sessions.get(1000), None);
+        assert_eq!(sessions.get(2000), None);
+        assert_eq!(sessions.iterator().count(), 0);
+        for entry in &sessions.entries {
+            assert_eq!(entry.session, 0);
+            assert!(entry.header.to_wire().iter().all(|&byte| byte == 0));
+        }
+
+        // A fresh `decode` (with an empty table) now succeeds and repopulates:
+        let mut source = ClientSessions::new();
+        source.put(9, &reply(3000, 11));
+        let mut wire = vec![0u8; ClientSessions::ENCODE_SIZE];
+        source.encode(&mut wire);
+        sessions.decode(&wire);
+        assert_eq!(sessions.count(), 1);
+        assert_eq!(sessions.get(3000), Some(&Entry { session: 9, header: reply(3000, 11) }));
+    }
+
+    /// A full-table encode then decode preserves every entry and the slot→client mapping.
+    #[test]
+    fn encode_decode_full_table() {
+        let mut sessions = ClientSessions::new();
+        for index in 0..CLIENTS {
+            let client = u128::try_from(index).unwrap_or(u128::MAX) + 500;
+            let commit = u64::try_from(index).unwrap_or(u64::MAX) + 1000;
+            sessions.put(commit, &reply(client, commit));
+        }
+        assert_eq!(sessions.count(), CLIENTS);
+
+        let mut wire = vec![0u8; ClientSessions::ENCODE_SIZE];
+        sessions.encode(&mut wire);
+
+        let mut decoded = ClientSessions::new();
+        decoded.decode(&wire);
+        assert_eq!(decoded.count(), CLIENTS);
+        for index in 0..CLIENTS {
+            let client = u128::try_from(index).unwrap_or(u128::MAX) + 500;
+            let commit = u64::try_from(index).unwrap_or(u64::MAX) + 1000;
+            assert_eq!(
+                decoded.get(client),
+                Some(&Entry { session: commit, header: reply(client, commit) })
+            );
+        }
+    }
 }
