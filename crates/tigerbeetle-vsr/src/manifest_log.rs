@@ -1175,6 +1175,70 @@ mod tests {
     }
 
     #[test]
+    fn pace_half_bar_compact_blocks_proportional() {
+        let pace = Pace::init(1, 1_000, 5);
+        let cap = pace.half_bar_compact_blocks_max;
+        let cycle = pace.log_blocks_cycle_max;
+        let append = u64::from(pace.half_bar_append_blocks_max);
+        assert!(cycle > append + 1); // precondition for the proportional branch below
+
+        let cycle = u32::try_from(cycle).unwrap();
+
+        // Precondition for the proportional branch to run at all:
+        // log_blocks_count + append_blocks < log_blocks_cycle_max.
+        let f = |blocks: u32, tables: u32| pace.half_bar_compact_blocks(blocks, tables);
+
+        // An empty log compacts nothing, regardless of tables (target clamped ≥ 1).
+        assert_eq!(f(0, pace.tables_max), 0);
+
+        // With the full tree of live tables, one block is below any proportional budget:
+        // compact = cap * 1 / cycle < cap.
+        assert!(f(1, pace.tables_max) < cap);
+
+        // At the cycle boundary the at-limit branch caps at half_bar_compact_blocks_max.
+        assert_eq!(f(cycle, pace.tables_max), cap);
+
+        // A zero-table forest clamps the target to 1, so any budget saturates the cap.
+        assert_eq!(f(cycle - append as u32 - 1, 0), cap);
+
+        // The proportional budget is monotone in the number of live log blocks.
+        for log_blocks_count in 0..cycle {
+            assert!(
+                f(log_blocks_count, pace.tables_max) <= f(log_blocks_count + 1, pace.tables_max)
+            );
+        }
+    }
+
+    #[test]
+    fn pace_half_bar_compact_blocks_tables_count_overflow_panics() {
+        let pace = Pace::init(1, 100, 5);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = pace.half_bar_compact_blocks(0, pace.tables_max + 1);
+        }));
+        assert!(result.is_err(), "tables_count > tables_max must panic");
+    }
+
+    #[test]
+    fn pace_init_rejects_invalid_arguments() {
+        let invalid: [(&str, u32, u32, u32); 4] = [
+            // tree_count must be > 0.
+            ("tree_count 0", 0, 100, 5),
+            // tables_max must be > 0.
+            ("tables_max 0", 1, 0, 5),
+            // tables_max must exceed tree_count.
+            ("tables_max <= tree_count", 100, 100, 5),
+            // compact_extra_blocks must be > 0.
+            ("compact_extra_blocks 0", 1, 100, 0),
+        ];
+        for (reason, tree_count, tables_max, compact_extra_blocks) in invalid {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = Pace::init(tree_count, tables_max, compact_extra_blocks);
+            }));
+            assert!(result.is_err(), "{reason} must panic");
+        }
+    }
+
+    #[test]
     fn manifest_log_new() {
         let _log = ManifestLog::new(test_superblock(), Pace::init(1, 100, 5), Some(0));
     }
