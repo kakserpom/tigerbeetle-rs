@@ -646,6 +646,33 @@ impl Replica {
         self.superblock.as_ref().map_or(0, |sb| sb.working().checkpoint_id())
     }
 
+    /// The highest durable view.
+    ///
+    /// Reads from `self.superblock.working.vsr_state.view` when a superblock is
+    /// mounted; returns `self.view` otherwise (matching pre-mount behavior, and
+    /// only valid because an unmounted replica cannot have persisted a view).
+    ///
+    /// Upstream: `src/vsr/replica.zig:9385` (`view_durable`).
+    #[must_use]
+    pub fn view_durable(&self) -> u32 {
+        self.superblock.as_ref().map_or(self.view, |sb| sb.working().vsr_state.view)
+    }
+
+    /// The highest durable log_view.
+    ///
+    /// Reads from `self.superblock.working.vsr_state.log_view` when a
+    /// superblock is mounted; returns `self.log_view` otherwise (matching
+    /// pre-mount behavior).
+    ///
+    /// A replica must never advertise a log_view (in a ViewChangeMessage) higher
+    /// than its durable log_view, since log_view must not regress after a crash.
+    ///
+    /// Upstream: `src/vsr/replica.zig:9436` (`log_view_durable`).
+    #[must_use]
+    pub fn log_view_durable(&self) -> u32 {
+        self.superblock.as_ref().map_or(self.log_view, |sb| sb.working().vsr_state.log_view)
+    }
+
     /// The smallest op that may not be discarded (`op_checkpoint + 1`).
     ///
     /// Upstream: `src/vsr/replica.zig:6786` (`op_repair_min`).
@@ -1827,13 +1854,13 @@ impl Replica {
 
         // DEVIATION: upstream uses `view_durable()` (the on-disk view) so that
         // pongs aren't dropped while the view is being updated, and `self.release`
-        // for the multiversion version; the sans-IO replica has neither superblock
-        // nor multiversion support, so the in-memory view and the minimum release
-        // stand in (matching the Prepare header construction).
+        // for the multiversion version; the sans-IO replica has no multiversion
+        // support, so the minimum release stands in (matching the Prepare header
+        // construction).
         let mut reply = message_header::Pong {
             cluster: self.cluster,
             replica: self.replica_u8(),
-            view: self.view,
+            view: self.view_durable(),
             release: crate::multiversion::Release::MINIMUM,
             // Copy the ping's monotonic timestamp and add our own wall-clock sample.
             ping_timestamp_monotonic: ping.ping_timestamp_monotonic,
@@ -1896,9 +1923,10 @@ impl Replica {
 
         let mut reply = message_header::PongClient {
             cluster: self.cluster,
-            // DEVIATION: upstream reports `log_view_durable()`; sans-IO has no
-            // superblock, so the in-memory log view stands in.
-            view: self.log_view,
+            // DEVIATION: upstream reports `log_view_durable()`; an unmounted
+            // sans-IO replica has no superblock, so the in-memory log view stands
+            // in there.
+            view: self.log_view_durable(),
             replica: self.replica_u8(),
             release: crate::multiversion::Release::MINIMUM,
             // Echo the client's monotonic timestamp back for clock synchronization.
@@ -2018,9 +2046,10 @@ impl Replica {
 
         let mut eviction = message_header::Eviction {
             cluster: self.cluster,
-            // DEVIATION: upstream reports `log_view_durable()`; sans-IO uses the
-            // in-memory log view.
-            view: self.log_view,
+            // DEVIATION: upstream reports `log_view_durable()`; an unmounted
+            // sans-IO replica has no superblock, so the in-memory log view stands
+            // in there.
+            view: self.log_view_durable(),
             replica: self.replica_u8(),
             release: crate::multiversion::Release::MINIMUM,
             client,
@@ -2038,8 +2067,8 @@ impl Replica {
     ///
     /// # Panics
     /// Panics if the header's cluster differs, if the header is not
-    /// client-directed, or if the header's view is newer than `log_view`
-    /// (upstream asserts all three; `view <= log_view_durable()`).
+    /// client-directed, or if the header's view is newer than the durable
+    /// `log_view` (upstream asserts all three; `view <= log_view_durable()`).
     ///
     /// Upstream: `src/vsr/replica.zig:8988` (`send_header_to_client`).
     fn send_header_to_client<T: TypedHeader>(&mut self, _client: u128, header: &T) {
@@ -2048,7 +2077,7 @@ impl Replica {
         // integration layer must pair it with the triggering PingClient.
         let frame = header.frame();
         assert_eq!(frame.cluster, self.cluster);
-        assert!(frame.view <= self.log_view);
+        assert!(frame.view <= self.log_view_durable());
         assert!(
             frame.command == crate::command::Command::PongClient
                 || frame.command == crate::command::Command::Eviction
@@ -2876,13 +2905,12 @@ impl Replica {
         self.ping_timeout.reset(constants::PING_TIMEOUT);
 
         // DEVIATION: upstream uses `view_durable()` (replica.zig:3574) and
-        // `self.release`, and `checkpoint_id` comes from the superblock's
-        // checkpoint; the sans-IO replica has no multiversion support yet.
+        // `self.release`; the sans-IO replica has no multiversion support yet.
         // `checkpoint_id` reads from the mounted superblock when present.
         let mut ping = message_header::Ping {
             cluster: self.cluster,
             replica: self.replica_u8(),
-            view: self.view,
+            view: self.view_durable(),
             release: crate::multiversion::Release::MINIMUM,
             checkpoint_id: self.checkpoint_id(),
             checkpoint_op: self.op_checkpoint(),
@@ -10430,6 +10458,22 @@ mod tests {
         assert_ne!(expected, 0);
         r.mount_superblock(sb);
         assert_eq!(r.checkpoint_id(), expected);
+    }
+
+    #[test]
+    fn durable_views_read_from_superblock_when_mounted() {
+        // Unmounted replicas fall back to the in-memory view/log_view.
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        r.view = 5;
+        r.log_view = 3;
+        assert_eq!(r.view_durable(), 5);
+        assert_eq!(r.log_view_durable(), 3);
+
+        // A freshly formatted/opened superblock reports the durable origin
+        // (view 0), overriding the in-memory values.
+        r.mount_superblock(opened_superblock_at_op(19));
+        assert_eq!(r.view_durable(), 0);
+        assert_eq!(r.log_view_durable(), 0);
     }
 
     #[test]
