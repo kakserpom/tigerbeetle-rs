@@ -126,6 +126,16 @@ pub struct Replica {
     /// for the grid; the grid's APIs take `&mut dyn Storage`, so both are handed
     /// out together via [`Self::grid_mut`].
     pub grid_storage: Option<MemoryStorage>,
+    /// The superblock: durable cluster metadata (VSR state, checkpoint, members).
+    ///
+    /// `None` until [`Self::mount_superblock`] attaches an opened superblock —
+    /// upstream owns the superblock from construction and runs it once `open`
+    /// completes.
+    ///
+    /// DEVIATION: the sans-IO replica starts without a superblock; the owner
+    /// mounts an externally-opened superblock before protocol messages need
+    /// real `op_checkpoint` / `checkpoint_id` values.
+    pub superblock: Option<crate::superblock::SuperBlock>,
     // state_machine: StateMachine,
     // clock: Clock,
     // client_replies: ClientReplies,
@@ -523,6 +533,7 @@ impl Replica {
             journal: crate::journal::Journal::new(cluster, replica_index),
             grid: None,
             grid_storage: None,
+            superblock: None,
             grid_serve_reads: Vec::new(),
             send_queue: Vec::new(),
             client_send_queue: Vec::new(),
@@ -556,6 +567,16 @@ impl Replica {
     pub fn mount_grid(&mut self, grid: Grid, storage: MemoryStorage) {
         self.grid = Some(grid);
         self.grid_storage = Some(storage);
+    }
+
+    /// Attach an opened superblock (upstream constructs it at `Replica` creation
+    /// and carries it throughout the lifecycle).
+    ///
+    /// DEVIATION: the sans-IO replica starts without a superblock; the owner
+    /// mounts an externally-opened superblock before protocol messages need
+    /// real `op_checkpoint` / `checkpoint_id` values.
+    pub fn mount_superblock(&mut self, superblock: crate::superblock::SuperBlock) {
+        self.superblock = Some(superblock);
     }
 
     /// The mounted grid and its storage, as a mutable pair.
@@ -604,11 +625,25 @@ impl Replica {
 
     /// The op of the completed checkpoint of the working superblock.
     ///
-    /// Upstream: `src/vsr/replica.zig:6770` (`op_checkpoint`).
+    /// Reads from `self.superblock.working.vsr_state.checkpoint.header.op`
+    /// when a superblock is mounted; returns `0` otherwise (matching the
+    /// pre-mount behavior).
+    ///
+    /// Upstream: `src/vsr/replica.zig:7047` (`op_checkpoint`).
     #[must_use]
     pub fn op_checkpoint(&self) -> u64 {
-        // TODO(port): the working superblock's checkpoint op. Sans-IO: 0.
-        0
+        self.superblock.as_ref().map_or(0, |sb| sb.working().vsr_state.checkpoint.header.op)
+    }
+
+    /// The checkpoint_id of the working superblock.
+    ///
+    /// Reads from `self.superblock.working.checkpoint_id()` when a superblock
+    /// is mounted; returns `0` otherwise (matching the pre-mount behavior).
+    ///
+    /// Upstream: `src/vsr/replica.zig:3587` (`ping` / `checkpoint_id`).
+    #[must_use]
+    pub fn checkpoint_id(&self) -> u128 {
+        self.superblock.as_ref().map_or(0, |sb| sb.working().checkpoint_id())
     }
 
     /// The smallest op that may not be discarded (`op_checkpoint + 1`).
@@ -626,8 +661,8 @@ impl Replica {
     /// Upstream: `src/vsr/replica.zig:6778` (`op_prepare_max_sync`).
     #[must_use]
     pub fn op_prepare_max_sync(&self) -> u64 {
-        // TODO(port): `op_checkpoint_sync` when syncing; sans-IO the working
-        // checkpoint is 0, so this is the prepare_max of checkpoint 0.
+        // TODO(port): `op_checkpoint_sync` when syncing; for now, delegates
+        // to `op_checkpoint()` which reads from the mounted superblock.
         self.op_checkpoint() + constants::VSR_CHECKPOINT_OPS as u64 - 1
     }
 
@@ -2415,7 +2450,7 @@ impl Replica {
             replica: self.replica_u8(),
             view: self.view,
             log_view: self.log_view,
-            checkpoint_op: 0, // TODO(port): op_checkpoint from the superblock.
+            checkpoint_op: self.op_checkpoint(),
             op: self.join_view_headers[0].op,
             commit_min: self.commit_min,
             nack_bitset,
@@ -2465,15 +2500,16 @@ impl Replica {
         assert_eq!(self.view_headers[0].op, self.op);
 
         // DEVIATION: upstream serializes `vsr.CheckpointState` (1024 bytes, the
-        // working superblock checkpoint) as the View body prefix; sans-IO has
-        // no superblock yet, so a zeroed prefix keeps the wire layout stable.
+        // working superblock checkpoint) as the View body prefix; the body is
+        // zeroed when no superblock is mounted yet, keeping the wire layout
+        // stable.
         let body_len =
             constants::CHECKPOINT_STATE_SIZE + self.view_headers.len() * message_header::SIZE;
         let mut view = message_header::View {
             cluster: self.cluster,
             replica: self.replica_u8(),
             view: self.view,
-            checkpoint_op: 0, // TODO(port): op_checkpoint from the superblock.
+            checkpoint_op: self.op_checkpoint(),
             op: self.op,
             commit_max: self.commit_max,
             nonce,
@@ -2655,7 +2691,7 @@ impl Replica {
             // The previous prepare's checksum, and the checksum being acked.
             parent: prepare.parent,
             prepare_checksum: prepare.checksum,
-            checkpoint_id: 0, // TODO(port): working superblock checkpoint_id.
+            checkpoint_id: self.checkpoint_id(),
             commit_min: self.commit_min,
             op: prepare.op,
             timestamp: prepare.timestamp,
@@ -2785,15 +2821,14 @@ impl Replica {
 
         // DEVIATION: upstream uses `view_durable()` (replica.zig:3574) and
         // `self.release`, and `checkpoint_id` comes from the superblock's
-        // checkpoint; the sans-IO replica has no superblock or multiversion
-        // support (matching the Prepare header construction). `checkpoint_id = 0`
-        // is not validated by `Ping::invalid_header`.
+        // checkpoint; the sans-IO replica has no multiversion support yet.
+        // `checkpoint_id` reads from the mounted superblock when present.
         let mut ping = message_header::Ping {
             cluster: self.cluster,
             replica: self.replica_u8(),
             view: self.view,
             release: crate::multiversion::Release::MINIMUM,
-            checkpoint_id: 0,
+            checkpoint_id: self.checkpoint_id(),
             checkpoint_op: self.op_checkpoint(),
             // Upstream samples `clock.monotonic()`; the owner's tick provides it.
             ping_timestamp_monotonic: self.monotonic_now,
@@ -10135,5 +10170,119 @@ mod tests {
         assert_eq!(r.commit_stage, CommitStage::Idle);
         assert!(!r.commit_dispatch_entered);
         assert!(r.commit_prepare.is_none());
+    }
+
+    /// Build an opened, checkpointed superblock whose working checkpoint holds
+    /// `op`, via the public format → open → checkpoint API.
+    fn opened_superblock_at_op(op: u64) -> crate::superblock::SuperBlock {
+        use crate::superblock::{
+            Event, FormatOptions, FreeSetReferences, ManifestReferences, TrailerReference,
+            UpdateCheckpoint,
+        };
+
+        let empty_reference = TrailerReference {
+            checksum: message_header::checksum_body_empty(),
+            last_block_address: 0,
+            last_block_checksum: 0,
+            trailer_size: 0,
+        };
+
+        let mut storage =
+            crate::storage::MemoryStorage::new(crate::superblock::DATA_FILE_SIZE_MIN as u64);
+        let mut sb =
+            crate::superblock::SuperBlock::new(crate::superblock::DATA_FILE_SIZE_MIN as u64);
+        sb.format(
+            &mut storage,
+            FormatOptions {
+                cluster: CLUSTER,
+                release: crate::multiversion::Release::MINIMUM,
+                replica: 0,
+                replica_count: 3,
+                view: None,
+            },
+        );
+        sb.poll(&mut storage);
+        assert_eq!(sb.take_events(), vec![Event::FormatDone]);
+        sb.open(&mut storage);
+        sb.poll(&mut storage);
+        assert_eq!(sb.take_events(), vec![Event::OpenDone]);
+
+        let mut header = message_header::Prepare::default();
+        header.cluster = CLUSTER;
+        header.op = op;
+        header.timestamp = op;
+        header.set_checksum_body(&[]);
+        header.set_checksum();
+        sb.checkpoint(
+            &mut storage,
+            &UpdateCheckpoint {
+                header,
+                view_attributes: None,
+                commit_max: op,
+                sync_op_min: 0,
+                sync_op_max: 0,
+                manifest_references: ManifestReferences {
+                    oldest_checksum: 0,
+                    oldest_address: 0,
+                    newest_checksum: 0,
+                    newest_address: 0,
+                    block_count: 0,
+                },
+                free_set_references: FreeSetReferences {
+                    blocks_acquired: empty_reference,
+                    blocks_released: empty_reference,
+                },
+                client_sessions_reference: empty_reference,
+                storage_size: crate::superblock::DATA_FILE_SIZE_MIN as u64,
+                release: crate::multiversion::Release::MINIMUM,
+            },
+        );
+        sb.poll(&mut storage);
+        assert_eq!(sb.take_events(), vec![Event::CheckpointDone]);
+        assert_eq!(sb.working().vsr_state.checkpoint.header.op, op);
+        sb
+    }
+
+    #[test]
+    fn op_checkpoint_reads_from_superblock() {
+        // Unmounted replica falls back to 0.
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        assert_eq!(r.op_checkpoint(), 0);
+
+        r.mount_superblock(opened_superblock_at_op(19));
+        assert_eq!(r.op_checkpoint(), 19);
+        assert_eq!(r.op_repair_min(), 20);
+    }
+
+    #[test]
+    fn checkpoint_id_reads_from_superblock() {
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        assert_eq!(r.checkpoint_id(), 0);
+
+        let sb = opened_superblock_at_op(19);
+        let expected = sb.working().checkpoint_id();
+        assert_ne!(expected, 0);
+        r.mount_superblock(sb);
+        assert_eq!(r.checkpoint_id(), expected);
+    }
+
+    #[test]
+    fn prepare_ok_checkpoint_id_from_superblock() {
+        // A backup with a mounted superblock acks a Prepare; the PrepareOk it
+        // enqueues carries the superblock's checkpoint_id.
+        let mut primary = Replica::new(CLUSTER, 0, 3);
+        primary.status = Status::Normal;
+        primary.primary_pipeline_prepare(1, 1, crate::Operation::NOOP, &[], 0).unwrap();
+        let prepare_msg = primary.send_queue[0].clone();
+
+        let mut backup = Replica::new(CLUSTER, 2, 3);
+        backup.mount_superblock(opened_superblock_at_op(19));
+        backup.status = Status::Normal;
+        backup.on_message(&prepare_msg, 20_000);
+
+        let ok = backup.send_queue.last().expect("prepare_ok enqueued");
+        let prepare_ok = ok.header::<message_header::PrepareOk>().expect("prepare_ok");
+        assert_eq!(prepare_ok.checkpoint_id, backup.checkpoint_id());
+        assert_ne!(prepare_ok.checkpoint_id, 0);
     }
 }
