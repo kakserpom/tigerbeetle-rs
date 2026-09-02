@@ -68,6 +68,19 @@ pub fn compaction_op_min(op: u64) -> u64 {
     op - op % HALF_BAR_BEAT_COUNT as u64
 }
 
+/// Returns whether the compaction for the given `level_b` is active during the half-bar
+/// containing `op` (upstream `level_active`, forest.zig:1099-1103).
+///
+/// Each bar is split into two half-bars of `HALF_BAR_BEAT_COUNT` beats each. Odd compactions
+/// (level_b = 1, 3, ...) are active during the first half-bar and even compactions
+/// (level_b = 0 = immutable → 0, then 2, 4, ...) during the second half-bar.
+#[must_use]
+pub fn level_active(level_b: usize, op: u64) -> bool {
+    let half_bar_beat_count = HALF_BAR_BEAT_COUNT as u64;
+    let compaction_beat = op % constants::LSM_COMPACTION_OPS as u64;
+    (compaction_beat < half_bar_beat_count) == (level_b % 2 == 1)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -93,5 +106,19 @@ mod tests {
         assert_eq!(snapshot_min, 6);
         assert_eq!(snapshot_max, 5);
         assert_eq!(snapshot_max + 1, snapshot_min);
+    }
+
+    #[test]
+    fn level_active_even_and_odd_levels_by_half_bar() {
+        // HALF_BAR_BEAT_COUNT = 2 (test-min config: LSM_COMPACTION_OPS = 4)
+        let ops = constants::LSM_COMPACTION_OPS as u64;
+        assert!(!level_active(0, ops)); // first half-bar: odd levels active
+        assert!(level_active(1, ops));
+        assert!(!level_active(2, ops));
+
+        let half_bar = HALF_BAR_BEAT_COUNT as u64;
+        assert!(level_active(0, ops + half_bar)); // second half-bar: even levels active
+        assert!(!level_active(1, ops + half_bar));
+        assert!(level_active(2, ops + half_bar));
     }
 }

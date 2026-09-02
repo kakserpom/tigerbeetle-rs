@@ -279,14 +279,210 @@ impl Forest {
 
     /// Compact every groove's mutable tables for the given op, sorting them with
     /// their per-tree radix-sort scratch and compacting the objects caches on the
-    /// last beat of the bar.
+    /// last beat of the bar; then drive the level-0 (immutable-flush) compaction of
+    /// every tree through the bar cadence (upstream `forest.compact_trees_start`
+    /// + `compact_finish`), factoring in the grid, storage, and manifest log.
     ///
     /// Port of upstream `forest.compact` (forest.zig:417), which drives each
-    /// groove's `compact(op, &radix_buffer)`.
-    pub fn compact(&mut self, op: u64) {
+    /// groove's `compact(op, &radix_buffer)` and the active level-0 compactions.
+    pub fn compact(&mut self, op: u64, storage: &mut dyn Storage) {
         self.accounts.compact(op, &mut self.accounts_scratch);
         self.transfers.compact(op, &mut self.transfers_scratch);
         self.transfers_pending.compact(op, &mut self.transfers_pending_scratch);
+
+        // DEVIATION: upstream plans and reserves grid blocks per beat for the whole forest
+        // (`forest.compact_trees_reserve_grid_blocks` + `ResourcePool`); this port drives each
+        // tree's level-0 compaction synchronously per beat, mirroring `compact_trees_start` +
+        // `compact_finish` (which run `level_active` compactions; the level-0 compactions are
+        // only advanced in the second half-bar, and every tree's mutable suffix is swapped on
+        // the last beat regardless).
+        self.compact_level0_trees(op, storage);
+    }
+
+    /// Drive the level-0 (immutable-flush) compaction of every tree in the forest, one op/beat.
+    ///
+    /// DEVIATION: upstream comptime-generates this loop (`inline for (std.enums.values(TreeID))`,
+    /// forest.zig:567); here the 25 trees of the three grooves are enumerated explicitly, each
+    /// with its own radix-sort scratch buffer (see the `*GrooveScratch` DEVIATION notes).
+    #[allow(clippy::too_many_lines)]
+    fn compact_level0_trees(&mut self, op: u64, storage: &mut dyn Storage) {
+        self.accounts.objects.compact_level0(
+            op,
+            &mut self.grid,
+            storage,
+            &mut self.manifest_log,
+            &mut self.accounts_scratch.objects,
+        );
+        self.accounts.id.compact_level0(
+            op,
+            &mut self.grid,
+            storage,
+            &mut self.manifest_log,
+            &mut self.accounts_scratch.id,
+        );
+        self.accounts.user_data_128.compact_level0(
+            op,
+            &mut self.grid,
+            storage,
+            &mut self.manifest_log,
+            &mut self.accounts_scratch.user_data_128,
+        );
+        self.accounts.user_data_64.compact_level0(
+            op,
+            &mut self.grid,
+            storage,
+            &mut self.manifest_log,
+            &mut self.accounts_scratch.composite_key_64,
+        );
+        self.accounts.user_data_32.compact_level0(
+            op,
+            &mut self.grid,
+            storage,
+            &mut self.manifest_log,
+            &mut self.accounts_scratch.composite_key_64,
+        );
+        self.accounts.ledger.compact_level0(
+            op,
+            &mut self.grid,
+            storage,
+            &mut self.manifest_log,
+            &mut self.accounts_scratch.composite_key_64,
+        );
+        self.accounts.code.compact_level0(
+            op,
+            &mut self.grid,
+            storage,
+            &mut self.manifest_log,
+            &mut self.accounts_scratch.composite_key_64,
+        );
+        self.accounts.imported.compact_level0(
+            op,
+            &mut self.grid,
+            storage,
+            &mut self.manifest_log,
+            &mut self.accounts_scratch.composite_key_unit,
+        );
+        self.accounts.closed.compact_level0(
+            op,
+            &mut self.grid,
+            storage,
+            &mut self.manifest_log,
+            &mut self.accounts_scratch.composite_key_unit,
+        );
+
+        self.transfers.objects.compact_level0(
+            op,
+            &mut self.grid,
+            storage,
+            &mut self.manifest_log,
+            &mut self.transfers_scratch.objects,
+        );
+        self.transfers.id.compact_level0(
+            op,
+            &mut self.grid,
+            storage,
+            &mut self.manifest_log,
+            &mut self.transfers_scratch.id,
+        );
+        self.transfers.debit_account_id.compact_level0(
+            op,
+            &mut self.grid,
+            storage,
+            &mut self.manifest_log,
+            &mut self.transfers_scratch.composite_key_128,
+        );
+        self.transfers.credit_account_id.compact_level0(
+            op,
+            &mut self.grid,
+            storage,
+            &mut self.manifest_log,
+            &mut self.transfers_scratch.composite_key_128,
+        );
+        self.transfers.amount.compact_level0(
+            op,
+            &mut self.grid,
+            storage,
+            &mut self.manifest_log,
+            &mut self.transfers_scratch.composite_key_128,
+        );
+        self.transfers.pending_id.compact_level0(
+            op,
+            &mut self.grid,
+            storage,
+            &mut self.manifest_log,
+            &mut self.transfers_scratch.composite_key_128,
+        );
+        self.transfers.user_data_128.compact_level0(
+            op,
+            &mut self.grid,
+            storage,
+            &mut self.manifest_log,
+            &mut self.transfers_scratch.composite_key_128,
+        );
+        self.transfers.user_data_64.compact_level0(
+            op,
+            &mut self.grid,
+            storage,
+            &mut self.manifest_log,
+            &mut self.transfers_scratch.composite_key_64,
+        );
+        self.transfers.user_data_32.compact_level0(
+            op,
+            &mut self.grid,
+            storage,
+            &mut self.manifest_log,
+            &mut self.transfers_scratch.composite_key_64,
+        );
+        self.transfers.ledger.compact_level0(
+            op,
+            &mut self.grid,
+            storage,
+            &mut self.manifest_log,
+            &mut self.transfers_scratch.composite_key_64,
+        );
+        self.transfers.code.compact_level0(
+            op,
+            &mut self.grid,
+            storage,
+            &mut self.manifest_log,
+            &mut self.transfers_scratch.composite_key_64,
+        );
+        self.transfers.expires_at.compact_level0(
+            op,
+            &mut self.grid,
+            storage,
+            &mut self.manifest_log,
+            &mut self.transfers_scratch.composite_key_64,
+        );
+        self.transfers.imported.compact_level0(
+            op,
+            &mut self.grid,
+            storage,
+            &mut self.manifest_log,
+            &mut self.transfers_scratch.composite_key_unit,
+        );
+        self.transfers.closing.compact_level0(
+            op,
+            &mut self.grid,
+            storage,
+            &mut self.manifest_log,
+            &mut self.transfers_scratch.composite_key_unit,
+        );
+
+        self.transfers_pending.objects_mut().compact_level0(
+            op,
+            &mut self.grid,
+            storage,
+            &mut self.manifest_log,
+            &mut self.transfers_pending_scratch.objects,
+        );
+        self.transfers_pending.status_mut().compact_level0(
+            op,
+            &mut self.grid,
+            storage,
+            &mut self.manifest_log,
+            &mut self.transfers_pending_scratch.status,
+        );
     }
 
     /// Compact the manifest log, re-appending live entries from old log blocks.
@@ -475,7 +671,7 @@ mod tests {
         forest.accounts.objects.put(&Account { id: 9, timestamp: 9, ..Account::default() });
         forest.accounts.objects.put(&Account { id: 9, timestamp: 9, ..Account::default() });
 
-        forest.compact(0);
+        forest.compact(0, &mut storage());
 
         let values = forest.accounts.objects.table_mutable_ref().values_used();
         assert_eq!(
@@ -484,13 +680,14 @@ mod tests {
         );
     }
 
-    /// Compacting across a full bar (including the last-beat objects-cache compact)
-    /// runs without panicking for all three grooves.
+    /// Compacting across a full bar (including the last-beat objects-cache compact and
+    /// the per-tree level-0 driver) runs without panicking for all three grooves.
     #[test]
     fn forest_compact_full_bar() {
         let mut forest = Forest::init(test_superblock(), grid_options(), 32);
+        let mut storage = storage();
         for op in 0..(constants::LSM_COMPACTION_OPS as u64) {
-            forest.compact(op);
+            forest.compact(op, &mut storage);
         }
     }
 
@@ -500,10 +697,10 @@ mod tests {
     /// *unflushed* immutable table via a prior swap, then runs the driver for one bar.
     ///
     /// This is the end-to-end seam the compact dispatch machinery was built for: the
-    /// 8-op bar paces `half_bar_commence` (first beat / half beat), drains the immutable
-    /// source through the grid via `dispatch`, `half_bar_complete` (last-half / last beat)
-    /// inserts the real output table into the manifest, and the last beat swaps
-    /// mutable→immutable.
+    /// bar paces `half_bar_commence` (the level-0 compaction is `level_active` only in
+    /// the second half-bar), drains the immutable source through the grid via `dispatch`,
+    /// `half_bar_complete` inserts the real output table into the manifest, and the last
+    /// beat swaps mutable→immutable.
     #[test]
     fn tree_compact_level0_driver_flushes_immutable_to_l0() {
         // The grid's free set holds `matrix_free_set_blocks` addresses (a few thousand), far
@@ -523,7 +720,7 @@ mod tests {
 
         // Run a full bar. The driver is keyed off op modulo LSM_COMPACTION_OPS; the first
         // valid half-bar begins at op = HALF_BAR_BEAT_COUNT (commence asserts op aligns to it),
-        // so start the steady-state bar at op 8 (8..16 is one full bar).
+        // so start the steady-state bar at `bar_start` (`bar_start..bar_start + bar_ops`).
         let bar_ops = constants::LSM_COMPACTION_OPS as u64;
         let bar_start = compaction::HALF_BAR_BEAT_COUNT as u64 * 2;
         for op in bar_start..bar_start + bar_ops {
@@ -548,6 +745,50 @@ mod tests {
         let mutability = forest.accounts.objects.table_immutable_ref().mutability();
         assert!(matches!(mutability, Mutability::Immutable(state) if state.flushed));
         assert_eq!(forest.accounts.objects.table_immutable_ref().count(), 0);
+    }
+
+    /// Higher-level end-to-end: `Forest::compact(op, storage)` drives the level-0
+    /// immutable-flush driver across *every* tree in all three grooves, so a real
+    /// unflushed immutable table in one groove flushes to a visible level-0 table.
+    ///
+    /// Seeds the account object tree's immutable (put → compact → swap, as above), runs one
+    /// full bar through `Forest::compact`, and asserts the flushed L0 table lands in the
+    /// manifest while the immutable is drained back to 0.
+    #[test]
+    fn forest_compact_level0_driver_flushes_immutable_to_l0() {
+        let mut forest = Forest::init(test_superblock(), grid_options(), 32);
+        let mut storage = large_storage();
+        open_forest(&mut forest, &mut storage);
+
+        forest.accounts.objects.put(&Account { id: 3, timestamp: 3, ..Account::default() });
+        forest.accounts.objects.put(&Account { id: 5, timestamp: 5, ..Account::default() });
+        forest.accounts.objects.compact(&mut forest.accounts_scratch.objects);
+        forest.accounts.objects.swap_mutable_and_immutable(1, &mut forest.accounts_scratch.objects);
+        assert_eq!(forest.accounts.objects.table_immutable_ref().count(), 2);
+
+        let bar_ops = constants::LSM_COMPACTION_OPS as u64;
+        let bar_start = compaction::HALF_BAR_BEAT_COUNT as u64 * 2;
+        for op in bar_start..bar_start + bar_ops {
+            forest.compact(op, &mut storage);
+        }
+
+        assert_eq!(
+            forest.accounts.objects.manifest_ref().levels[0].table_count_visible(),
+            1,
+            "the flushed L0 table should be visible"
+        );
+        assert!(matches!(
+            forest.accounts.objects.table_immutable_ref().mutability(),
+            Mutability::Immutable(state) if state.flushed
+        ));
+        assert_eq!(forest.accounts.objects.table_immutable_ref().count(), 0);
+
+        // Every other groove tree stayed idle through the bar (no immutable to flush), so the
+        // only manifest tables recorded are the account object tree's flushed L0 table.
+        assert_eq!(forest.accounts.id.manifest_table_count(), 0);
+        assert_eq!(forest.transfers.objects.manifest_table_count(), 0);
+        assert_eq!(forest.transfers_pending.objects_table_count(), 0);
+        assert_eq!(forest.transfers_pending.status_table_count(), 0);
     }
 
     /// `Forest::open` attaches the manifest log to every groove and, once the manifest log

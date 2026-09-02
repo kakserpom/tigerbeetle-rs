@@ -2101,6 +2101,18 @@ impl TransferPendingGroove {
     pub fn status_table_count(&self) -> u32 {
         self.status.manifest_table_count()
     }
+
+    /// The pending objects tree (mutable, for the forest's compaction driver).
+    #[must_use]
+    pub fn objects_mut(&mut self) -> &mut Tree<TransferPendingObjectSpec> {
+        &mut self.objects
+    }
+
+    /// The pending status tree (mutable, for the forest's compaction driver).
+    #[must_use]
+    pub fn status_mut(&mut self) -> &mut Tree<TransferPendingStatusSpec> {
+        &mut self.status
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -22,7 +22,7 @@
 #![allow(clippy::cast_sign_loss)]
 
 use tigerbeetle_core::constants::{self, VERIFY};
-use tigerbeetle_lsm::compaction::{compaction_op_min, snapshot_min_for_table_output};
+use tigerbeetle_lsm::compaction::{compaction_op_min, level_active, snapshot_min_for_table_output};
 use tigerbeetle_lsm::manifest::{
     Manifest, ManifestLog as ManifestLogTrait, TableKey as ManifestTableKey, TreeTableInfo,
 };
@@ -459,6 +459,13 @@ impl<S: TreeSpec> Tree<S> {
     /// - on the last beat of the bar, the mutable suffix is swapped into the immutable
     ///   table at the output snapshot_min.
     ///
+    /// The level-0 compaction is only advanced when the level is active (`level_active`):
+    /// `half_bar_commence`/`half_bar_complete` are gated to the second half-bar, so on the
+    /// first half-bar of every bar the driver is idle (upstream `forest.compact_trees_start`,
+    /// forest.zig:502-536, only runs `level_active` compactions). The last-beat
+    /// `swap_mutable_and_immutable` runs unconditionally, mirroring upstream `compact_finish`
+    /// (forest.zig:752-763).
+    ///
     /// DEVIATION: upstream reserves one grid block reservation per beat for the whole
     /// forest (`forest.compact_trees_reserve_grid_blocks`); this port holds a per-tree,
     /// per-dispatch reservation through the synchronous `dispatch` and forfeits it
@@ -496,7 +503,7 @@ impl<S: TreeSpec> Tree<S> {
             Compaction::new(core::ptr::null_mut(), core::ptr::null_mut(), level_b),
         );
 
-        if first_beat || half_beat {
+        if level_active(0, op) && (first_beat || half_beat) {
             compaction.half_bar_commence(op, self, grid);
         }
 
@@ -509,7 +516,7 @@ impl<S: TreeSpec> Tree<S> {
             grid.forfeit(reservation);
         }
 
-        if last_beat || last_half_beat {
+        if level_active(0, op) && (last_beat || last_half_beat) {
             compaction.half_bar_complete(self, grid, log);
         }
 
