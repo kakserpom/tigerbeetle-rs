@@ -136,6 +136,13 @@ pub struct Replica {
     /// mounts an externally-opened superblock before protocol messages need
     /// real `op_checkpoint` / `checkpoint_id` values.
     pub superblock: Option<crate::superblock::SuperBlock>,
+    /// The storage backing [`Self::superblock`].
+    ///
+    /// DEVIATION: upstream owns one `Storage` shared by the superblock and grid;
+    /// the sans-IO replica keeps a concrete in-memory storage for the superblock
+    /// (mirroring [`Self::grid_storage`]) so `view_change`/`checkpoint` can be
+    /// driven via [`Self::superblock_mut`].
+    pub superblock_storage: Option<MemoryStorage>,
     // state_machine: StateMachine,
     // clock: Clock,
     // client_replies: ClientReplies,
@@ -534,6 +541,7 @@ impl Replica {
             grid: None,
             grid_storage: None,
             superblock: None,
+            superblock_storage: None,
             grid_serve_reads: Vec::new(),
             send_queue: Vec::new(),
             client_send_queue: Vec::new(),
@@ -569,14 +577,37 @@ impl Replica {
         self.grid_storage = Some(storage);
     }
 
-    /// Attach an opened superblock (upstream constructs it at `Replica` creation
-    /// and carries it throughout the lifecycle).
+    /// Attach an opened superblock and the storage it was opened against
+    /// (upstream constructs it at `Replica` creation and carries it throughout
+    /// the lifecycle).
     ///
     /// DEVIATION: the sans-IO replica starts without a superblock; the owner
     /// mounts an externally-opened superblock before protocol messages need
-    /// real `op_checkpoint` / `checkpoint_id` values.
-    pub fn mount_superblock(&mut self, superblock: crate::superblock::SuperBlock) {
+    /// real `op_checkpoint` / `checkpoint_id` values. The `storage` is retained
+    /// so `view_durable_update`/`drive_superblock` can persist view changes.
+    pub fn mount_superblock(
+        &mut self,
+        superblock: crate::superblock::SuperBlock,
+        storage: MemoryStorage,
+    ) {
         self.superblock = Some(superblock);
+        self.superblock_storage = Some(storage);
+    }
+
+    /// The mounted superblock and its storage, as a mutable pair.
+    ///
+    /// # Panics
+    /// Panics if the superblock is not mounted (upstream asserts it exists).
+    pub fn superblock_mut(&mut self) -> (&mut crate::superblock::SuperBlock, &mut MemoryStorage) {
+        let sb = self
+            .superblock
+            .as_mut()
+            .unwrap_or_else(|| unreachable!("superblock is mounted before it is driven"));
+        let storage = self
+            .superblock_storage
+            .as_mut()
+            .unwrap_or_else(|| unreachable!("superblock storage is mounted with the superblock"));
+        (sb, storage)
     }
 
     /// The mounted grid and its storage, as a mutable pair.
@@ -671,6 +702,95 @@ impl Replica {
     #[must_use]
     pub fn log_view_durable(&self) -> u32 {
         self.superblock.as_ref().map_or(self.log_view, |sb| sb.working().vsr_state.log_view)
+    }
+
+    /// Persist the current view/log_view to the superblock (the async half of
+    /// the flow; the completion is driven by [`Self::drive_superblock`] and
+    /// becomes visible via [`Self::view_durable`] / [`Self::log_view_durable`]).
+    ///
+    /// When no superblock is mounted this is a no-op — the sane-IO replica cannot
+    /// persist anything, exactly as if the superblock's `updating(.view_change)`
+    /// gate stalled the write.
+    ///
+    /// # Panics
+    /// Panics if the upstream invariants are violated (upstream asserts them
+    /// all), or if a view change is already in flight (mirroring upstream's
+    /// early `return` on `view_durable_updating()`).
+    ///
+    /// Upstream: `src/vsr/replica.zig:9448` (`view_durable_update`).
+    pub fn view_durable_update(&mut self) {
+        if self.superblock.is_none() {
+            return; // Nothing to persist (no mounted superblock).
+        }
+        assert!(self.status == Status::Normal || self.status == Status::ViewChange);
+        assert!(self.view >= self.log_view);
+        assert!(self.view >= self.view_durable());
+        assert!(self.log_view >= self.log_view_durable());
+        assert!(self.log_view > self.log_view_durable() || self.view > self.view_durable());
+        assert!(!self.view_headers.is_empty());
+        assert!(self.view_headers[0].view <= self.log_view);
+        assert!(
+            self.commit_max
+                >= self.op.saturating_sub(u64::from(constants::PIPELINE_PREPARE_QUEUE_MAX))
+        );
+        if self.view_durable_updating() {
+            return; // One update in flight; the working value will be advanced later.
+        }
+        let commit_max = self.commit_max;
+        let log_view = self.log_view;
+        let view = self.view;
+        let headers =
+            crate::ViewChangeHeadersArray::init(crate::ViewChangeCommand::View, &self.view_headers);
+        {
+            let (sb, storage) = self.superblock_mut();
+            sb.view_change(
+                storage,
+                crate::superblock::UpdateViewChange {
+                    commit_max,
+                    log_view,
+                    view,
+                    headers,
+                    sync_checkpoint: None,
+                },
+            );
+            assert!(sb.updating(crate::superblock::Caller::ViewChange));
+        }
+    }
+
+    /// Drive an in-flight superblock `view_change` to completion (the sans-IO
+    /// equivalent of upstream's `view_durable_update_callback`,
+    /// replica.zig:9533).
+    ///
+    /// # Panics
+    /// Panics if the completed update violates upstream invariants.
+    pub fn drive_superblock(&mut self) {
+        if self.superblock.is_none() {
+            return;
+        }
+        let view = self.view;
+        let log_view = self.log_view;
+        {
+            let (sb, storage) = self.superblock_mut();
+            sb.poll(storage);
+            for event in sb.take_events() {
+                if event == crate::superblock::Event::ViewChangeDone {
+                    assert!(sb.working().vsr_state.view <= view);
+                    assert!(sb.working().vsr_state.log_view <= log_view);
+                }
+            }
+        }
+    }
+
+    /// Whether a `view_durable_update()` is already in flight.
+    ///
+    /// Returns `false` when no superblock is mounted (nothing to update).
+    ///
+    /// Upstream: `src/vsr/replica.zig:9440` (`view_durable_updating`).
+    #[must_use]
+    pub fn view_durable_updating(&self) -> bool {
+        self.superblock
+            .as_ref()
+            .is_some_and(|sb| sb.updating(crate::superblock::Caller::ViewChange))
     }
 
     /// The smallest op that may not be discarded (`op_checkpoint + 1`).
@@ -2272,7 +2392,7 @@ impl Replica {
             // whose log_view is the previous one, so the assignment always runs.
             self.view = view_new;
             self.log_view = view_new;
-            // TODO(port): `view_durable_update()` needs the superblock.
+            self.view_durable_update();
             self.ping_timeout = Timeout::start(constants::PING_TIMEOUT);
             self.commit_message_timeout.stop();
             self.exit_view_window_timeout.stop();
@@ -9606,7 +9726,8 @@ mod tests {
         // superblock is mounted.
         let mut primary = Replica::new(CLUSTER, 0, 3);
         primary.status = Status::Normal;
-        primary.mount_superblock(opened_superblock_at_op(1));
+        let (sb1, st1) = opened_superblock_at_op(1);
+        primary.mount_superblock(sb1, st1);
 
         let mut parent = 0;
         for op in 1..=2 {
@@ -10368,7 +10489,9 @@ mod tests {
 
     /// Build an opened, checkpointed superblock whose working checkpoint holds
     /// `op`, via the public format → open → checkpoint API.
-    fn opened_superblock_at_op(op: u64) -> crate::superblock::SuperBlock {
+    /// An opened superblock formatted to `op`, alongside the storage it was
+    /// opened against (so it can be mounted and driven).
+    fn opened_superblock_at_op(op: u64) -> (crate::superblock::SuperBlock, MemoryStorage) {
         use crate::superblock::{
             Event, FormatOptions, FreeSetReferences, ManifestReferences, TrailerReference,
             UpdateCheckpoint,
@@ -10434,7 +10557,7 @@ mod tests {
         sb.poll(&mut storage);
         assert_eq!(sb.take_events(), vec![Event::CheckpointDone]);
         assert_eq!(sb.working().vsr_state.checkpoint.header.op, op);
-        sb
+        (sb, storage)
     }
 
     #[test]
@@ -10443,7 +10566,8 @@ mod tests {
         let mut r = Replica::new(CLUSTER, 0, 3);
         assert_eq!(r.op_checkpoint(), 0);
 
-        r.mount_superblock(opened_superblock_at_op(19));
+        let (sb, st) = opened_superblock_at_op(19);
+        r.mount_superblock(sb, st);
         assert_eq!(r.op_checkpoint(), 19);
         assert_eq!(r.op_repair_min(), 20);
     }
@@ -10453,10 +10577,10 @@ mod tests {
         let mut r = Replica::new(CLUSTER, 0, 3);
         assert_eq!(r.checkpoint_id(), 0);
 
-        let sb = opened_superblock_at_op(19);
+        let (sb, st) = opened_superblock_at_op(19);
         let expected = sb.working().checkpoint_id();
         assert_ne!(expected, 0);
-        r.mount_superblock(sb);
+        r.mount_superblock(sb, st);
         assert_eq!(r.checkpoint_id(), expected);
     }
 
@@ -10471,9 +10595,40 @@ mod tests {
 
         // A freshly formatted/opened superblock reports the durable origin
         // (view 0), overriding the in-memory values.
-        r.mount_superblock(opened_superblock_at_op(19));
+        let (sb, st) = opened_superblock_at_op(19);
+        r.mount_superblock(sb, st);
         assert_eq!(r.view_durable(), 0);
         assert_eq!(r.log_view_durable(), 0);
+    }
+
+    #[test]
+    fn view_durable_update_persists_view_and_log_view() {
+        // A backup completing a view change persists its new view/log_view to the
+        // mounted superblock: initiated by `view_durable_update` and made durable
+        // by `drive_superblock`.
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        let (sb, st) = opened_superblock_at_op(19);
+        r.mount_superblock(sb, st);
+        r.status = Status::Normal;
+        r.view = 1;
+        r.log_view = 1;
+        r.commit_max = 19;
+        r.op = 19;
+        // Populate a valid View headers array whose head op trails the durable
+        // checkpoint, as the backup's installed log suffix would.
+        let head = make_prepare_for_replica(CLUSTER, 1, 19, 0, 18);
+        r.view_headers = vec![head];
+
+        assert_eq!(r.view_durable(), 0);
+        r.view_durable_update();
+        // Initiating is async: not durable until `drive_superblock` runs.
+        assert_eq!(r.view_durable(), 0);
+        assert!(r.view_durable_updating());
+
+        r.drive_superblock();
+        assert!(!r.view_durable_updating());
+        assert_eq!(r.view_durable(), 1);
+        assert_eq!(r.log_view_durable(), 1);
     }
 
     #[test]
@@ -10486,7 +10641,8 @@ mod tests {
         let prepare_msg = primary.send_queue[0].clone();
 
         let mut backup = Replica::new(CLUSTER, 2, 3);
-        backup.mount_superblock(opened_superblock_at_op(19));
+        let (sb, st) = opened_superblock_at_op(19);
+        backup.mount_superblock(sb, st);
         backup.status = Status::Normal;
         backup.on_message(&prepare_msg, 20_000);
 
