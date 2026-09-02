@@ -1689,4 +1689,150 @@ mod tests {
     fn fuzz_table_with_least_overlap_random_levels() {
         TestContext::<SpecNode256Max1024>::run_fuzz_overlap();
     }
+
+    /// Builds a level with four disjoint, visible (`snapshot_max == SNAPSHOT_LATEST`) tables:
+    /// `[1,10] [20,30] [40,50] [60,70]`. Each table carries a distinct (address, checksum) so
+    /// `equal` identity comparisons in the level never alias.
+    fn next_table_level() -> ManifestLevel<SpecNode256Max1024> {
+        let tagged = [(1_u64, 10_u64, 100_u64), (20, 30, 200), (40, 50, 300), (60, 70, 400)];
+        let mut level = ManifestLevel::new();
+        for (key_min, key_max, tag) in tagged {
+            level.insert_table(&TestTableInfo {
+                checksum: u128::from(tag),
+                address: tag,
+                snapshot_min: 1,
+                snapshot_max: u64::MAX,
+                key_min,
+                key_max,
+                value_count: 1,
+            });
+        }
+        level
+    }
+
+    fn next_table_params(
+        key_min: u64,
+        key_max: u64,
+        key_exclusive: Option<u64>,
+        direction: Direction,
+    ) -> NextTableParameters<u64> {
+        NextTableParameters {
+            snapshot: SNAPSHOT_LATEST,
+            key_min,
+            key_max,
+            key_exclusive,
+            direction,
+        }
+    }
+
+    /// No `key_exclusive`: the first table returned matches the direction (upstream
+    /// `ManifestLevel.next_table` null-exclusive branch).
+    #[test]
+    fn next_table_without_exclusive_returns_matching_bound() {
+        let level = next_table_level();
+
+        let Some(table) = level.next_table(next_table_params(0, u64::MAX, None, Ascending)) else {
+            unreachable!("first table must be returned");
+        };
+        assert_eq!(table.table_info.key_min(), 1);
+        assert_eq!(table.table_info.key_max(), 10);
+
+        let Some(table) = level.next_table(next_table_params(0, u64::MAX, None, Descending)) else {
+            unreachable!("first table must be returned");
+        };
+        assert_eq!(table.table_info.key_min(), 60);
+        assert_eq!(table.table_info.key_max(), 70);
+    }
+
+    /// With `key_exclusive` the returned table is the one past the exclusion bound in the
+    /// iteration direction, never the table that contains the bound (upstream skip logic).
+    #[test]
+    fn next_table_with_exclusive_steps_past_the_bound() {
+        let level = next_table_level();
+
+        // Ascending with key_exclusive == 10 (the key_max of the first table) steps to the
+        // second table; setting it to the first table's key_min would return the same table.
+        let Some(table) = level.next_table(next_table_params(0, u64::MAX, Some(10), Ascending))
+        else {
+            unreachable!("second table must be returned");
+        };
+        assert_eq!(table.table_info.key_min(), 20);
+
+        // Ascending with an exclusive above the last table returns nothing.
+        assert!(level.next_table(next_table_params(0, u64::MAX, Some(70), Ascending)).is_none());
+
+        // Descending with key_exclusive == the last table's key_max steps past it to the
+        // previous table (the bound-containing table is never returned); an exclusive below
+        // the first table returns nothing.
+        let Some(table) = level.next_table(next_table_params(0, u64::MAX, Some(70), Descending))
+        else {
+            unreachable!("previous table must be returned");
+        };
+        assert_eq!(table.table_info.key_min(), 40);
+        assert_eq!(table.table_info.key_max(), 50);
+        assert!(level.next_table(next_table_params(0, u64::MAX, Some(1), Descending)).is_none());
+    }
+
+    /// A table whose snapshot_max has been bounded (invisible to `SNAPSHOT_LATEST`) is skipped,
+    /// mirroring the visible-only iterator used by `next_table`.
+    #[test]
+    fn next_table_skips_invisible_tables() {
+        let mut level = next_table_level();
+
+        // Hide the first two tables from SNAPSHOT_LATEST.
+        let snapshot = 5;
+        let Some(first) = level.find(&TestTableInfo {
+            checksum: 100,
+            address: 100,
+            snapshot_min: 1,
+            snapshot_max: u64::MAX,
+            key_min: 1,
+            key_max: 10,
+            value_count: 1,
+        }) else {
+            unreachable!("first table is present");
+        };
+        level.set_snapshot_max(snapshot, first);
+        let Some(second) = level.find(&TestTableInfo {
+            checksum: 200,
+            address: 200,
+            snapshot_min: 1,
+            snapshot_max: u64::MAX,
+            key_min: 20,
+            key_max: 30,
+            value_count: 1,
+        }) else {
+            unreachable!("second table is present");
+        };
+        level.set_snapshot_max(snapshot, second);
+
+        // Ascending now starts at the third visible table.
+        let Some(table) = level.next_table(next_table_params(0, u64::MAX, None, Ascending)) else {
+            unreachable!("third visible table must be returned");
+        };
+        assert_eq!(table.table_info.key_min(), 40);
+
+        // A range over only-hidden tables returns nothing.
+        assert!(level.next_table(next_table_params(1, 30, None, Ascending)).is_none());
+    }
+
+    /// `next_table` respects a bounded key range even with `key_exclusive` present.
+    #[test]
+    fn next_table_respects_key_range_with_exclusive() {
+        let level = next_table_level();
+
+        // Restrict to [12, 55]: an exclusive of 30 (the second table's key_max) skips [20,30]
+        // and returns [40,50].
+        let Some(table) = level.next_table(next_table_params(12, 55, Some(30), Ascending)) else {
+            unreachable!("third table must be returned");
+        };
+        assert_eq!(table.table_info.key_min(), 40);
+
+        // Descending on [12,55] with exclusive 55 returns [40,50].
+        let Some(table) = level.next_table(next_table_params(12, 55, Some(55), Descending)) else {
+            unreachable!("third table must be returned");
+        };
+        assert_eq!(table.table_info.key_min(), 40);
+        assert_eq!(table.table_info.key_max(), 50);
+    }
 }
