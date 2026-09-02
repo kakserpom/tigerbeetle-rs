@@ -2512,8 +2512,8 @@ impl Replica {
         assert_eq!(self.view_headers[0].op, self.op);
 
         // DEVIATION: upstream serializes `vsr.CheckpointState` (1024 bytes, the
-        // working superblock checkpoint) as the View body prefix; the body is
-        // zeroed when no superblock is mounted yet, keeping the wire layout
+        // working superblock checkpoint) as the View body prefix; when no
+        // superblock is mounted the prefix is zeroed, keeping the wire layout
         // stable.
         let body_len =
             constants::CHECKPOINT_STATE_SIZE + self.view_headers.len() * message_header::SIZE;
@@ -2530,7 +2530,10 @@ impl Replica {
         };
 
         let mut body = Vec::with_capacity(body_len);
-        body.extend_from_slice(&[0; constants::CHECKPOINT_STATE_SIZE]);
+        match &self.superblock {
+            Some(sb) => body.extend_from_slice(&sb.working().vsr_state.checkpoint.to_wire()),
+            None => body.extend_from_slice(&[0; constants::CHECKPOINT_STATE_SIZE]),
+        }
         for header in &self.view_headers {
             body.extend_from_slice(&header.to_wire());
         }
@@ -9566,6 +9569,62 @@ mod tests {
             .try_into()
             .unwrap();
         assert_eq!(message_header::Prepare::from_wire(root).unwrap().op, 0);
+    }
+
+    #[test]
+    fn primary_view_body_serializes_working_checkpoint_state() {
+        // The primary serializes the working superblock's CheckpointState as the
+        // 1024-byte View body prefix, not the zeroed placeholder used when no
+        // superblock is mounted.
+        let mut primary = Replica::new(CLUSTER, 0, 3);
+        primary.status = Status::Normal;
+        primary.mount_superblock(opened_superblock_at_op(1));
+
+        let mut parent = 0;
+        for op in 1..=2 {
+            let h = make_prepare_for_replica(CLUSTER, 0, op, parent, 0);
+            parent = h.checksum();
+            primary.on_prepare(&h);
+        }
+        primary.commit_op(1);
+        primary.commit_op(2);
+        assert_eq!(primary.op, 2);
+        assert_eq!(primary.commit_max, 2);
+        assert!(primary.primary_journal_headers_repaired());
+
+        // A backup asks for our view in the same view; the primary replies.
+        let mut get_view = message_header::GetView::default();
+        get_view.cluster = CLUSTER;
+        get_view.replica = 1;
+        get_view.view = 0;
+        get_view.nonce = 99;
+        get_view.set_checksum_body(&[]);
+        get_view.set_checksum();
+        let mut msg = crate::message::Message::new();
+        msg.set_header(&get_view);
+        primary.on_get_view(&msg);
+        assert_eq!(primary.send_queue.len(), 1);
+        let view = primary.send_queue.pop().unwrap();
+        let body = view.body_used();
+
+        assert_eq!(
+            body.len(),
+            constants::CHECKPOINT_STATE_SIZE + primary.view_headers.len() * message_header::SIZE
+        );
+        let expected =
+            primary.superblock.as_ref().unwrap().working().vsr_state.checkpoint.to_wire();
+        assert_eq!(&body[..constants::CHECKPOINT_STATE_SIZE], &expected);
+        // DEVIATION: an unmounted primary would have zeroed the prefix; verify
+        // the mounted prefix differs from the zeroed placeholder.
+        assert_ne!(&expected, &[0; constants::CHECKPOINT_STATE_SIZE]);
+        // The suffix still heads at this op (the checkpoint op, 1, is already
+        // below the view-2 suffix and is not advertised as the head).
+        let start = constants::CHECKPOINT_STATE_SIZE;
+        let head = message_header::Prepare::from_wire(
+            body[start..start + message_header::SIZE].try_into().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(head.op, 2);
     }
 
     #[test]
