@@ -1283,10 +1283,21 @@ impl Replica {
             let op = self.commit_min + 1;
             // The prepare header must be present; without it there is nothing to
             // commit yet (a stale/nonexistent entry leaves the pipeline idle).
-            if self.journal.header_with_op(op).is_none() {
+            let Some(header) = self.journal.header_with_op(op).copied() else {
+                return true;
+            };
+            // Assuming the head op is correct, it is safe to commit the next
+            // prepare if it is from the same view as the head — the primary for
+            // that view already validated the hash chain. Otherwise, verify it
+            // ourselves that the chain is not broken (upstream replica.zig:4627).
+            let Some(head_view) = self.journal.header_with_op(self.op).map(|h| h.view) else {
+                return true;
+            };
+            let valid_hash_chain_or_same_view = self.valid_hash_chain()
+                || (self.status == Status::Normal && header.view == head_view);
+            if !valid_hash_chain_or_same_view {
                 return true;
             }
-            // TODO(port): `valid_hash_chain` check (deferred).
             // TODO(port): async prepare body read (`journal.read_prepare`).
             self.commit_prepare = Some(op);
         }
@@ -1767,7 +1778,8 @@ impl Replica {
         commit.commit = self.commit_max;
         commit.commit_checksum = commit_checksum;
         commit.timestamp_monotonic = now;
-        // TODO(port): checkpoint_op/checkpoint_id from the superblock.
+        commit.checkpoint_id = self.checkpoint_id();
+        commit.checkpoint_op = self.op_checkpoint();
         commit.set_checksum_body(&[]);
         commit.set_checksum();
         // Broadcast to every backup (upstream: `send_commit` →
@@ -2618,24 +2630,27 @@ impl Replica {
 
     /// Whether the journal holds a contiguous, connected hash chain over
     /// `op_min..=op_max` (each op's `parent` matching its predecessor's
-    /// checksum; `op_min` is the verified anchor).
+    /// checksum; `op_min` is the verified anchor). Viewstamps must be
+    /// ascending along the chain.
     ///
     /// # Panics
     ///
     /// Panics unless `op_max == self.op` (checking a sub-head range would risk
-    /// committing a forked chain that a new primary reordered).
+    /// committing a forked chain that a new primary reordered), or if a pair of
+    /// adjacent headers has descending viewstamps (an invariant violation).
     ///
     /// Upstream: `src/vsr/replica.zig:11004` (`valid_hash_chain_between`).
     fn valid_hash_chain_between(&self, op_min: u64, op_max: u64) -> bool {
         assert!(op_min <= op_max);
+        assert!(op_max >= self.op_checkpoint());
         assert_eq!(op_max, self.op);
-        // DEVIATION: upstream asserts `op_max >= op_checkpoint()` and that the
-        // op after the checkpoint connects to the superblock checkpoint header;
-        // sans-IO `op_checkpoint()` is 0 with no superblock to connect to.
-        let Some(head) = self.journal.header_with_op(op_max).copied() else {
+        // DEVIATION: upstream additionally asserts that the op after the
+        // checkpoint connects to the superblock checkpoint header here; that
+        // connection is verified via `valid_hash_chain`'s `op_verify_min` anchor
+        // (commit_min) instead of the checkpoint header directly.
+        let Some(mut b) = self.journal.header_with_op(op_max).copied() else {
             return false;
         };
-        let mut b = head;
         let mut op = op_max;
         while op > op_min {
             op -= 1;
@@ -2646,9 +2661,47 @@ impl Replica {
             if a.checksum() != b.parent {
                 return false;
             }
+            assert!(
+                a.view < b.view || (a.view == b.view && a.op < b.op),
+                "viewstamps not ascending: a(={}, {}) must precede b(={}, {})",
+                a.view,
+                a.op,
+                b.view,
+                b.op,
+            );
             b = a;
         }
         true
+    }
+
+    /// Stronger hash chain validation, matching upstream's defense-in-depth
+    /// wrapper: refuse to commit while the head trails the repair front, and
+    /// verify the chain back to (but not including) the checkpoint anchor.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless `op_checkpoint() <= commit_min` and `op_checkpoint() <= op`.
+    ///
+    /// Upstream: `src/vsr/replica.zig:10948` (`valid_hash_chain`).
+    #[must_use]
+    pub fn valid_hash_chain(&self) -> bool {
+        assert!(self.op_checkpoint() <= self.commit_min);
+        assert!(self.op_checkpoint() <= self.op);
+
+        // Wait until the head is repairable; partial coverage could let a
+        // forked (later reordered) chain through.
+        if self.op < self.op_repair_max() {
+            return false;
+        }
+        // State sync may arrive exactly at the checkpoint with the following
+        // ops not yet in the journal.
+        if self.op == self.op_checkpoint() {
+            return false;
+        }
+        let op_verify_min = self.commit_min.max(self.op_checkpoint() + 1);
+        assert!(op_verify_min <= self.commit_min + 1);
+
+        self.valid_hash_chain_between(op_verify_min, self.op)
     }
 
     /// Send a PrepareOk for every op in `commit_max+1..=op` that we have
@@ -8999,6 +9052,60 @@ mod tests {
         assert_eq!(r.commit_max, 1);
         assert_eq!(r.commit_min, 1);
         assert!(r.journal.header_with_op(2).is_none());
+    }
+
+    #[test]
+    fn valid_hash_chain_gates_on_repair_front_and_checkpoint_anchor() {
+        // A backup with a contiguous chain from commit_min through the head is
+        // valid once the head reaches the repair front.
+        let mut r = Replica::new(0, 1, 3);
+        r.status = Status::Normal;
+        let h1 = make_prepare_for_replica(0, 0, 1, 0, 0);
+        r.on_prepare(&h1);
+        let h2 = make_prepare_for_replica(0, 0, 2, h1.checksum(), 0);
+        r.on_prepare(&h2);
+        let h3 = make_prepare_for_replica(0, 0, 3, h2.checksum(), 0);
+        r.on_prepare(&h3);
+        assert_eq!(r.op, 3);
+        r.commit_min = 1;
+
+        // Head trails the repair front (commit_max advanced ahead of the head)
+        // → wait for repair.
+        r.commit_max = 8;
+        assert!(r.op < r.op_repair_max());
+        assert!(!r.valid_hash_chain());
+
+        // Head now reaches the repair front (commit_max back to op).
+        r.commit_max = r.op;
+        assert!(r.op >= r.op_repair_max());
+        assert!(r.valid_hash_chain());
+
+        // A broken chain (missing op 2) is detected.
+        r.journal.remove_entry(crate::journal::Journal::slot_for_op(2));
+        assert!(!r.valid_hash_chain());
+    }
+
+    #[test]
+    fn valid_hash_chain_walks_down_to_commit_min_anchor() {
+        // Chain of 5; verify it connects back to commit_min=2 (not the root).
+        let mut r = Replica::new(0, 1, 3);
+        r.status = Status::Normal;
+        let mut parent = 0;
+        for op in 1..=5 {
+            let h = make_prepare_for_replica(0, 0, op, parent, 0);
+            r.on_prepare(&h);
+            parent = h.checksum();
+        }
+        assert_eq!(r.op, 5);
+        r.commit_min = 2;
+        r.commit_max = r.op;
+        assert!(r.op >= r.op_repair_max());
+        assert!(r.valid_hash_chain());
+
+        // Breaking the link between op 3 and op 4 breaks the walk from the head
+        // (op 5) down to commit_min.
+        r.journal.remove_entry(crate::journal::Journal::slot_for_op(3));
+        assert!(!r.valid_hash_chain());
     }
 
     /// Build a checksum-valid Prepare header as a primary would, for feeding
