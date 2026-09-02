@@ -528,6 +528,22 @@ pub struct Compaction<S: TreeSpec> {
 
     pub level_a_immutable_stage: LevelAImmutableStage,
 
+    // Level-B disk-block scratch, decoded synchronously for the current
+    // `level_b_position.{index_block, value_block}`:
+    //
+    // DEVIATION: upstream keeps level-B index/value block queues in the resource pool and reuses
+    // them across beats. This sans-I/O port has no ResourcePool, so it decodes each block into
+    // these buffers keyed by position, re-reading only when the position advances.
+    /// The `index_block` position (table within `range_b`) whose value-block address/checksum
+    /// list is cached in `level_b_index_value_blocks`.
+    level_b_index_loaded_table: Option<u32>,
+    /// (value-block address, checksum) pairs for the current level-B table's index block.
+    level_b_index_value_blocks: Vec<(u64, u128)>,
+    /// Decoded values of the current level-B value block.
+    level_b_values: Vec<S::Value>,
+    /// The `value_block` position (within the current table) whose values are in `level_b_values`.
+    level_b_values_loaded_value_block: Option<u32>,
+
     // Beat-scoped fields (reset between beats):
     pub pool_is_active: bool,
     pub callback_is_set: bool,
@@ -562,6 +578,10 @@ impl<S: TreeSpec> Compaction<S> {
             table_builder_index_block: None,
             table_builder_value_block: None,
             level_a_immutable_stage: LevelAImmutableStage::Ready,
+            level_b_index_loaded_table: None,
+            level_b_index_value_blocks: Vec::new(),
+            level_b_values: Vec::new(),
+            level_b_values_loaded_value_block: None,
             pool_is_active: false,
             callback_is_set: false,
         }
@@ -595,6 +615,10 @@ impl<S: TreeSpec> Compaction<S> {
         self.table_builder_index_block = None;
         self.table_builder_value_block = None;
         self.level_a_immutable_stage = LevelAImmutableStage::Ready;
+        self.level_b_index_loaded_table = None;
+        self.level_b_index_value_blocks.clear();
+        self.level_b_values.clear();
+        self.level_b_values_loaded_value_block = None;
         self.pool_is_active = false;
         self.callback_is_set = false;
     }
@@ -686,9 +710,11 @@ impl<S: TreeSpec> Compaction<S> {
     /// Sans-I/O: all grid reads/writes complete synchronously via `storage`, so the
     /// dispatch loop runs to quota exhaustion before returning.
     ///
-    /// # Slice-1 restriction
-    /// Handles only the immutable (L0) source with no level-B overlap.
-    /// Block allocation uses the grid stash directly (no ResourcePool).
+    /// # Scope
+    /// Handles the immutable (L0) source against an optional level-B overlap (disk
+    /// tables). Level-B index/value blocks are read synchronously through the grid and
+    /// decoded on demand; the immutable source needs no reads. Block allocation uses the
+    /// grid stash directly (no ResourcePool).
     ///
     /// # Reservation
     /// The caller must acquire the grid reservation (via [`Grid::reserve`]) after
@@ -705,10 +731,6 @@ impl<S: TreeSpec> Compaction<S> {
         S: crate::table::TableSpec,
     {
         assert!(matches!(self.table_info_a, Some(TableInfoA::Immutable)));
-        assert!(
-            self.range_b.as_ref().is_some_and(|r| r.tables.tables.empty()),
-            "slice 1: level-B input blocks not yet ported"
-        );
         assert_eq!(self.level_a_position, Position::default());
         assert_eq!(self.level_b_position, Position::default());
         assert!(matches!(self.level_a_immutable_stage, LevelAImmutableStage::Ready));
@@ -755,49 +777,58 @@ impl<S: TreeSpec> Compaction<S> {
                 self.table_builder_value_block = Some(location);
             }
 
-            // Slice 1: level A is immutable, level B is empty (no reads).
-            let a_ready = matches!(self.level_a_immutable_stage, LevelAImmutableStage::Ready);
+            // Load the current level-B value block (synchronously) if any remains, so the
+            // merge gate below can decide whether B is ready or exhausted.
+            self.load_level_b(storage, tree, grid);
+
+            // Level A is the immutable table (in memory). B is a disk table's value block.
             let a_exhausted =
                 matches!(self.level_a_immutable_stage, LevelAImmutableStage::Exhausted);
-            let b_ready = false;
-            let b_exhausted = true;
+            let b_ready = self.level_b_values_loaded_value_block.is_some()
+                && (self.level_b_position.value as usize) < self.level_b_values.len();
+            let b_exhausted = self.level_b_index_loaded_table.is_none();
+
+            // Whether a merge can make progress this step: A is available until its stage is
+            // `Exhausted` (set once the immutable table is fully consumed); B is available while
+            // a value block is loaded. Both exhausted mid-beat is impossible.
+            let a_available =
+                !matches!(self.level_a_immutable_stage, LevelAImmutableStage::Exhausted);
 
             assert!(!a_exhausted || !b_exhausted);
             assert!(!self.quotas.beat_exhausted());
             assert!(!self.quotas.half_bar_exhausted());
 
             if matches!(self.table_builder.state(), BuilderState::IndexAndValueBlock)
-                && (a_exhausted || a_ready)
-                && (b_exhausted || b_ready)
+                && (a_available || b_ready)
                 && !self.table_builder.value_block_full(&S::LAYOUT)
             {
-                self.merge_step(storage, tree, grid);
+                self.merge_step(tree, grid);
             }
 
             self.flush_pending_writes(storage, tree, grid, reservation);
         }
     }
 
-    /// Merge one step from the input to the output table builder (upstream `merge` +
-    /// `merge_immutable` + `merge_callback` + `merge_advance_position`).
+    /// Merge one step from the immutable (A) and decoded level-B (B) inputs to the output
+    /// table builder (upstream `merge` + `merge_immutable` + `merge_callback` +
+    /// `merge_advance_position`).
     ///
-    /// Ported for the immutable A / empty B path only.
-    #[allow(clippy::too_many_lines)]
-    fn merge_step(
-        &mut self,
-        _storage: &mut dyn Storage,
-        tree: &crate::tree::Tree<S>,
-        grid: &mut Grid,
-    ) where
+    /// When both A and B are available we merge (A wins on equal keys, dropping A tombstones
+    /// if `drop_tombstones`); when only A remains we copy it; when only B remains we copy it —
+    /// mirroring the dispatch of upstream `merge_immutable`.
+    #[allow(clippy::too_many_lines, clippy::manual_div_ceil)]
+    fn merge_step(&mut self, tree: &crate::tree::Tree<S>, grid: &mut Grid)
+    where
         S: crate::table::TableSpec,
     {
-        assert!(!matches!(self.level_a_immutable_stage, LevelAImmutableStage::Exhausted));
         assert_eq!(self.table_builder.state(), BuilderState::IndexAndValueBlock);
 
+        // Port of upstream `merge`: transition the immutable stage (Ready → Merge), or
+        // accept Exhausted (level B may still need merging).
         if self.level_a_immutable_stage == LevelAImmutableStage::Ready {
             self.level_a_immutable_stage = LevelAImmutableStage::Merge;
         } else {
-            assert_eq!(self.level_a_immutable_stage, LevelAImmutableStage::Merge);
+            assert_eq!(self.level_a_immutable_stage, LevelAImmutableStage::Exhausted);
         }
 
         let mut iterator = ImmutableTableIterator::new(
@@ -815,67 +846,113 @@ impl<S: TreeSpec> Compaction<S> {
 
         let budget_immutable = S::LAYOUT.data.value_count_max.min(iterator.count_remaining());
         let space_left = S::LAYOUT.data.value_count_max - self.table_builder.value_count();
+        let b_source = &self.level_b_values[self.level_b_position.value as usize..];
 
         let Some(value_location) = self.table_builder_value_block else {
             unreachable!("value block required for merge")
         };
         let block = grid.block_mut(value_location);
 
-        let MergeResult { consumed_a, consumed_b, dropped, produced: _produced } =
-            if self.drop_tombstones {
-                // Immutable + B empty + drop tombstones (level 0 with no overlap).
-                let remaining_before = iterator.count_remaining();
-                let dropped_before = iterator.count_dropped();
-                let mut index_source: u32 = 0;
-                let mut index_target: u32 = 0;
+        // A is available iff its stage is not `Exhausted` (the immutable table still has
+        // values to merge). B is available iff a value block is loaded.
+        let a_available = !matches!(self.level_a_immutable_stage, LevelAImmutableStage::Exhausted);
+        let b_available = !b_source.is_empty();
+        assert!(a_available || b_available, "both inputs exhausted in a merge step");
 
-                while index_source < budget_immutable && index_target < space_left {
-                    let Some(value_in) = iterator.pop() else {
-                        break;
-                    };
-                    index_source += 1;
-                    if <S as TableTrait>::tombstone(&value_in) {
-                        assert!(<S as TableTrait>::USAGE != Usage::SecondaryIndex);
-                        continue;
+        let MergeResult { consumed_a, consumed_b, dropped, produced: _produced } = if !a_available {
+            // Only B remains: value_copy (upstream `values_source_a == null` branch).
+            let mut index_target: usize = 0;
+            while index_target < space_left as usize && index_target < b_source.len() {
+                self.table_builder.insert_block_value(&b_source[index_target], block, &S::LAYOUT);
+                index_target += 1;
+            }
+            MergeResult {
+                consumed_a: 0,
+                consumed_b: index_target as u32,
+                dropped: 0,
+                produced: index_target as u32,
+            }
+        } else if !b_available {
+            // Only A remains: value_copy_immutable (drop-tombstones sensitive).
+            let mut index_target: u32 = 0;
+            let mut index_source: u32 = 0;
+            while index_source < budget_immutable && index_target < space_left {
+                let Some(value_in) = iterator.pop() else {
+                    break;
+                };
+                index_source += 1;
+                if self.drop_tombstones && <S as TableTrait>::tombstone(&value_in) {
+                    assert!(<S as TableTrait>::USAGE != Usage::SecondaryIndex);
+                    continue;
+                }
+                self.table_builder.insert_block_value(&value_in, block, &S::LAYOUT);
+                index_target += 1;
+            }
+            MergeResult {
+                consumed_a: index_source,
+                consumed_b: 0,
+                dropped: index_source - index_target,
+                produced: index_target,
+            }
+        } else {
+            // Both A and B available: values_merge_immutable.
+            let mut index_source_a: usize = 0;
+            let mut index_source_b: usize = 0;
+            let mut index_target: usize = 0;
+
+            while index_source_a < budget_immutable as usize
+                && index_source_b < b_source.len()
+                && index_target < space_left as usize
+            {
+                let key_a =
+                    iterator.peek().unwrap_or_else(|| unreachable!("budget > 0 implies a value"));
+                let value_b = &b_source[index_source_b];
+                match key_a.cmp(&<S as TableTrait>::key_from_value(value_b)) {
+                    Ordering::Less => {
+                        // Pick value from level A.
+                        index_source_a += 1;
+                        let value_a =
+                            iterator.pop().unwrap_or_else(|| unreachable!("peeked a value"));
+                        if self.drop_tombstones && <S as TableTrait>::tombstone(&value_a) {
+                            assert!(<S as TableTrait>::USAGE != Usage::SecondaryIndex);
+                            continue;
+                        }
+                        self.table_builder.insert_block_value(&value_a, block, &S::LAYOUT);
+                        index_target += 1;
                     }
-                    self.table_builder.insert_block_value(&value_in, block, &S::LAYOUT);
-                    index_target += 1;
+                    Ordering::Greater => {
+                        // Pick value from level B.
+                        index_source_b += 1;
+                        self.table_builder.insert_block_value(value_b, block, &S::LAYOUT);
+                        index_target += 1;
+                    }
+                    Ordering::Equal => {
+                        // Equal keys — collapse them.
+                        index_source_a += 1;
+                        index_source_b += 1;
+                        let value_a =
+                            iterator.pop().unwrap_or_else(|| unreachable!("peeked a value"));
+                        if <S as TableTrait>::USAGE == Usage::SecondaryIndex {
+                            assert!(
+                                <S as TableTrait>::tombstone(&value_a)
+                                    != <S as TableTrait>::tombstone(value_b)
+                            );
+                        } else if self.drop_tombstones && <S as TableTrait>::tombstone(&value_a) {
+                            continue;
+                        }
+                        self.table_builder.insert_block_value(&value_a, block, &S::LAYOUT);
+                        index_target += 1;
+                    }
                 }
+            }
 
-                let consumed_iterator = remaining_before - iterator.count_remaining();
-                let dropped_iterator = iterator.count_dropped() - dropped_before;
-
-                MergeResult {
-                    consumed_a: consumed_iterator,
-                    consumed_b: 0,
-                    dropped: dropped_iterator + (index_source - index_target),
-                    produced: index_target,
-                }
-            } else {
-                // Immutable + B empty, no tombstone drop.
-                let remaining_before = iterator.count_remaining();
-                let dropped_before = iterator.count_dropped();
-                let mut index_target: u32 = 0;
-
-                while index_target < budget_immutable && index_target < space_left {
-                    let Some(value_in) = iterator.pop() else {
-                        break;
-                    };
-                    self.table_builder.insert_block_value(&value_in, block, &S::LAYOUT);
-                    index_target += 1;
-                }
-
-                let consumed_a = remaining_before - iterator.count_remaining();
-                let dropped = iterator.count_dropped() - dropped_before;
-
-                // Invariant mirroring upstream values_copy_immutable accounting.
-                assert!(
-                    index_target + dropped == (remaining_before - iterator.count_remaining()),
-                    "produced + internal_drops must equal total pops"
-                );
-
-                MergeResult { consumed_a, consumed_b: 0, dropped, produced: index_target }
-            };
+            MergeResult {
+                consumed_a: index_source_a as u32,
+                consumed_b: index_source_b as u32,
+                dropped: (index_source_a + index_source_b - index_target) as u32,
+                produced: index_target as u32,
+            }
+        };
 
         // Advance positions (port of merge_callback bookkeeping).
         self.level_a_position.value += consumed_a;
@@ -897,20 +974,79 @@ impl<S: TreeSpec> Compaction<S> {
         assert!(self.quotas.half_bar_done <= self.quotas.half_bar);
         self.counters.dropped += u64::from(dropped);
 
-        self.merge_advance_position();
+        self.merge_advance_position(grid, tree.table_immutable_ref().count());
+    }
+
+    /// Synchronously load the current level-B value block into [`Self::level_b_values`]
+    /// (upstream reads level-B index/value blocks through `read_index_block` +
+    /// `read_value_block`; this sans-I/O port reads them eagerly before each merge).
+    ///
+    /// The current table is `range_b[level_b_position.index_block]`; its index block is
+    /// decoded once per table into `level_b_index_value_blocks`. The current value block is
+    /// `value_block` within that table. Nothing is loaded once B is exhausted.
+    fn load_level_b(
+        &mut self,
+        storage: &mut dyn Storage,
+        tree: &crate::tree::Tree<S>,
+        grid: &mut Grid,
+    ) where
+        S: crate::table::TableSpec,
+    {
+        let table_index = self.level_b_position.index_block as usize;
+        let count = self.range_b.as_ref().map_or(0, |r| r.tables.tables.slice().len());
+        if table_index >= count {
+            // B exhausted; scratch stays empty (`level_b_index_loaded_table == None`).
+            return;
+        }
+
+        if self.level_b_index_loaded_table != Some(self.level_b_position.index_block) {
+            // Copy the table metadata out of `range_b` (it is `Copy`) so the scratch
+            // mutations below don't conflict with the borrow of `self.range_b`.
+            let Some(table) = self
+                .range_b
+                .as_ref()
+                .and_then(|r| r.tables.tables.slice().get(table_index))
+                .map(|t| t.table_info)
+            else {
+                unreachable!("table_index < count checked above")
+            };
+            let index_block = grid.read_block_sync(storage, table.address, table.checksum);
+            let index_schema =
+                S::LAYOUT.index.from_block_with_schema(&index_block, tree.config_ref().id);
+            let value_count = index_schema.value_blocks_used(&index_block) as usize;
+            let mut value_blocks = Vec::with_capacity(value_count);
+            for i in 0..value_count {
+                value_blocks.push((
+                    index_schema.value_address(&index_block, i),
+                    index_schema.value_checksum(&index_block, i),
+                ));
+            }
+            self.level_b_index_value_blocks = value_blocks;
+            self.level_b_index_loaded_table = Some(self.level_b_position.index_block);
+            self.level_b_values_loaded_value_block = None;
+        }
+
+        let value_block = self.level_b_position.value_block;
+        if self.level_b_values_loaded_value_block != Some(value_block) {
+            let (address, checksum) = self.level_b_index_value_blocks[value_block as usize];
+            let value_block_bytes = grid.read_block_sync(storage, address, checksum);
+            self.level_b_values =
+                crate::table::value_block_values_used::<S>(&value_block_bytes, &S::LAYOUT.data);
+            self.level_b_values_loaded_value_block = Some(value_block);
+        }
     }
 
     /// Advance level-A/B positions after a merge step (upstream `merge_advance_position`).
     ///
-    /// Handles immutable table carry-over (Ready ↔ Exhausted) and disk-block index/value
-    /// advancement (only immutable path ported so far).
-    fn merge_advance_position(&mut self)
+    /// Handles immutable-table carry-over (Ready ↔ Exhausted) and the level-B disk table's
+    /// value/index-block advancement (releasing a table's blocks once fully consumed).
+    fn merge_advance_position(&mut self, grid: &mut Grid, immutable_count: u32)
     where
         S: crate::table::TableSpec,
     {
         if matches!(self.table_info_a, Some(TableInfoA::Immutable)) {
             if self.level_a_immutable_stage == LevelAImmutableStage::Merge {
-                if self.level_a_position.value == <S as TableTrait>::VALUE_COUNT_MAX as u32 {
+                if self.level_a_position.value == immutable_count {
                     self.level_a_position.value_block += 1;
                     assert_eq!(self.level_a_position.value_block, 1);
                     self.level_a_position.value = 0;
@@ -922,11 +1058,48 @@ impl<S: TreeSpec> Compaction<S> {
                 assert!(matches!(self.level_a_immutable_stage, LevelAImmutableStage::Exhausted));
             }
         } else {
-            unreachable!("disk level-A not yet ported (slice 1 is immutable only)");
+            unreachable!("disk level-A not yet ported (this path is immutable level A only)");
         }
 
-        // Level B: no-op — empty in slice 1.
-        assert_eq!(self.level_b_position, Position::default());
+        // Level B: the current value block is fully consumed once the position reaches its
+        // used-value count. When the whole table (all its value blocks) is consumed, release
+        // its blocks and advance to the next table in range_b.
+        if self.level_b_position.value == self.level_b_values.len() as u32
+            && self.level_b_index_loaded_table.is_some()
+        {
+            self.level_b_position.value_block += 1;
+            self.level_b_position.value = 0;
+
+            let value_block_count = self.level_b_index_value_blocks.len() as u32;
+            if self.level_b_position.value_block == value_block_count {
+                self.level_b_position.index_block += 1;
+                assert_eq!(self.level_b_position.value_block, value_block_count);
+                self.level_b_position.value_block = 0;
+                self.release_current_level_b_table(grid);
+            }
+        }
+    }
+
+    /// Release the current level-B table's index and value blocks (upstream
+    /// `read_value_block_release_table`), then invalidate the level-B scratch so the next
+    /// table is re-read on the next [`Self::load_level_b`].
+    fn release_current_level_b_table(&mut self, grid: &mut Grid) {
+        let Some(table) = self.range_b.as_ref().and_then(|r| {
+            r.tables.tables.slice().get(self.level_b_position.index_block as usize - 1)
+        }) else {
+            unreachable!("released table was part of range_b");
+        };
+        let index_address = table.table_info.address;
+        let value_addresses: Vec<u64> =
+            self.level_b_index_value_blocks.iter().map(|(address, _)| *address).collect();
+
+        grid.release(&value_addresses);
+        grid.release(&[index_address]);
+
+        self.level_b_index_loaded_table = None;
+        self.level_b_index_value_blocks.clear();
+        self.level_b_values.clear();
+        self.level_b_values_loaded_value_block = None;
     }
 
     /// Write a completed value block through the grid (upstream `write_value_block`).
@@ -1283,6 +1456,11 @@ impl<S: TreeSpec> Compaction<S> {
         if matches!(&self.table_info_a, Some(TableInfoA::Immutable)) {
             self.counters.in_ += u64::from(tree.table_immutable_ref().count());
         }
+        if let Some(range_b) = &self.range_b {
+            for table in range_b.tables.tables.slice() {
+                self.counters.in_ += u64::from(table.table_info.value_count);
+            }
+        }
         self.quotas.half_bar
     }
 
@@ -1452,6 +1630,10 @@ impl<S: TreeSpec> Compaction<S> {
         self.table_builder_index_block = None;
         self.table_builder_value_block = None;
         self.level_a_immutable_stage = LevelAImmutableStage::Ready;
+        self.level_b_index_loaded_table = None;
+        self.level_b_index_value_blocks = Vec::new();
+        self.level_b_values = Vec::new();
+        self.level_b_values_loaded_value_block = None;
         self.pool_is_active = false;
         self.callback_is_set = false;
 
@@ -2174,6 +2356,147 @@ mod tests {
             tree.table_immutable_ref().mutability(),
             Mutability::Immutable(state) if state.flushed
         ));
+
+        grid.forfeit(reservation);
+    }
+
+    /// Build a single-value-block table for [`TestSpec`] (values must be strictly key-sorted).
+    fn build_test_table(
+        values: &[TestValue],
+        value_address: u64,
+        index_address: u64,
+    ) -> (Vec<u8>, Vec<u8>, crate::table::TableInfo<TestKey>) {
+        let layout = TestSpec::LAYOUT;
+        let mut index_block = vec![0u8; BLOCK_SIZE];
+        let mut value_block = vec![0u8; BLOCK_SIZE];
+
+        let mut builder = TableBuilder::new();
+        builder.set_index_block(&mut index_block);
+        builder.set_value_block(&mut value_block);
+        for value in values {
+            builder.insert_block_value(value, &mut value_block, &layout);
+        }
+        builder.value_block_finish::<TestSpec>(
+            &mut value_block,
+            &mut index_block,
+            &layout,
+            DataFinishOptions {
+                cluster: 0,
+                release: Release::MINIMUM,
+                address: value_address,
+                snapshot_min: 1,
+                tree_id: 1,
+            },
+        );
+        let info = builder.index_block_finish::<TestKey>(
+            &mut index_block,
+            &layout,
+            IndexFinishOptions {
+                cluster: 0,
+                release: Release::MINIMUM,
+                address: index_address,
+                snapshot_min: 1,
+                tree_id: 1,
+            },
+        );
+        (index_block, value_block, info)
+    }
+
+    /// Copy a finished block into the grid cache and return its header checksum.
+    fn seed_grid_block(grid: &mut Grid, address: u64, block: &[u8]) -> u128 {
+        assert!(!grid.free_set_is_free(address));
+        let location = grid.get_block();
+        grid.block_mut(location).copy_from_slice(block);
+        let checksum = crate::schema::header_from_block(grid.block(location)).checksum;
+        grid.cache_upsert(address, location);
+        checksum
+    }
+
+    /// The L0-flush merge path with a level-0 disk table overlapping the immutable A: reads the
+    /// level-B index/value blocks from the grid cache and merges them with the in-memory A.
+    #[test]
+    fn dispatch_l0_flush_immutable_with_level_b_overlap_merges() {
+        let mut tree = new_test_tree();
+        let mut log = MockLog::new_unopened();
+        tree.manifest_mut().open_commence(&log);
+        log.open();
+
+        // Level-B table spans keys 0..8, strictly key-sorted.
+        let level_b_values = [
+            TestValue { key: TestKey(0), data: 0 },
+            TestValue { key: TestKey(2), data: 200 },
+            TestValue { key: TestKey(4), data: 400 },
+            TestValue { key: TestKey(6), data: 600 },
+            TestValue { key: TestKey(8), data: 800 },
+        ];
+
+        // Immutable A: keys 1..7 odd (interleave with B, no key overlap).
+        for key in [1_u64, 3, 5, 7] {
+            tree.put(&TestValue { key: TestKey(key), data: key * 10 });
+        }
+        tree.compact(&mut ScratchMemory::<TestValue>::new(128));
+        tree.swap_mutable_and_immutable(1, &mut ScratchMemory::<TestValue>::new(128));
+        assert_eq!(tree.table_immutable_ref().count(), 4);
+
+        // Allocate and seed the level-B table's value and index blocks in the grid cache.
+        let (mut grid, mut storage) = new_dispatch_grid();
+        let reservation = grid.reserve(2);
+        let value_address = grid.acquire(reservation);
+        let index_address = grid.acquire(reservation);
+        let (index_block, value_block, info) =
+            build_test_table(&level_b_values, value_address, index_address);
+        let index_checksum = seed_grid_block(&mut grid, index_address, &index_block);
+        seed_grid_block(&mut grid, value_address, &value_block);
+
+        let table: TreeTableInfo<TestKey> = TreeTableInfo {
+            checksum: index_checksum,
+            address: index_address,
+            snapshot_min: 1,
+            snapshot_max: tigerbeetle_lsm::tree::SNAPSHOT_LATEST,
+            key_min: info.key_min,
+            key_max: info.key_max,
+            value_count: info.value_count,
+        };
+        tree.manifest_mut().insert_table(&mut log, 0, &table);
+
+        let mut compaction = Compaction::<TestSpec>::new(
+            core::ptr::addr_of_mut!(tree),
+            core::ptr::addr_of_mut!(grid),
+            0,
+        );
+
+        let quota_half_bar = compaction.half_bar_commence(8, &tree, &grid);
+        // Quota = immutable (4) + level-B table (5).
+        assert_eq!(quota_half_bar, 9);
+        assert!(compaction.drop_tombstones);
+        assert_eq!(compaction.range_b.as_ref().unwrap().tables.tables.count(), 1);
+
+        assert_eq!(compaction.quotas.half_bar, 9);
+        compaction.beat_commence(quota_half_bar);
+        let reservation = compaction.reserve_output_blocks(&mut grid);
+
+        compaction.dispatch(&mut storage, &tree, &mut grid, reservation);
+
+        assert_eq!(compaction.quotas.beat_done, 9);
+        assert_eq!(compaction.quotas.half_bar_done, 9);
+        assert_eq!(compaction.counters.in_, 9);
+        assert_eq!(compaction.counters.dropped, 0);
+        assert_eq!(compaction.counters.out, 9);
+        assert!(compaction.counters.consistent());
+        assert_eq!(compaction.stage, Stage::Paused);
+        assert!(compaction.quotas.beat_exhausted());
+        assert!(compaction.quotas.half_bar_exhausted());
+
+        // A single output table merging A and B.
+        assert_eq!(compaction.manifest_entries.len(), 1);
+        let entry = &compaction.manifest_entries[0];
+        assert_eq!(entry.table.value_count, 9);
+        assert_eq!(entry.table.key_min, TestKey(0));
+        assert_eq!(entry.table.key_max, TestKey(8));
+
+        // The level-B input blocks were released after being fully consumed.
+        assert!(grid.free_set_is_released(value_address));
+        assert!(grid.free_set_is_released(index_address));
 
         grid.forfeit(reservation);
     }

@@ -1313,6 +1313,50 @@ impl Grid {
         true
     }
 
+    /// Synchronously read a block, returning a copy of its [`BLOCK_SIZE`] bytes.
+    ///
+    /// This is the sans-I/O counterpart to upstream's read callbacks: it issues a coherent
+    /// read, drives any pending storage completion via [`Grid::poll`], and copies the block
+    /// out of the (transient, next-poll-invalidated) result location before returning.
+    ///
+    /// Used by the compaction dispatch loop to read level-B index/value blocks synchronously
+    /// (upstream completes them through `read_value_block`/`read_index_block` callbacks).
+    ///
+    /// # Panics
+    /// Panics if the read does not resolve as valid within the drained events.
+    #[must_use]
+    pub fn read_block_sync(
+        &mut self,
+        storage: &mut dyn Storage,
+        address: u64,
+        checksum: u128,
+    ) -> Vec<u8> {
+        let token = self.read_block(
+            storage,
+            address,
+            checksum,
+            true,
+            ReadOptions { cache_read: true, cache_write: true },
+        );
+        self.poll(storage);
+        let mut found = None;
+        for event in self.take_events() {
+            if let Event::ReadDone { token: done_token, result, valid_location, .. } = event
+                && done_token == token
+            {
+                assert!(
+                    matches!(result, ReadBlockResult::Valid),
+                    "sans-I/O coherent read must resolve valid"
+                );
+                let Some(location) = valid_location else {
+                    unreachable!("valid read must provide a location");
+                };
+                found = Some(self.block(location).to_vec());
+            }
+        }
+        found.unwrap_or_else(|| unreachable!("expected a ReadDone event matching the read token"))
+    }
+
     /// Drive IO completions. Must be called repeatedly until quiescent; events are
     /// collected for [`Grid::take_events`]. Also advances any in-flight
     /// open/checkpoint state machine (see [`Event::OpenDone`]/[`Event::CheckpointDone`]).

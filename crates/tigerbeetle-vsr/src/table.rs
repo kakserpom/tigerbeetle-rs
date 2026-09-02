@@ -867,6 +867,26 @@ fn read_values_from_block<V: BlockValue>(
     values
 }
 
+/// Decode every used [`TableValue`] from a value block (upstream `Table.value_block_values_used`).
+///
+/// The count comes from the value block's own metadata, so it works for any block written by
+/// this table schema.
+///
+/// # Panics
+/// Panics if the block's value schema does not match `layout`.
+#[must_use]
+pub fn value_block_values_used<S: tigerbeetle_lsm::table_memory::Table>(
+    value_block: &[u8],
+    layout: &TableValue,
+) -> Vec<S::Value>
+where
+    S::Value: BlockValue,
+{
+    let metadata = layout.block_metadata(value_block);
+    let count = metadata.value_count as usize;
+    read_values_from_block::<S::Value>(value_block, layout, count)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
