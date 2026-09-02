@@ -292,77 +292,89 @@ impl Forest {
 
         // DEVIATION: upstream plans and reserves grid blocks per beat for the whole forest
         // (`forest.compact_trees_reserve_grid_blocks` + `ResourcePool`); this port drives each
-        // tree's level-0 compaction synchronously per beat, mirroring `compact_trees_start` +
+        // tree's active compactions synchronously per beat, mirroring `compact_trees_start` +
         // `compact_finish` (which run `level_active` compactions; the level-0 compactions are
         // only advanced in the second half-bar, and every tree's mutable suffix is swapped on
         // the last beat regardless).
-        self.compact_level0_trees(op, storage);
+        self.compact_levels_trees(op, storage);
+
+        // The tree driver holds a persistent grid reservation on the manifest log (upstream
+        // reserves it only transiently during `manifest_log.compact`). A compaction's own
+        // shared output reservation is forfeited inside `compact_levels`, but with the manifest's
+        // reservation still outstanding the free set is left in `Forfeiting` (it only returns to
+        // `Reserving` when the count reaches zero). Release and re-acquire the manifest
+        // reservation so each op starts with the free set in `Reserving`, matching upstream's
+        // per-beat reserve/forfeit ordering.
+        if self.manifest_log.has_grid_reservation() {
+            self.manifest_log.forfeit_grid_reservation(&mut self.grid);
+            self.manifest_log.reserve_grid_blocks(&mut self.grid);
+        }
     }
 
-    /// Drive the level-0 (immutable-flush) compaction of every tree in the forest, one op/beat.
+    /// Drive each tree's `level_active` compactions (all levels) for one op/beat.
     ///
     /// DEVIATION: upstream comptime-generates this loop (`inline for (std.enums.values(TreeID))`,
     /// forest.zig:567); here the 25 trees of the three grooves are enumerated explicitly, each
     /// with its own radix-sort scratch buffer (see the `*GrooveScratch` DEVIATION notes).
     #[allow(clippy::too_many_lines)]
-    fn compact_level0_trees(&mut self, op: u64, storage: &mut dyn Storage) {
-        self.accounts.objects.compact_level0(
+    fn compact_levels_trees(&mut self, op: u64, storage: &mut dyn Storage) {
+        self.accounts.objects.compact_levels(
             op,
             &mut self.grid,
             storage,
             &mut self.manifest_log,
             &mut self.accounts_scratch.objects,
         );
-        self.accounts.id.compact_level0(
+        self.accounts.id.compact_levels(
             op,
             &mut self.grid,
             storage,
             &mut self.manifest_log,
             &mut self.accounts_scratch.id,
         );
-        self.accounts.user_data_128.compact_level0(
+        self.accounts.user_data_128.compact_levels(
             op,
             &mut self.grid,
             storage,
             &mut self.manifest_log,
             &mut self.accounts_scratch.user_data_128,
         );
-        self.accounts.user_data_64.compact_level0(
+        self.accounts.user_data_64.compact_levels(
             op,
             &mut self.grid,
             storage,
             &mut self.manifest_log,
             &mut self.accounts_scratch.composite_key_64,
         );
-        self.accounts.user_data_32.compact_level0(
+        self.accounts.user_data_32.compact_levels(
             op,
             &mut self.grid,
             storage,
             &mut self.manifest_log,
             &mut self.accounts_scratch.composite_key_64,
         );
-        self.accounts.ledger.compact_level0(
+        self.accounts.ledger.compact_levels(
             op,
             &mut self.grid,
             storage,
             &mut self.manifest_log,
             &mut self.accounts_scratch.composite_key_64,
         );
-        self.accounts.code.compact_level0(
+        self.accounts.code.compact_levels(
             op,
             &mut self.grid,
             storage,
             &mut self.manifest_log,
             &mut self.accounts_scratch.composite_key_64,
         );
-        self.accounts.imported.compact_level0(
+        self.accounts.imported.compact_levels(
             op,
             &mut self.grid,
             storage,
             &mut self.manifest_log,
             &mut self.accounts_scratch.composite_key_unit,
         );
-        self.accounts.closed.compact_level0(
+        self.accounts.closed.compact_levels(
             op,
             &mut self.grid,
             storage,
@@ -370,98 +382,98 @@ impl Forest {
             &mut self.accounts_scratch.composite_key_unit,
         );
 
-        self.transfers.objects.compact_level0(
+        self.transfers.objects.compact_levels(
             op,
             &mut self.grid,
             storage,
             &mut self.manifest_log,
             &mut self.transfers_scratch.objects,
         );
-        self.transfers.id.compact_level0(
+        self.transfers.id.compact_levels(
             op,
             &mut self.grid,
             storage,
             &mut self.manifest_log,
             &mut self.transfers_scratch.id,
         );
-        self.transfers.debit_account_id.compact_level0(
+        self.transfers.debit_account_id.compact_levels(
             op,
             &mut self.grid,
             storage,
             &mut self.manifest_log,
             &mut self.transfers_scratch.composite_key_128,
         );
-        self.transfers.credit_account_id.compact_level0(
+        self.transfers.credit_account_id.compact_levels(
             op,
             &mut self.grid,
             storage,
             &mut self.manifest_log,
             &mut self.transfers_scratch.composite_key_128,
         );
-        self.transfers.amount.compact_level0(
+        self.transfers.amount.compact_levels(
             op,
             &mut self.grid,
             storage,
             &mut self.manifest_log,
             &mut self.transfers_scratch.composite_key_128,
         );
-        self.transfers.pending_id.compact_level0(
+        self.transfers.pending_id.compact_levels(
             op,
             &mut self.grid,
             storage,
             &mut self.manifest_log,
             &mut self.transfers_scratch.composite_key_128,
         );
-        self.transfers.user_data_128.compact_level0(
+        self.transfers.user_data_128.compact_levels(
             op,
             &mut self.grid,
             storage,
             &mut self.manifest_log,
             &mut self.transfers_scratch.composite_key_128,
         );
-        self.transfers.user_data_64.compact_level0(
+        self.transfers.user_data_64.compact_levels(
             op,
             &mut self.grid,
             storage,
             &mut self.manifest_log,
             &mut self.transfers_scratch.composite_key_64,
         );
-        self.transfers.user_data_32.compact_level0(
+        self.transfers.user_data_32.compact_levels(
             op,
             &mut self.grid,
             storage,
             &mut self.manifest_log,
             &mut self.transfers_scratch.composite_key_64,
         );
-        self.transfers.ledger.compact_level0(
+        self.transfers.ledger.compact_levels(
             op,
             &mut self.grid,
             storage,
             &mut self.manifest_log,
             &mut self.transfers_scratch.composite_key_64,
         );
-        self.transfers.code.compact_level0(
+        self.transfers.code.compact_levels(
             op,
             &mut self.grid,
             storage,
             &mut self.manifest_log,
             &mut self.transfers_scratch.composite_key_64,
         );
-        self.transfers.expires_at.compact_level0(
+        self.transfers.expires_at.compact_levels(
             op,
             &mut self.grid,
             storage,
             &mut self.manifest_log,
             &mut self.transfers_scratch.composite_key_64,
         );
-        self.transfers.imported.compact_level0(
+        self.transfers.imported.compact_levels(
             op,
             &mut self.grid,
             storage,
             &mut self.manifest_log,
             &mut self.transfers_scratch.composite_key_unit,
         );
-        self.transfers.closing.compact_level0(
+        self.transfers.closing.compact_levels(
             op,
             &mut self.grid,
             storage,
@@ -469,14 +481,14 @@ impl Forest {
             &mut self.transfers_scratch.composite_key_unit,
         );
 
-        self.transfers_pending.objects_mut().compact_level0(
+        self.transfers_pending.objects_mut().compact_levels(
             op,
             &mut self.grid,
             storage,
             &mut self.manifest_log,
             &mut self.transfers_pending_scratch.objects,
         );
-        self.transfers_pending.status_mut().compact_level0(
+        self.transfers_pending.status_mut().compact_levels(
             op,
             &mut self.grid,
             storage,
@@ -671,7 +683,7 @@ mod tests {
         forest.accounts.objects.put(&Account { id: 9, timestamp: 9, ..Account::default() });
         forest.accounts.objects.put(&Account { id: 9, timestamp: 9, ..Account::default() });
 
-        forest.compact(0, &mut storage());
+        forest.compact(compaction::HALF_BAR_BEAT_COUNT as u64, &mut storage());
 
         let values = forest.accounts.objects.table_mutable_ref().values_used();
         assert_eq!(
@@ -686,12 +698,14 @@ mod tests {
     fn forest_compact_full_bar() {
         let mut forest = Forest::init(test_superblock(), grid_options(), 32);
         let mut storage = storage();
-        for op in 0..(constants::LSM_COMPACTION_OPS as u64) {
+        let bar_ops = constants::LSM_COMPACTION_OPS as u64;
+        let bar_start = compaction::HALF_BAR_BEAT_COUNT as u64 * 2;
+        for op in bar_start..bar_start + bar_ops {
             forest.compact(op, &mut storage);
         }
     }
 
-    /// Drive `Tree::compact_level0` (the L0 immutable-flush driver) across a full
+    /// Drive `Tree::compact_levels` (the per-tree, per-active-level compaction driver) across a full
     /// compaction bar on the account object tree, using the forest's real grid, storage,
     /// manifest log, and scratch. Puts values into the mutable table, pops them into an
     /// *unflushed* immutable table via a prior swap, then runs the driver for one bar.
@@ -724,7 +738,7 @@ mod tests {
         let bar_ops = constants::LSM_COMPACTION_OPS as u64;
         let bar_start = compaction::HALF_BAR_BEAT_COUNT as u64 * 2;
         for op in bar_start..bar_start + bar_ops {
-            forest.accounts.objects.compact_level0(
+            forest.accounts.objects.compact_levels(
                 op,
                 &mut forest.grid,
                 &mut storage,
@@ -791,6 +805,132 @@ mod tests {
         assert_eq!(forest.transfers_pending.status_table_count(), 0);
     }
 
+    /// Drive a real level-1 **disk** compaction through the forest's generic per-tree driver
+    /// (`compact_levels`) across a full compaction bar, end-to-end through `Forest::compact`.
+    ///
+    /// Seeds level 0 to its compaction threshold (`table_count_max_for_level(4, 0) == 4`) with
+    /// four single-value account-object tables plus one level-1 table whose range spans them
+    /// all, so `compaction_table(0)` picks the lowest-keyed level-0 table (T0) and must *merge*
+    /// it against the overlapping level-1 table (not move it). All input blocks are real
+    /// (built + cached via `build_and_seed_account_table`), so the second half-bar's dispatch
+    /// actually reads them and merges into a real output table at level 1.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn forest_compact_disk_level_one_merge_across_bar() {
+        use tigerbeetle_lsm::manifest::TreeTableInfo;
+        let mut forest = Forest::init(test_superblock(), grid_options(), 32);
+        let mut storage = large_storage();
+        open_forest(&mut forest, &mut storage);
+
+        // Acquire fresh addresses for the 4 level-0 tables + 1 level-1 table (2 blocks each).
+        let reservation = forest.grid.reserve(10);
+        let addresses: Vec<u64> = (0..10).map(|_| forest.grid.acquire(reservation)).collect();
+        forest.grid.forfeit(reservation);
+        // The seeding reservation left the free set in `Forfeiting` (the manifest log's persistent
+        // reservation keeps the count above zero). Restore it to `Reserving` before the bar, the
+        // same release/re-acquire the forest does at each op boundary.
+        forest.manifest_log.forfeit_grid_reservation(&mut forest.grid);
+        forest.manifest_log.reserve_grid_blocks(&mut forest.grid);
+
+        // Checkpoint once so the grid's released-block set (`blocks_released` after the
+        // checkpoint is durable) absorbs the disk merge's input releases; with no durable
+        // checkpoint the small prior-checkpoint-durability set overflows.
+        let done = std::rc::Rc::new(std::cell::Cell::new(false));
+        forest.checkpoint(
+            {
+                let done = done.clone();
+                move || done.set(true)
+            },
+            &mut storage,
+        );
+        let mut polls = 0;
+        while !done.get() {
+            forest.poll(&mut storage);
+            polls += 1;
+            assert!(polls < 1000, "checkpoint must complete");
+        }
+
+        // Four disjoint keys; the level-1 key sits between T0 and T1 so it overlaps every
+        // level-0 table (forcing a merge, tie-broken to the lowest-keyed table T0).
+        let level_0_keys = [1_u64, 11_u64, 21_u64, 31_u64];
+        let level_1_key = 2_u64;
+
+        let account =
+            |key: u64| Account { id: u128::from(key), timestamp: key, ..Account::default() };
+        let mut level_0_tables = Vec::new();
+        for (i, &key) in level_0_keys.iter().enumerate() {
+            let value_address = addresses[i * 2];
+            let index_address = addresses[i * 2 + 1];
+            let checksum = build_and_seed_account_table(
+                &mut forest.grid,
+                account(key),
+                value_address,
+                index_address,
+            );
+            let wire = manifest_node::TableInfo {
+                key_min: key.to_le_bytes_padded(),
+                key_max: key.to_le_bytes_padded(),
+                checksum,
+                address: index_address,
+                snapshot_min: 1,
+                snapshot_max: u64::MAX,
+                value_count: 1,
+                tree_id: 7,
+                label: Label { level: 0, event: Event::Insert },
+            };
+            let table = TreeTableInfo::<u64>::decode(&wire, 7);
+            forest.accounts.objects.manifest_mut().insert_table(
+                &mut forest.manifest_log,
+                0,
+                &table,
+            );
+            level_0_tables.push(table);
+        }
+
+        let b_value_address = addresses[8];
+        let b_index_address = addresses[9];
+        let b_checksum = build_and_seed_account_table(
+            &mut forest.grid,
+            account(level_1_key),
+            b_value_address,
+            b_index_address,
+        );
+        let b_wire = manifest_node::TableInfo {
+            key_min: 1_u64.to_le_bytes_padded(),
+            key_max: 32_u64.to_le_bytes_padded(),
+            checksum: b_checksum,
+            address: b_index_address,
+            snapshot_min: 1,
+            snapshot_max: u64::MAX,
+            value_count: 1,
+            tree_id: 7,
+            label: Label { level: 0, event: Event::Insert },
+        };
+        let level_1_table = TreeTableInfo::<u64>::decode(&b_wire, 7);
+        forest.accounts.objects.manifest_mut().insert_table(
+            &mut forest.manifest_log,
+            1,
+            &level_1_table,
+        );
+        assert_eq!(forest.accounts.objects.manifest_table_count(), 5);
+
+        // Drive one full bar. Level 0 is active on even beats (second half-bar); on
+        // `half_beat` the disk compaction commences, drains T0 + the level-1 table (2 values,
+        // disjoint keys → nothing dropped), and on `last_half_beat` completes (moves T0's Level-1
+        // output into the manifest and hides the inputs).
+        let bar_ops = constants::LSM_COMPACTION_OPS as u64;
+        let bar_start = compaction::HALF_BAR_BEAT_COUNT as u64 * 2;
+        for op in bar_start..bar_start + bar_ops {
+            forest.compact(op, &mut storage);
+        }
+
+        // T0 (the merged-away level-0 table) is gone; the three surviving level-0 tables and the
+        // merged output span level 0 / level 1.
+        assert_eq!(forest.accounts.objects.manifest_table_count(), 4);
+        assert_eq!(forest.accounts.objects.manifest_ref().levels[0].table_count_visible(), 3);
+        assert_eq!(forest.accounts.objects.manifest_ref().levels[1].table_count_visible(), 1);
+    }
+
     /// `Forest::open` attaches the manifest log to every groove and, once the manifest log
     /// (with empty checkpoint references) finishes opening, calls each groove's
     /// `open_complete(checkpoint_op)` — the trees are then opened. Poll until complete.
@@ -828,6 +968,64 @@ mod tests {
             }
         }
         assert!(done, "open must complete");
+    }
+
+    /// Build a real account-object (`AccountObjectSpec`) index+value block pair for `value`
+    /// (one account each), copy both blocks into the forest grid's cache so a later disk
+    /// compaction's `read_block_sync` serves them, and return the manifest-visible `TreeTableInfo`.
+    ///
+    /// Mirrors the `dispatch_disk_level_a_merges_with_level_b` seeding (compaction.rs) but for
+    /// account objects: the value block is finished with the account-object tree id (7) and the
+    /// address/checksum the compaction reads must match this cache entry.
+    fn build_and_seed_account_table(
+        grid: &mut Grid,
+        value: Account,
+        value_address: u64,
+        index_address: u64,
+    ) -> u128 {
+        use crate::groove::AccountObjectSpec;
+        use crate::table::{DataFinishOptions, IndexFinishOptions, TableBuilder};
+        use crate::tree::TreeSpec;
+        let layout = AccountObjectSpec::LAYOUT;
+
+        let mut index_block = vec![0_u8; BLOCK_SIZE];
+        let mut value_block = vec![0_u8; BLOCK_SIZE];
+        let mut builder = TableBuilder::new();
+        builder.set_index_block(&mut index_block);
+        builder.set_value_block(&mut value_block);
+        builder.insert_block_value(&value, &mut value_block, &layout);
+        builder.value_block_finish::<AccountObjectSpec>(
+            &mut value_block,
+            &mut index_block,
+            &layout,
+            DataFinishOptions {
+                cluster: 0,
+                release: Release::MINIMUM,
+                address: value_address,
+                snapshot_min: 1,
+                tree_id: 7,
+            },
+        );
+        builder.index_block_finish::<u64>(
+            &mut index_block,
+            &layout,
+            IndexFinishOptions {
+                cluster: 0,
+                release: Release::MINIMUM,
+                address: index_address,
+                snapshot_min: 1,
+                tree_id: 7,
+            },
+        );
+
+        let value_location = grid.get_block();
+        grid.block_mut(value_location).copy_from_slice(&value_block);
+        grid.cache_upsert(value_address, value_location);
+        let index_location = grid.get_block();
+        grid.block_mut(index_location).copy_from_slice(&index_block);
+        grid.cache_upsert(index_address, index_location);
+
+        crate::schema::header_from_block(grid.block(index_location)).checksum
     }
 
     /// Construct a valid manifest-node `TableInfo` for appending. Mirrors

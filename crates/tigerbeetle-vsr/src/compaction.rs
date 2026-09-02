@@ -702,12 +702,14 @@ impl<S: TreeSpec> Compaction<S> {
     /// beat and forfeited (via [`Grid::forfeit`]) at the end of the half-bar.
     ///
     /// # Panics
-    /// Panics on overflow or if the grid cannot cover the reservation (upstream
-    /// aborts the process).
+    /// Ceiling on the number of grid blocks the current beat's output can require for this
+    /// compaction, independent of any grid reservation (upstream `compact_trees_reserve_grid_blocks`).
+    ///
+    /// The +1s cover a partially-finished index/value block carried over from the previous beat
+    /// plus the up-to-one-block overshoot of the pacing.
+    #[must_use]
     #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
-    pub fn reserve_output_blocks(&mut self, grid: &mut Grid) -> Reservation {
-        // The +1 covers a partially-finished output block from the previous beat,
-        // plus the up-to-one-block overshoot of the pacing.
+    pub fn beat_output_blocks_total(&self) -> usize {
         let beat_value_blocks =
             self.quotas.beat.div_ceil(u64::from(S::LAYOUT.block_value_count_max)) + 1;
         // Index blocks fit `value_block_count_max` address entries each.
@@ -715,9 +717,18 @@ impl<S: TreeSpec> Compaction<S> {
             beat_value_blocks.div_ceil(u64::from(S::LAYOUT.value_block_count_max));
 
         // One carried-over index block and one carried-over value block.
-        let total = 1 + 1 + beat_value_blocks + beat_index_blocks;
+        (1 + 1 + beat_value_blocks + beat_index_blocks) as usize
+    }
 
-        grid.reserve(total as usize)
+    /// Reserve the grid blocks needed for this compaction's current beat output.
+    ///
+    /// # Panics
+    /// Panics on overflow or if the grid cannot cover the reservation (upstream
+    /// aborts the process).
+    #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+    pub fn reserve_output_blocks(&mut self, grid: &mut Grid) -> Reservation {
+        let total = self.beat_output_blocks_total();
+        grid.reserve(total)
     }
 
     /// Run the current beat to completion (upstream `compaction_dispatch` + `merge` +

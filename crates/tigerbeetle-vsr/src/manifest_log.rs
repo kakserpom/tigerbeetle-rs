@@ -319,6 +319,13 @@ impl ManifestLog {
         grid.forfeit(reservation);
     }
 
+    /// Returns whether the manifest log currently holds its ring grid reservation
+    /// (`init_blocks` reserves it; `forfeit_grid_reservation` drops it).
+    #[must_use]
+    pub fn has_grid_reservation(&self) -> bool {
+        self.grid_reservation.is_some()
+    }
+
     /// Re-reserve the manifest ring's grid capacity after `Grid::checkpoint`.
     ///
     /// # Panics

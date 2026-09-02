@@ -445,36 +445,34 @@ impl<S: TreeSpec> Tree<S> {
         self.table_mutable.sort_suffix(radix_buffer);
     }
 
-    /// Drive the level-0 (immutable-flush) compaction for one op/beat, mirroring
-    /// upstream `forest.compact(op)` → `compact_trees_start` + `compact_finish`
-    /// (forest.zig:417-765) restricted to the L0 immutable path.
+    /// Drive every `level_active` compaction of this tree for one op/beat, mirroring upstream
+    /// `forest.compact(op)` → `compact_trees_start` + `compact_finish` (forest.zig:417-765).
     ///
-    /// The `compactions[0]` instance is advanced through the bar cadence:
-    /// - on the first beat and the half-bar beat, `half_bar_commence(op)` starts a
-    ///   new half-bar (immutable → level-0) compaction;
+    /// For each active `level_b` the `compactions[level_b]` instance is advanced through the
+    /// bar cadence:
+    /// - on the first beat and the half-bar beat, `half_bar_commence(op)` starts a new
+    ///   half-bar compaction (immutable → level 0, or disk → disk for `level_b > 0`);
     /// - the compaction is then drained across beats via `beat_commence` +
     ///   `reserve_output_blocks` + `dispatch` until its half-bar quota is exhausted;
     /// - on the last half-bar beat and the last beat, `half_bar_complete` applies its
-    ///   manifest updates and flushes the immutable table;
-    /// - on the last beat of the bar, the mutable suffix is swapped into the immutable
-    ///   table at the output snapshot_min.
+    ///   manifest updates and flushes the immutable table (level 0 only).
     ///
-    /// The level-0 compaction is only advanced when the level is active (`level_active`):
-    /// `half_bar_commence`/`half_bar_complete` are gated to the second half-bar, so on the
-    /// first half-bar of every bar the driver is idle (upstream `forest.compact_trees_start`,
-    /// forest.zig:502-536, only runs `level_active` compactions). The last-beat
-    /// `swap_mutable_and_immutable` runs unconditionally, mirroring upstream `compact_finish`
-    /// (forest.zig:752-763).
+    /// A compaction is only advanced when its level is active (`level_active`): commence/
+    /// complete are gated to the second half-bar, so on the first half-bar of every bar the
+    /// driver is idle for the active levels (upstream `forest.compact_trees_start`,
+    /// forest.zig:502-536, only runs `level_active` compactions). On the last beat of the bar
+    /// the mutable suffix is swapped into the immutable table unconditionally, mirroring
+    /// upstream `compact_finish` (forest.zig:752-763).
     ///
     /// DEVIATION: upstream reserves one grid block reservation per beat for the whole
-    /// forest (`forest.compact_trees_reserve_grid_blocks`); this port holds a per-tree,
-    /// per-dispatch reservation through the synchronous `dispatch` and forfeits it
-    /// immediately, since there is no `ResourcePool`.
+    /// forest (`forest.compact_trees_reserve_grid_blocks`) which all active compactions draw
+    /// from; this port holds a per-compaction, per-dispatch reservation through the
+    /// synchronous `dispatch` and forfeits it immediately, since there is no `ResourcePool`.
     ///
     /// # Panics
     /// Panics if the compaction or table state is inconsistent (upstream asserts).
     #[allow(clippy::missing_panics_doc)]
-    pub fn compact_level0(
+    pub fn compact_levels(
         &mut self,
         op: u64,
         grid: &mut Grid,
@@ -491,36 +489,85 @@ impl<S: TreeSpec> Tree<S> {
         let last_half_beat = compaction_beat == half_bar - 1;
         let last_beat = compaction_beat == (constants::LSM_COMPACTION_OPS as u64) - 1;
 
-        // The driver below passes `self` (the tree) to compaction methods that also need
-        // `&mut` access to the compaction. Since the compaction is a field of the tree, those
-        // borrows would alias. Detach the compaction into a local and reattach it after the
-        // cadence; the pointer/grid/level_b fields are preserved inside it (rebuilt cheaply in
-        // the placeholder). This is sound: the detached `compaction` and `self` no longer share
-        // any borrow, and no other code reads `self.compactions[0]` during the call.
-        let level_b = self.compactions[0].level_b;
-        let mut compaction = core::mem::replace(
-            &mut self.compactions[0],
-            Compaction::new(core::ptr::null_mut(), core::ptr::null_mut(), level_b),
-        );
+        // Gather the active levels first: the driver passes `self` (the tree) to compaction
+        // methods that also need `&mut` access to the compaction. Since a compaction is a field
+        // of the tree, those borrows would alias. Detach it into a local and reattach it after
+        // the cadence; the pointer/grid/level_b fields are preserved inside it (rebuilt cheaply
+        // in the placeholder). This is sound: the detached `compaction` and `self` no longer
+        // share any borrow, and no other code reads `self.compactions[level_b]` during the call.
+        let active: std::vec::Vec<bool> =
+            (0..constants::LSM_LEVELS as usize).map(|b| level_active(b, op)).collect();
 
-        if level_active(0, op) && (first_beat || half_beat) {
-            compaction.half_bar_commence(op, self, grid);
+        // Commence each active compaction first, so every level's half-bar quota is set before
+        // we reserve output blocks for the whole tree for this beat.
+        for level_b in 0..constants::LSM_LEVELS {
+            if active[level_b as usize] && (first_beat || half_beat) {
+                let mut compaction = core::mem::replace(
+                    &mut self.compactions[level_b as usize],
+                    Compaction::new(core::ptr::null_mut(), core::ptr::null_mut(), level_b),
+                );
+                compaction.half_bar_commence(op, self, grid);
+                self.compactions[level_b as usize] = compaction;
+            }
         }
 
-        // Drain the level-0 compaction to (or near) its half-bar quota this beat.
-        while !compaction.quotas.half_bar_exhausted() {
-            let remaining = compaction.quotas.half_bar - compaction.quotas.half_bar_done;
-            compaction.beat_commence(remaining);
-            let reservation = compaction.reserve_output_blocks(grid);
-            compaction.dispatch(storage, self, grid, reservation);
+        // Reserve ONE output-block reservation covering every active level, then drain each
+        // level's remaining quota against it (upstream `compact_trees_reserve_grid_blocks`
+        // + `compact_trees_resume`). A single shared reservation lets the free set return to
+        // `Reserving` after the single forfeit below. Each level's beat quota is set first
+        // (upstream `beat_commence` precedes the reservation), so the block ceiling is exact.
+        let mut total = 0usize;
+        for level_b in 0..constants::LSM_LEVELS {
+            if active[level_b as usize]
+                && !self.compactions[level_b as usize].quotas.half_bar_exhausted()
+            {
+                let mut compaction = core::mem::replace(
+                    &mut self.compactions[level_b as usize],
+                    Compaction::new(core::ptr::null_mut(), core::ptr::null_mut(), level_b),
+                );
+                let remaining = compaction.quotas.half_bar - compaction.quotas.half_bar_done;
+                compaction.beat_commence(remaining);
+                total = total.saturating_add(compaction.beat_output_blocks_total());
+                self.compactions[level_b as usize] = compaction;
+            }
+        }
+
+        if total > 0 {
+            let reservation = grid.reserve(total);
+
+            // Drain each non-exhausted active compaction's remaining quota this beat.
+            for level_b in 0..constants::LSM_LEVELS {
+                if active[level_b as usize]
+                    && !self.compactions[level_b as usize].quotas.half_bar_exhausted()
+                {
+                    let mut compaction = core::mem::replace(
+                        &mut self.compactions[level_b as usize],
+                        Compaction::new(core::ptr::null_mut(), core::ptr::null_mut(), level_b),
+                    );
+                    while !compaction.quotas.half_bar_exhausted() {
+                        compaction.dispatch(storage, self, grid, reservation);
+                    }
+                    self.compactions[level_b as usize] = compaction;
+                }
+            }
+
             grid.forfeit(reservation);
         }
 
-        if level_active(0, op) && (last_beat || last_half_beat) {
-            compaction.half_bar_complete(self, grid, log);
+        // Apply each active compaction's manifest updates on the last beat of its half-bar
+        // (upstream `compact_finish`), regardless of whether it drained this beat.
+        if last_beat || last_half_beat {
+            for level_b in 0..constants::LSM_LEVELS {
+                if active[level_b as usize] {
+                    let mut compaction = core::mem::replace(
+                        &mut self.compactions[level_b as usize],
+                        Compaction::new(core::ptr::null_mut(), core::ptr::null_mut(), level_b),
+                    );
+                    compaction.half_bar_complete(self, grid, log);
+                    self.compactions[level_b as usize] = compaction;
+                }
+            }
         }
-
-        self.compactions[0] = compaction;
 
         if last_beat {
             let snapshot_min = snapshot_min_for_table_output(compaction_op_min(op));
