@@ -2370,6 +2370,11 @@ impl Replica {
             // clean). Sans-IO the journal is already verified, and the pipeline
             // was rebuilt by `primary_start_view_as_the_new_primary`.
             assert_eq!(self.commit_max + self.pipeline_queue.prepare_queue.len() as u64, self.op);
+            // The new primary persists its freshly-established view/log_view.
+            // Upstream drives this through the view_durable_update_callback chain
+            // (replica.zig:9585); sans-IO the persist is initiated here, exactly as
+            // in the backup branch (replica.zig:10125).
+            self.view_durable_update();
 
             self.ping_timeout = Timeout::start(constants::PING_TIMEOUT);
             // DEVIATION: upstream additionally stops join_view_message_timeout
@@ -9648,6 +9653,40 @@ mod tests {
         headers
     }
 
+    /// Like [`Self::prepare_and_commit_suffix`], but chains op 1 from the root
+    /// prepare (parent = root checksum) rather than from `parent = 0`, so the
+    /// whole hash chain — including the op-0 root entry that
+    /// `primary_update_view_headers` emits as a checkpoint hook — verifies.
+    fn prepare_and_commit_suffix_from_root(
+        r: &mut Replica,
+        cluster: u128,
+        op_max: u64,
+        committed: u64,
+    ) -> Vec<message_header::Prepare> {
+        assert!(committed >= 1);
+        assert!(committed <= op_max);
+        assert_eq!(message_header::Prepare::root(cluster).operation, crate::Operation::ROOT);
+        let mut parent = message_header::Prepare::root(cluster).checksum();
+        let mut headers = Vec::new();
+        for op in 1..=op_max {
+            let header = make_prepare_for_replica(cluster, 0, op, parent, 0);
+            parent = header.checksum();
+            assert_eq!(r.on_prepare(&header), OnPrepareResult::Accepted);
+            headers.push(header);
+        }
+        r.on_message(
+            &make_commit_message(
+                cluster,
+                0,
+                committed,
+                headers[committed as usize - 1].checksum(),
+                100,
+            ),
+            100,
+        );
+        headers
+    }
+
     /// Simulate the WAL writes for ops `committed+1..=op_max` completing, so the
     /// journal records them as durable/present (upstream `write_prepare` +
     /// `write_prepare_callback`). Sans-IO, `commit_op` is the only other writer
@@ -9927,6 +9966,48 @@ mod tests {
         // JoinView was popped and delivered as r1's quorum member).
         assert_eq!(r2.send_queue.len(), 1);
         assert_eq!(r2.send_queue[0].header::<message_header::ExitView>().unwrap().view, 0);
+    }
+
+    #[test]
+    fn primary_view_change_persists_its_new_view() {
+        // The new primary persisting its freshly-established view/log_view to the
+        // mounted superblock, driven through `drive_superblock`.
+        let mut r1 = Replica::new(0, 1, 3);
+        r1.status = Status::Normal;
+        prepare_and_commit_suffix_from_root(&mut r1, 0, 3, 3);
+        // Mount only after the ops are committed (a recovered replica's checkpoint
+        // op is never ahead of commit_min), and keep the checkpoint op below the
+        // head op so the primary's `valid_hash_chain_between` covers the suffix.
+        let (sb, st) = opened_superblock_at_op(1);
+        r1.mount_superblock(sb, st);
+        r1.commit_fault.signal(0);
+        r1.tick_normal_heartbeat_fault(10_000); // ExitView
+
+        let mut r2 = Replica::new(0, 2, 3);
+        r2.status = Status::Normal;
+        prepare_and_commit_suffix_from_root(&mut r2, 0, 3, 3);
+        r2.commit_fault.signal(0);
+        r2.tick_normal_heartbeat_fault(10_000); // ExitView
+
+        r1.on_message(&r2.send_queue[0], 10_001);
+        r2.on_message(&r1.send_queue[0], 10_001);
+        assert_eq!(r1.status, Status::ViewChange);
+
+        // r1 is the new primary; deliver r2's JoinView to complete its quorum.
+        assert_eq!(r1.view_durable(), 0);
+        let jv = r2.send_queue.pop().unwrap();
+        r1.on_message(&jv, 10_002);
+        assert_eq!(r1.view, 1);
+        assert_eq!(r1.log_view, 1);
+        assert_eq!(r1.status, Status::Normal);
+        // The persist is asynchronous: not durable until `drive_superblock` runs.
+        assert!(r1.view_durable_updating());
+        assert_eq!(r1.view_durable(), 0);
+
+        r1.drive_superblock();
+        assert!(!r1.view_durable_updating());
+        assert_eq!(r1.view_durable(), 1);
+        assert_eq!(r1.log_view_durable(), 1);
     }
 
     #[test]
