@@ -727,8 +727,17 @@ impl Replica {
         assert!(self.view >= self.view_durable());
         assert!(self.log_view >= self.log_view_durable());
         assert!(self.log_view > self.log_view_durable() || self.view > self.view_durable());
-        assert!(!self.view_headers.is_empty());
-        assert!(self.view_headers[0].view <= self.log_view);
+        // The persisted headers are the join-view headers while the new log is not
+        // yet established (log_view < view), and the View headers once it is
+        // (log_view == view) — mirroring upstream's single `view_headers` union,
+        // which holds JV headers in view-change and View headers after.
+        let (command, headers) = if self.log_view == self.view {
+            (crate::ViewChangeCommand::View, self.view_headers.as_slice())
+        } else {
+            (crate::ViewChangeCommand::JoinView, self.join_view_headers.as_slice())
+        };
+        assert!(!headers.is_empty());
+        assert!(headers[0].view <= self.log_view);
         assert!(
             self.commit_max
                 >= self.op.saturating_sub(u64::from(constants::PIPELINE_PREPARE_QUEUE_MAX))
@@ -739,8 +748,7 @@ impl Replica {
         let commit_max = self.commit_max;
         let log_view = self.log_view;
         let view = self.view;
-        let headers =
-            crate::ViewChangeHeadersArray::init(crate::ViewChangeCommand::View, &self.view_headers);
+        let headers = crate::ViewChangeHeadersArray::init(command, headers);
         {
             let (sb, storage) = self.superblock_mut();
             sb.view_change(
@@ -769,14 +777,31 @@ impl Replica {
         }
         let view = self.view;
         let log_view = self.log_view;
-        {
+        let completed = {
             let (sb, storage) = self.superblock_mut();
             sb.poll(storage);
+            let mut completed = false;
             for event in sb.take_events() {
                 if event == crate::superblock::Event::ViewChangeDone {
                     assert!(sb.working().vsr_state.view <= view);
                     assert!(sb.working().vsr_state.log_view <= log_view);
+                    completed = true;
                 }
+            }
+            completed
+        };
+        // Re-drive a follow-on persist when the replica outran the update that
+        // just completed (e.g. it persisted JoinView on entering the view change
+        // and the new log was established meanwhile) — upstream's
+        // `view_durable_update_callback` re-loops on such updates
+        // (replica.zig:9575-9585). Each `drive_superblock` completes at most one
+        // async update, so the caller re-invokes until `view_durable_updating()`
+        // is false.
+        if completed {
+            let view_durable = self.view_durable();
+            let log_view_durable = self.log_view_durable();
+            if self.log_view > log_view_durable || self.view > view_durable {
+                self.view_durable_update();
             }
         }
     }
@@ -2320,6 +2345,10 @@ impl Replica {
         }
         self.status = Status::ViewChange;
         self.view = new_view;
+        // Persist the bump into the new view (with JoinView headers) to the
+        // mounted superblock so the view survives a crash mid-view-change
+        // (upstream replica.zig:10207-10210).
+        self.view_durable_update();
         self.exit_view_from_all_replicas = 0;
         // Do not let messages from the previous (aborted) view change count
         // towards this one — the quorum-intersection property depends on it
@@ -10009,11 +10038,41 @@ mod tests {
         // The persist is asynchronous: not durable until `drive_superblock` runs.
         assert!(r1.view_durable_updating());
         assert_eq!(r1.view_durable(), 0);
-
-        r1.drive_superblock();
+        // The transition into view change already initiated a JoinView persist
+        // (view 1, log_view 0); the completion's View persist follows once it
+        // drains, so `drive_superblock` must be re-invoked until quiescent.
+        while r1.view_durable_updating() {
+            r1.drive_superblock();
+        }
         assert!(!r1.view_durable_updating());
         assert_eq!(r1.view_durable(), 1);
         assert_eq!(r1.log_view_durable(), 1);
+    }
+
+    #[test]
+    fn transition_into_view_change_persists_join_view() {
+        // A replica faulting out of Normal bumps into view 1 and persists it (with
+        // JoinView headers) so the new view survives a crash mid-view-change. The
+        // log is not yet established, so log_view stays durable at 0 and the
+        // superblock records the JoinView command.
+        let mut r = Replica::new(0, 1, 3);
+        r.status = Status::Normal;
+        prepare_and_commit_suffix_from_root(&mut r, 0, 3, 3);
+        let (sb, st) = opened_superblock_at_op(1);
+        r.mount_superblock(sb, st);
+        assert_eq!(r.view_durable(), 0);
+        assert_eq!(r.log_view_durable(), 0);
+
+        r.transition_to_view_change_status(1);
+        assert_eq!(r.status, Status::ViewChange);
+        assert_eq!(r.view, 1);
+        assert_eq!(r.log_view, 0); // no new log established yet
+        assert!(r.view_durable_updating());
+
+        r.drive_superblock();
+        assert!(!r.view_durable_updating()); // no follow-on: nothing outran it
+        assert_eq!(r.view_durable(), 1);
+        assert_eq!(r.log_view_durable(), 0); // JoinView persists view, not log_view
     }
 
     #[test]
