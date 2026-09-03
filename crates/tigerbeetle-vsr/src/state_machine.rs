@@ -41,7 +41,9 @@ use tigerbeetle_lsm::timestamp_range::TimestampRange;
 use tigerbeetle_lsm::tree::ScopeCloseMode;
 
 use crate::Operation;
+use crate::forest::Forest;
 use crate::objects_cache::ObjectsCache;
+use crate::storage::Storage;
 
 // ---------------------------------------------------------------------------
 // Query reply limits
@@ -2028,7 +2030,6 @@ pub fn transfer_results_to_bytes(results: &[CreateTransferResult]) -> Vec<u8> {
 /// the orchestrator results instead of rolling grooves back.
 ///
 /// Upstream: `src/state_machine.zig`.
-#[derive(Debug)]
 pub struct StateMachine {
     /// The timestamp of the last op committed to the state machine; every
     /// executed op must advance it strictly (upstream asserts the same in
@@ -2075,6 +2076,11 @@ pub struct StateMachine {
     /// runs (and finds any pre-existing expired pendings); becomes
     /// `timestamp_max` when there is nothing left to expire.
     pulse_next_timestamp: u64,
+    /// The LSM forest of grooves/trees, mounted once the storage layers land
+    /// (Phase 2/3). `None` until then: the accounting stores above are ephemeral
+    /// HashMap stand-ins, and a missing forest is treated as an always-ready,
+    /// no-op compaction target.
+    forest: Option<Forest>,
 }
 
 impl Default for StateMachine {
@@ -2092,11 +2098,43 @@ impl Default for StateMachine {
             account_events: HashMap::new(),
             account_events_index: HashMap::new(),
             pulse_next_timestamp: TimestampRange::TIMESTAMP_MIN,
+            forest: None,
         }
     }
 }
 
 impl StateMachine {
+    /// Mount an LSM forest for compaction.
+    ///
+    /// DEVIATION: upstream constructs the forest eagerly in `StateMachine.init` and compacts it
+    /// directly; sans-IO the forest is deferred (Phase 3), so the replica attaches it once the
+    /// storage layers are available.
+    pub fn mount_forest(&mut self, forest: Forest) {
+        assert!(self.forest.is_none());
+        self.forest = Some(forest);
+    }
+
+    /// Advance the forest's compaction for the given committed op.
+    ///
+    /// Upstream: `state_machine.zig` `compact` → `forest.compact`. The port's `Forest::compact`
+    /// drives every tree's active compactions synchronously (no async IO dispatch yet), so this
+    /// always returns ready. Off the bar cadence `Forest::compact` idles, matching upstream's
+    /// per-beat stepping.
+    ///
+    /// Without a mounted forest this returns ready without doing work.
+    ///
+    /// # Panics
+    /// Panics if a forest is mounted but `storage` is `None` (the forest needs a backing store
+    /// to compact against).
+    pub fn compact(&mut self, op: u64, storage: Option<&mut dyn Storage>) -> bool {
+        let Some(forest) = self.forest.as_mut() else {
+            return true;
+        };
+        let storage = storage.expect("compact() requires storage when a forest is mounted");
+        forest.compact(op, storage);
+        true
+    }
+
     /// Record that an op was executed against the state machine.
     ///
     /// DEVIATION: upstream threads the operation and its body through
@@ -3291,6 +3329,14 @@ impl StateMachine {
 mod tests {
     use super::*;
     use std::fmt::Write as _;
+    use tigerbeetle_core::constants::BLOCK_SIZE;
+    use tigerbeetle_lsm::compaction;
+
+    use crate::Zone;
+    use crate::grid::{GridOptions, SuperBlockView};
+    use crate::multiversion::Release;
+    use crate::storage::MemoryStorage;
+    use crate::superblock::DATA_FILE_SIZE_MIN;
 
     // ── StateMachine tests ───────────────────────────────────────────────
 
@@ -3310,6 +3356,114 @@ mod tests {
         let mut state_machine = StateMachine::default();
         state_machine.execute_op(2);
         state_machine.execute_op(2);
+    }
+
+    // ── forest-compaction tests ─────────────────────────────────────────
+
+    // Mirrors `forest::tests` grid options, sized so the forest's grid zone covers the
+    // free-set capacity (an L0 flush's dispatched writes address any free block).
+    const CACHE_BLOCKS_COUNT: usize = 256;
+    const READ_IOPS_MAX: usize = 2;
+    const WRITE_IOPS_MAX: usize = 2;
+    const FREE_SET_BLOCKS: usize = 1024;
+
+    fn test_superblock() -> SuperBlockView {
+        SuperBlockView {
+            cluster: 0xAB,
+            release: Release { value: 1 },
+            storage_size: DATA_FILE_SIZE_MIN as u64,
+            manifest_block_count: 0,
+            manifest_oldest_address: 0,
+            manifest_oldest_checksum: 0,
+            manifest_newest_address: 0,
+            manifest_newest_checksum: 0,
+            op_compacted: false,
+        }
+    }
+
+    fn forest_grid_options() -> GridOptions {
+        let pace = crate::forest::forest_pace();
+        GridOptions {
+            cache_blocks_count: CACHE_BLOCKS_COUNT,
+            stash_blocks_count: 2 * pace.blocks_count() as usize + READ_IOPS_MAX + 256,
+            read_iops_max: READ_IOPS_MAX,
+            write_iops_max: WRITE_IOPS_MAX,
+            free_set_blocks_count: None,
+            free_set_blocks_capacity: Some(FREE_SET_BLOCKS),
+        }
+    }
+
+    fn forest_storage() -> MemoryStorage {
+        MemoryStorage::new(Zone::Grid.start() + FREE_SET_BLOCKS as u64 * BLOCK_SIZE as u64)
+    }
+
+    /// `StateMachine::compact` drives the mounted forest's compaction. A mounted forest sorts
+    /// and dedups (by timestamp) the account object tree's mutable suffix, mirroring
+    /// `forest::tests::forest_compact_sorts_and_dedups_groove_trees`.
+    #[test]
+    fn state_machine_compact_drives_mounted_forest() {
+        let mut state_machine = StateMachine::default();
+        state_machine.mount_forest(Forest::init(test_superblock(), forest_grid_options(), 32));
+
+        state_machine.forest.as_mut().expect("forest mounted").accounts.objects.put(&Account {
+            id: 5,
+            timestamp: 5,
+            ..Account::default()
+        });
+        state_machine.forest.as_mut().expect("forest mounted").accounts.objects.put(&Account {
+            id: 3,
+            timestamp: 3,
+            ..Account::default()
+        });
+        state_machine.forest.as_mut().expect("forest mounted").accounts.objects.put(&Account {
+            id: 9,
+            timestamp: 9,
+            ..Account::default()
+        });
+        state_machine.forest.as_mut().expect("forest mounted").accounts.objects.put(&Account {
+            id: 9,
+            timestamp: 9,
+            ..Account::default()
+        });
+
+        let mut storage = forest_storage();
+        assert!(state_machine.compact(compaction::HALF_BAR_BEAT_COUNT as u64, Some(&mut storage)));
+
+        let values = state_machine
+            .forest
+            .as_ref()
+            .expect("forest mounted")
+            .accounts
+            .objects
+            .table_mutable_ref()
+            .values_used();
+        assert_eq!(
+            values.iter().map(|account| account.timestamp).collect::<Vec<_>>(),
+            vec![3, 5, 9]
+        );
+    }
+
+    /// Compacting across a full bar through the state machine (including the last-beat
+    /// mutable→immutable swap and the level-0 driver) runs without panicking, mirrors
+    /// `forest::tests::forest_compact_full_bar`.
+    #[test]
+    fn state_machine_compact_full_bar() {
+        let mut state_machine = StateMachine::default();
+        state_machine.mount_forest(Forest::init(test_superblock(), forest_grid_options(), 32));
+        let mut storage = forest_storage();
+        let bar_ops = constants::LSM_COMPACTION_OPS as u64;
+        let bar_start = compaction::HALF_BAR_BEAT_COUNT as u64 * 2;
+        for op in bar_start..bar_start + bar_ops {
+            assert!(state_machine.compact(op, Some(&mut storage)));
+        }
+    }
+
+    /// A state machine with no forest mounted (the default) is always compaction-ready and
+    /// needs no storage — the path the sans-IO replica exercises until a forest is mounted.
+    #[test]
+    fn state_machine_compact_without_forest_is_ready() {
+        let mut state_machine = StateMachine::default();
+        assert!(state_machine.compact(1, None));
     }
 
     // ── prefetch key-set tests ──────────────────────────────────────────

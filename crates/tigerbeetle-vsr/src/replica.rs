@@ -23,8 +23,7 @@ use crate::message_header;
 use crate::message_header::{GetBlocks, TypedHeader};
 use crate::repair_budget::{RepairBudgetGrid, RepairBudgetOptions};
 use crate::state_machine::StateMachine;
-use crate::storage::MemoryStorage;
-
+use crate::storage::{MemoryStorage, Storage};
 // ---------------------------------------------------------------------------
 // Status
 // ---------------------------------------------------------------------------
@@ -1837,10 +1836,13 @@ impl Replica {
     /// Stage: Compact — run one beat of LSM compaction.
     ///
     /// Upstream: `src/vsr/replica.zig:4943` (`commit_compact`).
-    fn commit_compact(&self) -> bool {
+    fn commit_compact(&mut self) -> bool {
         assert_eq!(self.commit_stage, CommitStage::Compact);
-        // TODO(port): state_machine.compact — async. For now, ready.
-        true
+        let Some(op) = self.commit_prepare else {
+            panic!("commit_compact requires commit_prepare");
+        };
+        let (state_machine, storage) = (&mut self.state_machine, self.grid_storage.as_mut());
+        state_machine.compact(op, storage.map(|s| s as &mut dyn Storage))
     }
 
     /// Stage: CheckpointData — persist the current state to disk.

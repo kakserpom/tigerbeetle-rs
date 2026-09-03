@@ -30,7 +30,7 @@ pub const TREE_COUNT: u32 = 25;
 
 /// The manifest log's compaction pace, sized for the forest's tree count (upstream
 /// `forest.manifest_log_compaction_pace`, forest.zig:195).
-fn forest_pace() -> Pace {
+pub(crate) fn forest_pace() -> Pace {
     // Upstream: `constants.lsm_manifest_compact_extra_blocks`; fits u32 like the comptime value.
     #[allow(clippy::cast_possible_truncation)]
     let compact_extra_blocks = CONFIG.cluster.lsm_manifest_compact_extra_blocks as u32;
