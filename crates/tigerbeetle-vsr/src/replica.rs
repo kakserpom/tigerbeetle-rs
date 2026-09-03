@@ -837,21 +837,40 @@ impl Replica {
         self.op_checkpoint() + constants::VSR_CHECKPOINT_OPS as u64 - 1
     }
 
-    /// Returns the checkpoint trigger op: the op at which the next checkpoint
-    /// should be initiated.
+    /// Returns the op that will be `op_checkpoint` after the next checkpoint.
     ///
-    /// Upstream: `vsr.checkpoint_next_trigger`.
+    /// Upstream: `src/vsr/replica.zig:7060` (`op_checkpoint_next`).
+    ///
+    /// # Panics
+    /// Panics unless `op_checkpoint()` is a valid checkpoint op and does not
+    /// outrun `commit_min` (upstream asserts).
+    #[must_use]
+    pub fn op_checkpoint_next(&self) -> u64 {
+        assert!(crate::checkpoint::valid(self.op_checkpoint()));
+        assert!(self.op_checkpoint() <= self.commit_min);
+        assert!(self.op_checkpoint() <= self.op);
+
+        crate::checkpoint::checkpoint_after(self.op_checkpoint())
+    }
+
+    /// Returns the next op that will trigger a checkpoint.
+    ///
+    /// See [`op_checkpoint_next`](Self::op_checkpoint_next). After the current
+    /// checkpoint, once `commit_min` reaches the trigger op the checkpoint is
+    /// initiated. Upstream: `src/vsr/replica.zig:7076` (`op_checkpoint_next_trigger`).
+    ///
+    /// # Panics
+    /// Panics unless `op_checkpoint()` is a valid checkpoint op that is not `0`
+    /// (the first checkpoint's trigger is covered by `op_checkpoint_next`'s own
+    /// pre-checkpoint state before any op-checkpoint exists).
     #[must_use]
     pub fn op_checkpoint_next_trigger(&self) -> u64 {
-        // Every `checkpoint_ops` ops we trigger a checkpoint.
-        // checkpoint_ops = constants.vsr_checkpoint_ops
-        // trigger = checkpoint_ops - 1 (the op that triggers the checkpoint)
-        // The trigger is the last op in the current checkpoint interval.
-        let checkpoint_ops = constants::VSR_CHECKPOINT_OPS as u64;
-        let interval = checkpoint_ops;
-        // Find the next trigger >= self.commit_min.
-        let base = self.commit_min / interval;
-        (base + 1) * interval
+        // `op_checkpoint_next()` is `checkpoint_after` of a valid checkpoint, so it is never 0
+        // and always has a trigger (upstream `.?` on `Checkpoint.trigger_for_checkpoint`).
+        match crate::checkpoint::trigger_for_checkpoint(self.op_checkpoint_next()) {
+            Some(trigger) => trigger,
+            None => panic!("op_checkpoint_next always has a checkpoint trigger"),
+        }
     }
 
     /// Advance `commit_max` monotonically.
@@ -10718,6 +10737,31 @@ mod tests {
         r.mount_superblock(sb, st);
         assert_eq!(r.op_checkpoint(), 19);
         assert_eq!(r.op_repair_min(), 20);
+    }
+
+    #[test]
+    fn op_checkpoint_next_and_trigger_from_superblock() {
+        // Pre-checkpoint (op 0): the next checkpoint is the first wrap, `VSR_CHECKPOINT_OPS - 1`;
+        // its trigger is one compaction interval beyond (upstream `vsr.Checkpoint`, vsr.zig:1613).
+        let checkpoint_ops = constants::VSR_CHECKPOINT_OPS as u64;
+        let compaction_ops = constants::LSM_COMPACTION_OPS as u64;
+
+        // Unmounted replica reports op_checkpoint() == 0 (the pre-checkpoint state).
+        let r = Replica::new(CLUSTER, 0, 3);
+        assert_eq!(r.op_checkpoint(), 0);
+        assert_eq!(r.op_checkpoint_next(), checkpoint_ops - 1);
+        assert_eq!(r.op_checkpoint_next_trigger(), r.op_checkpoint_next() + compaction_ops);
+
+        // After the first checkpoint (op = VSR_CHECKPOINT_OPS - 1): each subsequent checkpoint
+        // advances by `VSR_CHECKPOINT_OPS`, and the trigger lags it by one compaction interval.
+        let first_checkpoint = checkpoint_ops - 1;
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        let (sb, st) = opened_superblock_at_op(first_checkpoint);
+        r.mount_superblock(sb, st);
+        r.commit_min = first_checkpoint;
+        r.op = first_checkpoint;
+        assert_eq!(r.op_checkpoint_next(), first_checkpoint + checkpoint_ops);
+        assert_eq!(r.op_checkpoint_next_trigger(), r.op_checkpoint_next() + compaction_ops);
     }
 
     #[test]
