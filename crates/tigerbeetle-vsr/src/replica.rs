@@ -1173,7 +1173,13 @@ impl Replica {
         self.commit_min = op;
         self.advance_commit_max(op);
 
-        // TODO(port): execute the operation on the state machine, build Reply.
+        // DEVIATION: `commit_op` is only the post-execute bookkeeping tail of
+        // the commit pipeline. The state-machine execution and Reply build live
+        // in the Execute stage (`commit_execute`), which calls `commit_op(op)`
+        // after running `state_machine.execute` (upstream `commit_execute` calls
+        // `execute_op`, then `journal.remove_entries` etc. — replica.zig:4893).
+        // Tests may also call `commit_op` directly to commit already-prepared
+        // ops without touching the state machine.
 
         // Simulate the async prepare write completing: the header is already in
         // the journal (dirty); the on-disk copy accompanies commit.
