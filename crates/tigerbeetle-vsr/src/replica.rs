@@ -814,6 +814,21 @@ impl Replica {
         // `commit_dispatch`; a checkpoint driven directly (unit test, no in-flight
         // dispatch) must not resume.
         if checkpoint_done && self.commit_dispatch_entered {
+            // Upstream's `commit_checkpoint_superblock_callback` (replica.zig:5238)
+            // runs these effects before resuming the pipeline:
+            //
+            // DEVIATION (Phase 3): `grid.mark_checkpoint_not_durable()` and the
+            // free-set / client-sessions block releases (replica.zig:5262-5269)
+            // are deferred — the grid's checkpoint-durability tracking and
+            // `client_sessions_checkpoint` are not ported yet.
+            //
+            // DEVIATION (Phase 3): the `event_callback` `.checkpoint_completed`
+            // hook (replica.zig:5274) has no sans-IO counterpart yet.
+            //
+            // DEVIATION (Phase 3): `release_transition` on the multiversion
+            // release (replica.zig:10868) is a no-op — the sans-IO replica is
+            // pinned to `Release::MINIMUM`.
+            self.send_prepare_oks_after_checkpoint();
             self.commit_dispatch_resume();
         }
     }
@@ -897,6 +912,28 @@ impl Replica {
             Some(trigger) => trigger,
             None => panic!("op_checkpoint_next always has a checkpoint trigger"),
         }
+    }
+
+    /// The largest op for which this replica may send a PrepareOk.
+    ///
+    /// A replica must not acknowledge prepares beyond the checkpoint-quorum
+    /// safety window, otherwise it could falsely contribute to the durability
+    /// of a checkpoint before the grid is stable. The window is the *next*
+    /// checkpoint trigger plus the pipeline depth.
+    ///
+    /// DEVIATION: upstream (`src/vsr/replica.zig:7118`, `op_prepare_ok_max`) has
+    /// two additional state-sync branches that shrink this window while a
+    /// replica is syncing tables; there is no state sync in this sans-IO port
+    /// yet (Phase 3), so `sync_grid_done()` is always true and only the trusted
+    /// branch applies (`op_checkpoint_next_trigger() + pipeline_prepare_queue_max`).
+    ///
+    /// # Panics
+    /// Panics unless `op_checkpoint()` is a valid, non-zero checkpoint.
+    ///
+    /// Upstream: `src/vsr/replica.zig:7118` (`op_prepare_ok_max`).
+    #[must_use]
+    fn op_prepare_ok_max(&self) -> u64 {
+        self.op_checkpoint_next_trigger() + u64::from(constants::PIPELINE_PREPARE_QUEUE_MAX)
     }
 
     /// Advance `commit_max` monotonically.
@@ -3016,6 +3053,28 @@ impl Replica {
         self.send_prepare_oks_from(self.commit_max + 1);
     }
 
+    /// Re-send PrepareOks after the superblock checkpoint completes, releasing
+    /// the prepares that were withheld by `op_prepare_ok_max` on account of this
+    /// checkpoint's durability window.
+    ///
+    /// Starts one past `op_checkpoint_trigger + pipeline_prepare_queue_max`, so
+    /// the first ops in the newly-advanced window are (re-)sent.
+    ///
+    /// Upstream: `src/vsr/replica.zig:8734` (`send_prepare_oks_after_checkpoint`).
+    fn send_prepare_oks_after_checkpoint(&mut self) {
+        assert_eq!(self.status, Status::Normal);
+        let Some(op_checkpoint_trigger) =
+            crate::checkpoint::trigger_for_checkpoint(self.op_checkpoint())
+        else {
+            panic!("a valid checkpoint always has a trigger");
+        };
+        assert_eq!(self.commit_min, op_checkpoint_trigger);
+        self.send_prepare_oks_from(
+            (self.commit_max + 1)
+                .max(op_checkpoint_trigger + u64::from(constants::PIPELINE_PREPARE_QUEUE_MAX) + 1),
+        );
+    }
+
     /// Send a PrepareOk for every op in `op_start..=op` that we have journaled.
     ///
     /// Upstream: `src/vsr/replica.zig:8730` (`send_prepare_oks_from`).
@@ -3036,6 +3095,21 @@ impl Replica {
         assert!(prepare.valid_checksum());
         assert!(prepare.invalid().is_none());
         assert_eq!(prepare.command, Command::Prepare);
+
+        if self.status != Status::Normal {
+            return;
+        }
+
+        if prepare.op > self.op {
+            assert!(prepare.view < self.view);
+            return;
+        }
+
+        // DEVIATION: upstream also returns early while `self.syncing != .idle`
+        // (replica.zig:8638); there is no state sync in this sans-IO port.
+        if prepare.op > self.op_prepare_ok_max() {
+            return;
+        }
 
         let mut prepare_ok = message_header::PrepareOk {
             cluster: self.cluster,
@@ -10779,39 +10853,44 @@ mod tests {
         sb.poll(&mut storage);
         assert_eq!(sb.take_events(), vec![Event::OpenDone]);
 
-        let mut header = message_header::Prepare::default();
-        header.cluster = CLUSTER;
-        header.op = op;
-        header.timestamp = op;
-        header.set_checksum_body(&[]);
-        header.set_checksum();
-        sb.checkpoint(
-            &mut storage,
-            &UpdateCheckpoint {
-                header,
-                view_attributes: None,
-                commit_max: op,
-                sync_op_min: 0,
-                sync_op_max: 0,
-                manifest_references: ManifestReferences {
-                    oldest_checksum: 0,
-                    oldest_address: 0,
-                    newest_checksum: 0,
-                    newest_address: 0,
-                    block_count: 0,
+        // `op == 0` is a valid checkpoint op (the initial checkpoint): a freshly
+        // opened superblock already holds it, so there is nothing to advance (and
+        // `SuperBlock.checkpoint` would reject a non-advancing op).
+        if op != 0 {
+            let mut header = message_header::Prepare::default();
+            header.cluster = CLUSTER;
+            header.op = op;
+            header.timestamp = op;
+            header.set_checksum_body(&[]);
+            header.set_checksum();
+            sb.checkpoint(
+                &mut storage,
+                &UpdateCheckpoint {
+                    header,
+                    view_attributes: None,
+                    commit_max: op,
+                    sync_op_min: 0,
+                    sync_op_max: 0,
+                    manifest_references: ManifestReferences {
+                        oldest_checksum: 0,
+                        oldest_address: 0,
+                        newest_checksum: 0,
+                        newest_address: 0,
+                        block_count: 0,
+                    },
+                    free_set_references: FreeSetReferences {
+                        blocks_acquired: empty_reference,
+                        blocks_released: empty_reference,
+                    },
+                    client_sessions_reference: empty_reference,
+                    storage_size: crate::superblock::DATA_FILE_SIZE_MIN as u64,
+                    release: crate::multiversion::Release::MINIMUM,
                 },
-                free_set_references: FreeSetReferences {
-                    blocks_acquired: empty_reference,
-                    blocks_released: empty_reference,
-                },
-                client_sessions_reference: empty_reference,
-                storage_size: crate::superblock::DATA_FILE_SIZE_MIN as u64,
-                release: crate::multiversion::Release::MINIMUM,
-            },
-        );
-        sb.poll(&mut storage);
-        assert_eq!(sb.take_events(), vec![Event::CheckpointDone]);
-        assert_eq!(sb.working().vsr_state.checkpoint.header.op, op);
+            );
+            sb.poll(&mut storage);
+            assert_eq!(sb.take_events(), vec![Event::CheckpointDone]);
+            assert_eq!(sb.working().vsr_state.checkpoint.header.op, op);
+        }
         (sb, storage)
     }
 
@@ -10981,7 +11060,9 @@ mod tests {
         let prepare_msg = primary.send_queue[0].clone();
 
         let mut backup = Replica::new(CLUSTER, 2, 3);
-        let (sb, st) = opened_superblock_at_op(19);
+        // Mount at the initial (valid, op 0) checkpoint: a backup acking this
+        // low-op prepare sits before its first real checkpoint.
+        let (sb, st) = opened_superblock_at_op(0);
         backup.mount_superblock(sb, st);
         backup.status = Status::Normal;
         backup.on_message(&prepare_msg, 20_000);
