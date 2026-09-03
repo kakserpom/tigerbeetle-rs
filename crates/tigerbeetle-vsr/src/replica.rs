@@ -764,9 +764,10 @@ impl Replica {
         }
     }
 
-    /// Drive an in-flight superblock `view_change` to completion (the sans-IO
+    /// Drive an in-flight superblock operation to completion (the sans-IO
     /// equivalent of upstream's `view_durable_update_callback`,
-    /// replica.zig:9533).
+    /// replica.zig:9533, and `commit_checkpoint_superblock_callback`,
+    /// replica.zig:5238).
     ///
     /// # Panics
     /// Panics if the completed update violates upstream invariants.
@@ -776,18 +777,22 @@ impl Replica {
         }
         let view = self.view;
         let log_view = self.log_view;
-        let completed = {
+        let (completed, checkpoint_done) = {
             let (sb, storage) = self.superblock_mut();
             sb.poll(storage);
             let mut completed = false;
+            let mut checkpoint_done = false;
             for event in sb.take_events() {
                 if event == crate::superblock::Event::ViewChangeDone {
                     assert!(sb.working().vsr_state.view <= view);
                     assert!(sb.working().vsr_state.log_view <= log_view);
                     completed = true;
                 }
+                if event == crate::superblock::Event::CheckpointDone {
+                    checkpoint_done = true;
+                }
             }
-            completed
+            (completed, checkpoint_done)
         };
         // Re-drive a follow-on persist when the replica outran the update that
         // just completed (e.g. it persisted JoinView on entering the view change
@@ -803,6 +808,14 @@ impl Replica {
                 self.view_durable_update();
             }
         }
+        // A completed checkpoint resumes the commit pipeline (upstream's
+        // `commit_checkpoint_superblock_callback` → `commit_dispatch_resume`).
+        // This is only meaningful when the checkpoint was initiated from
+        // `commit_dispatch`; a checkpoint driven directly (unit test, no in-flight
+        // dispatch) must not resume.
+        if checkpoint_done && self.commit_dispatch_entered {
+            self.commit_dispatch_resume();
+        }
     }
 
     /// Whether a `view_durable_update()` is already in flight.
@@ -815,6 +828,19 @@ impl Replica {
         self.superblock
             .as_ref()
             .is_some_and(|sb| sb.updating(crate::superblock::Caller::ViewChange))
+    }
+
+    /// Whether a superblock `checkpoint` write is in flight.
+    ///
+    /// Returns `false` when no superblock is mounted (nothing to persist).
+    ///
+    /// Upstream: the `superblock.updating(.checkpoint)` gate of the
+    /// `commit_checkpoint_superblock` flow.
+    #[must_use]
+    pub fn checkpoint_updating(&self) -> bool {
+        self.superblock
+            .as_ref()
+            .is_some_and(|sb| sb.updating(crate::superblock::Caller::Checkpoint))
     }
 
     /// The smallest op that may not be discarded (`op_checkpoint + 1`).
@@ -1873,13 +1899,75 @@ impl Replica {
         true
     }
 
-    /// Stage: CheckpointSuperblock — update the superblock.
+    /// Stage: CheckpointSuperblock — write the VSR checkpoint to the superblock.
     ///
-    /// Upstream: `src/vsr/replica.zig` (`commit_checkpoint_superblock`).
-    fn commit_checkpoint_superblock(&self) -> bool {
+    /// Once `commit_op` reaches the next checkpoint trigger, computes the op that
+    /// becomes the next checkpoint (`vsr_state_commit_min = op_checkpoint_next()`)
+    /// and issues an async superblock `checkpoint` update; returns `false` (pending)
+    /// until that write completes and is driven through [`Self::drive_superblock`].
+    /// Below the trigger it returns `true` (ready) without writing.
+    ///
+    /// Upstream: `src/vsr/replica.zig:5110` (`commit_checkpoint_superblock`).
+    fn commit_checkpoint_superblock(&mut self) -> bool {
         assert_eq!(self.commit_stage, CommitStage::CheckpointSuperblock);
-        // TODO(port): superblock.checkpoint — async. For now, ready.
-        true
+        let commit_op = self
+            .commit_prepare
+            .unwrap_or_else(|| panic!("commit_checkpoint_superblock requires commit_prepare"));
+        assert_eq!(commit_op, self.commit_min);
+        assert!(commit_op <= self.op_checkpoint_next_trigger());
+        if commit_op < self.op_checkpoint_next_trigger() {
+            return true; // Not yet at a checkpoint: nothing to persist.
+        }
+
+        assert!(commit_op <= self.op);
+        assert_eq!(commit_op, self.op_checkpoint_next_trigger());
+        assert!(self.op_checkpoint_next_trigger() <= self.commit_max);
+
+        // The superblock's `commit_min` is the *upcoming* checkpoint op, not the
+        // triggering op: this bar's ops still live in the in-memory immutable
+        // table and only compact to disk in the next bar (upstream
+        // replica.zig:5126-5136).
+        let vsr_state_commit_min = self.op_checkpoint_next();
+
+        let header = *self
+            .journal
+            .header_with_op(vsr_state_commit_min)
+            .unwrap_or_else(|| panic!("journal must contain the op of the upcoming checkpoint"));
+
+        // DEVIATION (Phase 3): `view_attributes` (view_headers population),
+        // `sync_op_*` (state sync), the manifest / free-set / client-sessions
+        // reference blocks, and the grid free-set sizing are all deferred to
+        // later phases. The update is issued with `view_attributes = None`,
+        // `sync_op_* = 0`, empty references, and the minimum storage size —
+        // which the superblock accepts because the free-set references are empty.
+        let storage_size = crate::superblock::DATA_FILE_SIZE_MIN as u64;
+        let empty_reference = crate::superblock::TrailerReference {
+            checksum: message_header::checksum_body_empty(),
+            last_block_address: 0,
+            last_block_checksum: 0,
+            trailer_size: 0,
+        };
+        let update = crate::superblock::UpdateCheckpoint {
+            header,
+            view_attributes: None,
+            commit_max: self.commit_max,
+            sync_op_min: 0,
+            sync_op_max: 0,
+            manifest_references: crate::superblock::ManifestReferences::default(),
+            free_set_references: crate::superblock::FreeSetReferences {
+                blocks_acquired: empty_reference,
+                blocks_released: empty_reference,
+            },
+            client_sessions_reference: empty_reference,
+            storage_size,
+            release: crate::multiversion::Release::MINIMUM,
+        };
+        {
+            let (sb, storage) = self.superblock_mut();
+            sb.checkpoint(storage, &update);
+            assert!(sb.updating(crate::superblock::Caller::Checkpoint));
+        }
+        false // pending: completes when the superblock write is driven
     }
 
     /// Stage: Finish — cleanup after committing one prepare.
@@ -10762,6 +10850,66 @@ mod tests {
         r.op = first_checkpoint;
         assert_eq!(r.op_checkpoint_next(), first_checkpoint + checkpoint_ops);
         assert_eq!(r.op_checkpoint_next_trigger(), r.op_checkpoint_next() + compaction_ops);
+    }
+
+    #[test]
+    fn commit_checkpoint_superblock_below_trigger_is_ready() {
+        // Mount at the first valid checkpoint op (`VSR_CHECKPOINT_OPS - 1`); the
+        // next trigger is a full checkpoint interval plus one compaction interval
+        // away, so committing the checkpoint op does not (yet) persist anything.
+        let first_checkpoint = constants::VSR_CHECKPOINT_OPS as u64 - 1;
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        let (sb, st) = opened_superblock_at_op(first_checkpoint);
+        r.mount_superblock(sb, st);
+
+        r.commit_min = first_checkpoint;
+        r.commit_max = first_checkpoint;
+        r.op = first_checkpoint;
+        r.commit_prepare = Some(first_checkpoint);
+        r.commit_stage = CommitStage::CheckpointSuperblock;
+
+        assert!(r.commit_checkpoint_superblock());
+        assert!(!r.checkpoint_updating());
+    }
+
+    #[test]
+    fn commit_checkpoint_superblock_writes_superblock_at_trigger() {
+        // Mount at the first valid checkpoint op; the upcoming checkpoint op and
+        // its trigger are then derived deterministically from `vsr.Checkpoint`.
+        let first_checkpoint = constants::VSR_CHECKPOINT_OPS as u64 - 1;
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        let (sb, st) = opened_superblock_at_op(first_checkpoint);
+        r.mount_superblock(sb, st);
+        assert_eq!(r.op_checkpoint(), first_checkpoint);
+
+        // Bring `commit_min`/`op` up to the mounted checkpoint so the checkpoint
+        // boundary helpers' upstream asserts (`op_checkpoint() <= commit_min <= op`)
+        // hold before we ask for the upcoming checkpoint / trigger.
+        r.commit_min = first_checkpoint;
+        r.op = first_checkpoint;
+
+        let next = r.op_checkpoint_next();
+        let trigger = r.op_checkpoint_next_trigger();
+
+        // The upcoming checkpoint's prepare (at `next`) lives in the journal.
+        let header = make_prepare_for_replica(CLUSTER, 0, next, 0, 0);
+        r.journal.set_header_as_dirty(&header);
+
+        r.commit_min = trigger;
+        r.commit_max = trigger;
+        r.op = trigger;
+        r.commit_prepare = Some(trigger);
+        r.commit_stage = CommitStage::CheckpointSuperblock;
+
+        // At the trigger the superblock checkpoint is initiated (pending).
+        assert!(!r.commit_checkpoint_superblock());
+        assert!(r.checkpoint_updating());
+
+        // Driving the superblock persists the checkpoint; `op_checkpoint` jumps
+        // to the upcoming checkpoint op (`next`), past the trigger.
+        r.drive_superblock();
+        assert!(!r.checkpoint_updating());
+        assert_eq!(r.op_checkpoint(), next);
     }
 
     #[test]
