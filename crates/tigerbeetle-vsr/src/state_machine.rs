@@ -2209,6 +2209,26 @@ impl StateMachine {
         (manifest_references, free_set_references)
     }
 
+    /// Roll the forest checkpoint back to non-durable once the superblock checkpoint
+    /// write lands (upstream `grid.mark_checkpoint_not_durable`, replica.zig:5262):
+    /// releasing both free-set trailer blocks arms the released-set for the next
+    /// checkpoint, which re-encodes after asserting this checkpoint is *not* durable.
+    ///
+    /// Without this, a second full-pipeline checkpoint asserts inside
+    /// `Grid::checkpoint_durable` (`!free_set.checkpoint_durable()`).
+    ///
+    /// DEVIATION: upstream the replica reaches `grid.mark_checkpoint_not_durable`
+    /// directly (replica and state machine share one grid); sans-IO the forest owns
+    /// the grid, so this bridges through the state machine.
+    ///
+    /// # Panics
+    /// Panics if a forest is mounted but its current checkpoint is already non-durable.
+    pub fn mark_checkpoint_not_durable(&mut self) {
+        if let Some(forest) = &mut self.forest {
+            forest.grid.mark_checkpoint_not_durable();
+        }
+    }
+
     /// Record that an op was executed against the state machine.
     ///
     /// DEVIATION: upstream threads the operation and its body through
@@ -3611,6 +3631,48 @@ mod tests {
         assert!(manifest_references.empty());
         assert!(free_set_references.blocks_acquired.empty());
         assert!(free_set_references.blocks_released.empty());
+    }
+
+    /// `mark_checkpoint_not_durable` (the superblock-checkpoint callback effect) rolls the
+    /// forest grid's checkpoint back to non-durable, so a *second* forest checkpoint can
+    /// re-encode. Without it, `Grid::checkpoint_durable` (asserting
+    /// `!free_set.checkpoint_durable()`) panics on the second checkpoint.
+    #[test]
+    fn mark_checkpoint_not_durable_allows_second_checkpoint() {
+        let mut state_machine = StateMachine::default();
+        state_machine.mount_forest(Forest::init(test_superblock(), forest_grid_options(), 32));
+        let mut storage = forest_storage();
+        open_forest(state_machine.forest.as_mut().expect("forest mounted"), &mut storage);
+
+        // Seed an *unflushed* immutable table, then run a full bar so the level-0 driver
+        // flushes it to a real table (appending a manifest entry) before the checkpoint.
+        {
+            let forest = state_machine.forest.as_mut().expect("forest mounted");
+            forest.accounts.objects.put(&Account { id: 3, timestamp: 3, ..Account::default() });
+            forest.accounts.objects.put(&Account { id: 5, timestamp: 5, ..Account::default() });
+            forest.accounts.objects.compact(&mut forest.accounts_scratch.objects);
+            forest
+                .accounts
+                .objects
+                .swap_mutable_and_immutable(1, &mut forest.accounts_scratch.objects);
+        }
+        let bar_ops = constants::LSM_COMPACTION_OPS as u64;
+        let bar_start = compaction::HALF_BAR_BEAT_COUNT as u64 * 2;
+        for op in bar_start..bar_start + bar_ops {
+            assert!(state_machine.compact(op, Some(&mut storage)));
+        }
+
+        let (first_manifest, first_free_set) = state_machine.checkpoint(Some(&mut storage));
+        assert!(first_manifest.block_count >= 1);
+        assert!(!first_free_set.blocks_acquired.empty());
+
+        // The replica's `drive_superblock` checkpoint callback runs this between two
+        // `commit_checkpoint_data` invocations.
+        state_machine.mark_checkpoint_not_durable();
+
+        let (second_manifest, second_free_set) = state_machine.checkpoint(Some(&mut storage));
+        assert!(second_manifest.block_count >= 1);
+        assert!(!second_free_set.blocks_acquired.empty());
     }
 
     // ── prefetch key-set tests ──────────────────────────────────────────

@@ -824,10 +824,29 @@ impl Replica {
             // Upstream's `commit_checkpoint_superblock_callback` (replica.zig:5238)
             // runs these effects before resuming the pipeline:
             //
-            // DEVIATION (Phase 3): `grid.mark_checkpoint_not_durable()` and the
-            // free-set / client-sessions block releases (replica.zig:5262-5269)
-            // are deferred — the grid's checkpoint-durability tracking and
-            // `client_sessions_checkpoint` are not ported yet.
+            // The superblock write landed, so the working checkpoint is the one the
+            // update carried (`op_checkpoint() == op_checkpoint_next()`, the *upcoming*
+            // checkpoint op) and matches staging/working (replica.zig:5246-5250).
+            let superblock = self
+                .superblock
+                .as_ref()
+                .unwrap_or_else(|| panic!("checkpoint completion requires a mounted superblock"));
+            let op_checkpoint = self.op_checkpoint();
+            assert_eq!(op_checkpoint, self.commit_min - constants::LSM_COMPACTION_OPS as u64,);
+            assert_eq!(op_checkpoint, superblock.staging().vsr_state.checkpoint.header.op);
+            assert_eq!(op_checkpoint, superblock.working().vsr_state.checkpoint.header.op);
+
+            // Roll the forest checkpoint back to non-durable so the free-set trailer
+            // blocks release (arming `blocks_released` for the next checkpoint) and a
+            // subsequent forest checkpoint can re-encode (`Grid::checkpoint_durable`
+            // asserts `!checkpoint_durable`, replica.zig:5262).
+            self.state_machine.mark_checkpoint_not_durable();
+
+            // DEVIATION (Phase 3): the client-sessions checkpoint trailer block
+            // releases (replica.zig:5264-5268) — client sessions have no checkpoint
+            // trailer in the port (sessions stay in-memory), so nothing is released;
+            // the released-count assert (replica.zig:5269) still holds because
+            // `Grid::mark_checkpoint_not_durable` releases both free-set trailers.
             //
             // DEVIATION (Phase 3): the `event_callback` `.checkpoint_completed`
             // hook (replica.zig:5274) has no sans-IO counterpart yet.
@@ -11144,6 +11163,7 @@ mod tests {
         }
         r.state_machine.mount_forest(forest);
         r.grid_storage = Some(storage);
+        r.status = Status::Normal;
 
         // The upcoming checkpoint's prepare (at `next`) lives in the journal.
         let header = make_prepare_for_replica(CLUSTER, 0, next, 0, 0);
@@ -11160,12 +11180,18 @@ mod tests {
         assert!(r.checkpoint_manifest_references.is_some());
         assert!(r.checkpoint_free_set_references.is_some());
 
-        // The superblock checkpoint persists those references.
+        // The superblock checkpoint persists those references. The `CheckpointDone`
+        // effect branch (mirroring `commit_checkpoint_superblock_callback`) runs when a
+        // real commit dispatch is driving the pipeline: it asserts the working/staging
+        // checkpoint jumped to the upcoming op, rolls the forest checkpoint back to
+        // non-durable, and resumes the (here empty) pipeline.
         r.commit_stage = CommitStage::CheckpointSuperblock;
         assert!(!r.commit_checkpoint_superblock());
         assert!(r.checkpoint_updating());
+        r.commit_dispatch_entered = true;
         r.drive_superblock();
         assert!(!r.checkpoint_updating());
+        assert!(!r.commit_dispatch_entered);
         assert_eq!(r.op_checkpoint(), next);
 
         let references = r.superblock.as_ref().expect("mounted").working().manifest_references();
@@ -11173,6 +11199,38 @@ mod tests {
         assert!(references.oldest_address > 0);
         assert!(references.newest_address > 0);
         assert_eq!(references.oldest_checksum, references.newest_checksum);
+
+        // A second checkpoint must survive the full cycle: the effect branch marked the
+        // forest checkpoint non-durable (otherwise `Grid::checkpoint_durable` asserts on
+        // the re-encode), and the client-replies checkpoint registered during the first
+        // `commit_checkpoint_data` completes on its next poll.
+        {
+            let mut poll_storage = replica_forest_storage();
+            r.client_replies.poll(&mut poll_storage);
+        }
+        let next_2 = r.op_checkpoint_next();
+        let trigger_2 = r.op_checkpoint_next_trigger();
+        let header_2 = make_prepare_for_replica(CLUSTER, 0, next_2, 0, 0);
+        r.journal.set_header_as_dirty(&header_2);
+        r.commit_min = trigger_2;
+        r.commit_max = trigger_2;
+        r.op = trigger_2;
+        r.commit_prepare = Some(trigger_2);
+        r.commit_stage = CommitStage::CheckpointData;
+        assert!(r.commit_checkpoint_data());
+        r.commit_stage = CommitStage::CheckpointSuperblock;
+        assert!(!r.commit_checkpoint_superblock());
+        assert!(r.checkpoint_updating());
+        r.commit_dispatch_entered = true;
+        r.drive_superblock();
+        assert!(!r.checkpoint_updating());
+        assert!(!r.commit_dispatch_entered);
+        assert_eq!(r.op_checkpoint(), next_2);
+
+        let references_2 = r.superblock.as_ref().expect("mounted").working().manifest_references();
+        assert!(references_2.block_count >= 1);
+        assert!(references_2.oldest_address > 0);
+        assert!(references_2.newest_address > 0);
     }
 
     #[test]
