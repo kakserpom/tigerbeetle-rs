@@ -949,6 +949,66 @@ impl Replica {
         }
     }
 
+    /// The release the *next* checkpoint will be created under: `None` while the
+    /// next checkpoint is too far away to know, the running release when a
+    /// non-upgrade op precedes the last bar before the trigger, and the
+    /// in-flight upgrade release when (and only when) the entire last bar
+    /// before the trigger consists of upgrade ops.
+    ///
+    /// A mixed bar (upgrade and non-upgrade ops) is never allowed to advance
+    /// the checkpoint release: a non-upgrade op replayed after resuming under
+    /// the new release could produce a different result than the release that
+    /// originally executed it.
+    ///
+    /// Upstream: `src/vsr/replica.zig:10907` (`release_for_next_checkpoint`).
+    #[must_use]
+    fn release_for_next_checkpoint(&self) -> Option<crate::multiversion::Release> {
+        // The running release (pinned to `Release::MINIMUM` sans-IO) must match
+        // the release the last checkpoint was created under (upstream asserts).
+        // DEVIATION: upstream always has a superblock; an unmounted sans-IO
+        // replica is equivalent to the pre-open root state, whose checkpoint
+        // release is the minimum.
+        assert_eq!(
+            crate::multiversion::Release::MINIMUM.value,
+            self.superblock.as_ref().map_or_else(
+                || crate::multiversion::Release::MINIMUM.value,
+                |sb| sb.working().vsr_state.checkpoint.release.value,
+            )
+        );
+
+        if self.commit_min < self.op_checkpoint_next_trigger() {
+            return None;
+        }
+
+        let mut found_upgrade = 0;
+        for op in (self.op_checkpoint_next() + 1)..=self.op_checkpoint_next_trigger() {
+            let Some(header) = self.journal.header_for_op(op) else {
+                panic!("the bar preceding the trigger is journaled (upstream `header_for_op(op)`)")
+            };
+            assert_ne!(header.operation, crate::Operation::RESERVED);
+
+            if header.operation == crate::Operation::UPGRADE {
+                found_upgrade += 1;
+            } else {
+                // Only allow the next checkpoint's release to advance if the entire
+                // last bar preceding the checkpoint trigger consists of
+                // operation=upgrade.
+                //
+                // Otherwise we would risk the following:
+                // 1. Execute op=X in the state machine on version v1.
+                // 2. Upgrade, checkpoint, restart.
+                // 3. Replay op=X when recovering from checkpoint on v2.
+                // If v1 and v2 produce different results when executing op=X, then
+                // an assertion will trip (as v2's reply doesn't match v1's).
+                assert_eq!(found_upgrade, 0);
+                return Some(crate::multiversion::Release::MINIMUM);
+            }
+        }
+        assert_eq!(found_upgrade, constants::LSM_COMPACTION_OPS);
+        assert!(self.upgrade_release.is_some(), "an all-upgrade bar needs an in-flight upgrade");
+        self.upgrade_release
+    }
+
     /// The largest op for which this replica may send a PrepareOk.
     ///
     /// A replica must not acknowledge prepares beyond the checkpoint-quorum
@@ -1815,10 +1875,23 @@ impl Replica {
                 self.send_request_pulse_to_self();
             }
 
-            // TODO(port): upstream re-drives an in-flight upgrade by sending
-            // upgrade-to-self until `release_for_next_checkpoint` advances
-            // (replica.zig:4913-4944). Deferred: `release_for_next_checkpoint`
-            // needs the Phase-3 multiversion grid.
+            // Re-drive an in-flight upgrade (upstream: replica.zig:4927-4939):
+            // send the upgrade to self again while the next checkpoint's release
+            // is not yet known to advance — either too far below the trigger, or
+            // a non-upgrade op precedes the trigger's bar (so the next
+            // checkpoint stays on the running release). Once the entire bar
+            // before the trigger is upgrade ops, the next checkpoint crosses to
+            // the new release and the re-drive stops.
+            if let Some(upgrade_release) = self.upgrade_release {
+                assert!(upgrade_release.value > crate::multiversion::Release::MINIMUM.value);
+                assert!(!self.pulse_enabled());
+                let release_next = self.release_for_next_checkpoint();
+                if release_next.is_none_or(|release| {
+                    release.value == crate::multiversion::Release::MINIMUM.value
+                }) {
+                    self.send_request_upgrade_to_self();
+                }
+            }
         }
     }
 
@@ -4445,6 +4518,34 @@ impl Replica {
         let result = self.primary_pipeline_prepare(0, 0, crate::Operation::PULSE, &[], 0);
         assert!(result.is_ok(), "pulse must be preparable");
         assert!(self.pipeline_queue.contains_operation(crate::Operation::PULSE));
+    }
+
+    /// Re-drive an in-flight upgrade by preparing the upgrade again on behalf of
+    /// the cluster, carrying the release it will restart into (upstream
+    /// `send_request_upgrade_to_self`, replica.zig:11416).
+    ///
+    /// Unlike the pulse, a queued upgrade is allowed upstream (`maybe`), so no
+    /// exclusivity assert guards the pipeline.
+    fn send_request_upgrade_to_self(&mut self) {
+        assert_eq!(self.status, Status::Normal);
+        assert!(self.is_primary());
+        assert!(!self.view_durable_updating());
+        // The running release is pinned to `Release::MINIMUM` sans-IO (upstream:
+        // `assert(self.upgrade_release.?.value > self.release.value)`).
+        let Some(upgrade_release) = self.upgrade_release else {
+            panic!("an in-flight upgrade (upstream `self.upgrade_release.?`)")
+        };
+        assert!(upgrade_release.value > crate::multiversion::Release::MINIMUM.value);
+
+        // The `UpgradeRequest` body the op commits and replays after restarting
+        // into the new release (upstream: `send_request_to_self(.upgrade,
+        // std.mem.asBytes(&vsr.UpgradeRequest{ .release = self.upgrade_release.? }))`.
+        let mut body = vec![0_u8; size_of::<crate::UpgradeRequest>()];
+        body[..4].copy_from_slice(&upgrade_release.value.to_le_bytes());
+
+        let result = self.primary_pipeline_prepare(0, 0, crate::Operation::UPGRADE, &body, 0);
+        assert!(result.is_ok(), "the upgrade must be preparable");
+        assert!(self.pipeline_queue.contains_operation(crate::Operation::UPGRADE));
     }
 
     /// Periodic state-machine pulse driver (upstream `on_pulse_timeout`,
@@ -10156,6 +10257,45 @@ mod tests {
         header
     }
 
+    /// A checksum-valid Upgrade prepare carrying a full `UpgradeRequest` body.
+    fn make_upgrade_prepare_for_replica(
+        cluster: u128,
+        view: u32,
+        op: u64,
+        parent: u128,
+        commit: u64,
+        release: crate::multiversion::Release,
+    ) -> message_header::Prepare {
+        assert!(op > commit);
+        let body = upgrade_request_body(release);
+        let mut header = message_header::Prepare {
+            cluster,
+            view,
+            op,
+            parent,
+            commit,
+            release: crate::multiversion::Release::MINIMUM,
+            client: 0,
+            timestamp: op,
+            request: 0,
+            operation: crate::Operation::UPGRADE,
+            size: message_header::SIZE_U32
+                + u32::try_from(body.len()).unwrap_or_else(|_| unreachable!()),
+            ..message_header::Prepare::default()
+        };
+        header.set_checksum_body(&body);
+        header.set_checksum();
+        header
+    }
+
+    /// The wire bytes of an `UpgradeRequest` for `release` (release u32 LE + 12
+    /// zeroed reserved bytes).
+    fn upgrade_request_body(release: crate::multiversion::Release) -> Vec<u8> {
+        let mut body = vec![0_u8; size_of::<crate::UpgradeRequest>()];
+        body[..4].copy_from_slice(&release.value.to_le_bytes());
+        body
+    }
+
     /// Deliver a Prepare through the full dispatch path (`on_message`).
     fn deliver_prepare(r: &mut Replica, prepare: &message_header::Prepare) {
         let mut message = crate::message::Message::new();
@@ -12258,6 +12398,120 @@ mod tests {
 
         assert_eq!(r.commit_min, 1);
         assert_eq!(r.upgrade_release, Some(release));
+        // The commit-tail re-drive (replica.zig:4927-4939): with `commit_min`
+        // below the next checkpoint trigger, the next checkpoint's release is
+        // not yet known, so the upgrade is sent to self again for op 2.
+        assert_eq!(r.pipeline_queue.prepare_queue.len(), 1);
+        assert_eq!(r.pipeline_queue.prepare_queue[0].op, 2);
+        assert_eq!(r.pipeline_queue.prepare_queue[0].operation, crate::Operation::UPGRADE);
+        assert!(r.pipeline_queue.contains_operation(crate::Operation::UPGRADE));
+    }
+
+    /// Helper: `release_for_next_checkpoint`'s scan over the bar preceding the
+    /// trigger runs only past the trigger, which needs `commit_min`/
+    /// `op_checkpoint` far past the mounted checkpoint. Returns the (mounted)
+    /// replica with the journal's bar ops seeded and committed up to the
+    /// trigger.
+    fn replica_past_next_checkpoint_trigger(
+        bar_ops: &[(u64, crate::Operation)],
+        upgrade_release: Option<crate::multiversion::Release>,
+    ) -> Replica {
+        let first_checkpoint = constants::VSR_CHECKPOINT_OPS as u64 - 1;
+        let next = first_checkpoint + constants::VSR_CHECKPOINT_OPS as u64;
+        let trigger = next + constants::LSM_COMPACTION_OPS as u64;
+
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        r.status = Status::Normal;
+        r.upgrade_release = upgrade_release;
+        let (sb, st) = opened_superblock_at_op(first_checkpoint);
+        r.mount_superblock(sb, st);
+
+        // Deliver the bar's prepares (already past the mounted checkpoint) to the
+        // journal; `set_header_as_dirty` installs them directly.
+        for &(op, operation) in bar_ops {
+            let header = if operation == crate::Operation::UPGRADE {
+                make_upgrade_prepare_for_replica(
+                    CLUSTER,
+                    0,
+                    op,
+                    0,
+                    0,
+                    upgrade_release.expect("bar upgrades need the recorded release"),
+                )
+            } else {
+                let mut header = make_prepare_for_replica(CLUSTER, 0, op, 0, 0);
+                header.operation = operation;
+                header.set_checksum_body(&[]);
+                header.set_checksum();
+                header
+            };
+            r.journal.set_header_as_dirty(&header);
+        }
+
+        r.commit_min = trigger;
+        r.commit_max = trigger;
+        r.op = trigger;
+        r
+    }
+
+    #[test]
+    fn release_for_next_checkpoint_none_below_trigger() {
+        // An unmounted fresh replica: `op_checkpoint() == 0`, next checkpoint op
+        // `VSR_CHECKPOINT_OPS - 1`, and its trigger sits just above that. With
+        // `commit_min` below the trigger the scan cannot run, so the next
+        // checkpoint's release is unknown.
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        r.status = Status::Normal;
+        let trigger = r.op_checkpoint_next_trigger();
+        r.commit_min = trigger - 1;
+        r.op = trigger - 1;
+
+        assert_eq!(r.release_for_next_checkpoint(), None);
+    }
+
+    #[test]
+    fn release_for_next_checkpoint_returns_upgrade_when_last_bar_all_upgrade() {
+        let release =
+            crate::multiversion::Release::from_triple(crate::multiversion::ReleaseTriple {
+                major: 0,
+                minor: 0,
+                patch: 2,
+            });
+        let first_checkpoint = constants::VSR_CHECKPOINT_OPS as u64 - 1;
+        let next = first_checkpoint + constants::VSR_CHECKPOINT_OPS as u64;
+
+        let bar_ops = (next + 1..=next + constants::LSM_COMPACTION_OPS as u64)
+            .map(|op| (op, crate::Operation::UPGRADE))
+            .collect::<Vec<_>>();
+        let r = replica_past_next_checkpoint_trigger(&bar_ops, Some(release));
+
+        // The entire last bar before the trigger is upgrade ops, so the next
+        // checkpoint advances to the in-flight upgrade release.
+        assert_eq!(r.release_for_next_checkpoint(), Some(release));
+    }
+
+    #[test]
+    fn release_for_next_checkpoint_returns_running_release_when_bar_not_all_upgrade() {
+        let release =
+            crate::multiversion::Release::from_triple(crate::multiversion::ReleaseTriple {
+                major: 0,
+                minor: 0,
+                patch: 2,
+            });
+        let first_checkpoint = constants::VSR_CHECKPOINT_OPS as u64 - 1;
+        let next = first_checkpoint + constants::VSR_CHECKPOINT_OPS as u64;
+        let trigger = next + constants::LSM_COMPACTION_OPS as u64;
+
+        // A non-upgrade op within the bar preceding the trigger: the next
+        // checkpoint must stay on the running release (it would be replayed by
+        // a different release otherwise). The non-upgrade op appears first, so
+        // `found_upgrade == 0` holds upstream as well.
+        let mut bar_ops =
+            (next + 1..=trigger).map(|op| (op, crate::Operation::UPGRADE)).collect::<Vec<_>>();
+        bar_ops[0] = (next + 1, crate::Operation::NOOP);
+        let r = replica_past_next_checkpoint_trigger(&bar_ops, Some(release));
+
+        assert_eq!(r.release_for_next_checkpoint(), Some(crate::multiversion::Release::MINIMUM));
     }
 
     #[test]
