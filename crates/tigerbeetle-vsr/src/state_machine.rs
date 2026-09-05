@@ -42,8 +42,10 @@ use tigerbeetle_lsm::tree::ScopeCloseMode;
 
 use crate::Operation;
 use crate::forest::Forest;
+use crate::message_header::checksum_body_empty;
 use crate::objects_cache::ObjectsCache;
 use crate::storage::Storage;
+use crate::superblock::{FreeSetReferences, ManifestReferences, TrailerReference};
 
 // ---------------------------------------------------------------------------
 // Query reply limits
@@ -2135,6 +2137,78 @@ impl StateMachine {
         true
     }
 
+    /// Checkpoint the forest, flushing the manifest log and free set durably,
+    /// and return the references to persist into the superblock checkpoint
+    /// trailer.
+    ///
+    /// Upstream: `state_machine.zig:2937` (`checkpoint` → `forest.checkpoint`).
+    /// The forest checkpoint flushes every pending manifest-log block, runs the
+    /// grid free-set checkpoint, and restores the manifest log's grid
+    /// reservation; the returned `manifest_references` and `free_set_references`
+    /// are the reopen inputs for a later `Forest::open`.
+    ///
+    /// DEVIATION: upstream joins the state-machine / aof / client-sessions /
+    /// client-replies checkpoint callbacks asynchronously; sans-IO this pumps the
+    /// forest checkpoint to completion inline (the callback fires once the
+    /// manifest flush and free-set checkpoint have both traversed `poll`). The
+    /// aof, client-sessions and client-replies checkpoints are delegated by the
+    /// replica's `commit_checkpoint_data`.
+    ///
+    /// DEVIATION: without a mounted forest this returns empty references (the
+    /// stands-in HashMap stores have nothing to persist), matching the
+    /// pre-forest behavior of the checkpoint stages.
+    ///
+    /// # Panics
+    /// Panics if a forest is mounted but `storage` is `None` (the forest needs a
+    /// backing store to flush against), or if the forest checkpoint does not
+    /// complete within a bounded number of polls.
+    #[must_use]
+    pub fn checkpoint(
+        &mut self,
+        storage: Option<&mut dyn Storage>,
+    ) -> (ManifestReferences, FreeSetReferences) {
+        let empty_reference = TrailerReference {
+            checksum: checksum_body_empty(),
+            last_block_address: 0,
+            last_block_checksum: 0,
+            trailer_size: 0,
+        };
+        let Some(forest) = self.forest.as_mut() else {
+            return (
+                ManifestReferences::default(),
+                FreeSetReferences {
+                    blocks_acquired: empty_reference,
+                    blocks_released: empty_reference,
+                },
+            );
+        };
+        let storage = storage.expect("checkpoint() requires storage when a forest is mounted");
+
+        let done = std::rc::Rc::new(std::cell::Cell::new(false));
+        forest.checkpoint(
+            {
+                let done = done.clone();
+                move || done.set(true)
+            },
+            storage,
+        );
+        let mut polls = 0;
+        while !done.get() {
+            forest.poll(storage);
+            polls += 1;
+            assert!(polls < 1000, "forest checkpoint must complete");
+        }
+        assert!(forest.is_idle());
+
+        let manifest_references = forest.manifest_log.checkpoint_references();
+        let grid_references = forest.grid.free_set_checkpoint_references();
+        let free_set_references = FreeSetReferences {
+            blocks_acquired: grid_references.blocks_acquired,
+            blocks_released: grid_references.blocks_released,
+        };
+        (manifest_references, free_set_references)
+    }
+
     /// Record that an op was executed against the state machine.
     ///
     /// DEVIATION: upstream threads the operation and its body through
@@ -3333,7 +3407,7 @@ mod tests {
     use tigerbeetle_lsm::compaction;
 
     use crate::Zone;
-    use crate::grid::{GridOptions, SuperBlockView};
+    use crate::grid::{GridOpenReferences, GridOptions, SuperBlockView};
     use crate::multiversion::Release;
     use crate::storage::MemoryStorage;
     use crate::superblock::DATA_FILE_SIZE_MIN;
@@ -3464,6 +3538,79 @@ mod tests {
     fn state_machine_compact_without_forest_is_ready() {
         let mut state_machine = StateMachine::default();
         assert!(state_machine.compact(1, None));
+    }
+
+    /// Open the forest to completion, mirroring `forest::tests::open_forest`.
+    fn open_forest(forest: &mut Forest, storage: &mut MemoryStorage) {
+        let empty = TrailerReference {
+            checksum: checksum_body_empty(),
+            last_block_address: 0,
+            last_block_checksum: 0,
+            trailer_size: 0,
+        };
+        forest.open(
+            GridOpenReferences { blocks_acquired: empty, blocks_released: empty },
+            storage,
+            0,
+        );
+        let mut done = false;
+        for _ in 0..1000 {
+            forest.poll(storage);
+            if forest.accounts.objects.is_opened() && forest.is_idle() {
+                done = true;
+                break;
+            }
+        }
+        assert!(done, "open must complete");
+    }
+
+    /// `StateMachine::checkpoint` flushes a mounted forest's manifest log and free set, and
+    /// returns the real manifest / free-set references for the superblock checkpoint trailer.
+    ///
+    /// Mirrors `forest::tests::forest_checkpoint`, seeded through the full-bar L0 flush so the
+    /// checkpoint has a real manifest block to flush.
+    #[test]
+    fn state_machine_checkpoint_flushes_real_manifest_and_free_set_references() {
+        let mut state_machine = StateMachine::default();
+        state_machine.mount_forest(Forest::init(test_superblock(), forest_grid_options(), 32));
+        let mut storage = forest_storage();
+        open_forest(state_machine.forest.as_mut().expect("forest mounted"), &mut storage);
+
+        // Seed an *unflushed* immutable table, then run a full bar so the level-0 driver
+        // flushes it to a real table (appending a manifest entry) before the checkpoint.
+        {
+            let forest = state_machine.forest.as_mut().expect("forest mounted");
+            forest.accounts.objects.put(&Account { id: 3, timestamp: 3, ..Account::default() });
+            forest.accounts.objects.put(&Account { id: 5, timestamp: 5, ..Account::default() });
+            forest.accounts.objects.compact(&mut forest.accounts_scratch.objects);
+            forest
+                .accounts
+                .objects
+                .swap_mutable_and_immutable(1, &mut forest.accounts_scratch.objects);
+        }
+        let bar_ops = constants::LSM_COMPACTION_OPS as u64;
+        let bar_start = compaction::HALF_BAR_BEAT_COUNT as u64 * 2;
+        for op in bar_start..bar_start + bar_ops {
+            assert!(state_machine.compact(op, Some(&mut storage)));
+        }
+
+        let (manifest_references, free_set_references) =
+            state_machine.checkpoint(Some(&mut storage));
+        assert!(manifest_references.block_count >= 1);
+        assert!(manifest_references.oldest_address > 0);
+        assert!(manifest_references.newest_address > 0);
+        assert!(!free_set_references.blocks_acquired.empty());
+    }
+
+    /// Without a mounted forest (the default), `StateMachine::checkpoint` is a no-op that
+    /// returns empty references — the superblock's "nothing to persist" checkpoint.
+    #[test]
+    fn state_machine_checkpoint_without_forest_returns_empty_references() {
+        let mut state_machine = StateMachine::default();
+        let (manifest_references, free_set_references) = state_machine.checkpoint(None);
+        assert!(manifest_references.empty());
+        assert!(free_set_references.blocks_acquired.empty());
+        assert!(free_set_references.blocks_released.empty());
     }
 
     // ── prefetch key-set tests ──────────────────────────────────────────

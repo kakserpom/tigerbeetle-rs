@@ -100,6 +100,11 @@ pub struct Replica {
     pub commit_stage: CommitStage,
     /// Whether commit_dispatch is currently executing (reentrancy guard).
     pub commit_dispatch_entered: bool,
+    /// Checkpoint references produced by `commit_checkpoint_data` (the state-machine
+    /// / forest checkpoint) for `commit_checkpoint_superblock` to persist. `None`
+    /// until a checkpoint-boundary commit reaches the CheckpointData stage.
+    checkpoint_manifest_references: Option<crate::superblock::ManifestReferences>,
+    checkpoint_free_set_references: Option<crate::superblock::FreeSetReferences>,
 
     // ── Subsystems ───────────────────────────────────────────────────────
     /// The write-ahead log (WAL): suspend slot geometry, header ring, dirty/
@@ -517,6 +522,8 @@ impl Replica {
             commit_prepare: None,
             commit_stage: CommitStage::Idle,
             commit_dispatch_entered: false,
+            checkpoint_manifest_references: None,
+            checkpoint_free_set_references: None,
             ping_timeout: Timeout::default(),
             prepare_timeout: Timeout::default(),
             commit_message_timeout: Timeout::default(),
@@ -1929,10 +1936,35 @@ impl Replica {
 
     /// Stage: CheckpointData — persist the current state to disk.
     ///
+    /// At the checkpoint trigger, checkpoints the client-replies groove and the
+    /// state machine's forest (flushing every pending manifest-log block and the
+    /// grid free set), then stashes the produced manifest / free-set references
+    /// for [`Self::commit_checkpoint_superblock`] to persist. Below the trigger it
+    /// is a no-op.
+    ///
     /// Upstream: `src/vsr/replica.zig:4989` (`commit_checkpoint_data`).
-    fn commit_checkpoint_data(&self) -> bool {
+    fn commit_checkpoint_data(&mut self) -> bool {
         assert_eq!(self.commit_stage, CommitStage::CheckpointData);
-        // TODO(port): checkpoint_data — async. For now, ready.
+        let op = self
+            .commit_prepare
+            .unwrap_or_else(|| panic!("commit_checkpoint_data requires commit_prepare"));
+        assert_eq!(op, self.commit_min);
+        assert!(op <= self.op_checkpoint_next_trigger());
+        if op < self.op_checkpoint_next_trigger() {
+            return true; // Not yet at a checkpoint: nothing to persist.
+        }
+
+        // DEVIATION: upstream checkpoints the aof and the client-sessions grove
+        // here too (replica.zig:5031-5039), encoding client sessions into a
+        // checkpoint trailer; the sans-IO port has no aof and keeps client
+        // sessions in-memory, so the `client_sessions_reference` stays empty.
+        self.client_replies.checkpoint();
+
+        let (state_machine, storage) = (&mut self.state_machine, self.grid_storage.as_mut());
+        let (manifest_references, free_set_references) =
+            state_machine.checkpoint(storage.map(|s| s as &mut dyn Storage));
+        self.checkpoint_manifest_references = Some(manifest_references);
+        self.checkpoint_free_set_references = Some(free_set_references);
         true
     }
 
@@ -1971,30 +2003,37 @@ impl Replica {
             .header_with_op(vsr_state_commit_min)
             .unwrap_or_else(|| panic!("journal must contain the op of the upcoming checkpoint"));
 
-        // DEVIATION (Phase 3): `view_attributes` (view_headers population),
-        // `sync_op_*` (state sync), the manifest / free-set / client-sessions
-        // reference blocks, and the grid free-set sizing are all deferred to
-        // later phases. The update is issued with `view_attributes = None`,
-        // `sync_op_* = 0`, empty references, and the minimum storage size —
-        // which the superblock accepts because the free-set references are empty.
-        let storage_size = crate::superblock::DATA_FILE_SIZE_MIN as u64;
+        // DEVIATION (Phase 3): `view_attributes` (view_headers population) and `sync_op_*`
+        // (state sync) are deferred to later phases; the update is issued with
+        // `view_attributes = None` and `sync_op_* = 0`. The client-sessions reference is
+        // kept in-memory (empty trailer). The manifest / free-set references come from
+        // `commit_checkpoint_data`'s forest checkpoint, falling back to an empty
+        // checkpoint when no forest is mounted.
         let empty_reference = crate::superblock::TrailerReference {
             checksum: message_header::checksum_body_empty(),
             last_block_address: 0,
             last_block_checksum: 0,
             trailer_size: 0,
         };
+        let manifest_references = self.checkpoint_manifest_references.take().unwrap_or_default();
+        let free_set_references = self.checkpoint_free_set_references.take().unwrap_or(
+            crate::superblock::FreeSetReferences {
+                blocks_acquired: empty_reference,
+                blocks_released: empty_reference,
+            },
+        );
+        // Upstream: `vsr/replica.zig:5142-5160` — `storage_size` grows with the free set's
+        // highest acquired grid address (the last block the acquired free-set trailer spans).
+        let storage_size = crate::superblock::DATA_FILE_SIZE_MIN as u64
+            + free_set_references.blocks_acquired.last_block_address * constants::BLOCK_SIZE as u64;
         let update = crate::superblock::UpdateCheckpoint {
             header,
             view_attributes: None,
             commit_max: self.commit_max,
             sync_op_min: 0,
             sync_op_max: 0,
-            manifest_references: crate::superblock::ManifestReferences::default(),
-            free_set_references: crate::superblock::FreeSetReferences {
-                blocks_acquired: empty_reference,
-                blocks_released: empty_reference,
-            },
+            manifest_references,
+            free_set_references,
             client_sessions_reference: empty_reference,
             storage_size,
             release: crate::multiversion::Release::MINIMUM,
@@ -5707,15 +5746,20 @@ mod tests {
 
     use super::*;
     use crate::Zone;
-    use crate::grid::GridOptions;
+    use crate::forest::Forest;
+    use crate::forest::forest_pace;
+    use crate::grid::{GridOpenReferences, GridOptions, SuperBlockView};
     use crate::message::Message;
     use crate::message_header::BlockType;
     use crate::multiversion::Release;
+    use crate::superblock::DATA_FILE_SIZE_MIN;
     use tigerbeetle_core::constants::BLOCK_SIZE;
     use tigerbeetle_core::types::{Account, CreateAccountStatus, CreateTransferStatus, Transfer};
+    use tigerbeetle_lsm::compaction;
     use tigerbeetle_lsm::free_set::SHARD_BITS;
 
     const CLUSTER: u128 = 0xDEAD;
+    const FREE_SET_BLOCKS: usize = 1024;
 
     fn test_grid() -> Grid {
         Grid::new(GridOptions {
@@ -10817,10 +10861,20 @@ mod tests {
     }
 
     /// Build an opened, checkpointed superblock whose working checkpoint holds
-    /// `op`, via the public format → open → checkpoint API.
-    /// An opened superblock formatted to `op`, alongside the storage it was
-    /// opened against (so it can be mounted and driven).
+    /// Format and open a fresh superblock whose checkpoint lives at `op`, via the public
+    /// format → open → checkpoint API, backed by `storage_limit`-sized storage (the
+    /// minimum-compatible size, see `opened_superblock_in_storage`).
     fn opened_superblock_at_op(op: u64) -> (crate::superblock::SuperBlock, MemoryStorage) {
+        opened_superblock_in_storage(op, crate::superblock::DATA_FILE_SIZE_MIN as u64)
+    }
+
+    /// Like `opened_superblock_at_op`, but with the superblock formatted into a
+    /// `storage_limit`-sized storage. A larger limit leaves room for the checkpoint to grow
+    /// `storage_size` past the minimum once the grid ends up with a non-empty free set.
+    fn opened_superblock_in_storage(
+        op: u64,
+        storage_limit: u64,
+    ) -> (crate::superblock::SuperBlock, MemoryStorage) {
         use crate::superblock::{
             Event, FormatOptions, FreeSetReferences, ManifestReferences, TrailerReference,
             UpdateCheckpoint,
@@ -10833,10 +10887,8 @@ mod tests {
             trailer_size: 0,
         };
 
-        let mut storage =
-            crate::storage::MemoryStorage::new(crate::superblock::DATA_FILE_SIZE_MIN as u64);
-        let mut sb =
-            crate::superblock::SuperBlock::new(crate::superblock::DATA_FILE_SIZE_MIN as u64);
+        let mut storage = crate::storage::MemoryStorage::new(storage_limit);
+        let mut sb = crate::superblock::SuperBlock::new(storage_limit);
         sb.format(
             &mut storage,
             FormatOptions {
@@ -10989,6 +11041,138 @@ mod tests {
         r.drive_superblock();
         assert!(!r.checkpoint_updating());
         assert_eq!(r.op_checkpoint(), next);
+    }
+
+    /// A fresh `SuperBlockView` for the replica-level forest, matching the mounted
+    /// superblock's cluster/release/storage-size (nothing to reload from disk yet).
+    fn replica_forest_view() -> SuperBlockView {
+        SuperBlockView {
+            cluster: CLUSTER,
+            release: Release::MINIMUM,
+            storage_size: DATA_FILE_SIZE_MIN as u64,
+            manifest_block_count: 0,
+            manifest_oldest_address: 0,
+            manifest_oldest_checksum: 0,
+            manifest_newest_address: 0,
+            manifest_newest_checksum: 0,
+            op_compacted: false,
+        }
+    }
+
+    /// Grid options for a replica-mounted forest, mirroring `forest::tests::grid_options`.
+    fn replica_forest_grid_options() -> GridOptions {
+        let pace = forest_pace();
+        GridOptions {
+            cache_blocks_count: 256,
+            stash_blocks_count: 2 * pace.blocks_count() as usize + 2 + 256,
+            read_iops_max: 2,
+            write_iops_max: 2,
+            free_set_blocks_count: None,
+            free_set_blocks_capacity: Some(FREE_SET_BLOCKS),
+        }
+    }
+
+    fn replica_forest_storage_size() -> u64 {
+        Zone::Grid.start() + FREE_SET_BLOCKS as u64 * BLOCK_SIZE as u64
+    }
+
+    fn replica_forest_storage() -> MemoryStorage {
+        MemoryStorage::new(replica_forest_storage_size())
+    }
+
+    /// Open a forest to completion against `storage`, mirroring `forest::tests::open_forest`.
+    fn open_forest(forest: &mut Forest, storage: &mut MemoryStorage) {
+        let empty = crate::superblock::TrailerReference {
+            checksum: message_header::checksum_body_empty(),
+            last_block_address: 0,
+            last_block_checksum: 0,
+            trailer_size: 0,
+        };
+        forest.open(
+            GridOpenReferences { blocks_acquired: empty, blocks_released: empty },
+            storage,
+            0,
+        );
+        let mut done = false;
+        for _ in 0..1000 {
+            forest.poll(storage);
+            if forest.accounts.objects.is_opened() && forest.is_idle() {
+                done = true;
+                break;
+            }
+        }
+        assert!(done, "open must complete");
+    }
+
+    /// End-to-end checkpoint-data wiring: `commit_checkpoint_data` drives the mounted
+    /// forest's checkpoint and stashes the produced manifest / free-set references, then
+    /// `commit_checkpoint_superblock` persists them into the superblock checkpoint trailer.
+    ///
+    /// Seeds a real level-0 table (put → compact → swap, then a full compaction bar through
+    /// `Forest::compact`) so the checkpoint has a real manifest block to flush; the persisted
+    /// `manifest_references` must then be non-empty.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn checkpoint_data_persists_state_machine_manifest_references() {
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        let first_checkpoint = constants::VSR_CHECKPOINT_OPS as u64 - 1;
+        let (sb, st) =
+            opened_superblock_in_storage(first_checkpoint, replica_forest_storage_size());
+        r.mount_superblock(sb, st);
+        assert_eq!(r.op_checkpoint(), first_checkpoint);
+
+        // Bring `commit_min`/`op` up to the mounted checkpoint so the checkpoint
+        // boundary helpers hold, then derive the upcoming checkpoint / trigger.
+        r.commit_min = first_checkpoint;
+        r.op = first_checkpoint;
+        let next = r.op_checkpoint_next();
+        let trigger = r.op_checkpoint_next_trigger();
+
+        // Seed + flush a real level-0 table into the manifest *before* handing the forest to
+        // the state machine, so `commit_checkpoint_data` has a real manifest block to flush.
+        let mut forest = Forest::init(replica_forest_view(), replica_forest_grid_options(), 32);
+        let mut storage = replica_forest_storage();
+        open_forest(&mut forest, &mut storage);
+        forest.accounts.objects.put(&Account { id: 3, timestamp: 3, ..Account::default() });
+        forest.accounts.objects.put(&Account { id: 5, timestamp: 5, ..Account::default() });
+        forest.accounts.objects.compact(&mut forest.accounts_scratch.objects);
+        forest.accounts.objects.swap_mutable_and_immutable(1, &mut forest.accounts_scratch.objects);
+        let bar_ops = constants::LSM_COMPACTION_OPS as u64;
+        let bar_start = compaction::HALF_BAR_BEAT_COUNT as u64 * 2;
+        for op in bar_start..bar_start + bar_ops {
+            forest.compact(op, &mut storage);
+        }
+        r.state_machine.mount_forest(forest);
+        r.grid_storage = Some(storage);
+
+        // The upcoming checkpoint's prepare (at `next`) lives in the journal.
+        let header = make_prepare_for_replica(CLUSTER, 0, next, 0, 0);
+        r.journal.set_header_as_dirty(&header);
+
+        r.commit_min = trigger;
+        r.commit_max = trigger;
+        r.op = trigger;
+        r.commit_prepare = Some(trigger);
+        r.commit_stage = CommitStage::CheckpointData;
+
+        // The checkpoint-data stage drives the forest checkpoint and returns ready.
+        assert!(r.commit_checkpoint_data());
+        assert!(r.checkpoint_manifest_references.is_some());
+        assert!(r.checkpoint_free_set_references.is_some());
+
+        // The superblock checkpoint persists those references.
+        r.commit_stage = CommitStage::CheckpointSuperblock;
+        assert!(!r.commit_checkpoint_superblock());
+        assert!(r.checkpoint_updating());
+        r.drive_superblock();
+        assert!(!r.checkpoint_updating());
+        assert_eq!(r.op_checkpoint(), next);
+
+        let references = r.superblock.as_ref().expect("mounted").working().manifest_references();
+        assert!(references.block_count >= 1);
+        assert!(references.oldest_address > 0);
+        assert!(references.newest_address > 0);
+        assert_eq!(references.oldest_checksum, references.newest_checksum);
     }
 
     #[test]

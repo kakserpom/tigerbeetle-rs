@@ -165,6 +165,11 @@ impl Forest {
         self.progress = Some(ForestProgress::Open { checkpoint_op, replayed });
     }
 
+    /// Whether the forest is idle (no open or checkpoint in flight).
+    pub(crate) fn is_idle(&self) -> bool {
+        self.progress.is_none()
+    }
+
     /// Drive the grid and manifest log toward their pending completion.
     ///
     /// * **Open:** once the manifest log finishes reading, each groove's `open_complete` is
