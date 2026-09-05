@@ -161,6 +161,10 @@ pub struct Replica {
     /// [`Self::grid_storage`] (see the field's DEVIATION note); reads are
     /// deferred until the GetReply handler is ported.
     pub client_replies: crate::client_replies::ClientReplies,
+    /// The cluster's in-flight upgrade: the release committed by a `.upgrade`
+    /// op that this replica has committed but not yet restarted into
+    /// (upstream `upgrade_release`).
+    pub upgrade_release: Option<crate::multiversion::Release>,
 
     // ── Timeouts (tick counts) ──────────────────────────────────────────
     pub ping_timeout: Timeout,
@@ -553,6 +557,7 @@ impl Replica {
             client_send_queue: Vec::new(),
             client_sessions: crate::client_sessions::ClientSessions::new(),
             client_replies: crate::client_replies::ClientReplies::new(replica_index as u8),
+            upgrade_release: None,
             // Upstream boots from a superblock whose checkpoint holds the root
             // prepare at op 0; a fresh replica's JV always includes it.
             join_view_headers: vec![message_header::Prepare::root(cluster)],
@@ -1709,19 +1714,28 @@ impl Replica {
             let src_body = self.journal.body_with_op(op).map_or_else(Vec::new, ToOwned::to_owned);
             self.state_machine.execute(prepare.operation, prepare.timestamp, &src_body)
         } else {
+            // While an upgrade is in flight, no operation other than `.upgrade`
+            // may be committed (upstream replica.zig:5352).
+            assert!(
+                self.upgrade_release.is_none() || prepare.operation == crate::Operation::UPGRADE,
+                "no operations commit during an in-flight upgrade"
+            );
             let src_body = self.journal.body_with_op(op).map_or_else(Vec::new, ToOwned::to_owned);
             // vsr-reserved ops still advance the state machine's clock — upstream
             // asserts `commit_timestamp < prepare.timestamp` before its dispatch
             // switch (replica.zig:5441-5445). Of these, only the two
             // client-directed builtins produce a reply body: register echoes the
             // prepare body's `batch_size_limit`, reconfigure echoes the result
-            // the primary recorded when accepting the request.
+            // the primary recorded when accepting the request. Upgrade records
+            // the in-flight release for the post-restart upgrade protocol and
+            // produces no body (the cluster sends it to itself).
             self.state_machine.execute_op(prepare.timestamp);
             match prepare.operation {
                 crate::Operation::REGISTER => Self::execute_op_register(&prepare, &src_body),
                 crate::Operation::RECONFIGURE => {
                     Self::execute_op_reconfiguration(&prepare, &src_body)
                 }
+                crate::Operation::UPGRADE => self.execute_op_upgrade(&prepare, &src_body),
                 _ => Vec::new(),
             }
         };
@@ -1941,6 +1955,55 @@ impl Replica {
         let result = u32::from_le_bytes(bytes.try_into().unwrap_or_else(|_| unreachable!("sized")));
         assert_ne!(result, crate::ReconfigurationResult::Reserved as u32);
         result.to_le_bytes().to_vec()
+    }
+
+    /// The upgrade reply body: none — the cluster sends the upgrade request to
+    /// itself, so there is no client to reply to (upstream `execute_op_upgrade`,
+    /// replica.zig:5620). The op records the committed in-flight release in
+    /// [`Self::upgrade_release`], unless the replica is replaying the request
+    /// after restarting into the new version.
+    ///
+    /// # Panics
+    /// Panics if the prepare is not an upgrade, if a non-empty body is not a
+    /// zeroed-`reserved` `UpgradeRequest` whose release is not below the
+    /// running release (pinned to `Release::MINIMUM` sans-IO), or if a second
+    /// distinct in-flight release is committed while one is already recorded.
+    fn execute_op_upgrade(&mut self, prepare: &message_header::Prepare, body: &[u8]) -> Vec<u8> {
+        assert_eq!(prepare.operation, crate::Operation::UPGRADE);
+        // DEVIATION: upstream asserts `prepare.header.size == @sizeOf(Header) +
+        // @sizeOf(UpgradeRequest)` — an upgrade always carries the full request
+        // body. Sans-IO tests drive body-less upgrades with no in-flight
+        // release; accept that shape without touching `upgrade_release`.
+        if body.is_empty() {
+            assert!(self.upgrade_release.is_none());
+            return Vec::new();
+        }
+        assert_eq!(body.len(), size_of::<crate::UpgradeRequest>());
+        let release_value = u32::from_le_bytes(
+            body[..4].try_into().unwrap_or_else(|_| unreachable!("4-byte prefix")),
+        );
+        assert!(body[4..].iter().all(|&byte| byte == 0), "the upgrade reserved bytes are zeroed");
+        assert!(
+            u64::from(release_value) >= u64::from(crate::multiversion::Release::MINIMUM.value),
+            "the request release is at least the running release"
+        );
+
+        if release_value == crate::multiversion::Release::MINIMUM.value {
+            // Replaying the request after restarting into the new version: the
+            // running release is already the request's release, so there is
+            // nothing to record.
+            assert!(self.upgrade_release.is_none());
+            // DEVIATION: upstream also asserts `prepare.header.op <=
+            // Checkpoint.trigger_for_checkpoint(self.op_checkpoint()).?` — the
+            // replay window's upper bound. Omitted: the sans-IO replica carries
+            // no on-disk checkpoint during unit tests (a `trigger` would be
+            // `None`), so the range check has nothing to anchor to.
+        } else if let Some(upgrade_release) = self.upgrade_release {
+            assert_eq!(upgrade_release.value, release_value, "a second distinct in-flight upgrade");
+        } else {
+            self.upgrade_release = Some(crate::multiversion::Release { value: release_value });
+        }
+        Vec::new()
     }
 
     /// Update a registered client's latest reply on commit.
@@ -11476,6 +11539,109 @@ mod tests {
 
         // A body-less reconfigure yields an empty reply (sans-IO test shape).
         assert!(Replica::execute_op_reconfiguration(&prepare, &[]).is_empty());
+    }
+
+    #[test]
+    fn execute_op_upgrade_records_in_flight_release() {
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        let mut prepare = message_header::Prepare::default();
+        prepare.operation = crate::Operation::UPGRADE;
+
+        // An upgrade to a newer release records the in-flight release; the
+        // reply body is empty (the cluster sends the request to itself).
+        let release =
+            crate::multiversion::Release::from_triple(crate::multiversion::ReleaseTriple {
+                major: 0,
+                minor: 0,
+                patch: 2,
+            });
+        let mut request = vec![0_u8; size_of::<crate::UpgradeRequest>()];
+        request[..4].copy_from_slice(&release.value.to_le_bytes());
+        assert!(r.execute_op_upgrade(&prepare, &request).is_empty());
+        assert_eq!(r.upgrade_release, Some(release));
+
+        // Committing the same request again is tolerated (already upgrading).
+        assert!(r.execute_op_upgrade(&prepare, &request).is_empty());
+        assert_eq!(r.upgrade_release, Some(release));
+
+        // A distinct in-flight release in the same upgrade window panics.
+        let mut other = request;
+        other[..4].copy_from_slice(
+            &crate::multiversion::Release::from_triple(crate::multiversion::ReleaseTriple {
+                major: 0,
+                minor: 0,
+                patch: 3,
+            })
+            .value
+            .to_le_bytes(),
+        );
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            r.execute_op_upgrade(&prepare, &other)
+        }));
+        assert!(panicked.is_err(), "a second distinct in-flight release is rejected");
+    }
+
+    #[test]
+    fn execute_op_upgrade_ignores_replay_of_current_release() {
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        let mut prepare = message_header::Prepare::default();
+        prepare.operation = crate::Operation::UPGRADE;
+
+        // Replaying the request after restarting into the new version: the
+        // running release already equals the request's, so nothing is recorded.
+        let mut request = vec![0_u8; size_of::<crate::UpgradeRequest>()];
+        request[..4].copy_from_slice(&crate::multiversion::Release::MINIMUM.value.to_le_bytes());
+        assert!(r.execute_op_upgrade(&prepare, &request).is_empty());
+        assert_eq!(r.upgrade_release, None);
+
+        // A body-less upgrade (sans-IO test shape) is left unrecorded too.
+        assert!(r.execute_op_upgrade(&prepare, &[]).is_empty());
+        assert_eq!(r.upgrade_release, None);
+    }
+
+    #[test]
+    fn execute_op_upgrade_panics_on_unsupported_release() {
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        let mut prepare = message_header::Prepare::default();
+        prepare.operation = crate::Operation::UPGRADE;
+
+        // A release below the running release (pinned to `Release::MINIMUM`
+        // sans-IO) is rejected.
+        let mut request = vec![0_u8; size_of::<crate::UpgradeRequest>()];
+        request[..4].copy_from_slice(&crate::multiversion::Release::ZERO.value.to_le_bytes());
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            r.execute_op_upgrade(&prepare, &request)
+        }));
+        assert!(panicked.is_err(), "a downgrade request is rejected");
+    }
+
+    #[test]
+    fn commit_path_records_upgrade_release() {
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        r.status = Status::Normal;
+
+        let mut forest = Forest::init(replica_forest_view(), replica_forest_grid_options(), 32);
+        let mut storage = replica_forest_storage();
+        open_forest(&mut forest, &mut storage);
+        r.state_machine.mount_forest(forest);
+        r.grid_storage = Some(storage);
+
+        let release =
+            crate::multiversion::Release::from_triple(crate::multiversion::ReleaseTriple {
+                major: 0,
+                minor: 0,
+                patch: 2,
+            });
+        let mut body = vec![0_u8; size_of::<crate::UpgradeRequest>()];
+        body[..4].copy_from_slice(&release.value.to_le_bytes());
+        let op = r.primary_pipeline_prepare(0, 0, crate::Operation::UPGRADE, &body, 0).unwrap();
+        let checksum = r.journal.header_with_op(op).expect("prepare").checksum();
+        r.on_prepare_ok(op, checksum, 1);
+        r.commit_dispatch_enter();
+        r.poll_client_replies();
+
+        assert_eq!(r.commit_min, 1);
+        assert_eq!(r.upgrade_release, Some(release));
     }
 
     #[test]
