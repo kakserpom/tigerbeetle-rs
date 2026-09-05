@@ -2116,6 +2116,20 @@ impl StateMachine {
         self.forest = Some(forest);
     }
 
+    /// Look up a committed account by id (the temporary primary-key store that
+    /// mirrors the accounts-groove objects cache).
+    #[must_use]
+    pub fn account(&self, id: u128) -> Option<&Account> {
+        self.accounts.get(&id)
+    }
+
+    /// Look up a committed transfer by id (the temporary primary-key store that
+    /// mirrors the transfers-groove objects cache).
+    #[must_use]
+    pub fn transfer(&self, id: u128) -> Option<&Transfer> {
+        self.transfers.get(&id)
+    }
+
     /// Advance the forest's compaction for the given committed op.
     ///
     /// Upstream: `state_machine.zig` `compact` → `forest.compact`. The port's `Forest::compact`
@@ -2229,17 +2243,47 @@ impl StateMachine {
         }
     }
 
-    /// Record that an op was executed against the state machine.
+    /// Record that a vsr-reserved (control-plane) op was executed against the
+    /// state machine.
     ///
-    /// DEVIATION: upstream threads the operation and its body through
-    /// `state_machine.commit`, which executes and returns the reply body size;
-    /// sans-IO the replica executes nothing yet, so this (called from
-    /// `Replica::commit_execute`) only guards and advances the timestamp.
+    /// Upstream threads the operation and its body through `state_machine.commit`;
+    /// sans-IO `Replica::commit_execute` dispatches state-machine operations to
+    /// the operation-specific [`Self::execute`], and routes vsr-reserved ops
+    /// (register, noop, pulse, upgrade, reconfigure) here to advance the clock,
+    /// then uses [`Self::set_commit_timestamp`] for the final assignment.
     ///
     /// # Panics
     /// Panics unless `timestamp` strictly advances `commit_timestamp`.
     pub fn execute_op(&mut self, timestamp: u64) {
         assert!(self.commit_timestamp < timestamp);
+        self.commit_timestamp = timestamp;
+    }
+
+    /// The latest committed timestamp (`state_machine.commit_timestamp`).
+    #[must_use]
+    pub fn commit_timestamp(&self) -> u64 {
+        self.commit_timestamp
+    }
+
+    /// Whether `operation` is a state-machine operation (`≥
+    /// `vsr_operations_reserved``), i.e. one this state machine executes.
+    ///
+    /// The vsr-reserved half of the operation space (register, noop, pulse,
+    /// upgrade, reconfigure) is control-plane business owned by the replica,
+    /// never dispatched to `StateMachine::execute`.
+    #[must_use]
+    pub fn executes(operation: Operation) -> bool {
+        !operation.vsr_reserved()
+    }
+
+    /// Overwrite the committed timestamp after `StateMachine::execute` returns.
+    ///
+    /// `Replica::commit_execute` mirrors upstream's `execute_op`
+    /// (replica.zig:5464-5465): every `StateMachine::execute` variant already
+    /// guarded `commit_timestamp <= timestamp`, and the pure reads leave it
+    /// unchanged — so this final unconditional assignment brings the clock
+    /// exactly to the prepare's timestamp as upstream does.
+    pub fn set_commit_timestamp(&mut self, timestamp: u64) {
         self.commit_timestamp = timestamp;
     }
 
@@ -3521,7 +3565,7 @@ mod tests {
         });
 
         let mut storage = forest_storage();
-        assert!(state_machine.compact(compaction::HALF_BAR_BEAT_COUNT as u64, Some(&mut storage)));
+        assert!(state_machine.compact(constants::LSM_COMPACTION_OPS as u64, Some(&mut storage)));
 
         let values = state_machine
             .forest

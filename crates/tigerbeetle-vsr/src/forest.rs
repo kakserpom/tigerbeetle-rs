@@ -16,7 +16,7 @@ use crate::manifest_log::{ManifestLog, Pace};
 use crate::storage::Storage;
 use std::cell::RefCell;
 use std::rc::Rc;
-use tigerbeetle_core::constants::{CONFIG, LSM_GROWTH_FACTOR, LSM_LEVELS};
+use tigerbeetle_core::constants::{CONFIG, LSM_COMPACTION_OPS, LSM_GROWTH_FACTOR, LSM_LEVELS};
 use tigerbeetle_lsm::manifest::ManifestLog as ManifestLogTrait;
 use tigerbeetle_lsm::schema::manifest_node as mn;
 use tigerbeetle_lsm::tree::table_count_max_for_tree;
@@ -291,6 +291,17 @@ impl Forest {
     /// Port of upstream `forest.compact` (forest.zig:417), which drives each
     /// groove's `compact(op, &radix_buffer)` and the active level-0 compactions.
     pub fn compact(&mut self, op: u64, storage: &mut dyn Storage) {
+        // No compactions are run during the absolute first bar, or during the
+        // first bar of the checkpoint that we are currently recovering from
+        // (upstream `Forest.compact`, forest.zig:429-437). Without this gate the
+        // tree driver would commence mid-bar: `compact_levels` only commences at
+        // `first_beat`/`half_beat`, but calls `half_bar_complete` at
+        // `last_beat`/`last_half_beat` — a compaction that never began asserts
+        // `stage == Inactive`.
+        if op < LSM_COMPACTION_OPS as u64 || self.grid.superblock_view().op_compacted {
+            return;
+        }
+
         self.accounts.compact(op, &mut self.accounts_scratch);
         self.transfers.compact(op, &mut self.transfers_scratch);
         self.transfers_pending.compact(op, &mut self.transfers_pending_scratch);
@@ -688,7 +699,7 @@ mod tests {
         forest.accounts.objects.put(&Account { id: 9, timestamp: 9, ..Account::default() });
         forest.accounts.objects.put(&Account { id: 9, timestamp: 9, ..Account::default() });
 
-        forest.compact(compaction::HALF_BAR_BEAT_COUNT as u64, &mut storage());
+        forest.compact(LSM_COMPACTION_OPS as u64, &mut storage());
 
         let values = forest.accounts.objects.table_mutable_ref().values_used();
         assert_eq!(

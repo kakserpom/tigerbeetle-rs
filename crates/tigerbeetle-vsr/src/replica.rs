@@ -1685,27 +1685,35 @@ impl Replica {
             unreachable!("the op being committed is journaled");
         };
 
-        // Execute on state machine. Banking operations decode the request body
-        // recorded with the prepare and produce the reply body the client
-        // receives; every other operation only advances the state machine's
-        // clock (upstream `execute_op` asserts
-        // `state_machine.commit_timestamp < prepare.header.timestamp`, and the
-        // AOF-recovery exception is moot sans-IO — replica.zig:5441-5445).
-        let result_body = if matches!(
-            prepare.operation,
-            crate::Operation::CREATE_ACCOUNTS | crate::Operation::CREATE_TRANSFERS
-        ) {
-            // DEVIATION: upstream reads the prepare message (header + body)
-            // from the journal and passes `body_used()` to the state machine.
-            // The body may be empty when the prepare arrived header-only
-            // (backup replication and repairs, message-layer bodies deferred);
-            // an empty batch executes trivially and produces an empty reply.
+        // Execute on the state machine. State-machine operations (≥
+        // `vsr_operations_reserved`) decode the prepare body (if any) into the
+        // operation's request batch and produce the reply body the client
+        // receives (upstream: `state_machine.commit`, replica.zig:5419-5432).
+        // After execution the state machine's clock advances to the prepare's
+        // timestamp (replica.zig:5464-5465).
+        //
+        // vsr-reserved operations (register, noop, pulse, upgrade, reconfigure)
+        // are control-plane ops whose state lives in the replica rather than the
+        // state machine: register is serviced by `client_table_entry_*` below,
+        // and the rest simply advance the clock (`state_machine.execute_op`).
+        //
+        // DEVIATION: upstream threads the prepare message through
+        // `state_machine.commit` / `execute_op` (replica.zig:5411-5445). The
+        // AOF-recovery exception (`commit_timestamp < timestamp or
+        // aof_recovery`) is moot sans-IO — there is no AOF — so the strict
+        // ordering assert below is unconditional. The body may be empty when a
+        // prepare arrived header-only (backup replication and repairs,
+        // message-layer bodies deferred); an empty batch executes trivially and
+        // produces an empty reply.
+        let result_body = if crate::state_machine::StateMachine::executes(prepare.operation) {
             let src_body = self.journal.body_with_op(op).map_or_else(Vec::new, ToOwned::to_owned);
             self.state_machine.execute(prepare.operation, prepare.timestamp, &src_body)
         } else {
             self.state_machine.execute_op(prepare.timestamp);
             Vec::new()
         };
+        assert!(self.state_machine.commit_timestamp() <= prepare.timestamp);
+        self.state_machine.set_commit_timestamp(prepare.timestamp);
 
         // Construct the client reply from the committed prepare and update the
         // client sessions table (upstream `execute_op`: replica.zig:5391-5523).
@@ -11231,6 +11239,110 @@ mod tests {
         assert!(references_2.block_count >= 1);
         assert!(references_2.oldest_address > 0);
         assert!(references_2.newest_address > 0);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn commit_dispatch_executes_batches_and_replies_to_client() {
+        // Register, create two accounts, then move money between them: every op
+        // rides the primary pipeline (prepare → quorum → `commit_dispatch_enter`),
+        // executes against the state machine's stores, and lands a reply for the
+        // client in the send queue.
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        r.status = Status::Normal;
+
+        let mut forest = Forest::init(replica_forest_view(), replica_forest_grid_options(), 32);
+        let mut storage = replica_forest_storage();
+        open_forest(&mut forest, &mut storage);
+        r.state_machine.mount_forest(forest);
+        r.grid_storage = Some(storage);
+
+        // Quorum = 2 (replica_count 3): `primary_pipeline_prepare` contributes
+        // the primary's own ack, so a single backup ack completes each quorum.
+        // 1. Register client 41 (request 0) — establishes the client session.
+        assert_eq!(
+            r.primary_pipeline_prepare(41, 0, crate::Operation::REGISTER, &[], 0).unwrap(),
+            1
+        );
+        let checksum = r.journal.header_with_op(1).expect("prepare").checksum();
+        r.on_prepare_ok(1, checksum, 1);
+        r.commit_dispatch_enter();
+        assert_eq!(r.commit_min, 1);
+        assert!(r.client_sessions.get(41).is_some());
+        assert_eq!(r.state_machine.commit_timestamp(), 1);
+        // Drain the commit-trigger reply write so the next op's write has a free
+        // slot (upstream drains these through the IO loop between commits).
+        r.poll_client_replies();
+
+        // 2. Create two accounts.
+        let accounts = crate::state_machine::account_batch_to_bytes(&[
+            Account { id: 1, ledger: 1, code: 1, ..Account::default() },
+            Account { id: 2, ledger: 1, code: 1, ..Account::default() },
+        ]);
+        assert_eq!(
+            r.primary_pipeline_prepare(41, 1, crate::Operation::CREATE_ACCOUNTS, &accounts, 0)
+                .unwrap(),
+            2,
+        );
+        let checksum = r.journal.header_with_op(2).expect("prepare").checksum();
+        r.on_prepare_ok(2, checksum, 1);
+        r.commit_dispatch_enter();
+        assert_eq!(r.commit_min, 2);
+        assert_eq!(r.state_machine.commit_timestamp(), 2);
+        r.poll_client_replies();
+        let account_1 = r.state_machine.account(1).expect("account is committed");
+        assert_eq!(account_1.timestamp, 1);
+        let account_2 = r.state_machine.account(2).expect("account is committed");
+        assert_eq!(account_2.timestamp, 2);
+
+        // 3. Transfer 10 units from account 1 to account 2.
+        let transfer = crate::state_machine::transfer_batch_to_bytes(&[Transfer {
+            id: 10,
+            debit_account_id: 1,
+            credit_account_id: 2,
+            amount: 10,
+            ledger: 1,
+            code: 1,
+            ..Transfer::default()
+        }]);
+        assert_eq!(
+            r.primary_pipeline_prepare(41, 2, crate::Operation::CREATE_TRANSFERS, &transfer, 0)
+                .unwrap(),
+            3,
+        );
+        let checksum = r.journal.header_with_op(3).expect("prepare").checksum();
+        r.on_prepare_ok(3, checksum, 1);
+        r.commit_dispatch_enter();
+        assert_eq!(r.commit_min, 3);
+        assert_eq!(r.state_machine.commit_timestamp(), 3);
+        r.poll_client_replies();
+
+        // The transfer executed: balances moved and the transfer is committed
+        // with the op's timestamp.
+        let account_1 = r.state_machine.account(1).expect("debit account exists");
+        assert_eq!(account_1.debits_pending, 0);
+        assert_eq!(account_1.debits_posted, 10);
+        let account_2 = r.state_machine.account(2).expect("credit account exists");
+        assert_eq!(account_2.credits_pending, 0);
+        assert_eq!(account_2.credits_posted, 10);
+        let transfer = r.state_machine.transfer(10).expect("transfer is committed");
+        assert_eq!(transfer.timestamp, 3);
+        assert_eq!(transfer.amount, 10);
+
+        // The client's latest session reply reflects the transfer commit, and the
+        // primary queued the reply for delivery.
+        let entry = r.client_sessions.get(41).expect("session entry");
+        assert_eq!(entry.header.op, 3);
+        assert_eq!(entry.header.request, 2);
+        assert_eq!(entry.header.commit, 3);
+        assert!(
+            r.client_send_queue.iter().any(|message| {
+                message
+                    .header::<crate::message_header::Reply>()
+                    .is_some_and(|reply| reply.op == 3 && reply.client == 41)
+            }),
+            "the client's transfer reply is queued"
+        );
     }
 
     #[test]
