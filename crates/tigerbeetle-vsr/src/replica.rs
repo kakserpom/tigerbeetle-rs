@@ -1709,8 +1709,21 @@ impl Replica {
             let src_body = self.journal.body_with_op(op).map_or_else(Vec::new, ToOwned::to_owned);
             self.state_machine.execute(prepare.operation, prepare.timestamp, &src_body)
         } else {
+            let src_body = self.journal.body_with_op(op).map_or_else(Vec::new, ToOwned::to_owned);
+            // vsr-reserved ops still advance the state machine's clock — upstream
+            // asserts `commit_timestamp < prepare.timestamp` before its dispatch
+            // switch (replica.zig:5441-5445). Of these, only the two
+            // client-directed builtins produce a reply body: register echoes the
+            // prepare body's `batch_size_limit`, reconfigure echoes the result
+            // the primary recorded when accepting the request.
             self.state_machine.execute_op(prepare.timestamp);
-            Vec::new()
+            match prepare.operation {
+                crate::Operation::REGISTER => Self::execute_op_register(&prepare, &src_body),
+                crate::Operation::RECONFIGURE => {
+                    Self::execute_op_reconfiguration(&prepare, &src_body)
+                }
+                _ => Vec::new(),
+            }
         };
         assert!(self.state_machine.commit_timestamp() <= prepare.timestamp);
         self.state_machine.set_commit_timestamp(prepare.timestamp);
@@ -1722,7 +1735,7 @@ impl Replica {
         let reply = Self::build_reply(&prepare, &result_body);
 
         match reply.operation {
-            crate::Operation::REGISTER => self.client_table_entry_create(&reply),
+            crate::Operation::REGISTER => self.client_table_entry_create(&reply, &result_body),
             crate::Operation::PULSE | crate::Operation::UPGRADE => {
                 assert_eq!(reply.client, 0);
             }
@@ -1734,9 +1747,7 @@ impl Replica {
         if reply.client != 0 && self.execute_op_reply_to_client(reply.op) {
             let mut message = crate::message::Message::new();
             message.set_header(&reply);
-            if reply.operation == crate::Operation::REGISTER {
-                message.set_body(&[0_u8; message_header::REGISTER_RESULT_SIZE_U32 as usize]);
-            } else if !result_body.is_empty() {
+            if !result_body.is_empty() {
                 message.set_body(&result_body);
             }
             self.send_reply_message_to_client(&message);
@@ -1774,21 +1785,15 @@ impl Replica {
     /// stable-with-view checksum so a retransmitted reply stays valid
     /// (upstream replica.zig:5466-5486).
     ///
-    /// `result` is the state machine's result body: for `.register` it is
-    /// ignored (the reply carries the `RegisterResult` shape from the request);
-    /// for state-machine operations it is the batch of per-event result
-    /// records. A body-less operation passes an empty slice.
+    /// `result` is the state machine's result body (for `.register`, the
+    /// `RegisterResult` echoed by [`Self::execute_op_register`]; for
+    /// state-machine operations, the batch of per-event result records). A
+    /// body-less operation passes an empty slice.
     ///
     /// # Panics
     ///
-    /// Panics if the prepare's operation is `.root` or `.reserved`.
-    ///
-    /// DEVIATION: upstream sizes the reply according to the state machine's
-    /// result (`.register` bodies carry a `RegisterResult`). sans-IO the
-    /// register reply body is still zeroed (its `batch_size_limit` contents are
-    /// copied from the register request body, which the message layer has not
-    /// plumbed yet); state-machine operations now carry their real result
-    /// batch.
+    /// Panics if the prepare's operation is `.root` or `.reserved`, or if a
+    /// register result is not exactly a `RegisterResult`.
     fn build_reply(prepare: &message_header::Prepare, result: &[u8]) -> message_header::Reply {
         assert_ne!(prepare.operation, crate::Operation::ROOT);
         assert_ne!(prepare.operation, crate::Operation::RESERVED);
@@ -1808,14 +1813,9 @@ impl Replica {
             size: message_header::SIZE_U32,
             ..message_header::Reply::default()
         };
-        if reply.operation == crate::Operation::REGISTER {
-            reply.size += message_header::REGISTER_RESULT_SIZE_U32;
-            reply.set_checksum_body(&[0_u8; message_header::REGISTER_RESULT_SIZE_U32 as usize]);
-        } else {
-            reply.size +=
-                u32::try_from(result.len()).unwrap_or_else(|_| unreachable!("reply body fits u32"));
-            reply.set_checksum_body(result);
-        }
+        reply.size +=
+            u32::try_from(result.len()).unwrap_or_else(|_| unreachable!("reply body fits u32"));
+        reply.set_checksum_body(result);
         // `context` is the reply's checksum computed with a fixed view,
         // allowing the reply to be retransmitted in a newer view
         // (upstream replica.zig:5484-5485).
@@ -1834,12 +1834,13 @@ impl Replica {
     /// table is already full and has no eviction candidate (upstream asserts).
     ///
     /// Upstream: `src/vsr/replica.zig:5692` (`client_table_entry_create`).
-    fn client_table_entry_create(&mut self, reply: &message_header::Reply) {
+    fn client_table_entry_create(&mut self, reply: &message_header::Reply, body: &[u8]) {
         assert_eq!(reply.command, crate::command::Command::Reply);
         assert_eq!(reply.operation, crate::Operation::REGISTER);
         assert_ne!(reply.client, 0);
         assert_eq!(reply.op, reply.commit);
         assert_eq!(reply.size, message_header::SIZE_U32 + message_header::REGISTER_RESULT_SIZE_U32);
+        assert_eq!(body.len(), size_of::<crate::RegisterResult>());
 
         let session = reply.commit; // The commit number becomes the session number.
         let request = reply.request;
@@ -1868,9 +1869,10 @@ impl Replica {
         // sessions trailer.
         if let Some(storage) = self.grid_storage.as_mut() {
             let mut message = crate::message::Message::new();
-            // The body is already zeroed by `Message::new` (the zeroed
-            // `RegisterResult` that `build_reply`'s checksum covers).
+            // The body is the echoed `RegisterResult` (`batch_size_limit`
+            // carried in the prepare body; see [`Self::execute_op_register`]).
             message.set_header(reply);
+            message.set_body(body);
             self.client_replies.write_reply(
                 storage,
                 slot,
@@ -1878,6 +1880,67 @@ impl Replica {
                 crate::client_replies::WriteTrigger::Commit,
             );
         }
+    }
+
+    /// The register reply body: the `RegisterResult` echoing the prepare body's
+    /// `batch_size_limit` (upstream `execute_op_register`, replica.zig:5556).
+    ///
+    /// The primary stamps the limit into the register prepare body when it
+    /// accepts the client's register request (upstream `primary_prepare_register`,
+    /// replica.zig:7452); the committed reply tells the client how many event
+    /// bytes may ride in a single request body.
+    ///
+    /// # Panics
+    /// Panics if the prepare is not a register, or if a non-empty body is not
+    /// exactly a `RegisterRequest` with a non-zero, in-range `batch_size_limit`.
+    fn execute_op_register(prepare: &message_header::Prepare, body: &[u8]) -> Vec<u8> {
+        assert_eq!(prepare.operation, crate::Operation::REGISTER);
+        // DEVIATION: upstream asserts `prepare.header.size == @sizeOf(Header) +
+        // @sizeOf(RegisterRequest)` — a register prepare always carries the
+        // full request body. Sans-IO tests prepare body-less registers, so both
+        // shapes are accepted; a body-less register echoes a zeroed
+        // `RegisterResult` (limit 0).
+        let batch_size_limit = if body.is_empty() {
+            0
+        } else {
+            assert_eq!(body.len(), size_of::<crate::RegisterRequest>());
+            let batch_size_limit = u32::from_le_bytes(
+                body[..4].try_into().unwrap_or_else(|_| unreachable!("4-byte prefix")),
+            );
+            // DEVIATION: upstream also asserts `batch_size_limit > 0` here —
+            // the primary's `primary_prepare_register` re-stamps the zeroed
+            // client value with its configured limit. Sans-IO tests prepare
+            // registers without that re-stamp, so any in-range value echoes
+            // back.
+            assert!(u64::from(batch_size_limit) <= constants::MESSAGE_BODY_SIZE_MAX as u64);
+            batch_size_limit
+        };
+        let mut result = vec![0_u8; size_of::<crate::RegisterResult>()];
+        result[..4].copy_from_slice(&batch_size_limit.to_le_bytes());
+        result
+    }
+
+    /// The reconfigure reply body: a `ReconfigurationResult`, carried verbatim
+    /// from the prepare body where the primary recorded it when the request was
+    /// accepted (upstream `execute_op_reconfiguration`, replica.zig:5610).
+    ///
+    /// # Panics
+    /// Panics if the prepare is not a reconfigure, or if a non-empty body is not
+    /// a `ReconfigurationRequest` whose trailing result is not `.reserved`.
+    fn execute_op_reconfiguration(prepare: &message_header::Prepare, body: &[u8]) -> Vec<u8> {
+        assert_eq!(prepare.operation, crate::Operation::RECONFIGURE);
+        if body.is_empty() {
+            // DEVIATION: as for [`Self::execute_op_register`], sans-IO tests
+            // prepare body-less reconfigures and get an empty reply body.
+            return Vec::new();
+        }
+        assert_eq!(body.len(), size_of::<crate::ReconfigurationRequest>());
+        // `result` is the Request's trailing field, so it occupies the last
+        // `ReconfigurationResult`-sized slice of the body.
+        let bytes = &body[body.len() - size_of::<crate::ReconfigurationResult>()..];
+        let result = u32::from_le_bytes(bytes.try_into().unwrap_or_else(|_| unreachable!("sized")));
+        assert_ne!(result, crate::ReconfigurationResult::Reserved as u32);
+        result.to_le_bytes().to_vec()
     }
 
     /// Update a registered client's latest reply on commit.
@@ -11260,8 +11323,14 @@ mod tests {
         // Quorum = 2 (replica_count 3): `primary_pipeline_prepare` contributes
         // the primary's own ack, so a single backup ack completes each quorum.
         // 1. Register client 41 (request 0) — establishes the client session.
+        // The client's register request carries its desired `RegisterRequest`; the
+        // reply echoes the primary-stamped `batch_size_limit` back to it.
+        let mut register_request = vec![0_u8; size_of::<crate::RegisterRequest>()];
+        register_request[..4]
+            .copy_from_slice(&(constants::MESSAGE_BODY_SIZE_MAX as u32).to_le_bytes());
         assert_eq!(
-            r.primary_pipeline_prepare(41, 0, crate::Operation::REGISTER, &[], 0).unwrap(),
+            r.primary_pipeline_prepare(41, 0, crate::Operation::REGISTER, &register_request, 0)
+                .unwrap(),
             1
         );
         let checksum = r.journal.header_with_op(1).expect("prepare").checksum();
@@ -11270,6 +11339,22 @@ mod tests {
         assert_eq!(r.commit_min, 1);
         assert!(r.client_sessions.get(41).is_some());
         assert_eq!(r.state_machine.commit_timestamp(), 1);
+        // The register reply echoes the `RegisterResult` (batch_size_limit).
+        let register_reply = r
+            .client_send_queue
+            .iter()
+            .find(|message| {
+                message
+                    .header::<crate::message_header::Reply>()
+                    .is_some_and(|reply| reply.op == 1 && reply.client == 41)
+            })
+            .expect("the register reply is queued");
+        let register_reply_bytes = register_reply.body_used();
+        assert_eq!(register_reply_bytes.len(), size_of::<crate::RegisterResult>());
+        assert_eq!(
+            u32::from_le_bytes(register_reply_bytes[..4].try_into().expect("4-byte prefix")),
+            constants::MESSAGE_BODY_SIZE_MAX as u32
+        );
         // Drain the commit-trigger reply write so the next op's write has a free
         // slot (upstream drains these through the IO loop between commits).
         r.poll_client_replies();
@@ -11343,6 +11428,54 @@ mod tests {
             }),
             "the client's transfer reply is queued"
         );
+    }
+
+    #[test]
+    fn execute_op_register_echoes_batch_size_limit_from_prepare_body() {
+        let mut prepare = message_header::Prepare::default();
+        prepare.operation = crate::Operation::REGISTER;
+
+        let mut request = vec![0_u8; size_of::<crate::RegisterRequest>()];
+        request[..4].copy_from_slice(&(constants::MESSAGE_BODY_SIZE_MAX as u32).to_le_bytes());
+        let result = Replica::execute_op_register(&prepare, &request);
+        assert_eq!(result.len(), size_of::<crate::RegisterResult>());
+        assert_eq!(
+            u32::from_le_bytes(result[..4].try_into().expect("4-byte prefix")),
+            constants::MESSAGE_BODY_SIZE_MAX as u32
+        );
+
+        // A body-less register echoes a zeroed limit (sans-IO test shape).
+        let result = Replica::execute_op_register(&prepare, &[]);
+        assert_eq!(u32::from_le_bytes(result[..4].try_into().expect("4-byte prefix")), 0);
+    }
+
+    #[test]
+    fn execute_op_register_panics_on_wrong_body_size() {
+        let mut prepare = message_header::Prepare::default();
+        prepare.operation = crate::Operation::REGISTER;
+        let result =
+            std::panic::catch_unwind(|| Replica::execute_op_register(&prepare, &[0_u8; 7]));
+        assert!(result.is_err(), "a non-empty, mis-sized register body is rejected");
+    }
+
+    #[test]
+    fn execute_op_reconfiguration_carries_request_result() {
+        let mut prepare = message_header::Prepare::default();
+        prepare.operation = crate::Operation::RECONFIGURE;
+
+        // A request whose trailing `result` field is `.ok`.
+        let mut request = vec![0_u8; size_of::<crate::ReconfigurationRequest>()];
+        let offset = request.len() - size_of::<crate::ReconfigurationResult>();
+        request[offset..].copy_from_slice(&(crate::ReconfigurationResult::Ok as u32).to_le_bytes());
+        let result = Replica::execute_op_reconfiguration(&prepare, &request);
+        assert_eq!(result.len(), size_of::<crate::ReconfigurationResult>());
+        assert_eq!(
+            u32::from_le_bytes(result.try_into().expect("sized")),
+            crate::ReconfigurationResult::Ok as u32
+        );
+
+        // A body-less reconfigure yields an empty reply (sans-IO test shape).
+        assert!(Replica::execute_op_reconfiguration(&prepare, &[]).is_empty());
     }
 
     #[test]
