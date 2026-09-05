@@ -449,6 +449,11 @@ pub const JOURNAL_REPAIR_TIMEOUT: u32 = 100;
 /// (replica.zig:1427), i.e. the same cadence as the journal repair timeout.
 pub const GRID_REPAIR_TIMEOUT: u32 = 100;
 
+/// How often the primary injects a state-machine pulse to drive time-dependent
+/// operations when the pipeline is otherwise idle (upstream
+/// `timeout_pulse` = `100 / tick_ms`, replica.zig:1413).
+pub const PULSE_TIMEOUT: u32 = 100;
+
 /// The maximum number of outgoing messages that may be queued on a replica connection.
 pub const CONNECTION_SEND_QUEUE_MAX_REPLICA: usize = umax(umin(CLIENTS_MAX as usize, 4), 2);
 

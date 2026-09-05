@@ -178,6 +178,9 @@ pub struct Replica {
     /// Drives periodic `GetBlocks` grid-repair requests (upstream
     /// `grid_repair_timeout`).
     pub grid_repair_timeout: Timeout,
+    /// Drives the primary's periodic state-machine pulses (upstream
+    /// `pulse_timeout`).
+    pub pulse_timeout: Timeout,
 
     // ── Grid repair bookkeeping ──────────────────────────────────────────
     /// Per-replica budget of inflight block requests (upstream
@@ -537,6 +540,7 @@ impl Replica {
             primary_abdicate_timeout: Timeout::default(),
             journal_repair_timeout: Timeout::default(),
             grid_repair_timeout: Timeout::default(),
+            pulse_timeout: Timeout::default(),
             grid_repair_message_budget: RepairBudgetGrid::new(RepairBudgetOptions {
                 replica_index: replica_index as u8,
                 replica_count: replica_count as u8,
@@ -1116,6 +1120,7 @@ impl Replica {
             op,
             checksum: header.checksum(),
             client,
+            operation,
             acks_received: 0,
             ok_quorum_received: false,
             body: body.clone(),
@@ -1798,6 +1803,13 @@ impl Replica {
                 );
                 assert!(result.is_ok(), "popped request must be preparable");
             }
+
+            // TODO(port): upstream injects a state-machine pulse here when the
+            // expiry pump is owed (replica.zig:4906-4911), and chains
+            // upgrade-to-self requests (replica.zig:4913-4944). Both are
+            // deferred: the commit-tail pulse needs the primary to re-prepare
+            // after every committed op, and `release_for_next_checkpoint` is
+            // Phase-3 multiversion.
         }
     }
 
@@ -2818,6 +2830,9 @@ impl Replica {
             self.exit_view_window_timeout.stop();
             self.exit_view_message_timeout = Timeout::start(constants::EXIT_VIEW_MESSAGE_TIMEOUT);
             self.view_change_status_timeout.stop();
+            // The primary pulses the state machine to drive time-dependent
+            // operations (upstream replica.zig:9977, guarded by `!aof_recovery`).
+            self.pulse_timeout = Timeout::start(constants::PULSE_TIMEOUT);
 
             // Do not reset the pipeline as there may be uncommitted ops to
             // drive to completion (upstream `replica.zig:10095`).
@@ -2838,6 +2853,8 @@ impl Replica {
             self.exit_view_window_timeout.stop();
             self.exit_view_message_timeout = Timeout::start(constants::EXIT_VIEW_MESSAGE_TIMEOUT);
             self.view_change_status_timeout.stop();
+            // Only the primary pulses (upstream `become_other`, replica.zig:10227).
+            self.pulse_timeout.stop();
 
             // Upstream asserts `pipeline == .cache` (and `get_view_message_timeout`
             // ticking, which does not exist sans-IO); the skeleton's only pipeline
@@ -2921,6 +2938,7 @@ impl Replica {
                 op,
                 checksum: header.checksum(),
                 client: header.client,
+                operation: header.operation,
                 acks_received: 0,
                 ok_quorum_received: false,
                 // The body recorded with the survivor (empty for prepares that
@@ -3493,6 +3511,9 @@ impl Replica {
         if self.grid_repair_timeout.tick() {
             self.on_grid_repair_timeout();
         }
+        if self.pulse_timeout.tick() {
+            self.on_pulse_timeout(now);
+        }
     }
 
     /// Timeout: broadcast a Ping to all replicas.
@@ -3743,6 +3764,13 @@ impl PipelineQueue {
     pub fn prepare_queue_full(&self) -> bool {
         self.prepare_queue.len() >= constants::PIPELINE_PREPARE_QUEUE_MAX as usize
     }
+
+    /// Whether the prepared-but-uncommitted pipeline holds an operation
+    /// (upstream `prepare_queue.contains_operation`, replica.zig:11393).
+    #[must_use]
+    pub fn contains_operation(&self, operation: crate::Operation) -> bool {
+        self.prepare_queue.iter().any(|prepare| prepare.operation == operation)
+    }
 }
 
 /// A prepare in the pipeline.
@@ -3753,6 +3781,8 @@ pub struct PipelinePrepare {
     /// The client the prepare serves (used to wait for a session's register to
     /// commit — upstream `pipeline.queue.message_by_client`).
     pub client: u128,
+    /// The operation being prepared (upstream `prepare_queue.message.operation`).
+    pub operation: crate::Operation,
     /// Number of prepare_ok responses received.
     pub acks_received: u16,
     /// Whether a quorum of prepare_ok messages has been received.
@@ -4352,6 +4382,95 @@ impl Replica {
                 self.grid_repair_message_budget.next_destination(&mut self.prng)
         {
             self.send_get_blocks(destination);
+        }
+    }
+
+    /// Whether the replica runs a cluster of one (upstream `solo`,
+    /// replica.zig:6917). Standby nodes are not modeled.
+    #[must_use]
+    fn solo(&self) -> bool {
+        self.replica_count == 1
+    }
+
+    /// Whether the normal primary may inject a state-machine pulse.
+    ///
+    /// Upstream: `src/vsr/replica.zig:11383` (`pulse_enabled`).
+    #[must_use]
+    fn pulse_enabled(&self) -> bool {
+        assert_eq!(self.status, Status::Normal);
+        assert!(self.is_primary());
+        assert!(!self.pipeline_queue.prepare_queue_full());
+
+        // A pulse is already in the pipeline.
+        if self.pipeline_queue.contains_operation(crate::Operation::PULSE) {
+            return false;
+        }
+        // Solo replicas only change views immediately when they start up, and
+        // during that time they do not accept requests (upstream replica.zig:11393).
+        if self.solo() && self.view_durable_updating() {
+            return false;
+        }
+        // Requests are ignored during upgrades (upstream `self.upgrading()`).
+        // DEVIATION: the sans-IO replica pins `release` to MINIMUM and has no
+        // `upgrading()`; an in-flight `upgrade_release` is the closest analogue.
+        if self.upgrade_release.is_some() {
+            return false;
+        }
+        true
+    }
+
+    /// Inject a state-machine pulse prepare on behalf of the cluster.
+    ///
+    /// Upstream: `src/vsr/replica.zig:11402` (`send_request_pulse_to_self`).
+    fn send_request_pulse_to_self(&mut self) {
+        assert_eq!(self.status, Status::Normal);
+        assert!(self.is_primary());
+        assert!(!self.view_durable_updating());
+        assert!(!self.pipeline_queue.prepare_queue_full());
+        assert!(!self.pipeline_queue.contains_operation(crate::Operation::PULSE));
+        assert!(self.pulse_enabled());
+        assert!(self.state_machine.pulse_needed(self.prepare_timestamp));
+
+        // The pulse carries an empty body and client 0, so it never produces a
+        // client reply (upstream `send_request_to_self(.pulse, &.{})`).
+        let result = self.primary_pipeline_prepare(0, 0, crate::Operation::PULSE, &[], 0);
+        assert!(result.is_ok(), "pulse must be preparable");
+        assert!(self.pipeline_queue.contains_operation(crate::Operation::PULSE));
+    }
+
+    /// Periodic state-machine pulse driver (upstream `on_pulse_timeout`,
+    /// replica.zig:3936).
+    ///
+    /// `now` is the owner's synthetic monotonic clock (upstream
+    /// `clock.realtime()`); the state machine compares it against
+    /// `pulse_next_timestamp` when deciding whether an expiry is due.
+    ///
+    /// # Panics
+    /// Panics if the replica has not transitioned to primary in `Normal` status
+    /// (an invariant every protocol driver preserves before its timeouts fire).
+    pub fn on_pulse_timeout(&mut self, now: u64) {
+        assert_eq!(self.status, Status::Normal);
+        assert!(self.is_primary());
+        self.pulse_timeout.reset(constants::PULSE_TIMEOUT);
+        if self.pipeline_queue.prepare_queue_full() {
+            return;
+        }
+        if !self.pulse_enabled() {
+            return;
+        }
+
+        // To decide whether or not to pulse a time-dependent operation, the
+        // state machine needs an updated `prepare_timestamp` (upstream
+        // replica.zig:3949-3956).
+        let timestamp = self.prepare_timestamp.max(now);
+        if self.state_machine.pulse_needed(timestamp) {
+            self.prepare_timestamp = timestamp;
+            if self.view_durable_updating() {
+                // Ignore: pulses are withheld while the view-change durably
+                // persists (upstream replica.zig:3956-3961).
+            } else {
+                self.send_request_pulse_to_self();
+            }
         }
     }
 
@@ -6673,6 +6792,7 @@ mod tests {
             op: 10,
             checksum: 0xAB,
             client: 1,
+            operation: crate::Operation::NOOP,
             acks_received: 0,
             ok_quorum_received: false,
             body: Vec::new(),
@@ -6690,6 +6810,7 @@ mod tests {
             op: 0,
             checksum: 1,
             client: 1,
+            operation: crate::Operation::NOOP,
             acks_received: 0,
             ok_quorum_received: false,
             body: Vec::new(),
@@ -6698,6 +6819,7 @@ mod tests {
             op: 2,
             checksum: 2,
             client: 1,
+            operation: crate::Operation::NOOP,
             acks_received: 0,
             ok_quorum_received: false,
             body: Vec::new(),
@@ -7006,6 +7128,155 @@ mod tests {
         r.commit_execute();
 
         assert_eq!(r.client_send_queue.len(), 0, "pulse has no client to reply to");
+    }
+
+    #[test]
+    fn on_pulse_timeout_injects_a_pulse_prepare_when_expiry_is_due() {
+        // The primary's pulse timeout fires at `now` once a pending transfer's
+        // expiry is due: it re-arms, advances `prepare_timestamp` to `now`, and
+        // injects a client-0 pulse prepare through the normal accept path.
+        //
+        // The pump starts with `pulse_next_timestamp = TIMESTAMP_MIN`, so the
+        // very first pulse owes immediately and parks it at `TIMESTAMP_MAX`
+        // (upstream injects that pulse from the first committed op — replica
+        // commit_execute tail, deferred here — so this test drives it via the
+        // same `on_pulse_timeout`).
+        let mut r = Replica::new(CLUSTER, 0, 1);
+        r.status = Status::Normal;
+
+        // Account 1 (op 1), account 2 (op 2). Single-event batches keep each
+        // prepare's timestamp the batch's last event timestamp.
+        let account_body = |id| {
+            crate::state_machine::account_batch_to_bytes(&[Account {
+                id,
+                ledger: 1,
+                code: 1,
+                ..Account::default()
+            }])
+        };
+        let op1 = r
+            .primary_pipeline_prepare(7, 1, crate::Operation::CREATE_ACCOUNTS, &account_body(1), 0)
+            .unwrap();
+        commit_op_now(&mut r, op1);
+        let op2 = r
+            .primary_pipeline_prepare(7, 2, crate::Operation::CREATE_ACCOUNTS, &account_body(2), 0)
+            .unwrap();
+        commit_op_now(&mut r, op2);
+
+        // Parking pulse: no pendings exist yet, so committing it leaves the
+        // pump at `TIMESTAMP_MAX`.
+        r.pulse_timeout = Timeout::start(constants::PULSE_TIMEOUT);
+        r.on_pulse_timeout(2);
+        assert!(r.pipeline_queue.contains_operation(crate::Operation::PULSE));
+        commit_op_now(&mut r, 3);
+        assert_eq!(
+            r.state_machine.pulse_next_timestamp(),
+            tigerbeetle_lsm::timestamp_range::TimestampRange::TIMESTAMP_MAX
+        );
+
+        // Pending transfer (op 4) with a one-second timeout binds the next
+        // pulse to its expiry (timestamp 4 + 1s).
+        let transfer = Transfer {
+            id: 33,
+            debit_account_id: 1,
+            credit_account_id: 2,
+            flags: tigerbeetle_core::types::TransferFlags::PENDING,
+            code: 1,
+            ledger: 1,
+            amount: 50,
+            timeout: 1,
+            ..Transfer::default()
+        };
+        let transfer_body = crate::state_machine::transfer_batch_to_bytes(&[transfer]);
+        let op4 = r
+            .primary_pipeline_prepare(7, 3, crate::Operation::CREATE_TRANSFERS, &transfer_body, 0)
+            .unwrap();
+        commit_op_now(&mut r, op4);
+
+        let expires_at = 4 + tigerbeetle_core::types::NS_PER_S;
+        assert!(r.state_machine.pulse_needed(expires_at));
+        assert!(!r.state_machine.pulse_needed(expires_at - 1));
+        assert!(!r.pipeline_queue.contains_operation(crate::Operation::PULSE));
+
+        // The pulse timeout fires exactly when the expiry is due. The pulse op
+        // lands at `expires_at`; `primary_pipeline_prepare` then advances
+        // `prepare_timestamp` past it.
+        r.on_pulse_timeout(expires_at);
+        assert_eq!(r.prepare_timestamp, expires_at + 1);
+        assert!(r.pipeline_queue.contains_operation(crate::Operation::PULSE));
+        let prepare = r.pipeline_queue.prepare_queue.last().expect("pulse prepared");
+        assert_eq!(prepare.op, 5);
+        assert_eq!(prepare.client, 0);
+        assert_eq!(prepare.operation, crate::Operation::PULSE);
+        assert!(prepare.body.is_empty());
+        // The timeout re-arms for the next beat.
+        assert!(r.pulse_timeout.active);
+
+        // Committing the pulse drives the expiry pump: the pending balances
+        // return to their pools and no further pulse is owed.
+        let replies_before = r.client_send_queue.len();
+        commit_op_now(&mut r, 5);
+        assert_eq!(r.state_machine.account(1).expect("debit account").debits_pending, 0);
+        assert_eq!(r.state_machine.account(2).expect("credit account").credits_pending, 0);
+        assert!(!r.state_machine.pulse_needed(expires_at + 1));
+        assert!(!r.pipeline_queue.contains_operation(crate::Operation::PULSE));
+        // A pulse never produces a client reply.
+        assert_eq!(r.client_send_queue.len(), replies_before);
+    }
+
+    #[test]
+    fn pulse_enabled_and_contains_operation_detect_an_in_flight_pulse() {
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        r.status = Status::Normal;
+        assert!(r.pulse_enabled());
+
+        // A prepared pulse occupies the pipeline; a second one is withheld until
+        // the first commits.
+        r.primary_pipeline_prepare(0, 0, crate::Operation::PULSE, &[], 0).unwrap();
+        assert!(r.pipeline_queue.contains_operation(crate::Operation::PULSE));
+        assert!(!r.pulse_enabled());
+    }
+
+    #[test]
+    fn on_pulse_timeout_is_a_noop_when_no_expiry_is_due() {
+        let mut r = Replica::new(CLUSTER, 0, 1);
+        r.status = Status::Normal;
+
+        // With nothing mounted, `prepare_timestamp` starts at 0 and there is no
+        // pending transfer: a pulse at `now` 0 owes nothing (pulse_next is the
+        // parked baseline, not an expiry).
+        r.on_pulse_timeout(0);
+        assert_eq!(r.prepare_timestamp, 0);
+        assert!(!r.pipeline_queue.contains_operation(crate::Operation::PULSE));
+        assert_eq!(r.op, 0);
+    }
+
+    #[test]
+    fn on_pulse_timeout_is_a_noop_when_the_pipeline_is_full() {
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        r.status = Status::Normal;
+        for request in 0..constants::PIPELINE_PREPARE_QUEUE_MAX {
+            r.primary_pipeline_prepare(7, request, crate::Operation::NOOP, &[], 0).unwrap();
+        }
+        assert!(r.pipeline_queue.prepare_queue_full());
+
+        r.on_pulse_timeout(1_000);
+        assert!(!r.pipeline_queue.contains_operation(crate::Operation::PULSE));
+    }
+
+    #[test]
+    fn on_pulse_timeout_rejects_a_backup() {
+        let mut r = Replica::new(CLUSTER, 1, 2);
+        r.status = Status::Normal;
+        assert!(!r.is_primary(), "replica 1 is not the primary of view 0 in a 2-node cluster");
+
+        let op_before = r.op;
+        r.pulse_timeout = Timeout::start(constants::PULSE_TIMEOUT);
+        // `on_pulse_timeout` asserts primary status even before re-arming.
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| r.on_pulse_timeout(0)));
+        assert!(result.is_err(), "a backup must not inject a pulse");
+        assert_eq!(r.op, op_before);
     }
 
     #[test]

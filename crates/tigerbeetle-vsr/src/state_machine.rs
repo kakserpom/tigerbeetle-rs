@@ -2268,12 +2268,20 @@ impl StateMachine {
     /// Whether `operation` is a state-machine operation (`≥
     /// `vsr_operations_reserved``), i.e. one this state machine executes.
     ///
-    /// The vsr-reserved half of the operation space (register, noop, pulse,
-    /// upgrade, reconfigure) is control-plane business owned by the replica,
-    /// never dispatched to `StateMachine::execute`.
+    /// The vsr-reserved half of the operation space is control-plane business
+    /// owned by the replica, never dispatched to `StateMachine::execute` —
+    /// with one exception: a wire `.pulse` is cast to the state machine's
+    /// `Operation.pulse` and executed here, driving the pending-transfer
+    /// expiry pump (upstream replica.zig:5432, state_machine.zig:1138-1143).
+    ///
+    /// DEVIATION: upstream distinguishes the control-plane `.pulse`
+    /// (vsr.zig:294, value 4) from the state-machine operation it casts to
+    /// (tigerbeetle.zig `Operation.pulse`, value `vsr_operations_reserved`);
+    /// the unified `Operation` newtype carries both ([`Operation::PULSE`] and
+    /// [`Operation::STATE_MACHINE_PULSE`]).
     #[must_use]
     pub fn executes(operation: Operation) -> bool {
-        !operation.vsr_reserved()
+        operation == Operation::PULSE || !operation.vsr_reserved()
     }
 
     /// Overwrite the committed timestamp after `StateMachine::execute` returns.
@@ -2299,7 +2307,7 @@ impl StateMachine {
     #[must_use]
     pub fn execute(&mut self, operation: Operation, timestamp: u64, body: &[u8]) -> Vec<u8> {
         match operation {
-            Operation::STATE_MACHINE_PULSE => {
+            Operation::PULSE | Operation::STATE_MACHINE_PULSE => {
                 if !body.is_empty() {
                     unreachable!(
                         "pulse must carry an empty body (Operation.valid, state_machine.zig:1044)"
