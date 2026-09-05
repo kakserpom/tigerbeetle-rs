@@ -1804,12 +1804,21 @@ impl Replica {
                 assert!(result.is_ok(), "popped request must be preparable");
             }
 
-            // TODO(port): upstream injects a state-machine pulse here when the
-            // expiry pump is owed (replica.zig:4906-4911), and chains
-            // upgrade-to-self requests (replica.zig:4913-4944). Both are
-            // deferred: the commit-tail pulse needs the primary to re-prepare
-            // after every committed op, and `release_for_next_checkpoint` is
-            // Phase-3 multiversion.
+            // Inject a state-machine pulse when the expiry pump next owes one
+            // (upstream: replica.zig:4906-4911). A fresh primary has
+            // `pulse_next_timestamp == TIMESTAMP_MIN`, so the very first
+            // commit injects a "parking" pulse that launches the pump and
+            // re-arms it at the next pending-transfer expiry; while an upgrade
+            // is in flight `pulse_enabled()` is false and no pulse is sent.
+            if self.pulse_enabled() && self.state_machine.pulse_needed(self.prepare_timestamp) {
+                assert!(self.upgrade_release.is_none());
+                self.send_request_pulse_to_self();
+            }
+
+            // TODO(port): upstream re-drives an in-flight upgrade by sending
+            // upgrade-to-self until `release_for_next_checkpoint` advances
+            // (replica.zig:4913-4944). Deferred: `release_for_next_checkpoint`
+            // needs the Phase-3 multiversion grid.
         }
     }
 
@@ -6277,7 +6286,9 @@ mod tests {
     }
 
     /// Commits a register for `client` at the next op, returning that op
-    /// (its commit number becomes the client's session number).
+    /// (its commit number becomes the client's session number). The payload
+    /// pulse this register's commit injects is consumed here too, so callers
+    /// never have to chase it.
     fn register_client(r: &mut Replica, client: u128) -> u64 {
         let op = r.primary_pipeline_prepare(client, 0, crate::Operation::REGISTER, &[], 0).unwrap();
         r.commit_max = op;
@@ -6285,6 +6296,11 @@ mod tests {
         r.commit_stage = CommitStage::Execute;
         r.commit_execute();
         assert_eq!(r.client_sessions.get(client).expect("registered session").session, op,);
+        // Only the very first commit of a fresh primary injects a parking
+        // pulse; later registers (pulse parked at `TIMESTAMP_MAX`) owe none.
+        if r.pipeline_queue.contains_operation(crate::Operation::PULSE) {
+            commit_parking_pulse(r);
+        }
         r.send_queue.clear();
         r.client_send_queue.clear();
         op
@@ -6905,10 +6921,13 @@ mod tests {
         r.commit_prepare = Some(1);
         r.commit_stage = CommitStage::Execute;
         r.commit_execute();
+        // The register's commit injected the fresh primary's parking pulse;
+        // consume it so the noop below is op 3.
+        commit_parking_pulse(&mut r);
         let op = r.primary_pipeline_prepare(2, 1, crate::Operation::NOOP, &[], 0).unwrap();
-        assert_eq!(op, 2);
-        r.commit_max = 2;
-        r.commit_prepare = Some(2);
+        assert_eq!(op, 3);
+        r.commit_max = 3;
+        r.commit_prepare = Some(3);
         r.commit_stage = CommitStage::Execute;
         r.commit_execute();
         let session = r.client_sessions.get(2).expect("client 2 session");
@@ -6972,10 +6991,11 @@ mod tests {
         r.commit_stage = CommitStage::Execute;
         r.commit_execute();
 
-        // The queued request was prepared as op 2.
-        assert_eq!(r.op, 2);
+        // The queued request was prepared as op 2 (the fresh primary's parking
+        // pulse is op 3, behind it).
+        assert_eq!(r.op, 3);
         assert_eq!(r.pipeline_queue.request_queue.len(), 0);
-        assert_eq!(r.pipeline_queue.prepare_queue.len(), 1);
+        assert_eq!(r.pipeline_queue.prepare_queue.len(), 2);
         assert_eq!(r.pipeline_queue.prepare_queue[0].op, 2);
         let header = r.journal.header_with_op(2).expect("journal op 2");
         assert_eq!(header.client, 7);
@@ -7003,10 +7023,11 @@ mod tests {
             body: body.clone(),
         });
 
-        // Committing op 1 pops and prepares op 2, carrying the queued body into
-        // the journal.
+        // Committing op 1 pops and prepares op 2 from the queue, carrying the
+        // queued body into the journal; the fresh primary's parking pulse is
+        // op 3, behind it.
         commit_op_now(&mut r, 1);
-        assert_eq!(r.op, 2);
+        assert_eq!(r.op, 3);
         assert_eq!(r.journal.body_with_op(2), Some(&body[..]));
         r.client_send_queue.clear();
 
@@ -7023,6 +7044,8 @@ mod tests {
             Some(&body[..]),
             "journal body retained after commit"
         );
+        // Commit the still-pending parking pulse so the pipeline drains.
+        commit_parking_pulse(&mut r);
     }
 
     #[test]
@@ -7072,11 +7095,15 @@ mod tests {
         assert_eq!(entry.session, 1);
         assert_eq!(entry.header.request, 0);
 
-        // Client 7's next request (request 1, noop) commits as op 2.
+        // The register's commit injects the fresh primary's parking pulse;
+        // consume it before continuing.
+        commit_parking_pulse(&mut r);
+
+        // Client 7's next request (request 1, noop) commits as op 3.
         let op = r.primary_pipeline_prepare(7, 1, crate::Operation::NOOP, &[], 0).unwrap();
-        assert_eq!(op, 2);
-        r.commit_max = 2;
-        r.commit_prepare = Some(2);
+        assert_eq!(op, 3);
+        r.commit_max = 3;
+        r.commit_prepare = Some(3);
         r.commit_stage = CommitStage::Execute;
         r.commit_execute();
 
@@ -7087,8 +7114,8 @@ mod tests {
         assert_eq!(entry.session, 1);
         assert_eq!(entry.header.operation, crate::Operation::NOOP);
         assert_eq!(entry.header.request, 1);
-        assert_eq!(entry.header.op, 2);
-        assert_eq!(entry.header.commit, 2);
+        assert_eq!(entry.header.op, 3);
+        assert_eq!(entry.header.commit, 3);
     }
 
     #[test]
@@ -7137,15 +7164,15 @@ mod tests {
         // injects a client-0 pulse prepare through the normal accept path.
         //
         // The pump starts with `pulse_next_timestamp = TIMESTAMP_MIN`, so the
-        // very first pulse owes immediately and parks it at `TIMESTAMP_MAX`
-        // (upstream injects that pulse from the first committed op — replica
-        // commit_execute tail, deferred here — so this test drives it via the
-        // same `on_pulse_timeout`).
+        // fresh primary's first committed op injects the parking pulse from the
+        // commit-execute tail (upstream replica.zig:4906-4911); committing it
+        // parks the pump at `TIMESTAMP_MAX` until a pending transfer re-arms it.
         let mut r = Replica::new(CLUSTER, 0, 1);
         r.status = Status::Normal;
 
-        // Account 1 (op 1), account 2 (op 2). Single-event batches keep each
-        // prepare's timestamp the batch's last event timestamp.
+        // Account 1 (op 1), account 2 (op 3; the parking pulse took op 2).
+        // Single-event batches keep each prepare's timestamp the batch's last
+        // event timestamp.
         let account_body = |id| {
             crate::state_machine::account_batch_to_bytes(&[Account {
                 id,
@@ -7157,22 +7184,19 @@ mod tests {
         let op1 = r
             .primary_pipeline_prepare(7, 1, crate::Operation::CREATE_ACCOUNTS, &account_body(1), 0)
             .unwrap();
+        assert_eq!(op1, 1);
         commit_op_now(&mut r, op1);
-        let op2 = r
-            .primary_pipeline_prepare(7, 2, crate::Operation::CREATE_ACCOUNTS, &account_body(2), 0)
-            .unwrap();
-        commit_op_now(&mut r, op2);
-
-        // Parking pulse: no pendings exist yet, so committing it leaves the
-        // pump at `TIMESTAMP_MAX`.
-        r.pulse_timeout = Timeout::start(constants::PULSE_TIMEOUT);
-        r.on_pulse_timeout(2);
-        assert!(r.pipeline_queue.contains_operation(crate::Operation::PULSE));
-        commit_op_now(&mut r, 3);
+        // The op-1 commit's tail injected the parking pulse (op 2): no pendings
+        // exist yet, so committing it leaves the pump at `TIMESTAMP_MAX`.
+        commit_parking_pulse(&mut r);
         assert_eq!(
             r.state_machine.pulse_next_timestamp(),
             tigerbeetle_lsm::timestamp_range::TimestampRange::TIMESTAMP_MAX
         );
+        let op3 = r
+            .primary_pipeline_prepare(7, 2, crate::Operation::CREATE_ACCOUNTS, &account_body(2), 0)
+            .unwrap();
+        commit_op_now(&mut r, op3);
 
         // Pending transfer (op 4) with a one-second timeout binds the next
         // pulse to its expiry (timestamp 4 + 1s).
@@ -7345,18 +7369,20 @@ mod tests {
         let mut r = Replica::new(CLUSTER, 0, 3);
         r.status = Status::Normal;
 
-        // Register client 7 (commit 1), then commit a noop for client 8.
+        // Register client 7 (commit 1), consume the fresh primary's parking
+        // pulse, then commit a noop for client 8 (op 3).
         let op = r.primary_pipeline_prepare(7, 0, crate::Operation::REGISTER, &[], 0).unwrap();
         assert_eq!(op, 1);
         r.commit_max = 1;
         r.commit_prepare = Some(1);
         r.commit_stage = CommitStage::Execute;
         r.commit_execute();
+        commit_parking_pulse(&mut r);
 
         let op = r.primary_pipeline_prepare(8, 1, crate::Operation::NOOP, &[], 0).unwrap();
-        assert_eq!(op, 2);
-        r.commit_max = 2;
-        r.commit_prepare = Some(2);
+        assert_eq!(op, 3);
+        r.commit_max = 3;
+        r.commit_prepare = Some(3);
         r.commit_stage = CommitStage::Execute;
         r.commit_execute();
 
@@ -7420,19 +7446,21 @@ mod tests {
             Zone::ClientReplies.start() + 4 * crate::message::MESSAGE_SIZE_MAX as u64,
         ));
 
-        // Register client 7 (commit 1) then commit its body-less noop (op 2).
+        // Register client 7 (commit 1), consume the fresh primary's parking
+        // pulse, then commit its body-less noop (op 3).
         let op = r.primary_pipeline_prepare(7, 0, crate::Operation::REGISTER, &[], 0).unwrap();
         assert_eq!(op, 1);
         r.commit_max = 1;
         r.commit_prepare = Some(1);
         r.commit_stage = CommitStage::Execute;
         r.commit_execute();
+        commit_parking_pulse(&mut r);
         r.poll_client_replies();
 
         let op = r.primary_pipeline_prepare(7, 1, crate::Operation::NOOP, &[], 0).unwrap();
-        assert_eq!(op, 2);
-        r.commit_max = 2;
-        r.commit_prepare = Some(2);
+        assert_eq!(op, 3);
+        r.commit_max = 3;
+        r.commit_prepare = Some(3);
         r.commit_stage = CommitStage::Execute;
         r.commit_execute();
 
@@ -7460,6 +7488,8 @@ mod tests {
 
         // A later op is stamped strictly later, so execution advances too
         // (upstream `state_machine.commit_timestamp < prepare.header.timestamp`).
+        // Consume the parking pulse first so the noop below lands at op 3.
+        commit_parking_pulse(&mut r);
         let op2 = r.primary_pipeline_prepare(7, 1, crate::Operation::NOOP, &[], 0).unwrap();
         let timestamp2 = r.journal.header_with_op(op2).expect("prepare").timestamp;
         assert!(timestamp2 > timestamp1);
@@ -7549,33 +7579,34 @@ mod tests {
         assert_eq!(r.client_sessions.count(), constants::CLIENTS_MAX as usize);
 
         // A register for a new client sharing the pipeline with client 7's next
-        // request: op 8 (client 14's register) commits first — the table is
-        // full, so the oldest entry (client 7) is evicted — and op 9 (client
+        // request: op 9 (client 14's register) commits first — the table is
+        // full, so the oldest entry (client 7) is evicted — and op 10 (client
         // 7's request) executes afterwards.
         assert_eq!(
             r.primary_pipeline_prepare(14, 0, crate::Operation::REGISTER, &[], 0).unwrap(),
-            8
+            9
         );
-        assert_eq!(r.primary_pipeline_prepare(7, 1, crate::Operation::NOOP, &[], 0).unwrap(), 9);
-        r.commit_max = 8;
-        r.commit_prepare = Some(8);
-        r.commit_stage = CommitStage::Execute;
-        r.commit_execute();
-
-        assert_eq!(r.client_sessions.get(7), None, "client 7 evicted at capacity");
-        assert_eq!(r.client_sessions.get(14).expect("new session").session, 8);
-        r.client_send_queue.clear();
-
-        // Op 9 executes with the session already gone: the reply is still
-        // delivered, told the client nothing was tracked (upstream
-        // `client_table_entry_update` — the next request receives an
-        // eviction).
+        assert_eq!(r.primary_pipeline_prepare(7, 1, crate::Operation::NOOP, &[], 0).unwrap(), 10);
         r.commit_max = 9;
         r.commit_prepare = Some(9);
         r.commit_stage = CommitStage::Execute;
         r.commit_execute();
 
-        assert_eq!(r.op, 9);
+        assert_eq!(r.client_sessions.get(7), None, "client 7 evicted at capacity");
+        assert_eq!(r.client_sessions.get(14).expect("new session").session, 9);
+        r.client_send_queue.clear();
+        r.send_queue.clear();
+
+        // Op 10 executes with the session already gone: the reply is still
+        // delivered, told the client nothing was tracked (upstream
+        // `client_table_entry_update` — the next request receives an
+        // eviction).
+        r.commit_max = 10;
+        r.commit_prepare = Some(10);
+        r.commit_stage = CommitStage::Execute;
+        r.commit_execute();
+
+        assert_eq!(r.op, 10);
         assert_eq!(r.pipeline_queue.prepare_queue.len(), 0);
         assert_eq!(r.client_send_queue.len(), 1, "reply still delivered");
         let reply = r
@@ -7585,7 +7616,7 @@ mod tests {
             .header::<message_header::Reply>()
             .expect("reply header");
         assert_eq!(reply.client, 7);
-        assert_eq!(reply.op, 9);
+        assert_eq!(reply.op, 10);
 
         // The evicted client is unregistered, so its next request is evicted:
         r.on_message(&request_message(7, 2, crate::Operation::NOOP), 0);
@@ -7609,13 +7640,64 @@ mod tests {
         r.commit_execute();
     }
 
+    /// Commits the "parking" pulse a fresh primary injects after its very
+    /// first commit: `pulse_next_timestamp` starts at `TIMESTAMP_MIN`, so the
+    /// expiry pump owes one immediately (upstream replica.zig:4906-4911).
+    /// Committing it parks the pump at `TIMESTAMP_MAX` until a pending
+    /// transfer re-arms it — a one-time de-rail that multi-op flows must
+    /// consume before continuing with client ops.
+    fn commit_parking_pulse(r: &mut Replica) {
+        let op = r.commit_min + 1;
+        assert!(
+            r.pipeline_queue.contains_operation(crate::Operation::PULSE),
+            "a fresh primary owes a parking pulse after its first commit"
+        );
+        commit_op_now(r, op);
+    }
+
+    #[test]
+    fn commit_execute_injects_parking_pulse_from_the_commit_tail() {
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        r.status = Status::Normal;
+
+        // No pulse is owed before the first commit.
+        assert!(!r.pipeline_queue.contains_operation(crate::Operation::PULSE));
+
+        // The first committed op injects the parking pulse (op 2) through the
+        // commit-execute tail (`pulse_next_timestamp` starts at TIMESTAMP_MIN,
+        // upstream replica.zig:4906-4911).
+        let op = r.primary_pipeline_prepare(7, 0, crate::Operation::REGISTER, &[], 0).unwrap();
+        assert_eq!(op, 1);
+        commit_op_now(&mut r, op);
+        assert_eq!(r.commit_min, 1);
+        assert!(r.pipeline_queue.contains_operation(crate::Operation::PULSE));
+        let pulse = r.pipeline_queue.prepare_queue.last().expect("parking pulse");
+        assert_eq!(pulse.op, 2);
+        assert_eq!(pulse.client, 0);
+        assert_eq!(pulse.operation, crate::Operation::PULSE);
+        assert!(pulse.body.is_empty());
+
+        // Committing it parks the pump at TIMESTAMP_MAX; the next commit
+        // injects no further pulse (no pending transfer has re-armed it).
+        commit_parking_pulse(&mut r);
+        assert_eq!(
+            r.state_machine.pulse_next_timestamp(),
+            tigerbeetle_lsm::timestamp_range::TimestampRange::TIMESTAMP_MAX
+        );
+        let op = r.primary_pipeline_prepare(7, 1, crate::Operation::NOOP, &[], 0).unwrap();
+        assert_eq!(op, 3);
+        commit_op_now(&mut r, op);
+        assert!(!r.pipeline_queue.contains_operation(crate::Operation::PULSE));
+    }
+
     #[test]
     fn commit_execute_create_accounts_replies_with_result_bodies() {
         let mut r = Replica::new(CLUSTER, 0, 3);
         r.status = Status::Normal;
         register_client(&mut r, 7);
 
-        // Client 7 creates two accounts in one batch (op 2).
+        // Client 7 creates two accounts in one batch (op 3; the parking pulse
+        // consumed the earlier op 2).
         let accounts = [
             Account { id: 1, ledger: 1, code: 1, ..Account::default() },
             Account { id: 2, ledger: 1, code: 1, ..Account::default() },
@@ -7623,7 +7705,7 @@ mod tests {
         let body = crate::state_machine::account_batch_to_bytes(&accounts);
         let op =
             r.primary_pipeline_prepare(7, 1, crate::Operation::CREATE_ACCOUNTS, &body, 0).unwrap();
-        assert_eq!(op, 2);
+        assert_eq!(op, 3);
         commit_op_now(&mut r, op);
 
         // The reply carries one 16-byte result per event — the event's
@@ -7639,7 +7721,7 @@ mod tests {
         assert!(reply.valid_checksum_body(reply_message.body_used()));
 
         let results = reply_message.body_used();
-        for (index, expected_timestamp) in [1_u64, 2].into_iter().enumerate() {
+        for (index, expected_timestamp) in [2_u64, 3].into_iter().enumerate() {
             let result = &results[index * 16..index * 16 + 16];
             assert_eq!(
                 u64::from_le_bytes(result[0..8].try_into().unwrap()),
@@ -7669,25 +7751,26 @@ mod tests {
         let accounts = [Account { id: 1, ledger: 1, code: 1, ..Account::default() }];
         let body = crate::state_machine::account_batch_to_bytes(&accounts);
 
-        // Create account 1 (op 2); the single event's timestamp is 2.
+        // Create account 1 (op 3; the parking pulse consumed op 2); the single
+        // event's timestamp is 3.
         let op =
             r.primary_pipeline_prepare(7, 1, crate::Operation::CREATE_ACCOUNTS, &body, 0).unwrap();
-        assert_eq!(op, 2);
+        assert_eq!(op, 3);
         commit_op_now(&mut r, op);
         r.client_send_queue.clear();
 
-        // Recreating account 1 (op 3) reports `.exists` with the original
-        // record's timestamp (2) — not the re-execution timestamp (3).
+        // Recreating account 1 (op 4) reports `.exists` with the original
+        // record's timestamp (3) — not the re-execution timestamp (4).
         let op =
             r.primary_pipeline_prepare(7, 2, crate::Operation::CREATE_ACCOUNTS, &body, 0).unwrap();
-        assert_eq!(op, 3);
-        assert_eq!(r.prepare_timestamp, 3, "re-execution batch timestamp");
+        assert_eq!(op, 4);
+        assert_eq!(r.prepare_timestamp, 4, "re-execution batch timestamp");
         commit_op_now(&mut r, op);
 
         let results = r.client_send_queue.last().expect("reply").body_used();
         assert_eq!(
             u64::from_le_bytes(results[0..8].try_into().unwrap()),
-            2,
+            3,
             "existing account's stored timestamp"
         );
         assert_eq!(
@@ -7703,7 +7786,8 @@ mod tests {
         register_client(&mut r, 7);
 
         // Two accounts back the transfers. Account batch events get timestamps
-        // 1 and 2; each account's stored timestamp is its own event's.
+        // 2 and 3 (the parking pulse consumed op 2); each account's stored
+        // timestamp is its own event's.
         let accounts = [
             Account { id: 1, ledger: 1, code: 1, ..Account::default() },
             Account { id: 2, ledger: 1, code: 1, ..Account::default() },
@@ -7712,11 +7796,11 @@ mod tests {
         let op = r
             .primary_pipeline_prepare(7, 1, crate::Operation::CREATE_ACCOUNTS, &account_body, 0)
             .unwrap();
-        assert_eq!(op, 2);
+        assert_eq!(op, 3);
         commit_op_now(&mut r, op);
         r.client_send_queue.clear();
 
-        // A transfer between the two known accounts (op 3) commits `.created`.
+        // A transfer between the two known accounts (op 4) commits `.created`.
         let transfers = [Transfer {
             id: 10,
             debit_account_id: 1,
@@ -7730,18 +7814,18 @@ mod tests {
         let op = r
             .primary_pipeline_prepare(7, 2, crate::Operation::CREATE_TRANSFERS, &transfer_body, 0)
             .unwrap();
-        assert_eq!(op, 3);
+        assert_eq!(op, 4);
         commit_op_now(&mut r, op);
 
         let results = r.client_send_queue.last().expect("reply").body_used();
-        assert_eq!(u64::from_le_bytes(results[0..8].try_into().unwrap()), 3);
+        assert_eq!(u64::from_le_bytes(results[0..8].try_into().unwrap()), 4);
         assert_eq!(
             u32::from_le_bytes(results[8..12].try_into().unwrap()),
             CreateTransferStatus::Created as u32
         );
         r.client_send_queue.clear();
 
-        // A transfer between unknown accounts (op 4) fails with the debit
+        // A transfer between unknown accounts (op 5) fails with the debit
         // account's missing status (upstream validates debit first).
         let orphan = [Transfer {
             id: 20,
@@ -7756,7 +7840,7 @@ mod tests {
         let op = r
             .primary_pipeline_prepare(7, 3, crate::Operation::CREATE_TRANSFERS, &orphan_body, 0)
             .unwrap();
-        assert_eq!(op, 4);
+        assert_eq!(op, 5);
         commit_op_now(&mut r, op);
 
         let results = r.client_send_queue.last().expect("reply").body_used();
@@ -7766,18 +7850,18 @@ mod tests {
         );
         r.client_send_queue.clear();
 
-        // Duplicating the first transfer (op 5) reports `.exists` (proving the
-        // op-3 transfer persisted in the state machine store).
+        // Duplicating the first transfer (op 6) reports `.exists` (proving the
+        // op-4 transfer persisted in the state machine store).
         let op = r
             .primary_pipeline_prepare(7, 4, crate::Operation::CREATE_TRANSFERS, &transfer_body, 0)
             .unwrap();
-        assert_eq!(op, 5);
+        assert_eq!(op, 6);
         commit_op_now(&mut r, op);
 
         let results = r.client_send_queue.last().expect("reply").body_used();
         assert_eq!(
             u64::from_le_bytes(results[0..8].try_into().unwrap()),
-            3,
+            4,
             "original transfer timestamp"
         );
         assert_eq!(
@@ -7803,9 +7887,12 @@ mod tests {
         // A follow-up request must prove it received the register reply.
         let context = r.client_sessions.get(7).expect("session").header.context;
         r.client_send_queue.clear();
+        // The register's commit injected the fresh primary's parking pulse;
+        // consume it so the request below is op 3.
+        commit_parking_pulse(&mut r);
 
         // Client 7's create_accounts request (request 1) carries the batch body
-        // through on_message → pipeline → journal → state machine (op 2).
+        // through on_message → pipeline → journal → state machine (op 3).
         let accounts = [Account { id: 5, ledger: 1, code: 1, ..Account::default() }];
         let body = crate::state_machine::account_batch_to_bytes(&accounts);
         let mut header = message_header::Request::default();
@@ -7825,14 +7912,14 @@ mod tests {
         request.set_body(&body);
         r.on_message(&request, 0);
 
-        assert_eq!(r.op, 2);
-        assert_eq!(r.journal.body_with_op(2), Some(&body[..]));
+        assert_eq!(r.op, 3);
+        assert_eq!(r.journal.body_with_op(3), Some(&body[..]));
 
-        commit_op_now(&mut r, 2);
+        commit_op_now(&mut r, 3);
 
         let results = r.client_send_queue.last().expect("banking reply").body_used();
         assert_eq!(results.len(), 16, "one result per event");
-        assert_eq!(u64::from_le_bytes(results[0..8].try_into().unwrap()), 2, "event timestamp");
+        assert_eq!(u64::from_le_bytes(results[0..8].try_into().unwrap()), 3, "event timestamp");
         assert_eq!(
             u32::from_le_bytes(results[8..12].try_into().unwrap()),
             CreateAccountStatus::Created as u32
@@ -7942,6 +8029,20 @@ mod tests {
         let register = request_message_full(7, 0, crate::Operation::REGISTER, 0, 0, register_size);
         // The register commits and both replicas reply with the register body.
         let (_, _) = federated_op(&mut primary, &mut backup, &register, 1, 1_000);
+
+        // The register's commit injected the fresh primary's parking pulse
+        // (op 2) onto the wire; quorum and commit it through the same relay so
+        // both replicas agree before the client ops below (op 3, op 4).
+        let pulse_prepare = primary.send_queue.pop().expect("pulse prepare broadcast");
+        backup.on_message(&pulse_prepare, 0);
+        assert_eq!(backup.op, 2);
+        let pulse_prepare_ok = backup.send_queue.pop().expect("pulse prepare_ok");
+        primary.on_message(&pulse_prepare_ok, 0);
+        primary.send_commit(1_500);
+        let pulse_commit = primary.send_queue.pop().expect("pulse commit broadcast");
+        backup.on_message(&pulse_commit, 1_500);
+        assert_eq!(backup.commit_max, 2);
+        assert!(primary.client_send_queue.is_empty(), "the pulse has no client reply");
         assert_eq!(
             primary.client_sessions.get(7).expect("primary session").header.operation,
             crate::Operation::REGISTER
@@ -7949,7 +8050,7 @@ mod tests {
         // The next request links its parent to the register reply's checksum.
         let mut context = backup.client_sessions.get(7).expect("backup session").header.context;
 
-        // Client 7's create_accounts (request 1, op 2).
+        // Client 7's create_accounts (request 1, op 3).
         let accounts = [Account { id: 21, ledger: 1, code: 1, ..Account::default() }];
         let body = crate::state_machine::account_batch_to_bytes(&accounts);
         let build_request = |request_number: u32, context: u128, body: &[u8]| {
@@ -7974,12 +8075,12 @@ mod tests {
         let create = build_request(1, context, &body);
 
         let (primary_results, backup_results) =
-            federated_op(&mut primary, &mut backup, &create, 2, 2_000);
+            federated_op(&mut primary, &mut backup, &create, 3, 2_000);
         assert_eq!(primary_results, backup_results, "primary and backup agree");
         assert_eq!(primary_results.len(), 16, "one result per event");
         assert_eq!(
             u64::from_le_bytes(primary_results[0..8].try_into().unwrap()),
-            2,
+            3,
             "event timestamp"
         );
         assert_eq!(
@@ -7987,19 +8088,19 @@ mod tests {
             CreateAccountStatus::Created as u32
         );
 
-        // A duplicate create (request 2, op 3) reports `.exists` with the
+        // A duplicate create (request 2, op 4) reports `.exists` with the
         // account's original timestamp, on both replicas. The request proves
-        // receipt of the op-2 reply by linking its parent to that reply's
+        // receipt of the op-3 reply by linking its parent to that reply's
         // checksum.
         context = primary.client_sessions.get(7).expect("primary session").header.context;
         let duplicate = build_request(2, context, &body);
         let (primary_results, backup_results) =
-            federated_op(&mut primary, &mut backup, &duplicate, 3, 3_000);
+            federated_op(&mut primary, &mut backup, &duplicate, 4, 3_000);
         assert_eq!(primary_results, backup_results, "primary and backup agree");
         assert_eq!(primary_results.len(), 16, "one result per event");
         assert_eq!(
             u64::from_le_bytes(primary_results[0..8].try_into().unwrap()),
-            2,
+            3,
             "original account timestamp"
         );
         assert_eq!(
@@ -8030,6 +8131,8 @@ mod tests {
         r.commit_prepare = Some(1);
         r.commit_stage = CommitStage::Execute;
         r.commit_execute();
+        // The commit injected the fresh primary's parking pulse (op 2).
+        commit_parking_pulse(&mut r);
         assert!(r.client_sessions.get(7).is_some());
         assert_eq!(r.client_send_queue.len(), 1, "commit reply");
         r.send_queue.clear();
@@ -8049,7 +8152,7 @@ mod tests {
         assert_eq!(repeat_header.checksum, stored.checksum);
         assert_eq!(repeat_header.client, 7);
         assert_eq!(repeat_header.size, stored.size);
-        assert_eq!(r.op, 1, "duplicate must not re-prepare");
+        assert_eq!(r.op, 2, "duplicate must not re-prepare");
         assert_eq!(r.pipeline_queue.prepare_queue.len(), 0, "committed op was popped");
         assert_eq!(r.send_queue.len(), 0, "duplicate must not broadcast");
     }
@@ -8069,6 +8172,8 @@ mod tests {
         r.commit_prepare = Some(1);
         r.commit_stage = CommitStage::Execute;
         r.commit_execute();
+        // The commit injected the fresh primary's parking pulse (op 2).
+        commit_parking_pulse(&mut r);
         r.send_queue.clear();
         r.client_send_queue.clear();
 
@@ -8091,7 +8196,7 @@ mod tests {
             .expect("reply header");
         assert_eq!(repeat_header.checksum, stored.checksum);
         assert_eq!(repeat_header.client, 7);
-        assert_eq!(r.op, 1, "duplicate must not re-prepare");
+        assert_eq!(r.op, 2, "duplicate must not re-prepare");
     }
 
     #[test]
@@ -8109,6 +8214,8 @@ mod tests {
         r.commit_prepare = Some(1);
         r.commit_stage = CommitStage::Execute;
         r.commit_execute();
+        // The commit injected the fresh primary's parking pulse (op 2).
+        commit_parking_pulse(&mut r);
         r.send_queue.clear();
 
         // A new request must carry `parent` equal to the last reply's context.
@@ -8123,9 +8230,9 @@ mod tests {
             message_header::SIZE as u32,
         );
         r.on_message(&noop, 0);
-        assert_eq!(r.op, 2);
-        r.commit_max = 2;
-        r.commit_prepare = Some(2);
+        assert_eq!(r.op, 3);
+        r.commit_max = 3;
+        r.commit_prepare = Some(3);
         r.commit_stage = CommitStage::Execute;
         r.commit_execute();
         assert_eq!(r.client_send_queue.len(), 2, "register + noop commit replies");
@@ -8146,7 +8253,7 @@ mod tests {
             .expect("reply header");
         assert_eq!(repeat_header.checksum, stored.checksum);
         assert_eq!(repeat_header.size, message_header::SIZE_U32);
-        assert_eq!(r.op, 2, "duplicate must not re-prepare");
+        assert_eq!(r.op, 3, "duplicate must not re-prepare");
         assert_eq!(r.send_queue.len(), 0, "duplicate must not broadcast");
     }
 
@@ -8161,12 +8268,13 @@ mod tests {
         r.commit_prepare = Some(1);
         r.commit_stage = CommitStage::Execute;
         r.commit_execute();
+        commit_parking_pulse(&mut r);
         r.primary_pipeline_prepare(7, 1, crate::Operation::NOOP, &[], 0).unwrap();
-        r.commit_max = 2;
-        r.commit_prepare = Some(2);
+        r.commit_max = 3;
+        r.commit_prepare = Some(3);
         r.commit_stage = CommitStage::Execute;
         r.commit_execute();
-        assert_eq!(r.op, 2);
+        assert_eq!(r.op, 3);
         r.client_send_queue.clear();
         r.send_queue.clear();
 
@@ -8223,7 +8331,7 @@ mod tests {
             0,
         );
 
-        assert_eq!(r.op, 2, "no dropped request may prepare");
+        assert_eq!(r.op, 3, "no dropped request may prepare");
         assert_eq!(r.pipeline_queue.prepare_queue.len(), 0);
         assert!(r.client_send_queue.is_empty(), "no reply or eviction for drops");
         assert_eq!(r.send_queue.len(), 0, "no broadcast");
@@ -8234,7 +8342,8 @@ mod tests {
         let mut r = Replica::new(CLUSTER, 0, 3);
         r.status = Status::Normal;
 
-        // Client 7 is registered (session = commit 1).
+        // Client 7 is registered (session = commit 1). The parking pulse (op 2)
+        // stays in the pipeline; client 9's register lands on op 3.
         r.primary_pipeline_prepare(7, 0, crate::Operation::REGISTER, &[], 0).unwrap();
         r.commit_max = 1;
         r.commit_prepare = Some(1);
@@ -8256,9 +8365,9 @@ mod tests {
         r.send_queue.clear();
         r.client_send_queue.clear();
         let op = r.primary_pipeline_prepare(9, 0, crate::Operation::REGISTER, &[], 0).unwrap();
-        assert_eq!(op, 2);
+        assert_eq!(op, 3);
         r.on_message(&request_message(9, 1, crate::Operation::NOOP), 0);
-        assert_eq!(r.op, 2, "waiting for the in-pipeline register: nothing prepared");
+        assert_eq!(r.op, 3, "waiting for the in-pipeline register: nothing prepared");
         assert!(r.client_send_queue.is_empty(), "no eviction while the register is pending");
     }
 
@@ -8277,7 +8386,7 @@ mod tests {
         register_client(&mut r, 8);
         assert_eq!(r.client_sessions.count(), constants::CLIENTS_MAX as usize);
         assert_eq!(r.client_sessions.get(1), None, "the oldest registration is evicted");
-        assert_eq!(r.client_sessions.get(8).expect("newest session").session, 8);
+        assert_eq!(r.client_sessions.get(8).expect("newest session").session, 9);
 
         // The evicted client is now unknown: its next request is evicted with
         // `no_session`.
@@ -8290,7 +8399,7 @@ mod tests {
             .expect("eviction header");
         assert_eq!(evicted.reason(), Some(message_header::Reason::NoSession));
         assert_eq!(evicted.client, 1);
-        assert_eq!(r.op, 8, "no request may prepare");
+        assert_eq!(r.op, 9, "no request may prepare");
     }
 
     #[test]
@@ -8306,9 +8415,9 @@ mod tests {
         register_client(&mut r, 8);
         assert_eq!(r.client_sessions.get(1), None);
 
-        // Client 1 re-registers: its new session (9) exceeds the old one.
+        // Client 1 re-registers: its new session (10) exceeds the old one.
         register_client(&mut r, 1);
-        assert_eq!(r.client_sessions.get(1).expect("re-registered session").session, 9);
+        assert_eq!(r.client_sessions.get(1).expect("re-registered session").session, 10);
 
         // A stale request still carrying the client's pre-eviction session is
         // evicted with `session_too_low`: that session number now belongs to a
@@ -8325,7 +8434,7 @@ mod tests {
             .expect("eviction header");
         assert_eq!(evicted.reason(), Some(message_header::Reason::SessionTooLow));
         assert_eq!(evicted.client, 1);
-        assert_eq!(r.op, 9, "no request may prepare");
+        assert_eq!(r.op, 10, "no request may prepare");
     }
 
     fn get_reply_message(
@@ -8720,6 +8829,8 @@ mod tests {
         // Once a backup acks, retransmission stops.
         r.on_prepare_ok(op, checksum, 1);
         r.commit_dispatch_enter();
+        commit_parking_pulse(&mut r);
+        r.send_queue.clear(); // the commit-tail pulse broadcast is not under test
         r.on_prepare_timeout();
         assert!(r.send_queue.is_empty());
         assert!(!r.prepare_timeout.active); // pending none → stopped
@@ -8733,12 +8844,14 @@ mod tests {
         r.primary_pipeline_prepare(2, 2, crate::Operation::NOOP, &[], 0).unwrap();
         r.send_queue.clear(); // the initial broadcasts are not under test
 
-        // Quorum op 1 and commit it; op 2 remains pending.
+        // Quorum op 1 and commit it; op 2 remains pending, and the commit-tail
+        // adds the fresh primary's parking pulse behind it (op 3).
         let checksum = r.journal.header_with_op(1).unwrap().checksum();
         r.on_prepare_ok(1, checksum, 1);
         r.commit_dispatch_enter();
         assert_eq!(r.commit_min, 1);
-        assert_eq!(r.pipeline_queue.prepare_queue.len(), 1);
+        assert_eq!(r.pipeline_queue.prepare_queue.len(), 2);
+        r.send_queue.clear(); // the commit-tail pulse broadcast is not under test
 
         // The timeout re-sends op 2 (still unacked by both backups), not op 1.
         r.on_prepare_timeout();
@@ -8779,6 +8892,9 @@ mod tests {
         r1.on_message(&r2.send_queue[0], 20_001);
         assert_eq!(r1.commit_min, 1);
         assert_eq!(r1.commit_max, 1);
+        // The commit-tail injected a parking pulse; consume it so the pipeline
+        // returns to empty.
+        commit_parking_pulse(&mut r1);
         assert!(r1.pipeline_queue.prepare_queue.is_empty());
         assert_eq!(r2.commit_min, 0); // the backup has not committed yet
     }
@@ -10951,22 +11067,27 @@ mod tests {
         r1.on_message(&r2.send_queue[0], 20_002);
         assert_eq!(r1.commit_min, 2);
         assert_eq!(r1.commit_max, 2);
+        // The op-2 commit's tail injected a fresh-primary parking pulse (op 4)
+        // behind the op-3 survivor.
         let survivor_ops: Vec<u64> = r1.pipeline_queue.prepare_queue.iter().map(|p| p.op).collect();
-        assert_eq!(survivor_ops, [3]);
+        assert_eq!(survivor_ops, [3, 4]);
 
         r1.on_message(&r2.send_queue[1], 20_003);
         assert_eq!(r1.commit_min, 3);
         assert_eq!(r1.commit_max, 3);
-        assert!(r1.pipeline_queue.prepare_queue.is_empty());
 
-        // The commit heartbeat reached the backup, which commits its (clean)
-        // op 2,3 from the journal.
+        // The op-2 commit's tail injected a fresh-primary parking pulse (op 4)
+        // behind the op-3 survivor. The backup never saw it, so advertise commit
+        // 3 via the heartbeat first, then consume the pulse locally so the
+        // pipeline drains.
         r1.send_commit(20_004);
         let commit = r1.send_queue.pop().unwrap();
         assert!(commit.header::<message_header::Commit>().is_some());
         r2.on_message(&commit, 20_005);
         assert_eq!(r2.commit_min, 3);
         assert_eq!(r2.commit_max, 3);
+        commit_parking_pulse(&mut r1);
+        assert!(r1.pipeline_queue.prepare_queue.is_empty());
     }
 
     #[test]
@@ -11285,6 +11406,8 @@ mod tests {
         assert_eq!(r.commit_min, op);
         assert_eq!(r.commit_max, op);
         assert!(r.commit_prepare.is_none());
+        // The commit-tail injected a parking pulse; consume it.
+        commit_parking_pulse(&mut r);
         assert!(r.pipeline_queue.prepare_queue.is_empty());
     }
 
@@ -11307,6 +11430,8 @@ mod tests {
         r.commit_dispatch_enter();
         assert_eq!(r.commit_stage, CommitStage::Idle);
         assert_eq!(r.commit_min, op3);
+        // The third commit's tail injected a parking pulse; consume it.
+        commit_parking_pulse(&mut r);
         assert!(r.pipeline_queue.prepare_queue.is_empty());
     }
 
@@ -11755,6 +11880,14 @@ mod tests {
         // slot (upstream drains these through the IO loop between commits).
         r.poll_client_replies();
 
+        // The register's commit injected the fresh primary's parking pulse; give it
+        // a backup quorum and commit it through the dispatch pipeline so the
+        // client ops below stay contiguous (op 3, op 4).
+        let pulse_checksum = r.journal.header_with_op(2).expect("parking pulse").checksum();
+        r.on_prepare_ok(2, pulse_checksum, 1);
+        r.commit_dispatch_enter();
+        assert_eq!(r.commit_min, 2);
+
         // 2. Create two accounts.
         let accounts = crate::state_machine::account_batch_to_bytes(&[
             Account { id: 1, ledger: 1, code: 1, ..Account::default() },
@@ -11763,18 +11896,18 @@ mod tests {
         assert_eq!(
             r.primary_pipeline_prepare(41, 1, crate::Operation::CREATE_ACCOUNTS, &accounts, 0)
                 .unwrap(),
-            2,
+            3,
         );
-        let checksum = r.journal.header_with_op(2).expect("prepare").checksum();
-        r.on_prepare_ok(2, checksum, 1);
+        let checksum = r.journal.header_with_op(3).expect("prepare").checksum();
+        r.on_prepare_ok(3, checksum, 1);
         r.commit_dispatch_enter();
-        assert_eq!(r.commit_min, 2);
-        assert_eq!(r.state_machine.commit_timestamp(), 2);
+        assert_eq!(r.commit_min, 3);
+        assert_eq!(r.state_machine.commit_timestamp(), 3);
         r.poll_client_replies();
         let account_1 = r.state_machine.account(1).expect("account is committed");
-        assert_eq!(account_1.timestamp, 1);
+        assert_eq!(account_1.timestamp, 2);
         let account_2 = r.state_machine.account(2).expect("account is committed");
-        assert_eq!(account_2.timestamp, 2);
+        assert_eq!(account_2.timestamp, 3);
 
         // 3. Transfer 10 units from account 1 to account 2.
         let transfer = crate::state_machine::transfer_batch_to_bytes(&[Transfer {
@@ -11789,13 +11922,13 @@ mod tests {
         assert_eq!(
             r.primary_pipeline_prepare(41, 2, crate::Operation::CREATE_TRANSFERS, &transfer, 0)
                 .unwrap(),
-            3,
+            4,
         );
-        let checksum = r.journal.header_with_op(3).expect("prepare").checksum();
-        r.on_prepare_ok(3, checksum, 1);
+        let checksum = r.journal.header_with_op(4).expect("prepare").checksum();
+        r.on_prepare_ok(4, checksum, 1);
         r.commit_dispatch_enter();
-        assert_eq!(r.commit_min, 3);
-        assert_eq!(r.state_machine.commit_timestamp(), 3);
+        assert_eq!(r.commit_min, 4);
+        assert_eq!(r.state_machine.commit_timestamp(), 4);
         r.poll_client_replies();
 
         // The transfer executed: balances moved and the transfer is committed
@@ -11807,20 +11940,20 @@ mod tests {
         assert_eq!(account_2.credits_pending, 0);
         assert_eq!(account_2.credits_posted, 10);
         let transfer = r.state_machine.transfer(10).expect("transfer is committed");
-        assert_eq!(transfer.timestamp, 3);
+        assert_eq!(transfer.timestamp, 4);
         assert_eq!(transfer.amount, 10);
 
         // The client's latest session reply reflects the transfer commit, and the
         // primary queued the reply for delivery.
         let entry = r.client_sessions.get(41).expect("session entry");
-        assert_eq!(entry.header.op, 3);
+        assert_eq!(entry.header.op, 4);
         assert_eq!(entry.header.request, 2);
-        assert_eq!(entry.header.commit, 3);
+        assert_eq!(entry.header.commit, 4);
         assert!(
             r.client_send_queue.iter().any(|message| {
                 message
                     .header::<crate::message_header::Reply>()
-                    .is_some_and(|reply| reply.op == 3 && reply.client == 41)
+                    .is_some_and(|reply| reply.op == 4 && reply.client == 41)
             }),
             "the client's transfer reply is queued"
         );
@@ -11956,6 +12089,13 @@ mod tests {
         assert_eq!(r.commit_min, 1);
         r.poll_client_replies();
 
+        // The register's commit injected the fresh primary's parking pulse; give
+        // it a backup quorum and commit it so the reconfiguration is op 3.
+        let pulse_checksum = r.journal.header_with_op(2).expect("parking pulse").checksum();
+        r.on_prepare_ok(2, pulse_checksum, 1);
+        r.commit_dispatch_enter();
+        assert_eq!(r.commit_min, 2);
+
         let root = crate::root_members(CLUSTER);
         let set = |ids: &[u128; 3]| -> crate::Members {
             let mut members = [0; 12];
@@ -11973,12 +12113,12 @@ mod tests {
         assert_eq!(
             r.primary_pipeline_prepare(41, 1, crate::Operation::RECONFIGURE, &request.to_wire(), 0)
                 .unwrap(),
-            2
+            3
         );
-        let checksum = r.journal.header_with_op(2).expect("prepare").checksum();
-        r.on_prepare_ok(2, checksum, 1);
+        let checksum = r.journal.header_with_op(3).expect("prepare").checksum();
+        r.on_prepare_ok(3, checksum, 1);
         r.commit_dispatch_enter();
-        assert_eq!(r.commit_min, 2);
+        assert_eq!(r.commit_min, 3);
         r.poll_client_replies();
 
         let reply = r
@@ -11987,7 +12127,7 @@ mod tests {
             .find(|message| {
                 message
                     .header::<crate::message_header::Reply>()
-                    .is_some_and(|reply| reply.op == 2 && reply.client == 41)
+                    .is_some_and(|reply| reply.op == 3 && reply.client == 41)
             })
             .expect("the reconfiguration reply is queued");
         assert_eq!(reply.body_used().len(), size_of::<crate::ReconfigurationResult>());
