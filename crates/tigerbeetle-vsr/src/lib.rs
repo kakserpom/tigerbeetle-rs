@@ -6,7 +6,7 @@
 pub use tigerbeetle_core::checksum::{ChecksumStream, checksum};
 
 use crate::command::Command;
-use tigerbeetle_core::constants::{PIPELINE_PREPARE_QUEUE_MAX, VIEW_HEADERS_MAX};
+use tigerbeetle_core::constants::{MEMBERS_MAX, PIPELINE_PREPARE_QUEUE_MAX, VIEW_HEADERS_MAX};
 
 pub mod checkpoint_trailer;
 pub mod client_replies;
@@ -189,8 +189,6 @@ pub struct BlockRequest {
 const _: () = assert!(size_of::<BlockRequest>() == 32);
 
 /// Body of the builtin operation=.reconfigure request.
-///
-/// TODO(port): src/vsr.zig ReconfigurationRequest.validate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(C)]
 pub struct ReconfigurationRequest {
@@ -265,6 +263,194 @@ pub enum ReconfigurationResult {
 }
 
 const _: () = assert!(size_of::<ReconfigurationRequest>() == 256);
+
+/// The current cluster configuration that a reconfiguration request is
+/// validated against (mirrors upstream's anonymous `current` struct passed to
+/// `ReconfigurationRequest.validate`, vsr.zig:450-456).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReconfigurationCurrent {
+    pub members: Members,
+    pub epoch: u32,
+    pub replica_count: u8,
+    pub standby_count: u8,
+}
+
+impl ReconfigurationRequest {
+    /// The little-endian wire layout of a `ReconfigurationRequest`. The struct
+    /// is `#[repr(C)]` with no padding (`@sizeOf == 256`, upstream vsr.zig:445),
+    /// and `u128` members are serialized in declaration order.
+    const MEMBERS_END: usize = MEMBERS_MAX * 16;
+    const EPHEMERAL_END: usize = Self::MEMBERS_END + 4;
+    const REPLICA_COUNT_END: usize = Self::EPHEMERAL_END + 1;
+    const STANDBY_COUNT_END: usize = Self::REPLICA_COUNT_END + 1;
+    const RESERVED_END: usize = Self::STANDBY_COUNT_END + 54;
+    const SIZE: usize = Self::RESERVED_END + 4;
+
+    /// Decode a `ReconfigurationRequest` from its 256-byte wire encoding.
+    ///
+    /// # Panics
+    /// Panics if `bytes.len() != size_of::<ReconfigurationRequest>()` or the
+    /// trailing `result` is not a valid `ReconfigurationResult` value.
+    #[must_use]
+    pub fn from_wire(bytes: &[u8]) -> Self {
+        assert_eq!(Self::SIZE, size_of::<Self>());
+        assert_eq!(bytes.len(), Self::SIZE);
+
+        let mut members = [0; MEMBERS_MAX];
+        for (i, member) in members.iter_mut().enumerate() {
+            let offset = i * 16;
+            *member = u128::from_le_bytes(
+                bytes[offset..offset + 16].try_into().unwrap_or_else(|_| unreachable!("sized")),
+            );
+        }
+
+        let mut reserved = [0_u8; 54];
+        reserved.copy_from_slice(&bytes[Self::STANDBY_COUNT_END..Self::RESERVED_END]);
+
+        let result = match u32::from_le_bytes(
+            bytes[Self::RESERVED_END..Self::SIZE]
+                .try_into()
+                .unwrap_or_else(|_| unreachable!("sized")),
+        ) {
+            0 => ReconfigurationResult::Reserved,
+            1 => ReconfigurationResult::Ok,
+            2 => ReconfigurationResult::ReplicaCountZero,
+            3 => ReconfigurationResult::ReplicaCountMaxExceeded,
+            4 => ReconfigurationResult::StandbyCountMaxExceeded,
+            5 => ReconfigurationResult::MembersInvalid,
+            6 => ReconfigurationResult::MembersCountInvalid,
+            7 => ReconfigurationResult::ReservedField,
+            8 => ReconfigurationResult::ResultMustBeReserved,
+            9 => ReconfigurationResult::EpochInThePast,
+            10 => ReconfigurationResult::EpochInTheFuture,
+            11 => ReconfigurationResult::DifferentReplicaCount,
+            12 => ReconfigurationResult::DifferentStandbyCount,
+            13 => ReconfigurationResult::DifferentMemberSet,
+            14 => ReconfigurationResult::ConfigurationApplied,
+            15 => ReconfigurationResult::ConfigurationConflict,
+            16 => ReconfigurationResult::ConfigurationIsNoOp,
+            _ => unreachable!("invalid ReconfigurationResult discriminant"),
+        };
+
+        Self {
+            members,
+            epoch: u32::from_le_bytes(
+                bytes[Self::MEMBERS_END..Self::EPHEMERAL_END]
+                    .try_into()
+                    .unwrap_or_else(|_| unreachable!("sized")),
+            ),
+            replica_count: bytes[Self::EPHEMERAL_END],
+            standby_count: bytes[Self::REPLICA_COUNT_END],
+            reserved,
+            result,
+        }
+    }
+
+    /// Encode this request to its 256-byte wire encoding.
+    ///
+    /// # Panics
+    /// Panics if the struct no longer matches its wire layout (upstream asserts).
+    #[must_use]
+    pub fn to_wire(&self) -> Vec<u8> {
+        assert_eq!(Self::SIZE, size_of::<Self>());
+        let mut bytes = vec![0_u8; Self::SIZE];
+        for (i, member) in self.members.iter().enumerate() {
+            let offset = i * 16;
+            bytes[offset..offset + 16].copy_from_slice(&member.to_le_bytes());
+        }
+        bytes[Self::MEMBERS_END..Self::EPHEMERAL_END].copy_from_slice(&self.epoch.to_le_bytes());
+        bytes[Self::EPHEMERAL_END] = self.replica_count;
+        bytes[Self::REPLICA_COUNT_END] = self.standby_count;
+        bytes[Self::STANDBY_COUNT_END..Self::RESERVED_END].copy_from_slice(&self.reserved);
+        bytes[Self::RESERVED_END..Self::SIZE].copy_from_slice(&(self.result as u32).to_le_bytes());
+        bytes
+    }
+
+    /// Validate a reconfiguration request against the current configuration,
+    /// returning the result the primary records in the request body when it
+    /// accepts it.
+    ///
+    /// Port of `vsr.ReconfigurationRequest.validate` (src/vsr.zig:449-504).
+    ///
+    /// # Panics
+    /// Panics if the current configuration is inconsistent (upstream asserts).
+    #[must_use]
+    pub fn validate(&self, current: &ReconfigurationCurrent) -> ReconfigurationResult {
+        assert_eq!(
+            member_count(&current.members),
+            usize::from(current.replica_count) + usize::from(current.standby_count)
+        );
+
+        if self.replica_count == 0 {
+            return ReconfigurationResult::ReplicaCountZero;
+        }
+        if usize::from(self.replica_count) > tigerbeetle_core::constants::REPLICAS_MAX {
+            return ReconfigurationResult::ReplicaCountMaxExceeded;
+        }
+        if usize::from(self.standby_count) > tigerbeetle_core::constants::STANDBYS_MAX {
+            return ReconfigurationResult::StandbyCountMaxExceeded;
+        }
+
+        if !valid_members(&self.members) {
+            return ReconfigurationResult::MembersInvalid;
+        }
+        if member_count(&self.members)
+            != usize::from(self.replica_count) + usize::from(self.standby_count)
+        {
+            return ReconfigurationResult::MembersCountInvalid;
+        }
+
+        if !self.reserved.iter().all(|&byte| byte == 0) {
+            return ReconfigurationResult::ReservedField;
+        }
+        if self.result != ReconfigurationResult::Reserved {
+            return ReconfigurationResult::ResultMustBeReserved;
+        }
+
+        // The cluster's node counts cannot change (not yet supported).
+        if self.replica_count != current.replica_count {
+            return ReconfigurationResult::DifferentReplicaCount;
+        }
+        if self.standby_count != current.standby_count {
+            return ReconfigurationResult::DifferentStandbyCount;
+        }
+
+        if self.epoch < current.epoch {
+            return ReconfigurationResult::EpochInThePast;
+        }
+        if self.epoch == current.epoch {
+            return if self.members == current.members {
+                ReconfigurationResult::ConfigurationApplied
+            } else {
+                ReconfigurationResult::ConfigurationConflict
+            };
+        }
+        if self.epoch - current.epoch > 1 {
+            return ReconfigurationResult::EpochInTheFuture;
+        }
+
+        assert_eq!(self.epoch, current.epoch + 1);
+        assert!(valid_members(&current.members));
+        assert!(valid_members(&self.members));
+        assert_eq!(member_count(&current.members), member_count(&self.members));
+        // The sets have no duplicates and equal lengths, so it is enough to
+        // check that current.members is a subset of request.members.
+        for member_current in current.members {
+            if member_current == 0 {
+                break;
+            }
+            if !self.members.contains(&member_current) {
+                return ReconfigurationResult::DifferentMemberSet;
+            }
+        }
+
+        if self.members == current.members {
+            return ReconfigurationResult::ConfigurationIsNoOp;
+        }
+
+        ReconfigurationResult::Ok
+    }
+}
 
 /// Port of `vsr.Peer`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -385,6 +571,17 @@ pub fn valid_members(members: &Members) -> bool {
         }
     }
     true
+}
+
+/// Port of `vsr.member_count` (src/vsr.zig).
+#[must_use]
+pub fn member_count(members: &Members) -> usize {
+    for (index, &member) in members.iter().enumerate() {
+        if member == 0 {
+            return index;
+        }
+    }
+    MEMBERS_MAX
 }
 
 /// Port of `vsr.member_index` (src/vsr.zig).
@@ -1006,6 +1203,179 @@ pub mod snapshot {
         // TODO: This is going to become more complicated when snapshot numbers match the op
         // acquiring the snapshot.
         op + 1
+    }
+}
+
+#[cfg(test)]
+mod reconfiguration_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::{Members, ReconfigurationCurrent, ReconfigurationRequest, ReconfigurationResult};
+    use tigerbeetle_core::constants::MEMBERS_MAX;
+
+    fn to_members(ids: &[u128]) -> Members {
+        let mut result = [0; MEMBERS_MAX];
+        for (slot, member) in result.iter_mut().zip(ids) {
+            *slot = *member;
+        }
+        result
+    }
+
+    /// Port of upstream test "ReconfigurationRequest" (src/vsr.zig).
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn validate_matches_upstream_cases() {
+        let current = ReconfigurationCurrent {
+            members: to_members(&[1, 2, 3, 4]),
+            epoch: 1,
+            replica_count: 3,
+            standby_count: 1,
+        };
+
+        let r = ReconfigurationRequest {
+            members: to_members(&[4, 1, 2, 3]),
+            epoch: 2,
+            replica_count: 3,
+            standby_count: 1,
+            reserved: [0; 54],
+            result: ReconfigurationResult::Reserved,
+        };
+
+        let check =
+            |request: &ReconfigurationRequest, current: &ReconfigurationCurrent, expected| {
+                assert_eq!(request.validate(current), expected);
+            };
+
+        check(&r, &current, ReconfigurationResult::Ok);
+        check(
+            &ReconfigurationRequest { replica_count: 0, ..r },
+            &current,
+            ReconfigurationResult::ReplicaCountZero,
+        );
+        check(
+            &ReconfigurationRequest { replica_count: u8::MAX, ..r },
+            &current,
+            ReconfigurationResult::ReplicaCountMaxExceeded,
+        );
+        check(
+            &ReconfigurationRequest { standby_count: 7, ..r },
+            &current,
+            ReconfigurationResult::StandbyCountMaxExceeded,
+        );
+        check(
+            &ReconfigurationRequest { members: to_members(&[4, 1, 4, 3]), ..r },
+            &current,
+            ReconfigurationResult::MembersInvalid,
+        );
+        check(
+            &ReconfigurationRequest { members: to_members(&[4, 1, 0, 2, 3]), ..r },
+            &current,
+            ReconfigurationResult::MembersInvalid,
+        );
+        check(
+            &ReconfigurationRequest { epoch: 0, members: to_members(&[4, 1, 0, 2, 3]), ..r },
+            &current,
+            ReconfigurationResult::MembersInvalid,
+        );
+        check(
+            &ReconfigurationRequest { epoch: 1, members: to_members(&[4, 1, 0, 2, 3]), ..r },
+            &current,
+            ReconfigurationResult::MembersInvalid,
+        );
+        check(
+            &ReconfigurationRequest { replica_count: 4, ..r },
+            &current,
+            ReconfigurationResult::MembersCountInvalid,
+        );
+        check(
+            &ReconfigurationRequest { reserved: [1; 54], ..r },
+            &current,
+            ReconfigurationResult::ReservedField,
+        );
+        check(
+            &ReconfigurationRequest { result: ReconfigurationResult::Ok, ..r },
+            &current,
+            ReconfigurationResult::ResultMustBeReserved,
+        );
+        check(
+            &ReconfigurationRequest { epoch: 0, ..r },
+            &current,
+            ReconfigurationResult::EpochInThePast,
+        );
+        check(
+            &ReconfigurationRequest { epoch: 3, ..r },
+            &current,
+            ReconfigurationResult::EpochInTheFuture,
+        );
+        check(
+            &ReconfigurationRequest { members: to_members(&[1, 2, 3]), replica_count: 2, ..r },
+            &current,
+            ReconfigurationResult::DifferentReplicaCount,
+        );
+        check(
+            &ReconfigurationRequest {
+                members: to_members(&[1, 2, 3, 4, 5]),
+                standby_count: 2,
+                ..r
+            },
+            &current,
+            ReconfigurationResult::DifferentStandbyCount,
+        );
+        check(
+            &ReconfigurationRequest { members: to_members(&[8, 1, 2, 3]), ..r },
+            &current,
+            ReconfigurationResult::DifferentMemberSet,
+        );
+        check(
+            &ReconfigurationRequest { epoch: 1, members: to_members(&[1, 2, 3, 4]), ..r },
+            &current,
+            ReconfigurationResult::ConfigurationApplied,
+        );
+        check(
+            &ReconfigurationRequest { epoch: 1, ..r },
+            &current,
+            ReconfigurationResult::ConfigurationConflict,
+        );
+        check(
+            &ReconfigurationRequest { members: to_members(&[1, 2, 3, 4]), ..r },
+            &current,
+            ReconfigurationResult::ConfigurationIsNoOp,
+        );
+
+        // With the current epoch at its maximum, every higher epoch is in the past.
+        let current = ReconfigurationCurrent { epoch: u32::MAX, ..current };
+        check(&r, &current, ReconfigurationResult::EpochInThePast);
+        check(
+            &ReconfigurationRequest { epoch: u32::MAX, ..r },
+            &current,
+            ReconfigurationResult::ConfigurationConflict,
+        );
+        check(
+            &ReconfigurationRequest { epoch: u32::MAX, members: to_members(&[1, 2, 3, 4]), ..r },
+            &current,
+            ReconfigurationResult::ConfigurationApplied,
+        );
+    }
+
+    #[test]
+    fn from_wire_round_trips_and_offsets() {
+        let request = ReconfigurationRequest {
+            members: to_members(&[1, 2, 3, 4]),
+            epoch: 7,
+            replica_count: 3,
+            standby_count: 1,
+            reserved: [9; 54],
+            result: ReconfigurationResult::ConfigurationConflict,
+        };
+        let wire = request.to_wire();
+        assert_eq!(wire.len(), 256);
+        assert_eq!(wire[..16].to_vec(), 1_u128.to_le_bytes());
+        assert_eq!(wire[192..196].to_vec(), 7_u32.to_le_bytes());
+        assert_eq!(wire[196], 3);
+        assert_eq!(wire[197], 1);
+        assert_eq!(wire[198..252].to_vec(), vec![9; 54]);
+        assert_eq!(wire[252..256].to_vec(), 15_u32.to_le_bytes());
+        assert_eq!(ReconfigurationRequest::from_wire(&wire), request);
     }
 }
 

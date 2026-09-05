@@ -1066,6 +1066,15 @@ impl Replica {
         let parent =
             self.journal.header_with_op(self.op).map_or(0, message_header::Prepare::checksum);
 
+        // A reconfiguration request is validated against the current cluster
+        // configuration and the result is stamped into the body before the
+        // request is prepared (upstream `primary_prepare_reconfiguration`,
+        // replica.zig:7476); the committed reply echoes that result back.
+        let mut body = body.to_vec();
+        if operation == crate::Operation::RECONFIGURE {
+            body = self.primary_prepare_reconfiguration(&body);
+        }
+
         let mut header = message_header::Prepare {
             cluster: self.cluster,
             replica: self.replica_u8(),
@@ -1092,7 +1101,7 @@ impl Replica {
         // the body checksum cover the batch backups will receive.
         header.size = message_header::SIZE_U32
             + u32::try_from(body.len()).unwrap_or_else(|_| unreachable!("request body fits u32"));
-        header.set_checksum_body(body);
+        header.set_checksum_body(&body);
         header.set_checksum();
 
         // The primary "self-sends" the prepare through the shared accept path
@@ -1101,7 +1110,7 @@ impl Replica {
         // along so the commit path can execute it:
         let result = self.on_prepare(&header);
         assert_eq!(result, OnPrepareResult::Accepted);
-        self.journal.set_prepare_body(header.op, body);
+        self.journal.set_prepare_body(header.op, &body);
 
         let prepare = PipelinePrepare {
             op,
@@ -1109,7 +1118,7 @@ impl Replica {
             client,
             acks_received: 0,
             ok_quorum_received: false,
-            body: body.to_vec(),
+            body: body.clone(),
         };
         self.pipeline_queue.prepare_queue.push(prepare);
         self.ok_from_all_replicas.push(0);
@@ -1138,7 +1147,7 @@ impl Replica {
         // prepare from headers alone still record an empty body.)
         let mut message = crate::message::Message::new();
         message.set_header(&header);
-        message.set_body(body);
+        message.set_body(&body);
         for _ in 1..self.replica_count {
             self.send_queue.push(message.clone());
         }
@@ -2004,6 +2013,59 @@ impl Replica {
             self.upgrade_release = Some(crate::multiversion::Release { value: release_value });
         }
         Vec::new()
+    }
+
+    /// Validate and stamp the result of a reconfiguration request the primary
+    /// is about to prepare (upstream `primary_prepare_reconfiguration`,
+    /// replica.zig:7476): the request body is returned with `result` filled in,
+    /// and the committed reply echoes that result (see
+    /// [`Self::execute_op_reconfiguration`]).
+    ///
+    /// The request is validated against the current cluster configuration:
+    /// the mounted superblock's `vsr_state.members` when there is one, else the
+    /// deterministic initial members of `self.cluster` (`root_members`).
+    ///
+    /// # Panics
+    /// Panics if a non-empty body is not a full `ReconfigurationRequest`, or if
+    /// the validated result is `.reserved` (upstream asserts).
+    fn primary_prepare_reconfiguration(&self, body: &[u8]) -> Vec<u8> {
+        // DEVIATION: upstream asserts the request always carries the full
+        // `ReconfigurationRequest` body (replica.zig:7480-7483). Sans-IO tests
+        // prepare body-less reconfigures; those pass through unchanged.
+        if body.is_empty() {
+            return Vec::new();
+        }
+        let mut request = crate::ReconfigurationRequest::from_wire(body);
+        // DEVIATION: upstream derives `standby_count` from the node count and
+        // passes `.epoch = 0` (replica.zig:7495); sans-IO replicas have no
+        // standbys and the epoch is a no-op placeholder.
+        //
+        // The initial `vsr_state.members` built by `SuperBlockHeader::format`
+        // holds every `root_members` id (upstream `superblock.zig:779`), while
+        // `validate` asserts `member_count(members) == replica_count +
+        // standby_count` (vsr.zig:452) — a tension upstream never exercises
+        // (no vopr coverage of `primary_prepare_reconfiguration`). Clamp the
+        // current member set to the node count (zero-padded) so the invariant
+        // holds and only the real members are compared against.
+        let member_count = usize::from(self.replica_count);
+        let mut current_members = [0; constants::MEMBERS_MAX];
+        current_members[..member_count].copy_from_slice(
+            &self.superblock.as_ref().map_or_else(
+                || crate::root_members(self.cluster),
+                |sb| sb.working().vsr_state.members,
+            )[..member_count],
+        );
+        let current = crate::ReconfigurationCurrent {
+            members: current_members,
+            epoch: 0,
+            replica_count: u8::try_from(member_count)
+                .unwrap_or_else(|_| unreachable!("replica_count fits u8")),
+            standby_count: 0,
+        };
+        let result = request.validate(&current);
+        assert_ne!(result, crate::ReconfigurationResult::Reserved);
+        request.result = result;
+        request.to_wire()
     }
 
     /// Update a registered client's latest reply on commit.
@@ -11519,6 +11581,149 @@ mod tests {
         let result =
             std::panic::catch_unwind(|| Replica::execute_op_register(&prepare, &[0_u8; 7]));
         assert!(result.is_err(), "a non-empty, mis-sized register body is rejected");
+    }
+
+    #[test]
+    fn primary_prepare_reconfiguration_stamps_accepted_and_rejected_results() {
+        // The current cluster is the first `replica_count` root members; a
+        // reconfiguration request that permutes them at the next epoch is
+        // validated and stamped `.ok` into the prepared body.
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        r.status = Status::Normal;
+
+        let root = crate::root_members(CLUSTER);
+        let set = |ids: &[u128; 3]| -> crate::Members {
+            let mut members = [0; 12];
+            members[..3].copy_from_slice(ids);
+            members
+        };
+
+        let request = crate::ReconfigurationRequest {
+            members: set(&[root[1], root[2], root[0]]),
+            epoch: 1,
+            replica_count: 3,
+            standby_count: 0,
+            reserved: [0; 54],
+            result: crate::ReconfigurationResult::Reserved,
+        };
+        let mut body = request.to_wire();
+        let stamped = r.primary_prepare_reconfiguration(&body);
+        let end = body.len();
+        body[end - 4..].copy_from_slice(&(crate::ReconfigurationResult::Ok as u32).to_le_bytes());
+        assert_eq!(stamped, body);
+
+        // A request that drops a current member is rejected.
+        let dropped = crate::ReconfigurationRequest {
+            members: set(&[root[3], root[1], root[2]]),
+            epoch: 1,
+            ..request
+        };
+        let mut body = dropped.to_wire();
+        let stamped = r.primary_prepare_reconfiguration(&body);
+        let end = body.len();
+        body[end - 4..].copy_from_slice(
+            &(crate::ReconfigurationResult::DifferentMemberSet as u32).to_le_bytes(),
+        );
+        assert_eq!(stamped, body);
+
+        // A request whose member set has no overlap with the cluster's is
+        // rejected the same way.
+        let foreign = crate::ReconfigurationRequest {
+            members: set(&[root[3], root[4], root[5]]),
+            epoch: 1,
+            ..request
+        };
+        let mut body = foreign.to_wire();
+        let stamped = r.primary_prepare_reconfiguration(&body);
+        let end = body.len();
+        body[end - 4..].copy_from_slice(
+            &(crate::ReconfigurationResult::DifferentMemberSet as u32).to_le_bytes(),
+        );
+        assert_eq!(stamped, body);
+
+        // A reconfiguration at the current epoch that matches the current
+        // configuration is a duplicate, not an error.
+        let duplicate = crate::ReconfigurationRequest {
+            members: set(&[root[0], root[1], root[2]]),
+            epoch: 0,
+            ..request
+        };
+        let mut body = duplicate.to_wire();
+        let stamped = r.primary_prepare_reconfiguration(&body);
+        let end = body.len();
+        body[end - 4..].copy_from_slice(
+            &(crate::ReconfigurationResult::ConfigurationApplied as u32).to_le_bytes(),
+        );
+        assert_eq!(stamped, body);
+    }
+
+    #[test]
+    fn primary_pipeline_prepare_commits_stamped_reconfiguration_reply() {
+        // Register a client, then prepare a valid reconfiguration: the primary
+        // stamps `.ok` into the body, and the commit path echoes that result to
+        // the client in the reply (as `execute_op_reconfiguration`).
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        r.status = Status::Normal;
+
+        let mut forest = Forest::init(replica_forest_view(), replica_forest_grid_options(), 32);
+        let mut storage = replica_forest_storage();
+        open_forest(&mut forest, &mut storage);
+        r.state_machine.mount_forest(forest);
+        r.grid_storage = Some(storage);
+
+        let mut register_request = vec![0_u8; size_of::<crate::RegisterRequest>()];
+        register_request[..4]
+            .copy_from_slice(&(constants::MESSAGE_BODY_SIZE_MAX as u32).to_le_bytes());
+        assert_eq!(
+            r.primary_pipeline_prepare(41, 0, crate::Operation::REGISTER, &register_request, 0)
+                .unwrap(),
+            1
+        );
+        let checksum = r.journal.header_with_op(1).expect("prepare").checksum();
+        r.on_prepare_ok(1, checksum, 1);
+        r.commit_dispatch_enter();
+        assert_eq!(r.commit_min, 1);
+        r.poll_client_replies();
+
+        let root = crate::root_members(CLUSTER);
+        let set = |ids: &[u128; 3]| -> crate::Members {
+            let mut members = [0; 12];
+            members[..3].copy_from_slice(ids);
+            members
+        };
+        let request = crate::ReconfigurationRequest {
+            members: set(&[root[1], root[2], root[0]]),
+            epoch: 1,
+            replica_count: 3,
+            standby_count: 0,
+            reserved: [0; 54],
+            result: crate::ReconfigurationResult::Reserved,
+        };
+        assert_eq!(
+            r.primary_pipeline_prepare(41, 1, crate::Operation::RECONFIGURE, &request.to_wire(), 0)
+                .unwrap(),
+            2
+        );
+        let checksum = r.journal.header_with_op(2).expect("prepare").checksum();
+        r.on_prepare_ok(2, checksum, 1);
+        r.commit_dispatch_enter();
+        assert_eq!(r.commit_min, 2);
+        r.poll_client_replies();
+
+        let reply = r
+            .client_send_queue
+            .iter()
+            .find(|message| {
+                message
+                    .header::<crate::message_header::Reply>()
+                    .is_some_and(|reply| reply.op == 2 && reply.client == 41)
+            })
+            .expect("the reconfiguration reply is queued");
+        assert_eq!(reply.body_used().len(), size_of::<crate::ReconfigurationResult>());
+        assert_eq!(
+            u32::from_le_bytes(reply.body_used()[..4].try_into().expect("4-byte prefix")),
+            crate::ReconfigurationResult::Ok as u32
+        );
     }
 
     #[test]
