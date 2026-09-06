@@ -4474,6 +4474,19 @@ impl Replica {
         self.replica_count == 1
     }
 
+    /// Whether the replica is in the middle of an upgrade: an upgrade release
+    /// is in flight, or an upgrade op is already queued in the pipeline (the
+    /// latter covers a primary that promoted to normal while an upgrade op is
+    /// heading toward the pipeline, before it has committed and recorded the
+    /// release).
+    ///
+    /// Upstream: `src/vsr/replica.zig:11399` (`upgrading`).
+    #[must_use]
+    fn upgrading(&self) -> bool {
+        self.upgrade_release.is_some()
+            || self.pipeline_queue.contains_operation(crate::Operation::UPGRADE)
+    }
+
     /// Whether the normal primary may inject a state-machine pulse.
     ///
     /// Upstream: `src/vsr/replica.zig:11383` (`pulse_enabled`).
@@ -4492,10 +4505,9 @@ impl Replica {
         if self.solo() && self.view_durable_updating() {
             return false;
         }
-        // Requests are ignored during upgrades (upstream `self.upgrading()`).
-        // DEVIATION: the sans-IO replica pins `release` to MINIMUM and has no
-        // `upgrading()`; an in-flight `upgrade_release` is the closest analogue.
-        if self.upgrade_release.is_some() {
+        // Requests are ignored during upgrades (upstream `self.upgrading()`): an
+        // in-flight release, or an upgrade op already queued in the pipeline.
+        if self.upgrading() {
             return false;
         }
         true
@@ -7359,6 +7371,60 @@ mod tests {
         // the first commits.
         r.primary_pipeline_prepare(0, 0, crate::Operation::PULSE, &[], 0).unwrap();
         assert!(r.pipeline_queue.contains_operation(crate::Operation::PULSE));
+        assert!(!r.pulse_enabled());
+    }
+
+    #[test]
+    fn upgrading_true_when_upgrade_release_in_flight() {
+        let release =
+            crate::multiversion::Release::from_triple(crate::multiversion::ReleaseTriple {
+                major: 0,
+                minor: 0,
+                patch: 2,
+            });
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        r.status = Status::Normal;
+        assert!(!r.upgrading());
+
+        r.upgrade_release = Some(release);
+        assert!(r.upgrading());
+    }
+
+    #[test]
+    fn upgrading_true_when_upgrade_pipeline_prepare_queued() {
+        // A primary can promote to normal (or re-prepare) with an upgrade op
+        // already heading toward the pipeline while `upgrade_release` is still
+        // unrecorded; upstream's `upgrading()` covers that via the pipeline.
+        let release =
+            crate::multiversion::Release::from_triple(crate::multiversion::ReleaseTriple {
+                major: 0,
+                minor: 0,
+                patch: 2,
+            });
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        r.status = Status::Normal;
+        let body = upgrade_request_body(release);
+        r.primary_pipeline_prepare(0, 0, crate::Operation::UPGRADE, &body, 0).unwrap();
+        assert!(r.pipeline_queue.contains_operation(crate::Operation::UPGRADE));
+        assert_eq!(r.upgrade_release, None);
+        assert!(r.upgrading());
+    }
+
+    #[test]
+    fn pulse_enabled_false_while_upgrade_pipeline_prepare_queued() {
+        // The pipeline-queued upgrade suppresses the pulse before the upgrade
+        // commits and records `upgrade_release` (upstream replica.zig:11397).
+        let release =
+            crate::multiversion::Release::from_triple(crate::multiversion::ReleaseTriple {
+                major: 0,
+                minor: 0,
+                patch: 2,
+            });
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        r.status = Status::Normal;
+        let body = upgrade_request_body(release);
+        r.primary_pipeline_prepare(0, 0, crate::Operation::UPGRADE, &body, 0).unwrap();
+        assert_eq!(r.upgrade_release, None);
         assert!(!r.pulse_enabled());
     }
 
