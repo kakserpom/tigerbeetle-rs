@@ -5054,8 +5054,30 @@ impl Replica {
         assert!(header.op <= self.op);
         // Never advance the op.
         assert!(header.op <= self.op_prepare_max_sync());
-        // TODO(port): the `header.op == op_checkpoint() + 1` parent assertion
-        // needs the superblock checkpoint header (upstream :8514).
+        // A header at a committed op whom we already hold something for must be
+        // exactly what we have (upstream :8509-8512; the `updating_checkpoint`
+        // clause collapses to the journal check — there is no state sync).
+        if header.op > self.op_checkpoint()
+            && header.op <= self.commit_min
+            && self.journal.header_with_op(header.op).is_some()
+        {
+            assert!(self.journal.has_header(header));
+        }
+        // The first op after a checkpoint chains directly onto the checkpoint's
+        // own last prepare (the checkpoint header) (upstream :8514).
+        // DEVIATION: pre-mount there is no checkpoint to verify against, so the
+        // assertion is skipped — matching the initial op-0 checkpoint
+        // placeholder used by `checkpoint_id_for_op`.
+        if header.op == self.op_checkpoint() + 1
+            && let Some(sb) = &self.superblock
+        {
+            assert_eq!(
+                header.parent,
+                sb.working().vsr_state.checkpoint.header.checksum(),
+                "replace_header: op {} must chain to the checkpoint header",
+                header.op,
+            );
+        }
         if header.op < self.op_repair_min() {
             return; // Restart-recovery would never use this header.
         }
@@ -13095,6 +13117,108 @@ mod tests {
             backup.send_prepare_ok(&prepare);
         }));
         assert!(panicked.is_err());
+    }
+
+    #[test]
+    fn replace_header_requires_first_post_checkpoint_op_to_chain_to_checkpoint() {
+        // `replace_header` (upstream replica.zig:8514) asserts that the first
+        // op after a checkpoint (`op == op_checkpoint() + 1`) chains directly
+        // onto the checkpoint's own last prepare, because that prepare
+        // *is* the checkpoint header.
+        let first_checkpoint = constants::VSR_CHECKPOINT_OPS as u64 - 1;
+
+        // Setup shared by both the matching and mismatching header.
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        r.status = Status::Normal;
+        let (sb, st) = opened_superblock_at_op(first_checkpoint);
+        let checkpoint_checksum = sb.working().vsr_state.checkpoint.header.checksum();
+        r.mount_superblock(sb, st);
+        r.op = first_checkpoint + 1;
+        // commit_min == checkpoint op: the op-just-onwards header is *not* a
+        // committed op we already hold, so the committed-op invariant
+        // (upstream :8509-8512) stays out of this test's way.
+        r.commit_min = first_checkpoint;
+        r.commit_max = first_checkpoint;
+
+        // A header that fails to parent to the checkpoint header panics.
+        let broken = make_prepare_for_replica(CLUSTER, 0, first_checkpoint + 1, 0, 0);
+        assert_ne!(broken.parent, checkpoint_checksum);
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            r.replace_header(&broken);
+        }));
+        assert!(panicked.is_err());
+
+        // The same header, correctly linked to the checkpoint header, is
+        // accepted (marked dirty for a WAL write).
+        let mut linked = make_prepare_for_replica(CLUSTER, 0, first_checkpoint + 1, 0, 0);
+        linked.parent = checkpoint_checksum;
+        linked.set_checksum();
+        r.status = Status::Normal;
+        r.replace_header(&linked);
+        assert_eq!(
+            r.journal.header_with_op(first_checkpoint + 1).map(message_header::Prepare::checksum),
+            Some(linked.checksum()),
+        );
+
+        // Unmounted replicas have no checkpoint to verify against, so the
+        // assertion is skipped (DEVIATION): the same broken, unmounted header
+        // is accepted.
+        let mut unmounted = Replica::new(CLUSTER, 0, 3);
+        unmounted.status = Status::Normal;
+        unmounted.op = 1;
+        unmounted.commit_min = 0;
+        unmounted.commit_max = 0;
+        assert_eq!(unmounted.op_checkpoint(), 0);
+        let mut broken = make_prepare_for_replica(CLUSTER, 0, 1, 0, 0);
+        broken.set_checksum();
+        unmounted.replace_header(&broken);
+        assert_eq!(
+            unmounted.journal.header_with_op(1).map(message_header::Prepare::checksum),
+            Some(broken.checksum())
+        );
+    }
+
+    #[test]
+    fn replace_header_requires_committed_op_to_match_journal_if_present() {
+        // Once a header's op has been committed, the journal must already hold
+        // *that* header, not something else at the same op
+        // (upstream replica.zig:8509-8512).
+        let first_checkpoint = constants::VSR_CHECKPOINT_OPS as u64 - 1;
+
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        r.status = Status::Normal;
+        let (sb, st) = opened_superblock_at_op(first_checkpoint);
+        let checkpoint_checksum = sb.working().vsr_state.checkpoint.header.checksum();
+        r.mount_superblock(sb, st);
+        r.op = first_checkpoint + 1;
+        r.commit_min = first_checkpoint + 1;
+        r.commit_max = first_checkpoint + 1;
+
+        // The journal already holds a (different) prepare at op = checkpoint + 1.
+        let mut existing = make_prepare_for_replica(CLUSTER, 0, first_checkpoint + 1, 0, 0);
+        existing.parent = checkpoint_checksum;
+        existing.set_checksum();
+        r.journal.set_header_as_dirty(&existing);
+
+        // An incoming header at the same committed op, also correctly linked to
+        // the checkpoint (so the first-op-after check would pass) but a
+        // different checksum, trips the committed-op invariant instead.
+        let mut incoming = make_prepare_for_replica(CLUSTER, 0, first_checkpoint + 1, 0, 0);
+        incoming.parent = checkpoint_checksum;
+        incoming.client = 99;
+        incoming.set_checksum();
+        assert_ne!(incoming.checksum(), existing.checksum());
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            r.replace_header(&incoming);
+        }));
+        assert!(panicked.is_err());
+
+        // When the journal agrees with the incoming header, it is accepted
+        // (and — already present — is not re-marked dirty).
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            r.replace_header(&existing);
+        }));
+        assert!(panicked.is_ok());
     }
 
     #[test]
