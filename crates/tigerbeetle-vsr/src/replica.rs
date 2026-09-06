@@ -5336,16 +5336,34 @@ impl Replica {
         let Some(prepare) = message.header::<message_header::Prepare>() else {
             return; // Command mismatch or invalid header.
         };
-        // Upstream ignores prepares sent outside our normal current-view state
-        // (older/newer view, view-change status); raw `on_prepare` asserts a
-        // matching view, so filter first (upstream: replica.zig:2066-2086).
-        if self.status != Status::Normal || prepare.view != self.view {
-            return;
-        }
         let body = message.body_used();
         // Receive-time body validation the message bus performs upstream: the
         // prepare's body checksum must cover the transmitted body.
         if !prepare.valid_checksum_body(body) {
+            return;
+        }
+
+        // A prepare from an older view is never accepted — we have joined a
+        // newer view — but it can still repair the journal: the previous
+        // primary's replication may arrive late and backfill a hole the current
+        // view's headers left behind, or re-trigger an ack for a slot we
+        // already hold (upstream routes these to `on_repair`,
+        // replica.zig:2066-2071). Raw `on_prepare` asserts a matching view, so
+        // dispatch the repair path directly.
+        if self.status == Status::Normal && prepare.view < self.view {
+            self.on_repair(&prepare);
+            // (Re-)record the transmitted body, mirroring the Stale branch
+            // below: a header-only repair or a lost journal write may have left
+            // the stored body empty.
+            if self.journal.header_with_op(prepare.op).is_some() {
+                self.journal.set_prepare_body(prepare.op, body);
+            }
+            return;
+        }
+        // Upstream ignores prepares sent outside our normal current-view state
+        // (newer view, view-change status); raw `on_prepare` asserts a matching
+        // view, so filter first (upstream: replica.zig:2066-2086).
+        if self.status != Status::Normal || prepare.view != self.view {
             return;
         }
         match self.on_prepare(&prepare) {
@@ -5764,14 +5782,15 @@ impl Replica {
     ///
     /// Upstream `on_repair` is reached from `on_prepare` for prepares that are
     /// older (`view < self.view`) or that we already hold (`op <= self.op`,
-    /// current view). The sans-IO port reaches it only from
-    /// [`Self::on_prepare_message`] via [`OnPrepareResult::Stale`] (view
-    /// matches, `op <= self.op`).
+    /// current view). The sans-IO port reaches it from
+    /// [`Self::on_prepare_message`] for both: stale current-view prepares via
+    /// [`OnPrepareResult::Stale`] and older-view repairs dispatched directly.
     ///
     /// If the prepare is already journaled and clean, we resend our prepare_ok:
     /// the primary's copy of that ack may have been lost, and republishing it
     /// lets the quorum make progress. Otherwise the prepare is (re-)installed
-    /// as dirty and, on a backup, a commit pass is attempted.
+    /// as dirty, a commit pass is attempted on a backup, and repairs continue
+    /// for any gaps the newly-installed header exposed.
     ///
     /// DEVIATION: upstream also consults the pipeline-cache and the
     /// repair-message budget, and writes the repaired prepare through
@@ -5805,6 +5824,10 @@ impl Replica {
             if !self.is_primary() {
                 self.commit_journal();
             }
+            // Continue repairing the gaps exposed by the newly-staged header
+            // (upstream ends `on_repair` with `repair()`; a no-op unless the
+            // journal repair timeout is active, replica.zig:2549-2551).
+            self.repair();
         }
     }
 
@@ -9524,6 +9547,80 @@ mod tests {
         r.on_repair(&h3);
         assert!(r.send_queue.is_empty());
         assert!(r.journal.header_with_op(3).is_none());
+    }
+
+    #[test]
+    fn on_prepare_message_repairs_older_view_prepare() {
+        // r joined view 1 mid-stream: its journal holds op 1 (view 0) and op 3
+        // (view 1) but op 2's slot is empty — the current view's headers never
+        // covered it. The old view-0 primary's replication of op 2 arrives
+        // late: the older-view branch of `on_prepare_message` repairs it in
+        // rather than dropping it (upstream replica.zig:2066-2071).
+        let mut r = Replica::new(0, 1, 3);
+        r.status = Status::Normal;
+        let h1 = make_prepare_for_replica(0, 0, 1, 0, 0);
+        assert_eq!(r.on_prepare(&h1), OnPrepareResult::Accepted);
+        r.view = 1;
+        // h2 was replicated by the view-0 primary; the view-1 log chains onto it.
+        let h2_old = make_prepare_for_replica(0, 0, 2, h1.checksum(), 0);
+        let h3 = make_prepare_for_replica(0, 1, 3, h2_old.checksum(), 0);
+        r.journal.set_header_as_dirty(&h3);
+        r.op = 3;
+        assert!(r.journal.header_with_op(2).is_none());
+
+        r.send_queue.clear();
+        deliver_prepare(&mut r, &h2_old);
+        // The older view did not advance op; it only backfilled the hole:
+        assert_eq!(r.op, 3);
+        assert!(r.send_queue.is_empty()); // a fresh fill is not an ack
+        let installed = r.journal.header_with_op(2).expect("op 2 repaired in");
+        assert_eq!(installed.checksum(), h2_old.checksum());
+        assert!(r.journal.body_with_op(2).is_some());
+    }
+
+    #[test]
+    fn on_prepare_message_republishes_ack_for_older_view_duplicate() {
+        // r accepted h1 in view 0 and committed it; it has since joined view 1
+        // (replica 2 is a backup of view 1). The old view-0 primary re-sends
+        // h1 — its copy of our ack may be lost: the older-view republishes the
+        // prepare_ok instead of dropping the message (upstream on_repair).
+        let mut r = Replica::new(0, 2, 3); // backup of view 1 (primary is 1)
+        r.status = Status::Normal;
+        let h1 = make_prepare_for_replica(0, 0, 1, 0, 0);
+        deliver_prepare(&mut r, &h1); // accepted in view 0 -> acks h1
+        assert_eq!(r.send_queue.len(), 1);
+
+        r.commit_max = 1;
+        r.commit_journal();
+        assert_eq!(r.commit_min, 1);
+        assert!(r.journal.has_prepare(&h1));
+
+        r.view = 1;
+        r.send_queue.clear();
+        deliver_prepare(&mut r, &h1); // same view-0 header, arriving late
+        assert_eq!(r.send_queue.len(), 1);
+        let ack = r.send_queue.pop().unwrap().header::<message_header::PrepareOk>().unwrap();
+        assert_eq!(ack.prepare_checksum, h1.checksum);
+        assert_eq!(ack.op, 1);
+        assert_eq!(ack.replica, 2);
+    }
+
+    #[test]
+    fn on_prepare_message_ignores_older_view_prepare_past_the_head() {
+        // An older-view prepare may never advance `self.op`; the repair path
+        // refuses ops past the head, and nothing is staged.
+        let mut r = Replica::new(0, 1, 3);
+        r.status = Status::Normal;
+        let h1 = make_prepare_for_replica(0, 0, 1, 0, 0);
+        assert_eq!(r.on_prepare(&h1), OnPrepareResult::Accepted);
+        r.view = 1;
+        assert_eq!(r.op, 1);
+
+        let h2_old = make_prepare_for_replica(0, 0, 2, h1.checksum(), 0);
+        deliver_prepare(&mut r, &h2_old);
+        assert_eq!(r.op, 1);
+        assert!(r.send_queue.is_empty());
+        assert!(r.journal.header_with_op(2).is_none());
     }
 
     #[test]
