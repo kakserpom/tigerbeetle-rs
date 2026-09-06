@@ -21,7 +21,7 @@ use crate::command::Command;
 use crate::grid::{Event, Grid, ReadBlockResult, ReadOptions};
 use crate::message_header;
 use crate::message_header::{GetBlocks, TypedHeader};
-use crate::repair_budget::{RepairBudgetGrid, RepairBudgetOptions};
+use crate::repair_budget::{RepairBudgetGrid, RepairBudgetJournal, RepairBudgetOptions};
 use crate::state_machine::StateMachine;
 use crate::storage::{MemoryStorage, Storage};
 // ---------------------------------------------------------------------------
@@ -190,6 +190,9 @@ pub struct Replica {
     /// Per-replica budget of inflight block requests (upstream
     /// `grid_repair_message_budget`).
     pub grid_repair_message_budget: RepairBudgetGrid,
+    /// Budget of inflight journal repair requests, keyed by requested op per
+    /// remote replica (upstream `journal_repair_message_budget`).
+    pub journal_repair_message_budget: RepairBudgetJournal,
     /// Deterministic PRNG for repair-selection shuffles (upstream `prng`).
     pub prng: Prng,
     /// The most recent monotonic clock value, in nanoseconds, used to stamp
@@ -570,6 +573,10 @@ impl Replica {
             grid_repair_timeout: Timeout::default(),
             pulse_timeout: Timeout::default(),
             grid_repair_message_budget: RepairBudgetGrid::new(RepairBudgetOptions {
+                replica_index: replica_index as u8,
+                replica_count: replica_count as u8,
+            }),
+            journal_repair_message_budget: RepairBudgetJournal::new(RepairBudgetOptions {
                 replica_index: replica_index as u8,
                 replica_count: replica_count as u8,
             }),
@@ -3046,6 +3053,7 @@ impl Replica {
         // (upstream `reset_quorum_join_view`).
         self.join_view_from_all_replicas.fill(None);
         self.join_view_quorum = false;
+        self.journal_repair_message_budget.refill();
         self.pipeline_queue = PipelineQueue::default();
         self.ok_from_all_replicas.clear();
         // Upstream stops the pipeline timers and drops abdication when leaving
@@ -3177,6 +3185,7 @@ impl Replica {
         // collected the quorum it just transitioned out of):
         self.join_view_from_all_replicas.fill(None);
         self.join_view_quorum = false;
+        self.journal_repair_message_budget.refill();
     }
 
     /// Become a `Normal` primary over the quorum's log (the new primary's tail
@@ -5691,7 +5700,11 @@ impl Replica {
 
     /// Request the prepare for `op` (whose header we hold, dirty) from a peer.
     ///
-    /// Upstream: `src/vsr/replica.zig:8311` (`repair_prepare`).
+    /// Picks the peer via [`Self::journal_repair_message_budget`]: the budget
+    /// disallows requesting an op already in-flight from a replica, caps
+    /// in-flight requests per replica, and prefers the peer with the lowest
+    /// measured repair latency. Returns `false` — without sending — when no
+    /// peer has budget left.
     ///
     /// DEVIATION: no write budget, pipeline cache, or `journal.writing`
     /// consultation; upstream further has a mode that requests an
@@ -5702,20 +5715,36 @@ impl Replica {
     ///
     /// # Panics
     ///
-    /// Panics if not `.normal`/`.view_change` or if repairs are not allowed.
+    /// Panics if not `.normal`/`.view_change`, if repairs are not allowed, or
+    /// if the journal repair budget has zero capacity (a solo replica, which
+    /// never repairs from peers).
     ///
     /// Upstream: `src/vsr/replica.zig:8311` (`repair_prepare`).
-    fn repair_prepare(&mut self, op: u64) {
+    fn repair_prepare(&mut self, op: u64) -> bool {
         assert!(self.status == Status::Normal || self.status == Status::ViewChange);
         assert!(self.repairs_allowed());
         let Some(header) = self.journal.header_with_op(op).copied() else {
-            return;
+            return false;
         };
-        let to = self.choose_any_other_replica();
+        let Some(to) = self.journal_repair_message_budget.decrement(
+            op,
+            Instant { ns: self.monotonic_now },
+            &mut self.prng,
+        ) else {
+            return false;
+        };
         self.send_get_prepare(to, op, header.checksum());
+        true
     }
 
-    /// Repair every op in `op_min..=op_max` that lacks a clean prepare.
+    /// Repair every op in `op_min..=op_max` that lacks a clean prepare, bounded
+    /// by the repair-message budget.
+    ///
+    /// Each op is either newly asked for or has its outstanding `get_prepare`
+    /// rebroadcast. The budget caps in-flight requests at
+    /// `2 * (replica_count - 1)`, so a pass stops once the budget is spent; the
+    /// remaining ops are picked up by the next pass once their predecessors are
+    /// served (or expire).
     ///
     /// # Panics
     ///
@@ -5730,13 +5759,18 @@ impl Replica {
         assert!(op_min <= op_max);
         assert!(op_max <= self.op);
 
-        // DEVIATION: no IOP/write budget to schedule against — request every op
-        // whose slot is absent or dirty (the repair-message budget is deferred).
+        // DEVIATION: the IOP/write budget (`io_budget`) is not ported, so the
+        // repair-message budget alone bounds the pass (upstream 8240-8252).
         for op in op_min..=op_max {
             let missing_or_dirty =
                 self.journal.slot_with_op(op).is_none_or(|slot| self.journal.dirty.bit(slot));
-            if missing_or_dirty {
-                self.repair_prepare(op);
+            if !missing_or_dirty {
+                continue;
+            }
+            if !self.repair_prepare(op) && self.journal_repair_message_budget.available() == 0 {
+                // Upstream: `else if (budget.available == 0) break` (8246-8251):
+                // budget spent for this pass.
+                break;
             }
         }
     }
@@ -5790,8 +5824,11 @@ impl Replica {
 
     /// Periodic repair driver: re-arm our repair cadence and run a pass.
     ///
-    /// Upstream also reaps expired `journal_repair_message_budget` requests;
-    /// the sans-IO port has no message budgets.
+    /// Before repairing, expired in-flight [`Self::journal_repair_message_budget`]
+    /// requests are reaped: a peer that never answered the requested op has its
+    /// budget restored (and its tracked repair latency penalized), so a later
+    /// pass may re-request it, possibly from another replica (upstream
+    /// replica.zig:3775).
     ///
     /// # Panics
     ///
@@ -5804,6 +5841,10 @@ impl Replica {
         // (upstream `reset_with_jitter`, replica.zig:3773).
         self.journal_repair_timeout
             .reset_with_jitter(constants::JOURNAL_REPAIR_TIMEOUT, &mut self.prng);
+        // Release budget for in-flight journal repair requests outstanding
+        // longer than the measured repair latency (upstream replica.zig:3775).
+        self.journal_repair_message_budget
+            .reap_expired_requests(Instant { ns: self.monotonic_now });
         self.repair();
     }
 
@@ -5943,9 +5984,11 @@ impl Replica {
     /// as dirty, a commit pass is attempted on a backup, and repairs continue
     /// for any gaps the newly-installed header exposed.
     ///
-    /// DEVIATION: upstream also consults the pipeline-cache and the
-    /// repair-message budget, and writes the repaired prepare through
-    /// `write_prepare`; sans-IO installs the header via `repair_header` only.
+    /// DEVIATION: upstream also consults the pipeline-cache and writes the
+    /// repaired prepare through `write_prepare`; sans-IO installs the header via
+    /// `repair_header` only (the body write completes synchronously at
+    /// `commit_op` — see its DEVIATION). The budget is still restored here
+    /// (upstream `increment`, replica.zig:2527).
     ///
     /// # Panics
     ///
@@ -5975,6 +6018,10 @@ impl Replica {
             if !self.is_primary() {
                 self.commit_journal();
             }
+            // The prepare is now safely in the journal, so the budget slot it
+            // consumed is restored (upstream `increment`, replica.zig:2527).
+            self.journal_repair_message_budget
+                .increment(header.op, Instant { ns: self.monotonic_now });
             // Continue repairing the gaps exposed by the newly-staged header
             // (upstream ends `on_repair` with `repair()`; a no-op unless the
             // journal repair timeout is active, replica.zig:2549-2551).
@@ -5994,11 +6041,10 @@ impl Replica {
     /// the op, letting the responder resolve the op in its own log. That form
     /// is unsatisfiable for `view == 0` (the responder treats `view == 0` as
     /// requiring the explicit checksum), so the port always sends the explicit
-    /// checksum. Upstream also picks `to` via the repair-message budget
-    /// (`journal_repair_message_budget.decrement`); sans-IO has no budgets, the
-    /// caller supplies the destination. The flat `send_queue` carries no
-    /// routing metadata, so the single queued `GetPrepare` must be delivered to
-    /// `to`.
+    /// checksum. The intended peer is chosen by the caller ([`Self::repair_prepare`]
+    /// picks it via [`Self::journal_repair_message_budget`]). The flat
+    /// `send_queue` carries no routing metadata, so the single queued
+    /// `GetPrepare` must be delivered to `to`.
     ///
     /// # Panics
     ///
@@ -10106,23 +10152,27 @@ mod tests {
         let response = primary.send_queue.pop().unwrap();
         r.on_message(&response, 100);
 
-        assert_eq!(r.send_queue.len(), 6); // one GetPrepare per recovered op
+        // The repair-message budget admits only `2 * (replica_count - 1)`
+        // in-flight prepares per pass (one peer per op, two per peer): four of
+        // the six recovered ops are asked for, the rest wait their turn.
+        assert_eq!(r.send_queue.len(), 4);
         let mut repair_ops: Vec<u64> = r
             .send_queue
             .iter()
             .map(|m| m.header::<message_header::GetPrepare>().unwrap().prepare_op)
             .collect();
         repair_ops.sort_unstable();
-        assert_eq!(repair_ops, [6, 7, 8, 9, 10, 11]);
+        assert_eq!(repair_ops, [6, 7, 8, 9]);
         for m in &r.send_queue {
             let request = m.header::<message_header::GetPrepare>().unwrap();
             assert_eq!(request.replica, 1);
             let expected = &h_by_op[&request.prepare_op];
             assert_eq!(request.prepare_checksum, expected.checksum);
         }
+        assert_eq!(r.journal_repair_message_budget.available(), 0, "budget fully committed");
 
         // Pass 2: serve the op-6 body; the backup's journal now holds the
-        // repaired header+prepare for op 6.
+        // repaired header for op 6.
         let index = r
             .send_queue
             .iter()
@@ -10138,6 +10188,42 @@ mod tests {
         assert_eq!(prepare.header::<message_header::Prepare>().unwrap().op, 6);
         r.on_message(&prepare, 100);
         assert_eq!(r.journal.header_with_op(6).unwrap().checksum(), h_by_op[&6].checksum);
+        // Serving a repair prepare restores its budget slot (upstream
+        // `on_repair`'s `increment`); the tail-of-`on_repair` repair pass then
+        // spends it on a rebroadcast of the still-dirty op 6 (dirty bits clear
+        // only at `commit_op` in this port).
+        assert!(
+            r.send_queue.iter().any(|m| m
+                .header::<message_header::GetPrepare>()
+                .is_some_and(|g| g.prepare_op == 6)),
+            "freed slot is rebroadcast to op 6"
+        );
+        assert_eq!(r.journal_repair_message_budget.available(), 0);
+
+        // The served-but-not-yet-durable op 6 keeps its replenished slot: the
+        // tail-of-`on_repair` rebroadcast re-committed it. Simulate the WAL
+        // write completing (upstream `write_prepare_callback`) — the slot stays
+        // in-flight until that request is expired or answered, so a fresh pass
+        // is still quiet.
+        let slot = crate::journal::Journal::slot_for_op(6);
+        r.journal.dirty.clear(slot);
+        r.journal.prepare_inhabited[slot.index] = true;
+        r.journal.prepare_checksums[slot.index] = h_by_op[&6].checksum;
+        r.send_queue.clear();
+        r.repair();
+        assert!(r.send_queue.is_empty(), "op 6's in-flight entry still holds its slot");
+
+        // Once the journal repair timeout reaps the expired in-flight entry,
+        // the restored slot first funds the next unrequested op (10): op 6 is
+        // clean now, and ops 7..=9 are already in-flight.
+        r.monotonic_now = 600_000_000;
+        r.on_journal_repair_timeout();
+        let after_expiry: Vec<u64> = r
+            .send_queue
+            .iter()
+            .map(|m| m.header::<message_header::GetPrepare>().unwrap().prepare_op)
+            .collect();
+        assert_eq!(after_expiry, [7, 8, 9, 10], "expired slot reaches the next unrequested op");
     }
 
     #[test]
@@ -10476,6 +10562,137 @@ mod tests {
         let get_prepare =
             r.send_queue.pop().unwrap().header::<message_header::GetPrepare>().unwrap();
         assert_eq!(get_prepare.prepare_op, 8);
+    }
+
+    #[test]
+    fn repair_message_budget_caps_request_per_pass() {
+        // The journal repair budget admits `2 * (replica_count - 1)` in-flight
+        // prepares (two per remote peer): a pass asks for at most that many,
+        // and later passes stay quiet until a served (or expired) prepare frees
+        // a slot (upstream `repair_prepares_between`, replica.zig:8246-8251).
+        let mut r = Replica::new(0, 1, 3); // backup; peers 0 and 2
+        r.status = Status::Normal;
+        let mut parent = 0;
+        for op in 1..=5 {
+            let h = make_prepare_for_replica(0, 0, op, parent, 0);
+            parent = h.checksum();
+            r.on_prepare(&h);
+        }
+        for op in 1..=5 {
+            r.commit_op(op);
+        }
+        r.commit_min = 11;
+        r.commit_max = 11;
+        let h15 = make_prepare_for_replica(0, 0, 15, parent, 0);
+        deliver_prepare(&mut r, &h15); // jump to op 14
+        deliver_prepare(&mut r, &h15); // accept across the gap -> op 15
+        assert_eq!(r.op, 15);
+        // The lost-after-commit ops 6..=11 have headers (no break to repair),
+        // but their bodies never arrived: each slot stays dirty.
+        for op in 6..=11 {
+            let h = make_prepare_for_replica(0, 0, op, parent, 0);
+            parent = h.checksum();
+            r.journal.set_header_as_dirty(&h);
+        }
+        r.send_queue.clear();
+
+        r.journal_repair_timeout = Timeout::start(constants::JOURNAL_REPAIR_TIMEOUT);
+        r.repair();
+        let requested: Vec<u64> = r
+            .send_queue
+            .iter()
+            .map(|m| m.header::<message_header::GetPrepare>().unwrap().prepare_op)
+            .collect();
+        assert_eq!(requested, [6, 7, 8, 9], "two per peer, ops 10..=11 wait");
+        assert_eq!(r.journal_repair_message_budget.available(), 0, "budget fully committed");
+
+        // Nothing is rebroadcast until a slot frees: every peer holds its cap
+        // and every requested op is already in-flight.
+        r.send_queue.clear();
+        r.repair();
+        assert!(r.send_queue.is_empty(), "quiescent while the budget is committed");
+        assert_eq!(r.journal_repair_message_budget.available(), 0);
+    }
+
+    #[test]
+    fn journal_repair_timeout_reaps_expired_requests() {
+        // Expired in-flight prepare requests return their budget to the pool
+        // (upstream `reap_expired_requests`, replica.zig:3775), so the next
+        // timeout re-requests them. Under the initial (unknown, zero) latency
+        // the expiry threshold is `duration_expiry_max` = 500ms.
+        let mut r = Replica::new(0, 1, 3); // backup
+        r.status = Status::Normal;
+        let mut parent = 0;
+        for op in 1..=5 {
+            let h = make_prepare_for_replica(0, 0, op, parent, 0);
+            parent = h.checksum();
+            r.on_prepare(&h);
+        }
+        for op in 1..=5 {
+            r.commit_op(op);
+        }
+        r.commit_min = 11;
+        r.commit_max = 11;
+        let h15 = make_prepare_for_replica(0, 0, 15, parent, 0);
+        deliver_prepare(&mut r, &h15);
+        deliver_prepare(&mut r, &h15);
+        for op in 6..=11 {
+            let h = make_prepare_for_replica(0, 0, op, parent, 0);
+            parent = h.checksum();
+            r.journal.set_header_as_dirty(&h);
+        }
+        r.send_queue.clear();
+        r.journal_repair_timeout = Timeout::start(constants::JOURNAL_REPAIR_TIMEOUT);
+
+        // First timeout at t = 1000ns: the initial repair pass commits the
+        // whole budget.
+        r.monotonic_now = 1_000;
+        r.on_journal_repair_timeout();
+        assert_eq!(r.send_queue.len(), 4);
+        assert_eq!(r.journal_repair_message_budget.available(), 0);
+
+        // 600ms later the requests are long-expired: the reply never arrived,
+        // so the budget is restored and the timeouts re-issue the requests.
+        r.send_queue.clear();
+        r.monotonic_now = 600_000_000;
+        r.on_journal_repair_timeout();
+        let reissued: Vec<u64> = r
+            .send_queue
+            .iter()
+            .map(|m| m.header::<message_header::GetPrepare>().unwrap().prepare_op)
+            .collect();
+        assert_eq!(reissued, [6, 7, 8, 9], "expired requests are re-issued");
+        assert_eq!(r.journal_repair_message_budget.available(), 0);
+    }
+    #[test]
+    fn view_change_refills_journal_repair_budget() {
+        // Entering a view change refills the journal repair budget (upstream
+        // `reset_quorum_join_view`, replica.zig:10585): requests in-flight
+        // during the aborted view must not count towards the next one.
+        let mut r = Replica::new(CLUSTER, 1, 3); // backup; peers 0 and 2
+        r.status = Status::Normal;
+        // A contiguous journal (needed by `transition_to_view_change_status`
+        // when it builds the JV suffix).
+        prepare_and_commit_suffix(&mut r, CLUSTER, 15, 11);
+        // Ops 1..=11 are committed (clean). Re-dirty a contiguous subset of
+        // committed ops to simulate missing prepare bodies after a crash.
+        for op in 6..=9 {
+            let slot = crate::journal::Journal::slot_for_op(op);
+            r.journal.dirty.set(slot);
+        }
+        r.journal_repair_timeout = Timeout::start(constants::JOURNAL_REPAIR_TIMEOUT);
+        r.repair();
+        assert_eq!(r.send_queue.len(), 4);
+        assert_eq!(r.journal_repair_message_budget.available(), 0, "budget committed");
+
+        // Into the next view: the in-flight entries are discarded wholesale.
+        r.transition_to_view_change_status(1);
+        assert_eq!(r.status, Status::ViewChange);
+        assert_eq!(
+            r.journal_repair_message_budget.available(),
+            4,
+            "budget refilled; none of the previous view's requests count"
+        );
     }
 
     #[test]

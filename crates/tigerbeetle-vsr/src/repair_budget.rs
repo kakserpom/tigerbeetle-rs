@@ -108,6 +108,13 @@ impl RepairBudgetJournal {
         }
     }
 
+    /// The number of in-flight prepare requests still permitted across all
+    /// remote replicas (upstream reads the field `budget.available` directly).
+    #[must_use]
+    pub fn available(&self) -> u32 {
+        self.available
+    }
+
     /// Returns the index of the replica with the lowest repair latency, and budget availability, if
     /// one exists. Otherwise, returns `None`. For a fraction of ops (guided by
     /// `experiment_chance`), diverges from this heuristic and returns the index of a random replica
