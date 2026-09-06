@@ -442,6 +442,9 @@ pub const EXIT_VIEW_MESSAGE_TIMEOUT: u32 = 500;
 pub const VIEW_CHANGE_STATUS_TIMEOUT: u32 = 5_000;
 /// How often a view-changing replica re-sends its JoinView (upstream: 500ms).
 pub const JOIN_VIEW_MESSAGE_TIMEOUT: u32 = 500;
+/// How often a view-changing backup polls the new primary with GetView
+/// (upstream: 1s).
+pub const GET_VIEW_MESSAGE_TIMEOUT: u32 = 1_000;
 /// How often the repair timeout fires to drive `repair()` passes (upstream: 100ms).
 pub const JOURNAL_REPAIR_TIMEOUT: u32 = 100;
 

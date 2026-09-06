@@ -174,6 +174,9 @@ pub struct Replica {
     pub exit_view_message_timeout: Timeout,
     pub exit_view_window_timeout: Timeout,
     pub join_view_message_timeout: Timeout,
+    /// Polls the new primary with GetView while in view change (upstream
+    /// `get_view_message_timeout`).
+    pub get_view_message_timeout: Timeout,
     pub primary_abdicate_timeout: Timeout,
     pub journal_repair_timeout: Timeout,
     /// Drives periodic `GetBlocks` grid-repair requests (upstream
@@ -539,6 +542,7 @@ impl Replica {
             exit_view_message_timeout: Timeout::default(),
             exit_view_window_timeout: Timeout::default(),
             join_view_message_timeout: Timeout::default(),
+            get_view_message_timeout: Timeout::default(),
             primary_abdicate_timeout: Timeout::default(),
             journal_repair_timeout: Timeout::default(),
             grid_repair_timeout: Timeout::default(),
@@ -3000,6 +3004,14 @@ impl Replica {
         self.primary_abdicating = false;
         self.view_change_status_timeout = Timeout::start(constants::VIEW_CHANGE_STATUS_TIMEOUT);
         self.join_view_message_timeout = Timeout::start(constants::JOIN_VIEW_MESSAGE_TIMEOUT);
+        // Only backups poll the new primary for its View; a would-be primary
+        // that jumps straight into the view needs no GetView timer (upstream
+        // replica.zig:10233-10237).
+        if Self::primary_index_for_view(self.view, self.replica_count) == self.replica_index {
+            self.get_view_message_timeout.stop();
+        } else {
+            self.get_view_message_timeout = Timeout::start(constants::GET_VIEW_MESSAGE_TIMEOUT);
+        }
         // Stop driving repairs while the journal may be inconsistent with the
         // new view (upstream `replica.zig:10231`).
         self.journal_repair_timeout.stop();
@@ -3055,8 +3067,7 @@ impl Replica {
 
             self.ping_timeout = Timeout::start(constants::PING_TIMEOUT);
             self.join_view_message_timeout.stop();
-            // DEVIATION: upstream additionally stops get_view_message_timeout
-            // (sans-IO timeouts do not exist).
+            self.get_view_message_timeout.stop();
             self.commit_message_timeout = Timeout::start(constants::COMMIT_MESSAGE_TIMEOUT);
             self.exit_view_window_timeout.stop();
             self.exit_view_message_timeout = Timeout::start(constants::EXIT_VIEW_MESSAGE_TIMEOUT);
@@ -3085,17 +3096,21 @@ impl Replica {
             self.exit_view_message_timeout = Timeout::start(constants::EXIT_VIEW_MESSAGE_TIMEOUT);
             self.view_change_status_timeout.stop();
             self.join_view_message_timeout.stop();
+            // Upstream asserts `get_view_message_timeout.ticking`
+            // (replica.zig:10116) — a backup reaches Normal only while polling
+            // the view's primary; the timer was armed by its view-change entry.
+            assert!(self.get_view_message_timeout.active);
+            self.get_view_message_timeout.stop();
             // Only the primary pulses (upstream `become_other`, replica.zig:10227).
             self.pulse_timeout.stop();
 
-            // Upstream asserts `pipeline == .cache` (and `get_view_message_timeout`
-            // ticking, which does not exist sans-IO); the skeleton's only pipeline
+            // Upstream asserts `pipeline == .cache`; the skeleton's only pipeline
             // is the primary's queue, emptied at transition_to_view_change_status.
             assert!(self.pipeline_queue.prepare_queue.is_empty());
         }
 
-        // DEVIATION: upstream additionally starts get_view_message_timeout and
-        // repair_sync_timeout, and resets `commit_mins` / `head_ops` EWMA history.
+        // DEVIATION: upstream additionally starts repair_sync_timeout, and resets
+        // `commit_mins` / `head_ops` EWMA history.
         self.journal_repair_timeout = Timeout::start(constants::JOURNAL_REPAIR_TIMEOUT);
         // Upstream starts the grid repair timeout with `100 / tick_ms` ticks
         // (replica.zig:9921); sans-IO ticks are unitless, so it uses the same
@@ -3742,6 +3757,9 @@ impl Replica {
         if self.join_view_message_timeout.tick() {
             self.on_join_view_message_timeout();
         }
+        if self.get_view_message_timeout.tick() {
+            self.on_get_view_message_timeout();
+        }
         if self.view_change_status_timeout.tick() {
             self.on_view_change_status_timeout();
         }
@@ -3956,6 +3974,27 @@ impl Replica {
             assert!(self.view > self.log_view);
             self.send_join_view();
         }
+    }
+
+    /// Timeout: a view-changing backup polls the new primary with GetView.
+    ///
+    /// A backup that missed the View broadcast re-requests it at a fixed
+    /// cadence, so the view change completes even when a View is lost
+    /// (upstream replica.zig:3750-3768). Sans-IO the single queued `GetView`
+    /// reaches whichever peer services it (the flat `send_queue` carries no
+    /// routing metadata).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the replica is not in `ViewChange` status, or is the
+    /// would-be primary of `self.view`.
+    ///
+    /// Upstream: `src/vsr/replica.zig:3750` (`on_get_view_message_timeout`).
+    pub fn on_get_view_message_timeout(&mut self) {
+        assert_eq!(self.status, Status::ViewChange);
+        assert_ne!(Self::primary_index_for_view(self.view, self.replica_count), self.replica_index);
+        self.get_view_message_timeout.reset(constants::GET_VIEW_MESSAGE_TIMEOUT);
+        self.send_get_view();
     }
 
     /// Timeout: the primary starts abdicating after `PRIMARY_ABDICATE_TIMEOUT`
@@ -11329,6 +11368,7 @@ mod tests {
         // returned to Normal (its quorum flag reset by the transition).
         assert!(!r1.join_view_quorum);
         assert!(!r1.join_view_message_timeout.active); // stopped by the transition
+        assert!(!r1.get_view_message_timeout.active); // never armed for primaries
         assert_eq!(r1.status, Status::Normal);
         assert!(r1.is_primary());
         assert_eq!(r1.log_view, 1);
@@ -11679,6 +11719,7 @@ mod tests {
         r2.on_message(&view_msg, 20_001);
         assert_eq!(r2.status, Status::Normal);
         assert!(!r2.join_view_message_timeout.active); // stopped by the transition
+        assert!(!r2.get_view_message_timeout.active); // the poll is no longer needed
         assert_eq!(r2.view, 1);
         assert_eq!(r2.log_view, 1);
         assert_eq!(r2.op, 3);
@@ -12166,6 +12207,58 @@ mod tests {
             r.send_queue[0].header::<message_header::JoinView>().expect("join_view").view,
             1
         );
+    }
+
+    #[test]
+    fn on_get_view_message_timeout_requests_view() {
+        // A view-changing backup polls the new primary until it receives the
+        // View broadcast (upstream `on_get_view_message_timeout`).
+        let mut r = Replica::new(0, 2, 3); // backup of view 1
+        r.status = Status::Normal;
+        prepare_and_commit_suffix(&mut r, 0, 3, 1);
+        r.transition_to_view_change_status(1);
+        assert!(r.get_view_message_timeout.active); // armed for backup replicas
+        assert!(!r.is_primary());
+
+        r.send_queue.clear(); // drop the initial JoinView broadcast
+        r.on_get_view_message_timeout();
+        assert_eq!(r.send_queue.len(), 1);
+        let get_view = r.send_queue[0].header::<message_header::GetView>().expect("get_view");
+        assert_eq!(get_view.view, 1);
+        assert!(r.get_view_message_timeout.active);
+        assert_eq!(r.get_view_message_timeout.ticks, constants::GET_VIEW_MESSAGE_TIMEOUT);
+    }
+
+    #[test]
+    fn on_get_view_message_timeout_not_for_new_primary() {
+        // A would-be primary never polls itself: the timer is not armed at the
+        // view-change entry, and stepping on the handler panics (upstream
+        // replica.zig:10233-10234 / :3752).
+        let mut r = Replica::new(0, 1, 3); // new primary of view 1
+        r.status = Status::Normal;
+        prepare_and_commit_suffix(&mut r, 0, 3, 1);
+        r.transition_to_view_change_status(1);
+        assert!(!r.get_view_message_timeout.active);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            r.on_get_view_message_timeout()
+        }));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn tick_dispatches_get_view_message_timeout() {
+        // `tick` drives the GetView poll alongside the other timeouts.
+        let mut r = Replica::new(0, 2, 3); // backup of view 1
+        r.status = Status::Normal;
+        prepare_and_commit_suffix(&mut r, 0, 3, 1);
+        r.transition_to_view_change_status(1);
+        r.send_queue.clear(); // drop the initial JoinView broadcast
+        r.get_view_message_timeout = Timeout::start(1);
+
+        r.tick(0);
+        assert!(r.get_view_message_timeout.active); // reset by the handler
+        assert_eq!(r.send_queue[0].header::<message_header::GetView>().expect("get_view").view, 1);
     }
 
     // ── Commit pipeline tests ────────────────────────────────────────────
