@@ -173,6 +173,7 @@ pub struct Replica {
     pub view_change_status_timeout: Timeout,
     pub exit_view_message_timeout: Timeout,
     pub exit_view_window_timeout: Timeout,
+    pub join_view_message_timeout: Timeout,
     pub primary_abdicate_timeout: Timeout,
     pub journal_repair_timeout: Timeout,
     /// Drives periodic `GetBlocks` grid-repair requests (upstream
@@ -537,6 +538,7 @@ impl Replica {
             view_change_status_timeout: Timeout::default(),
             exit_view_message_timeout: Timeout::default(),
             exit_view_window_timeout: Timeout::default(),
+            join_view_message_timeout: Timeout::default(),
             primary_abdicate_timeout: Timeout::default(),
             journal_repair_timeout: Timeout::default(),
             grid_repair_timeout: Timeout::default(),
@@ -2997,6 +2999,7 @@ impl Replica {
         self.primary_abdicate_timeout.stop();
         self.primary_abdicating = false;
         self.view_change_status_timeout = Timeout::start(constants::VIEW_CHANGE_STATUS_TIMEOUT);
+        self.join_view_message_timeout = Timeout::start(constants::JOIN_VIEW_MESSAGE_TIMEOUT);
         // Stop driving repairs while the journal may be inconsistent with the
         // new view (upstream `replica.zig:10231`).
         self.journal_repair_timeout.stop();
@@ -3051,8 +3054,9 @@ impl Replica {
             self.view_durable_update();
 
             self.ping_timeout = Timeout::start(constants::PING_TIMEOUT);
-            // DEVIATION: upstream additionally stops join_view_message_timeout
-            // and get_view_message_timeout (sans-IO timeouts do not exist).
+            self.join_view_message_timeout.stop();
+            // DEVIATION: upstream additionally stops get_view_message_timeout
+            // (sans-IO timeouts do not exist).
             self.commit_message_timeout = Timeout::start(constants::COMMIT_MESSAGE_TIMEOUT);
             self.exit_view_window_timeout.stop();
             self.exit_view_message_timeout = Timeout::start(constants::EXIT_VIEW_MESSAGE_TIMEOUT);
@@ -3080,6 +3084,7 @@ impl Replica {
             self.exit_view_window_timeout.stop();
             self.exit_view_message_timeout = Timeout::start(constants::EXIT_VIEW_MESSAGE_TIMEOUT);
             self.view_change_status_timeout.stop();
+            self.join_view_message_timeout.stop();
             // Only the primary pulses (upstream `become_other`, replica.zig:10227).
             self.pulse_timeout.stop();
 
@@ -3317,13 +3322,12 @@ impl Replica {
         // here. Only the new primary ever consumes its own slot — backups
         // never collect JVs (upstream `ignore_view_change_message` asserts
         // `join_view_from_all_replicas` is all null for them).
+        //
+        // Re-sends (e.g. from `on_join_view_message_timeout`) are legal and go
+        // through the same replace-if-newer path as any looped-back message
+        // (upstream `primary_receive_join_view`, replica.zig:4061).
         if Self::primary_index_for_view(self.view, self.replica_count) == self.replica_index {
-            let slot = usize::from(self.replica_index);
-            assert!(self.join_view_from_all_replicas[slot].is_none());
-            self.join_view_from_all_replicas[slot] = Some(crate::jv_quorum::JoinedView {
-                header: join_view,
-                headers: self.join_view_headers.clone(),
-            });
+            self.primary_receive_join_view(&join_view, &body);
         }
     }
 
@@ -3735,6 +3739,9 @@ impl Replica {
         if self.exit_view_window_timeout.tick() {
             self.on_exit_view_window_timeout();
         }
+        if self.join_view_message_timeout.tick() {
+            self.on_join_view_message_timeout();
+        }
         if self.view_change_status_timeout.tick() {
             self.on_view_change_status_timeout();
         }
@@ -3919,6 +3926,36 @@ impl Replica {
         assert_eq!(self.status, Status::ViewChange);
         self.view_change_status_timeout.reset(constants::VIEW_CHANGE_STATUS_TIMEOUT);
         self.send_exit_view();
+    }
+
+    /// Timeout: re-send JoinView while still in view change.
+    ///
+    /// A view-changing replica re-advertises its log to the new primary at a
+    /// fixed cadence so a JV lost during the transition is retransmitted. A
+    /// primary that already holds the JV quorum is repairing and must not
+    /// signal others (upstream replica.zig:3740-3743).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the replica is not in `ViewChange` status, or is solo.
+    ///
+    /// Upstream: `src/vsr/replica.zig:3735` (`on_join_view_message_timeout`).
+    pub fn on_join_view_message_timeout(&mut self) {
+        assert_eq!(self.status, Status::ViewChange);
+        assert!(self.replica_count > 1);
+        self.join_view_message_timeout.reset(constants::JOIN_VIEW_MESSAGE_TIMEOUT);
+
+        if Self::primary_index_for_view(self.view, self.replica_count) == self.replica_index
+            && self.join_view_quorum
+        {
+            // A primary in view_change with a complete JV quorum must be
+            // repairing — it does not need to signal other replicas (upstream
+            // replica.zig:3740-3743, `assert(self.view == self.log_view)`).
+            assert_eq!(self.view, self.log_view);
+        } else {
+            assert!(self.view > self.log_view);
+            self.send_join_view();
+        }
     }
 
     /// Timeout: the primary starts abdicating after `PRIMARY_ABDICATE_TIMEOUT`
@@ -11291,6 +11328,7 @@ mod tests {
         // Quorum reached; log established; View broadcast; the new primary
         // returned to Normal (its quorum flag reset by the transition).
         assert!(!r1.join_view_quorum);
+        assert!(!r1.join_view_message_timeout.active); // stopped by the transition
         assert_eq!(r1.status, Status::Normal);
         assert!(r1.is_primary());
         assert_eq!(r1.log_view, 1);
@@ -11640,6 +11678,7 @@ mod tests {
 
         r2.on_message(&view_msg, 20_001);
         assert_eq!(r2.status, Status::Normal);
+        assert!(!r2.join_view_message_timeout.active); // stopped by the transition
         assert_eq!(r2.view, 1);
         assert_eq!(r2.log_view, 1);
         assert_eq!(r2.op, 3);
@@ -12064,6 +12103,69 @@ mod tests {
         assert_eq!(r.view_change_status_timeout.ticks, constants::VIEW_CHANGE_STATUS_TIMEOUT);
         assert_eq!(r.status, Status::ViewChange);
         assert_ne!(r.exit_view_from_all_replicas & (1u64 << 1), 0);
+    }
+
+    #[test]
+    fn on_join_view_message_timeout_resends_join_view() {
+        // A view-changing new primary re-advertises its log at a fixed cadence
+        // until its JV quorum completes (upstream `on_join_view_message_timeout`,
+        // replica.zig:3735).
+        let mut r = Replica::new(0, 1, 3);
+        r.status = Status::Normal;
+        prepare_and_commit_suffix(&mut r, 0, 3, 1);
+        r.transition_to_view_change_status(1);
+        assert_eq!(r.send_queue.len(), 1); // initial JoinView broadcast
+        let first_jv = r.send_queue[0].header::<message_header::JoinView>().unwrap().op;
+        assert!(r.join_view_message_timeout.active);
+        assert!(!r.join_view_quorum);
+
+        // The re-send carries the same log advert and must not clobber our own
+        // quorum slot (replace-if-newer keeps it).
+        r.send_queue.clear();
+        r.on_join_view_message_timeout();
+        assert_eq!(r.send_queue.len(), 1);
+        let jv = r.send_queue[0].header::<message_header::JoinView>().expect("join_view");
+        assert_eq!(jv.op, first_jv);
+        assert_eq!(jv.view, 1);
+        assert!(r.join_view_from_all_replicas[1].is_some());
+        assert!(r.join_view_message_timeout.active);
+        assert_eq!(r.join_view_message_timeout.ticks, constants::JOIN_VIEW_MESSAGE_TIMEOUT);
+    }
+
+    #[test]
+    fn on_join_view_message_timeout_primary_with_quorum_repairs_silently() {
+        // A view-changing primary that already collected its JV quorum must be
+        // repairing — it does not need to signal other replicas (upstream
+        // replica.zig:3740-3743).
+        let mut r = Replica::new(0, 1, 3);
+        r.status = Status::Normal;
+        prepare_and_commit_suffix(&mut r, 0, 3, 1);
+        r.transition_to_view_change_status(1);
+        r.log_view = r.view; // quorum collected; CTRL journal repairs pending
+        r.join_view_quorum = true;
+
+        r.send_queue.clear();
+        r.on_join_view_message_timeout();
+        assert_eq!(r.send_queue.len(), 0); // nothing re-broadcast
+        assert!(r.join_view_message_timeout.active);
+        assert_eq!(r.join_view_message_timeout.ticks, constants::JOIN_VIEW_MESSAGE_TIMEOUT);
+    }
+
+    #[test]
+    fn tick_dispatches_join_view_message_timeout() {
+        // `tick` drives the JV re-send timer alongside the other timeouts.
+        let mut r = Replica::new(0, 1, 3);
+        r.status = Status::Normal;
+        prepare_and_commit_suffix(&mut r, 0, 3, 1);
+        r.transition_to_view_change_status(1);
+        r.join_view_message_timeout = Timeout::start(1);
+
+        r.tick(0);
+        assert!(r.join_view_message_timeout.active); // reset by the handler
+        assert_eq!(
+            r.send_queue[0].header::<message_header::JoinView>().expect("join_view").view,
+            1
+        );
     }
 
     // ── Commit pipeline tests ────────────────────────────────────────────
