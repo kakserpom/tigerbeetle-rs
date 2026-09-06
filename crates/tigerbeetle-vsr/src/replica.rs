@@ -692,6 +692,22 @@ impl Replica {
         self.superblock.as_ref().map_or(0, |sb| sb.working().checkpoint_id())
     }
 
+    /// The parent_checkpoint_id of the working superblock's checkpoint.
+    ///
+    /// Reads from `self.superblock.working().vsr_state.checkpoint.parent_checkpoint_id`
+    /// when a superblock is mounted; returns `0` otherwise (matching the
+    /// pre-mount behavior, where the initial checkpoint's parent is zero).
+    ///
+    /// Upstream: `src/vsr/replica.zig:7374` (used in `send_prepare`'s
+    /// `checkpoint_id` selection) and :2199 (the `on_prepare` checkpoint
+    /// divergence check).
+    #[must_use]
+    pub fn parent_checkpoint_id(&self) -> u128 {
+        self.superblock
+            .as_ref()
+            .map_or(0, |sb| sb.working().vsr_state.checkpoint.parent_checkpoint_id)
+    }
+
     /// The highest durable view.
     ///
     /// Reads from `self.superblock.working.vsr_state.view` when a superblock is
@@ -1130,6 +1146,18 @@ impl Replica {
         let parent =
             self.journal.header_with_op(self.op).map_or(0, message_header::Prepare::checksum);
 
+        // The checkpoint_id the prepare must carry: the parent checkpoint's id
+        // while preparing toward the next checkpoint, then the current
+        // checkpoint's id once the next checkpoint op has been passed. Backups
+        // use these two ids to detect a divergence in stored checkpoints.
+        //
+        // Upstream: `src/vsr/replica.zig:7373-7374`.
+        let checkpoint_id = if self.op < self.op_checkpoint_next() {
+            self.parent_checkpoint_id()
+        } else {
+            self.checkpoint_id()
+        };
+
         // A reconfiguration request is validated against the current cluster
         // configuration and the result is stamped into the body before the
         // request is prepared (upstream `primary_prepare_reconfiguration`,
@@ -1153,6 +1181,7 @@ impl Replica {
             parent,
             client,
             request_checksum,
+            checkpoint_id,
             op,
             commit: self.commit_max,
             timestamp,
@@ -1245,8 +1274,10 @@ impl Replica {
     ///
     /// # Panics
     /// Panics if the replica is not `.normal`, if the header's cluster/view/
-    /// replica do not match ours, if the operation is `.reserved`/`.root`, or if
-    /// the header breaks the journal hash chain within this view.
+    /// replica do not match ours, if the operation is `.reserved`/`.root`,
+    /// if the header breaks the journal hash chain within this view, or if a
+    /// prepare within the WAL prepare range carries a `checkpoint_id` that
+    /// matches neither the working nor the parent checkpoint id.
     ///
     /// Upstream: `src/vsr/replica.zig:2021` (`on_prepare`).
     pub fn on_prepare(&mut self, header: &message_header::Prepare) -> OnPrepareResult {
@@ -1260,6 +1291,34 @@ impl Replica {
         if header.op <= self.op {
             return OnPrepareResult::Stale;
         }
+
+        // Verify the prepare's checkpoint_id before accepting it (upstream:
+        // replica.zig:2160-2204): within the WAL's prepare range a backup can
+        // vouch for the id — it must be the current checkpoint's id or the
+        // parent's, the two ids a primary can stamp. Anything else means the
+        // stored checkpoints have diverged, so there is no way to tell which
+        // replica is right.
+        //
+        // DEVIATION: upstream's sibling branch (`op > op_prepare_max`) clamps
+        // the op against a WAL-fit bound derived from `journal_slot_count`;
+        // sans-IO journals are in-memory and unbounded, so that fit clamp is
+        // deferred to Phase 3 (the check below is gated the same way, on
+        // `op_prepare_max_sync`).
+        if header.op <= self.op_prepare_max_sync()
+            && header.checkpoint_id != self.checkpoint_id()
+            && header.checkpoint_id != self.parent_checkpoint_id()
+        {
+            // DEVIATION: upstream logs the details via `log.err` before
+            // panicking; this port has no logger, so the panic carries them.
+            panic!(
+                "checkpoint diverged (op={} expect={:032x} received={:032x} from={})",
+                header.op,
+                self.checkpoint_id(),
+                header.checkpoint_id,
+                header.replica,
+            );
+        }
+
         if header.op > self.op + 1 {
             return OnPrepareResult::FutureOp;
         }
@@ -10966,7 +11025,13 @@ mod tests {
 
         let mut parent = 0;
         for op in 1..=2 {
-            let h = make_prepare_for_replica(CLUSTER, 0, op, parent, 0);
+            let mut h = make_prepare_for_replica(CLUSTER, 0, op, parent, 0);
+            // The prepares come from the primary's journal, so they carry the
+            // checkpoint id the primary would have stamped against its mounted
+            // superblock (the parent checkpoint's id, both ops sitting within
+            // the next checkpoint's range).
+            h.checkpoint_id = primary.parent_checkpoint_id();
+            h.set_checksum();
             parent = h.checksum();
             primary.on_prepare(&h);
         }
@@ -12786,5 +12851,117 @@ mod tests {
         let prepare_ok = ok.header::<message_header::PrepareOk>().expect("prepare_ok");
         assert_eq!(prepare_ok.checkpoint_id, backup.checkpoint_id());
         assert_ne!(prepare_ok.checkpoint_id, 0);
+    }
+
+    #[test]
+    fn primary_pipeline_prepare_stamps_parent_checkpoint_id_within_next_checkpoint() {
+        // A fresh (unmounted) primary is preparing toward its first checkpoint;
+        // it stamps the parent checkpoint's id, which is 0 pre-open.
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        r.status = Status::Normal;
+        let op = r.primary_pipeline_prepare(1, 1, crate::Operation::NOOP, &[], 0).unwrap();
+        assert_eq!(op, 1);
+        let header = r.send_queue[0].header::<message_header::Prepare>().unwrap();
+        assert_eq!(header.op, 1);
+        assert_eq!(header.checkpoint_id, r.parent_checkpoint_id());
+        assert_eq!(header.checkpoint_id, 0);
+
+        // A mounted primary (op at the first checkpoint, preparing the next op)
+        // also sits within `op_checkpoint_next`'s range, and its parent
+        // checkpoint id is nonzero.
+        let first_checkpoint = constants::VSR_CHECKPOINT_OPS as u64 - 1;
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        r.status = Status::Normal;
+        let (sb, st) = opened_superblock_at_op(first_checkpoint);
+        r.mount_superblock(sb, st);
+        r.op = first_checkpoint;
+        r.commit_min = first_checkpoint;
+        r.commit_max = first_checkpoint;
+        assert_ne!(r.parent_checkpoint_id(), 0);
+        let op = r.primary_pipeline_prepare(1, 1, crate::Operation::NOOP, &[], 0).unwrap();
+        assert_eq!(op, first_checkpoint + 1);
+        let header = r.send_queue[0].header::<message_header::Prepare>().unwrap();
+        assert_eq!(header.checkpoint_id, r.parent_checkpoint_id());
+    }
+
+    #[test]
+    fn primary_pipeline_prepare_stamps_working_checkpoint_id_after_next_checkpoint() {
+        // A primary whose op has passed its next checkpoint stamps the current
+        // (working) checkpoint id instead of the parent's.
+        let first_checkpoint = constants::VSR_CHECKPOINT_OPS as u64 - 1;
+        let next_checkpoint = first_checkpoint + constants::VSR_CHECKPOINT_OPS as u64;
+
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        r.status = Status::Normal;
+        let (sb, st) = opened_superblock_at_op(first_checkpoint);
+        r.mount_superblock(sb, st);
+        r.op = next_checkpoint;
+        r.commit_min = next_checkpoint;
+        r.commit_max = next_checkpoint;
+        let op = r.primary_pipeline_prepare(1, 1, crate::Operation::NOOP, &[], 0).unwrap();
+        assert_eq!(op, next_checkpoint + 1);
+        let header = r.send_queue[0].header::<message_header::Prepare>().unwrap();
+        assert_eq!(header.checkpoint_id, r.checkpoint_id());
+        assert_ne!(header.checkpoint_id, 0);
+        assert_ne!(header.checkpoint_id, r.parent_checkpoint_id());
+    }
+
+    #[test]
+    fn on_prepare_accepts_prepare_with_parent_and_working_checkpoint_id() {
+        // A backup mounted at the first checkpoint accepts a Prepare carrying
+        // either of the two checkpoint ids a primary can stamp: the parent's
+        // (while that primary is preparing toward the next checkpoint) or the
+        // working checkpoint's (once a primary is past its next checkpoint).
+        let first_checkpoint = constants::VSR_CHECKPOINT_OPS as u64 - 1;
+        let mut backup = Replica::new(CLUSTER, 2, 3);
+        backup.status = Status::Normal;
+        let (sb, st) = opened_superblock_at_op(first_checkpoint);
+        backup.mount_superblock(sb, st);
+        backup.op = first_checkpoint;
+        assert_ne!(backup.parent_checkpoint_id(), 0);
+
+        let mut prepare_parent_id =
+            make_prepare_for_replica(CLUSTER, 0, first_checkpoint + 1, 0, first_checkpoint);
+        prepare_parent_id.checkpoint_id = backup.parent_checkpoint_id();
+        prepare_parent_id.set_checksum();
+        assert_eq!(backup.on_prepare(&prepare_parent_id), OnPrepareResult::Accepted);
+
+        let mut prepare_working_id = make_prepare_for_replica(
+            CLUSTER,
+            0,
+            first_checkpoint + 2,
+            prepare_parent_id.checksum(),
+            first_checkpoint,
+        );
+        prepare_working_id.checkpoint_id = backup.checkpoint_id();
+        prepare_working_id.set_checksum();
+        assert_eq!(backup.on_prepare(&prepare_working_id), OnPrepareResult::Accepted);
+    }
+
+    #[test]
+    fn on_prepare_panics_on_checkpoint_divergence() {
+        // A backup mounted at the first checkpoint knows its own checkpoint id
+        // and its parent's; a Prepare within its prepare range carrying a third
+        // id is a storage divergence, so the replica panics ("checkpoint
+        // diverged", upstream replica.zig:2197-2204).
+        let first_checkpoint = constants::VSR_CHECKPOINT_OPS as u64 - 1;
+        let mut backup = Replica::new(CLUSTER, 2, 3);
+        backup.status = Status::Normal;
+        let (sb, st) = opened_superblock_at_op(first_checkpoint);
+        backup.mount_superblock(sb, st);
+        backup.op = first_checkpoint;
+        assert_ne!(backup.checkpoint_id(), 0);
+        assert_ne!(backup.parent_checkpoint_id(), 0);
+        assert!(backup.op <= backup.op_prepare_max_sync());
+
+        let mut prepare =
+            make_prepare_for_replica(CLUSTER, 0, first_checkpoint + 1, 0, first_checkpoint);
+        prepare.checkpoint_id = 0xdead_beef;
+        prepare.set_checksum();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            backup.on_prepare(&prepare);
+        }));
+        assert!(result.is_err());
     }
 }
