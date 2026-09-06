@@ -1303,6 +1303,7 @@ impl Replica {
         let prepare = PipelinePrepare {
             op,
             checksum: header.checksum(),
+            checkpoint_id: header.checkpoint_id,
             client,
             operation,
             acks_received: 0,
@@ -1316,7 +1317,8 @@ impl Replica {
         // prepare_oks ("including ourself", replica.zig:2293): the primary's
         // journal write completes on the loopback as `write_prepare_callback`
         // → `send_prepare_ok`. Contribute that self-ack here.
-        let result = self.on_prepare_ok(op, header.checksum(), self.replica_index);
+        let result =
+            self.on_prepare_ok(op, header.checksum(), header.checkpoint_id, self.replica_index);
         assert!(matches!(
             result,
             PrepareOkResult::AckCounted
@@ -1441,15 +1443,22 @@ impl Replica {
     ///
     /// Tracks the ack, counts quorum, and triggers commit when reached.
     ///
-    /// DEVIATION: upstream also asserts the prepare_ok's `checkpoint_id` — that
-    /// it matches the prepare being acked and the per-op id from
-    /// `checkpoint_id_for_op` (replica.zig:2289-2291). This port's signature
-    /// carries only `(op, checksum, replica)` and the sender (a neighbor acking
-    /// the same prepare) runs the same `send_prepare_ok` validation, so the
-    /// check is dropped rather than plumbed through every ack path.
+    /// The ack's `checkpoint_id` must match the prepare being acked and the
+    /// per-op id from `checkpoint_id_for_op` (upstream asserts both,
+    /// replica.zig:2289-2291).
+    ///
+    /// # Panics
+    /// Panics if the checkpoint_id does not match the pipeline entry or the
+    /// primary's own checkpoint id for the op.
     ///
     /// Upstream: `src/vsr/replica.zig:2248` (`on_prepare_ok`).
-    pub fn on_prepare_ok(&mut self, op: u64, checksum: u128, replica: u16) -> PrepareOkResult {
+    pub fn on_prepare_ok(
+        &mut self,
+        op: u64,
+        checksum: u128,
+        checkpoint_id: u128,
+        replica: u16,
+    ) -> PrepareOkResult {
         if !self.is_primary() {
             return PrepareOkResult::Ignored;
         }
@@ -1462,10 +1471,30 @@ impl Replica {
             return PrepareOkResult::UnknownOp;
         };
 
-        let prepare = &mut self.pipeline_queue.prepare_queue[slot];
-        if prepare.checksum != 0 && prepare.checksum != checksum {
+        // The acks for an op must all describe the same prepare (upstream asserts
+        // the prepare_ok's `checkpoint_id` against the pipeline entry and the
+        // per-op id, replica.zig:2289-2291). Read the recorded values first so
+        // the `&self` checkpoint lookup does not fight the `&mut` below.
+        let (recorded_checksum, recorded_checkpoint_id) = {
+            let prepare = &self.pipeline_queue.prepare_queue[slot];
+            (prepare.checksum, prepare.checkpoint_id)
+        };
+        if recorded_checksum != 0 && recorded_checksum != checksum {
             return PrepareOkResult::ChecksumMismatch;
         }
+        assert_eq!(
+            recorded_checkpoint_id, checkpoint_id,
+            "prepare_ok: checkpoint_id mismatch (op {op})",
+        );
+        let Some(expected_checkpoint_id) = self.checkpoint_id_for_op(op) else {
+            panic!("pipeline op {op} has no remembered checkpoint id")
+        };
+        assert_eq!(
+            recorded_checkpoint_id, expected_checkpoint_id,
+            "prepare_ok: checkpoint_id does not match checkpoint_id_for_op (op {op})",
+        );
+
+        let prepare = &mut self.pipeline_queue.prepare_queue[slot];
 
         // Set the checksum if not yet set.
         if prepare.checksum == 0 {
@@ -1522,6 +1551,7 @@ impl Replica {
         match self.on_prepare_ok(
             prepare_ok.op,
             prepare_ok.prepare_checksum,
+            prepare_ok.checkpoint_id,
             u16::from(prepare_ok.replica),
         ) {
             PrepareOkResult::Ignored
@@ -3206,6 +3236,7 @@ impl Replica {
             self.pipeline_queue.prepare_queue.push(PipelinePrepare {
                 op,
                 checksum: header.checksum(),
+                checkpoint_id: header.checkpoint_id,
                 client: header.client,
                 operation: header.operation,
                 acks_received: 0,
@@ -3224,14 +3255,14 @@ impl Replica {
         // Contribute our own prepare_oks (upstream
         // `send_prepare_oks_after_view_change`, with the primary's prepare_oks
         // self-routed through `on_prepare_ok`).
-        let survivors: Vec<(u64, u128)> = self
+        let survivors: Vec<(u64, u128, u128)> = self
             .pipeline_queue
             .prepare_queue
             .iter()
-            .map(|prepare| (prepare.op, prepare.checksum))
+            .map(|prepare| (prepare.op, prepare.checksum, prepare.checkpoint_id))
             .collect();
-        for (op, checksum) in survivors {
-            let result = self.on_prepare_ok(op, checksum, self.replica_index);
+        for (op, checksum, checkpoint_id) in survivors {
+            let result = self.on_prepare_ok(op, checksum, checkpoint_id, self.replica_index);
             assert!(
                 matches!(result, PrepareOkResult::AckCounted | PrepareOkResult::DuplicateAck),
                 "self prepare_ok cannot quorum a survivor op"
@@ -4118,6 +4149,9 @@ impl PipelineQueue {
 pub struct PipelinePrepare {
     pub op: u64,
     pub checksum: u128,
+    /// The prepare's checkpoint id — validates prepare_oks against the pipeline
+    /// entry (upstream `prepare.message.header.checkpoint_id`).
+    pub checkpoint_id: u128,
     /// The client the prepare serves (used to wait for a session's register to
     /// commit — upstream `pipeline.queue.message_by_client`).
     pub client: u128,
@@ -7272,6 +7306,7 @@ mod tests {
         let p = PipelinePrepare {
             op: 10,
             checksum: 0xAB,
+            checkpoint_id: 1,
             client: 1,
             operation: crate::Operation::NOOP,
             acks_received: 0,
@@ -7290,6 +7325,7 @@ mod tests {
         let p1 = PipelinePrepare {
             op: 0,
             checksum: 1,
+            checkpoint_id: 1,
             client: 1,
             operation: crate::Operation::NOOP,
             acks_received: 0,
@@ -7299,6 +7335,7 @@ mod tests {
         let p2 = PipelinePrepare {
             op: 2,
             checksum: 2,
+            checkpoint_id: 1,
             client: 1,
             operation: crate::Operation::NOOP,
             acks_received: 0,
@@ -9279,11 +9316,11 @@ mod tests {
         assert!(r.pipeline_queue.prepare_queue[0].acks_received >= 1);
 
         // Replica 1 acks → quorum reached (primary + one backup).
-        let result = r.on_prepare_ok(1, checksum, 1);
+        let result = r.on_prepare_ok(1, checksum, r.checkpoint_id_for_op(1).unwrap(), 1);
         assert!(matches!(result, PrepareOkResult::QuorumReached { op: 1, .. }));
 
         // A repeated ack is not re-counted.
-        let result = r.on_prepare_ok(1, checksum, 1);
+        let result = r.on_prepare_ok(1, checksum, r.checkpoint_id_for_op(1).unwrap(), 1);
         assert_eq!(result, PrepareOkResult::DuplicateAck);
     }
 
@@ -9294,9 +9331,66 @@ mod tests {
         r.primary_pipeline_prepare(1, 100, crate::Operation(6), &[], 0).unwrap();
         let checksum = r.journal.header_with_op(1).unwrap().checksum();
 
-        let _ = r.on_prepare_ok(1, checksum, 1);
-        let result = r.on_prepare_ok(1, checksum, 1); // duplicate
+        let _ = r.on_prepare_ok(1, checksum, r.checkpoint_id_for_op(1).unwrap(), 1);
+        let result = r.on_prepare_ok(1, checksum, r.checkpoint_id_for_op(1).unwrap(), 1); // duplicate
         assert_eq!(result, PrepareOkResult::DuplicateAck);
+    }
+
+    #[test]
+    #[should_panic(expected = "prepare_ok: checkpoint_id mismatch")]
+    fn on_prepare_ok_rejects_mismatched_checkpoint_id() {
+        // A prepare_ok carrying a checkpoint id that does not match the prepare
+        // being acked is an invariant violation (upstream asserts,
+        // replica.zig:2289): all acks for an op must describe the same prepare.
+        let mut r = Replica::new(0, 0, 3); // primary
+        r.status = Status::Normal;
+        r.primary_pipeline_prepare(1, 100, crate::Operation(6), &[], 0).unwrap();
+        let checksum = r.journal.header_with_op(1).unwrap().checksum();
+
+        let wrong = r.checkpoint_id_for_op(1).unwrap() ^ 0xDEAD_BEEF;
+        let _ = r.on_prepare_ok(1, checksum, wrong, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "prepare_ok: checkpoint_id does not match checkpoint_id_for_op")]
+    fn on_prepare_ok_detects_corrupted_pipeline_checkpoint() {
+        // The pipeline entry's checkpoint id is inconsistent with the primary's
+        // own journal-derived id for the op (upstream asserts the pipeline
+        // prepare's header checkpoint_id against `checkpoint_id_for_op`,
+        // replica.zig:2291). Simulate a desynced pipeline entry: the ack agrees
+        // with the pipeline entry, so only the cross-check catches it.
+        let mut r = Replica::new(0, 0, 3); // primary
+        r.status = Status::Normal;
+        r.primary_pipeline_prepare(1, 100, crate::Operation(6), &[], 0).unwrap();
+        let checksum = r.journal.header_with_op(1).unwrap().checksum();
+        let checkpoint_id = r.checkpoint_id_for_op(1).unwrap();
+
+        r.pipeline_queue.prepare_queue[0].checkpoint_id = checkpoint_id ^ 0xDEAD_BEEF;
+        let _ = r.on_prepare_ok(1, checksum, checkpoint_id ^ 0xDEAD_BEEF, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "prepare_ok: checkpoint_id mismatch")]
+    fn on_prepare_ok_message_rejects_wrong_checkpoint_id() {
+        // The wire path threads the PrepareOk's checkpoint id into the
+        // validation: a crafted PrepareOk with a wrong id is rejected.
+        let mut r = Replica::new(0, 0, 3); // primary
+        r.status = Status::Normal;
+        r.primary_pipeline_prepare(1, 100, crate::Operation(6), &[], 0).unwrap();
+        let prepare = *r.journal.header_with_op(1).unwrap();
+
+        let mut prepare_ok = message_header::PrepareOk::default();
+        prepare_ok.cluster = r.cluster;
+        prepare_ok.replica = 1;
+        prepare_ok.view = r.view;
+        prepare_ok.op = 1;
+        prepare_ok.prepare_checksum = prepare.checksum();
+        prepare_ok.checkpoint_id = prepare.checkpoint_id ^ 0xDEAD_BEEF;
+        prepare_ok.set_checksum_body(&[]);
+        prepare_ok.set_checksum();
+        let mut message = crate::message::Message::new();
+        message.set_header(&prepare_ok);
+        r.on_message(&message, 0);
     }
 
     #[test]
@@ -9317,7 +9411,7 @@ mod tests {
         // Reaching the quorum drains the pipeline and stops both timers until
         // the next prepare (upstream replica.zig:2333-2337).
         let checksum = r.journal.header_with_op(1).unwrap().checksum();
-        let result = r.on_prepare_ok(1, checksum, 1);
+        let result = r.on_prepare_ok(1, checksum, r.checkpoint_id_for_op(1).unwrap(), 1);
         assert!(matches!(result, PrepareOkResult::QuorumReached { op: 1, .. }));
         assert!(!r.prepare_timeout.active);
         assert!(!r.primary_abdicate_timeout.active);
@@ -9381,14 +9475,14 @@ mod tests {
 
         // Quorum op 1 (self + replica 1): the new head is op 2.
         let checksum = r.journal.header_with_op(1).unwrap().checksum();
-        r.on_prepare_ok(1, checksum, 1);
+        r.on_prepare_ok(1, checksum, r.checkpoint_id_for_op(1).unwrap(), 1);
         let (slot, pending) = r.primary_pipeline_pending().unwrap();
         assert_eq!(slot, 1);
         assert_eq!(pending.op, 2);
 
         // Quorum op 2 too: nothing left pending.
         let checksum = r.journal.header_with_op(2).unwrap().checksum();
-        r.on_prepare_ok(2, checksum, 1);
+        r.on_prepare_ok(2, checksum, r.checkpoint_id_for_op(2).unwrap(), 1);
         assert!(r.primary_pipeline_pending().is_none());
     }
 
@@ -9413,7 +9507,7 @@ mod tests {
         r.send_queue.clear();
 
         // Once a backup acks, retransmission stops.
-        r.on_prepare_ok(op, checksum, 1);
+        r.on_prepare_ok(op, checksum, r.checkpoint_id_for_op(op).unwrap(), 1);
         r.commit_dispatch_enter();
         commit_parking_pulse(&mut r);
         r.send_queue.clear(); // the commit-tail pulse broadcast is not under test
@@ -9433,7 +9527,7 @@ mod tests {
         // Quorum op 1 and commit it; op 2 remains pending, and the commit-tail
         // adds the fresh primary's parking pulse behind it (op 3).
         let checksum = r.journal.header_with_op(1).unwrap().checksum();
-        r.on_prepare_ok(1, checksum, 1);
+        r.on_prepare_ok(1, checksum, r.checkpoint_id_for_op(1).unwrap(), 1);
         r.commit_dispatch_enter();
         assert_eq!(r.commit_min, 1);
         assert_eq!(r.pipeline_queue.prepare_queue.len(), 2);
@@ -12393,7 +12487,7 @@ mod tests {
         // Quorum = 2 (replica_count 3): the primary's own prepare_ok was
         // contributed on prepare, so one backup ack completes the quorum.
         let checksum = r.journal.header_with_op(op).unwrap().checksum();
-        r.on_prepare_ok(op, checksum, 1); // replica 1 → quorum
+        r.on_prepare_ok(op, checksum, r.checkpoint_id_for_op(op).unwrap(), 1); // replica 1 → quorum
 
         assert!(r.pipeline_queue.prepare_queue[0].ok_quorum_received);
         assert_eq!(r.commit_min, 0);
@@ -12422,7 +12516,7 @@ mod tests {
         // quorum with a single backup ack.
         for op in [op1, op2, op3] {
             let checksum = r.journal.header_with_op(op).unwrap().checksum();
-            r.on_prepare_ok(op, checksum, 1);
+            r.on_prepare_ok(op, checksum, r.checkpoint_id_for_op(op).unwrap(), 1);
         }
 
         r.commit_dispatch_enter();
@@ -12453,7 +12547,7 @@ mod tests {
         r.status = Status::Normal;
         let op = r.primary_pipeline_prepare(1, 1, crate::Operation::NOOP, &[], 0).unwrap();
         let checksum = r.journal.header_with_op(op).unwrap().checksum();
-        r.on_prepare_ok(op, checksum, 1); // replica 1 → quorum (with the self-ack)
+        r.on_prepare_ok(op, checksum, r.checkpoint_id_for_op(op).unwrap(), 1); // replica 1 → quorum (with the self-ack)
 
         // Enter dispatch (sets commit_dispatch_entered via internal state).
         r.commit_dispatch_enter();
@@ -12853,7 +12947,7 @@ mod tests {
             1
         );
         let checksum = r.journal.header_with_op(1).expect("prepare").checksum();
-        r.on_prepare_ok(1, checksum, 1);
+        r.on_prepare_ok(1, checksum, r.checkpoint_id_for_op(1).unwrap(), 1);
         r.commit_dispatch_enter();
         assert_eq!(r.commit_min, 1);
         assert!(r.client_sessions.get(41).is_some());
@@ -12882,7 +12976,7 @@ mod tests {
         // a backup quorum and commit it through the dispatch pipeline so the
         // client ops below stay contiguous (op 3, op 4).
         let pulse_checksum = r.journal.header_with_op(2).expect("parking pulse").checksum();
-        r.on_prepare_ok(2, pulse_checksum, 1);
+        r.on_prepare_ok(2, pulse_checksum, r.checkpoint_id_for_op(2).unwrap(), 1);
         r.commit_dispatch_enter();
         assert_eq!(r.commit_min, 2);
 
@@ -12897,7 +12991,7 @@ mod tests {
             3,
         );
         let checksum = r.journal.header_with_op(3).expect("prepare").checksum();
-        r.on_prepare_ok(3, checksum, 1);
+        r.on_prepare_ok(3, checksum, r.checkpoint_id_for_op(3).unwrap(), 1);
         r.commit_dispatch_enter();
         assert_eq!(r.commit_min, 3);
         assert_eq!(r.state_machine.commit_timestamp(), 3);
@@ -12923,7 +13017,7 @@ mod tests {
             4,
         );
         let checksum = r.journal.header_with_op(4).expect("prepare").checksum();
-        r.on_prepare_ok(4, checksum, 1);
+        r.on_prepare_ok(4, checksum, r.checkpoint_id_for_op(4).unwrap(), 1);
         r.commit_dispatch_enter();
         assert_eq!(r.commit_min, 4);
         assert_eq!(r.state_machine.commit_timestamp(), 4);
@@ -13082,7 +13176,7 @@ mod tests {
             1
         );
         let checksum = r.journal.header_with_op(1).expect("prepare").checksum();
-        r.on_prepare_ok(1, checksum, 1);
+        r.on_prepare_ok(1, checksum, r.checkpoint_id_for_op(1).unwrap(), 1);
         r.commit_dispatch_enter();
         assert_eq!(r.commit_min, 1);
         r.poll_client_replies();
@@ -13090,7 +13184,7 @@ mod tests {
         // The register's commit injected the fresh primary's parking pulse; give
         // it a backup quorum and commit it so the reconfiguration is op 3.
         let pulse_checksum = r.journal.header_with_op(2).expect("parking pulse").checksum();
-        r.on_prepare_ok(2, pulse_checksum, 1);
+        r.on_prepare_ok(2, pulse_checksum, r.checkpoint_id_for_op(2).unwrap(), 1);
         r.commit_dispatch_enter();
         assert_eq!(r.commit_min, 2);
 
@@ -13114,7 +13208,7 @@ mod tests {
             3
         );
         let checksum = r.journal.header_with_op(3).expect("prepare").checksum();
-        r.on_prepare_ok(3, checksum, 1);
+        r.on_prepare_ok(3, checksum, r.checkpoint_id_for_op(3).unwrap(), 1);
         r.commit_dispatch_enter();
         assert_eq!(r.commit_min, 3);
         r.poll_client_replies();
@@ -13250,7 +13344,7 @@ mod tests {
         body[..4].copy_from_slice(&release.value.to_le_bytes());
         let op = r.primary_pipeline_prepare(0, 0, crate::Operation::UPGRADE, &body, 0).unwrap();
         let checksum = r.journal.header_with_op(op).expect("prepare").checksum();
-        r.on_prepare_ok(op, checksum, 1);
+        r.on_prepare_ok(op, checksum, r.checkpoint_id_for_op(op).unwrap(), 1);
         r.commit_dispatch_enter();
         r.poll_client_replies();
 
