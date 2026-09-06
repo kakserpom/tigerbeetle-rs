@@ -708,6 +708,73 @@ impl Replica {
             .map_or(0, |sb| sb.working().vsr_state.checkpoint.parent_checkpoint_id)
     }
 
+    /// The grandparent_checkpoint_id of the working superblock's checkpoint.
+    ///
+    /// Reads from `self.superblock.working().vsr_state.checkpoint.grandparent_checkpoint_id`
+    /// when a superblock is mounted; returns `0` otherwise (matching the
+    /// pre-mount behavior, where the initial checkpoint's grandparent is zero).
+    ///
+    /// Upstream: the `grandparent_checkpoint_id` field access in
+    /// `checkpoint_id_for_op` (replica.zig:7159).
+    #[must_use]
+    pub fn grandparent_checkpoint_id(&self) -> u128 {
+        self.superblock
+            .as_ref()
+            .map_or(0, |sb| sb.working().vsr_state.checkpoint.grandparent_checkpoint_id)
+    }
+
+    /// The checkpoint id a prepare at `op` must carry, or `None` if the op is
+    /// so old that the corresponding checkpoint has been forgotten, or so new
+    /// that no one knows its checkpoint yet.
+    ///
+    /// Unlike [`checkpoint_id`](Self::checkpoint_id), which always returns the
+    /// working checkpoint's id, this is the id of the destaggered checkpoint
+    /// containing `op`: the grandparent's id for ops at/below the current
+    /// checkpoint, the parent's id for ops up to the next checkpoint, and the
+    /// current checkpoint's id for ops up to the one after that.
+    ///
+    /// # Panics
+    /// Panics if `op_checkpoint()` is not a valid checkpoint op (the
+    /// `checkpoint_after` asserts). Unmounted replicas always satisfy this
+    /// (pre-mount state reads as the initial op-0 checkpoint).
+    ///
+    /// Upstream: `src/vsr/replica.zig:7148` (`checkpoint_id_for_op`).
+    #[must_use]
+    pub fn checkpoint_id_for_op(&self, op: u64) -> Option<u128> {
+        let checkpoint_now = self.op_checkpoint();
+        let checkpoint_next_1 = crate::checkpoint::checkpoint_after(checkpoint_now);
+        let checkpoint_next_2 = crate::checkpoint::checkpoint_after(checkpoint_next_1);
+
+        // DEVIATION: upstream reads the checkpoint being installed during a
+        // state sync (`self.syncing.updating_checkpoint`); there is no state
+        // sync in this sans-IO port, so we always read the working checkpoint
+        // (the unmounted fallback matches a freshly-formatted superblock's
+        // initial checkpoint: parent and grandparent are zero, and case 4 hash
+        // is the working id, which is 0 pre-mount).
+        // DEVIATION: for case 4 (`checkpoint_next_1 < op <= checkpoint_next_2`)
+        // upstream hashes the checkpoint state directly
+        // (`vsr.checksum(std.mem.asBytes(checkpoint))`); that is exactly
+        // `SuperBlock.checkpoint_id()` (superblock.rs:1147), so we reuse it.
+        if op + constants::VSR_CHECKPOINT_OPS as u64 <= checkpoint_now {
+            // Case 1: op is from a too distant past for us to know its checkpoint id.
+            return None;
+        }
+        if op <= checkpoint_now {
+            // Case 2: op is from the previous checkpoint whose id we still remember.
+            return Some(self.grandparent_checkpoint_id());
+        }
+        if op <= checkpoint_next_1 {
+            // Case 3: op is in the current checkpoint.
+            return Some(self.parent_checkpoint_id());
+        }
+        if op <= checkpoint_next_2 {
+            // Case 4: op is in the next checkpoint (which we have not checkpointed).
+            return Some(self.checkpoint_id());
+        }
+        // Case 5: op is from the too far future for us to know anything!
+        None
+    }
+
     /// The highest durable view.
     ///
     /// Reads from `self.superblock.working.vsr_state.view` when a superblock is
@@ -1340,6 +1407,13 @@ impl Replica {
     /// Handle a prepare_ok from a backup.
     ///
     /// Tracks the ack, counts quorum, and triggers commit when reached.
+    ///
+    /// DEVIATION: upstream also asserts the prepare_ok's `checkpoint_id` — that
+    /// it matches the prepare being acked and the per-op id from
+    /// `checkpoint_id_for_op` (replica.zig:2289-2291). This port's signature
+    /// carries only `(op, checksum, replica)` and the sender (a neighbor acking
+    /// the same prepare) runs the same `send_prepare_ok` validation, so the
+    /// check is dropped rather than plumbed through every ack path.
     ///
     /// Upstream: `src/vsr/replica.zig:2248` (`on_prepare_ok`).
     pub fn on_prepare_ok(&mut self, op: u64, checksum: u128, replica: u16) -> PrepareOkResult {
@@ -3524,6 +3598,15 @@ impl Replica {
             return;
         }
 
+        // Withhold acks for ops whose checkpoint we can no longer vouch for
+        // (too old to remember the id, or too far in the future to know it).
+        let Some(checkpoint_id) = self.checkpoint_id_for_op(prepare.op) else {
+            return;
+        };
+        // The acked prepare must carry the very checkpoint id we'd assign it
+        // (upstream replica.zig:8678).
+        assert_eq!(checkpoint_id, prepare.checkpoint_id, "prepare_ok: checkpoint mismatch");
+
         let mut prepare_ok = message_header::PrepareOk {
             cluster: self.cluster,
             replica: self.replica_u8(),
@@ -3532,7 +3615,7 @@ impl Replica {
             // The previous prepare's checksum, and the checksum being acked.
             parent: prepare.parent,
             prepare_checksum: prepare.checksum,
-            checkpoint_id: self.checkpoint_id(),
+            checkpoint_id,
             commit_min: self.commit_min,
             op: prepare.op,
             timestamp: prepare.timestamp,
@@ -12833,24 +12916,185 @@ mod tests {
     #[test]
     fn prepare_ok_checkpoint_id_from_superblock() {
         // A backup with a mounted superblock acks a Prepare; the PrepareOk it
-        // enqueues carries the superblock's checkpoint_id.
+        // enqueues carries the checkpoint id that `checkpoint_id_for_op`
+        // assigns that op (both replicas mounted at the first checkpoint, so
+        // the prepare sits in the current checkpoint and its id is the
+        // parent's).
+        let first_checkpoint = constants::VSR_CHECKPOINT_OPS as u64 - 1;
         let mut primary = Replica::new(CLUSTER, 0, 3);
         primary.status = Status::Normal;
+        let (sb, st) = opened_superblock_at_op(first_checkpoint);
+        primary.mount_superblock(sb, st);
+        primary.op = first_checkpoint;
+        primary.commit_min = first_checkpoint;
+        primary.commit_max = first_checkpoint;
         primary.primary_pipeline_prepare(1, 1, crate::Operation::NOOP, &[], 0).unwrap();
         let prepare_msg = primary.send_queue[0].clone();
+        let prepare = prepare_msg.header::<message_header::Prepare>().unwrap();
+        assert_eq!(prepare.op, first_checkpoint + 1);
+        assert_eq!(prepare.checkpoint_id, primary.parent_checkpoint_id());
+        assert_ne!(prepare.checkpoint_id, 0);
 
         let mut backup = Replica::new(CLUSTER, 2, 3);
-        // Mount at the initial (valid, op 0) checkpoint: a backup acking this
-        // low-op prepare sits before its first real checkpoint.
-        let (sb, st) = opened_superblock_at_op(0);
-        backup.mount_superblock(sb, st);
         backup.status = Status::Normal;
+        let (sb, st) = opened_superblock_at_op(first_checkpoint);
+        backup.mount_superblock(sb, st);
+        backup.op = first_checkpoint;
+        backup.commit_min = first_checkpoint;
+        backup.commit_max = first_checkpoint;
         backup.on_message(&prepare_msg, 20_000);
 
         let ok = backup.send_queue.last().expect("prepare_ok enqueued");
         let prepare_ok = ok.header::<message_header::PrepareOk>().expect("prepare_ok");
-        assert_eq!(prepare_ok.checkpoint_id, backup.checkpoint_id());
+        // The per-op id, not the working checkpoint id: both replicas sit on
+        // the same checkpoint, and its parent (nonzero) is the correct id for
+        // an op inside the next checkpoint's range.
+        assert_eq!(prepare_ok.checkpoint_id, backup.parent_checkpoint_id());
+        assert_eq!(prepare_ok.checkpoint_id, backup.checkpoint_id_for_op(prepare.op).unwrap());
+        assert_ne!(prepare_ok.checkpoint_id, backup.checkpoint_id());
         assert_ne!(prepare_ok.checkpoint_id, 0);
+    }
+
+    #[test]
+    fn checkpoint_id_for_op_case_boundaries() {
+        // The five checkpoint-id bands of upstream replica.zig:7148 against
+        // the checkpoint op itself and the two following checkpoints.
+        let cp = constants::VSR_CHECKPOINT_OPS as u64;
+
+        // Unmounted: the initial op-0 checkpoint, whose parent and grandparent
+        // are zero and whose own id is 0 pre-mount.
+        let r = Replica::new(CLUSTER, 0, 3);
+        assert_eq!(r.checkpoint_id_for_op(0), Some(0)); // case 2, op == checkpoint_now
+        assert_eq!(r.checkpoint_id_for_op(cp - 1), Some(0)); // case 3, op == next_1
+        assert_eq!(r.checkpoint_id_for_op(cp), Some(0)); // case 4 low boundary
+        assert_eq!(r.checkpoint_id_for_op(2 * cp - 1), Some(0)); // case 4 high boundary
+        assert_eq!(r.checkpoint_id_for_op(2 * cp), None); // case 5
+        assert_eq!(r.checkpoint_id_for_op(3 * cp), None); // case 5
+
+        // Mounted at the first checkpoint: past checkpoints carry the
+        // grandparent's id (zero — the initial checkpoint's parent), ops up to
+        // the next checkpoint the parent's id (nonzero), and ops up to the one
+        // after that the working checkpoint's id.
+        let first_checkpoint = cp - 1;
+        let next_checkpoint = first_checkpoint + cp;
+        let next_next_checkpoint = next_checkpoint + cp;
+
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        let (sb, st) = opened_superblock_at_op(first_checkpoint);
+        r.mount_superblock(sb, st);
+        assert_eq!(r.op_checkpoint(), first_checkpoint);
+        assert_eq!(r.checkpoint_id_for_op(1), Some(0)); // grandparent of first checkpoint
+        assert_eq!(r.checkpoint_id_for_op(first_checkpoint), Some(0)); // case 2 boundary
+        let parent = r.checkpoint_id_for_op(first_checkpoint + 1).unwrap();
+        assert_ne!(parent, 0);
+        assert_eq!(r.checkpoint_id_for_op(next_checkpoint), Some(parent)); // case 3 boundary
+        let working = r.checkpoint_id_for_op(next_checkpoint + 1).unwrap();
+        assert_ne!(working, parent);
+        assert_ne!(working, 0);
+        assert_eq!(r.checkpoint_id_for_op(next_next_checkpoint), Some(working)); // case 4 boundary
+        assert_eq!(r.checkpoint_id_for_op(next_next_checkpoint + 1), None); // case 5
+
+        // Mounted at the second checkpoint: ops from the previous wrap are now
+        // forgotten (case 1); the current-checkpoint band's case 2 id is the
+        // grandparent, which at exactly the second checkpoint is the initial
+        // checkpoint's id (0).
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        let (sb, st) = opened_superblock_at_op(next_checkpoint);
+        r.mount_superblock(sb, st);
+        assert_eq!(r.op_checkpoint(), next_checkpoint);
+        let next_1 = next_checkpoint + cp;
+        let next_2 = next_1 + cp;
+        assert_eq!(r.checkpoint_id_for_op(1), None); // case 1: too old
+        assert_eq!(r.checkpoint_id_for_op(first_checkpoint), None); // case 1 boundary
+        assert_eq!(r.checkpoint_id_for_op(first_checkpoint + 1), Some(0)); // case 2: grandparent (initial id)
+        assert_eq!(r.checkpoint_id_for_op(next_checkpoint), Some(0)); // case 2 boundary
+        let parent = r.checkpoint_id_for_op(next_checkpoint + 1).unwrap();
+        assert_ne!(parent, 0);
+        assert_eq!(r.checkpoint_id_for_op(next_1), Some(parent)); // case 3 boundary
+        let working = r.checkpoint_id_for_op(next_1 + 1).unwrap();
+        assert_ne!(working, parent);
+        assert_ne!(working, 0);
+        assert_eq!(r.checkpoint_id_for_op(next_2), Some(working)); // case 4 boundary
+        assert_eq!(r.checkpoint_id_for_op(next_2 + 1), None); // case 5
+        // (A nonzero grandparent — case 2 returning a real id — needs the
+        // fixture to chain through a third checkpoint, which is out of scope
+        // here; the band selection itself is proven above.)
+    }
+
+    #[test]
+    fn send_prepare_ok_skips_prepare_with_forgotten_checkpoint() {
+        // A backup past its second checkpoint can no longer vouch for prepares
+        // from the previous wrap (their checkpoint is forgotten); its
+        // `checkpoint_id_for_op` is `None`, so no PrepareOk is sent (upstream
+        // replica.zig:8673-8674, "not sending (old)").
+        let first_checkpoint = constants::VSR_CHECKPOINT_OPS as u64 - 1;
+        let next_checkpoint = first_checkpoint + constants::VSR_CHECKPOINT_OPS as u64;
+
+        let mut backup = Replica::new(CLUSTER, 2, 3);
+        backup.status = Status::Normal;
+        let (sb, st) = opened_superblock_at_op(next_checkpoint);
+        backup.mount_superblock(sb, st);
+        backup.op = next_checkpoint;
+        backup.commit_min = next_checkpoint;
+        backup.commit_max = next_checkpoint;
+        assert_eq!(backup.checkpoint_id_for_op(1), None);
+
+        // A prepare from the earlier wrap, carrying a checkpoint id that would
+        // have passed the `on_prepare` divergence check (the current working
+        // id) had it been delivered through `on_message`.
+        let mut old = make_prepare_for_replica(CLUSTER, 0, 1, 0, 0);
+        old.checkpoint_id = backup.checkpoint_id();
+        old.set_checksum();
+        backup.send_prepare_ok(&old);
+
+        assert!(backup.send_queue.is_empty());
+    }
+
+    #[test]
+    fn send_prepare_ok_panics_on_checkpoint_mismatch() {
+        // A backup at the first checkpoint acks a prepare carrying the working
+        // checkpoint id: `on_prepare`'s divergence check accepts it (the id is
+        // one of the two it can vouch for), but the per-op id for an op inside
+        // the current checkpoint is the *parent*'s, so `send_prepare_ok`'s
+        // assert fires (upstream replica.zig:8678).
+        let first_checkpoint = constants::VSR_CHECKPOINT_OPS as u64 - 1;
+
+        let mut primary = Replica::new(CLUSTER, 0, 3);
+        primary.status = Status::Normal;
+        let (sb, st) = opened_superblock_at_op(first_checkpoint);
+        primary.mount_superblock(sb, st);
+        primary.op = first_checkpoint;
+        primary.commit_min = first_checkpoint;
+        primary.commit_max = first_checkpoint;
+        primary.primary_pipeline_prepare(1, 1, crate::Operation::NOOP, &[], 0).unwrap();
+        let mut prepare = primary.send_queue[0].header::<message_header::Prepare>().unwrap();
+        assert_ne!(prepare.checkpoint_id, 0);
+        // Corrupt the stamp: the working id instead of the parent's.
+        assert_ne!(prepare.checkpoint_id, primary.checkpoint_id());
+        prepare.checkpoint_id = primary.checkpoint_id();
+        prepare.set_checksum();
+        // `on_message` is not used: `on_prepare_message` would not stop the
+        // corrupted stamp either, but the checkpoint-mismatch assert below is
+        // what this test pins.
+
+        let mut backup = Replica::new(CLUSTER, 2, 3);
+        backup.status = Status::Normal;
+        let (sb, st) = opened_superblock_at_op(first_checkpoint);
+        backup.mount_superblock(sb, st);
+        backup.op = first_checkpoint;
+        backup.commit_min = first_checkpoint;
+        backup.commit_max = first_checkpoint;
+        assert_eq!(
+            backup.checkpoint_id_for_op(first_checkpoint + 1).unwrap(),
+            backup.parent_checkpoint_id(),
+        );
+        // The divergence check passes (working id is a vouchable id)...
+        assert_eq!(backup.on_prepare(&prepare), OnPrepareResult::Accepted);
+        // ...but the ack path rejects it.
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            backup.send_prepare_ok(&prepare);
+        }));
+        assert!(panicked.is_err());
     }
 
     #[test]
