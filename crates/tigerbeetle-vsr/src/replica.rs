@@ -299,6 +299,28 @@ impl Timeout {
         self.active = true;
     }
 
+    /// Re-arm with a countdown uniformly drawn from `[ticks/2, 2*ticks - ticks/2]`
+    /// — i.e. `[0.5x, 1.5x]` — matching upstream `reset_with_jitter`, which
+    /// draws `after_dynamic` from `[after/2, 2*after - after/2]`. The
+    /// replica's deterministic PRNG drives the draw, so the cadence stays
+    /// reproducible.
+    ///
+    /// `attempts` is left untouched (upstream increments it here): the port
+    /// counts fires in [`Timeout::tick`], which already advances `attempts`
+    /// once per cycle, so the unconditional-repair decoy still lands every 50
+    /// fires.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `ticks <= 1` (upstream asserts `after > 1`).
+    pub fn reset_with_jitter(&mut self, ticks: u32, prng: &mut Prng) {
+        assert!(ticks > 1);
+        let min = ticks / 2;
+        let max = ticks.saturating_mul(2) - ticks / 2;
+        self.ticks = min + prng.gen_int_inclusive_u32(max - min);
+        self.active = true;
+    }
+
     pub fn stop(&mut self) {
         self.active = false;
     }
@@ -4689,10 +4711,10 @@ impl Replica {
     pub fn on_grid_repair_timeout(&mut self) {
         // Re-arm *before* requesting: `Timeout::tick` clears `active` when it
         // fires (mirroring `on_journal_repair_timeout`, which resets before
-        // calling `repair()`).
-        self.grid_repair_timeout.reset(constants::GRID_REPAIR_TIMEOUT);
-        // Upstream uses `reset_with_jitter`; sans-IO is deterministic, so we
-        // re-arm with a fixed cadence (DEVIATION).
+        // calling `repair()`). The jittered cadence unsynchronizes repair
+        // requests across replicas (upstream `reset_with_jitter`,
+        // replica.zig:3819).
+        self.grid_repair_timeout.reset_with_jitter(constants::GRID_REPAIR_TIMEOUT, &mut self.prng);
         self.grid_repair_message_budget.reap_expired_requests(Instant { ns: self.monotonic_now });
 
         if self.grid.is_some()
@@ -5744,9 +5766,10 @@ impl Replica {
     /// Upstream: `src/vsr/replica.zig:3771` (`on_journal_repair_timeout`).
     pub fn on_journal_repair_timeout(&mut self) {
         assert!(self.status == Status::Normal || self.status == Status::ViewChange);
-        // Upstream uses `reset_with_jitter`; sans-IO is deterministic, so we
-        // re-arm with a fixed cadence (DEVIATION).
-        self.journal_repair_timeout.reset(constants::JOURNAL_REPAIR_TIMEOUT);
+        // Jittered cadence unsynchronizes repair requests across replicas
+        // (upstream `reset_with_jitter`, replica.zig:3773).
+        self.journal_repair_timeout
+            .reset_with_jitter(constants::JOURNAL_REPAIR_TIMEOUT, &mut self.prng);
         self.repair();
     }
 
@@ -10238,6 +10261,65 @@ mod tests {
     }
 
     #[test]
+    fn repair_timeouts_rearm_with_jittered_cadence() {
+        // The repair handlers re-arm with a jittered countdown in
+        // `[TIME/2, 2*TIME - TIME/2]` rather than a fixed cadence, matching
+        // upstream `reset_with_jitter` (replica.zig:3773/:3819). The draw
+        // comes from the replica's deterministic PRNG.
+        let mut r = Replica::new(0, 1, 3); // backup
+        r.status = Status::Normal;
+        prepare_and_commit_suffix(&mut r, 0, 8, 8);
+        r.commit_max = 12;
+
+        r.journal_repair_timeout = Timeout::start(constants::JOURNAL_REPAIR_TIMEOUT);
+        // Fire the timer once (the initial arm fires at exactly TIME ticks),
+        // then read back the jittered post-re-arm countdown.
+        for _ in 0..=constants::JOURNAL_REPAIR_TIMEOUT {
+            r.tick(100);
+        }
+        assert_eq!(r.journal_repair_timeout.attempts, 1);
+        let ticks_after_fire = r.journal_repair_timeout.ticks;
+        assert!(
+            (constants::JOURNAL_REPAIR_TIMEOUT / 2) <= ticks_after_fire
+                && ticks_after_fire
+                    <= constants::JOURNAL_REPAIR_TIMEOUT.saturating_mul(2)
+                        - constants::JOURNAL_REPAIR_TIMEOUT / 2
+        );
+        assert!(r.journal_repair_timeout.active);
+    }
+
+    #[test]
+    fn reset_with_jitter_bounds_and_determinism() {
+        // Bounds mirror upstream `reset_with_jitter`: uniformly in
+        // `[after/2, 2*after - after/2]`; the same seed reproduces the same
+        // cadence sequence.
+        let mut prng_a = tigerbeetle_core::stdx::prng::Prng::from_seed(7);
+        let mut prng_b = tigerbeetle_core::stdx::prng::Prng::from_seed(7);
+        let min = constants::JOURNAL_REPAIR_TIMEOUT / 2;
+        let max = constants::JOURNAL_REPAIR_TIMEOUT.saturating_mul(2)
+            - constants::JOURNAL_REPAIR_TIMEOUT / 2;
+        for _ in 0..16 {
+            let mut a = Timeout::default();
+            let mut b = Timeout::default();
+            a.reset_with_jitter(constants::JOURNAL_REPAIR_TIMEOUT, &mut prng_a);
+            b.reset_with_jitter(constants::JOURNAL_REPAIR_TIMEOUT, &mut prng_b);
+            assert_eq!(a.ticks, b.ticks, "deterministic for a seed");
+            assert!(a.ticks >= min && a.ticks <= max, "within [50, 150]: {}", a.ticks);
+        }
+    }
+
+    #[test]
+    fn reset_with_jitter_requires_more_than_one_tick() {
+        // Upstream asserts `after > 1`; the port asserts `ticks > 1`.
+        let mut prng = tigerbeetle_core::stdx::prng::Prng::from_seed(1);
+        let mut timeout = Timeout::default();
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            timeout.reset_with_jitter(1, &mut prng);
+        }));
+        assert!(caught.is_err());
+    }
+
+    #[test]
     fn every_fiftieth_repair_pass_is_unconditional() {
         // In normal status the repair window is [commit_min+1, op - pipeline];
         // a gap outside that window goes unrequested until the 50th timeout
@@ -10265,19 +10347,32 @@ mod tests {
         r.journal_repair_timeout = Timeout::start(constants::JOURNAL_REPAIR_TIMEOUT);
         // With pipeline=4 the bounded window is `op - 4 = 4`, so the 6..=7
         // break's range is not requested, and the dirty head op 8 is out of
-        // `[commit_min+1, repair_op_max]`:
-        for _fire in 1..=49 {
-            for _ in 0..constants::JOURNAL_REPAIR_TIMEOUT {
+        // `[commit_min+1, repair_op_max]`. The handler re-arms with a jittered
+        // cadence on `[50, 150]` ticks, so drive it by watching `attempts`
+        // advance rather than ticking a fixed count per fire.
+        for _ in 0..49 {
+            let before = r.journal_repair_timeout.attempts;
+            // Tick up to the maximum jitter bound (`2*TIME - TIME/2`); the
+            // countdown fires once somewhere within it.
+            for _ in 0..=150 {
                 r.tick(100);
+                if r.journal_repair_timeout.attempts == before + 1 {
+                    break;
+                }
             }
-            assert_eq!(r.send_queue.len(), 0);
+            assert_eq!(r.journal_repair_timeout.attempts, before + 1, "one fire per drive");
+            assert_eq!(r.send_queue.len(), 0, "decoy fires 1..=49 request nothing");
         }
         assert_eq!(r.journal_repair_timeout.attempts, 49);
 
         // The 50th fire repairs unconditionally: GetHeaders for the 6..=7 gap
         // and a GetPrepare for the dirty head op 8.
-        for _ in 0..constants::JOURNAL_REPAIR_TIMEOUT {
+        let before = r.journal_repair_timeout.attempts;
+        for _ in 0..=150 {
             r.tick(100);
+            if r.journal_repair_timeout.attempts == before + 1 {
+                break;
+            }
         }
         assert_eq!(r.journal_repair_timeout.attempts, 50);
         assert_eq!(r.send_queue.len(), 2);
@@ -12241,7 +12336,7 @@ mod tests {
         assert!(!r.get_view_message_timeout.active);
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            r.on_get_view_message_timeout()
+            r.on_get_view_message_timeout();
         }));
         assert!(result.is_err());
     }
