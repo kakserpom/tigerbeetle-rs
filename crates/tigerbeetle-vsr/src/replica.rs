@@ -1296,9 +1296,14 @@ impl Replica {
                 | PrepareOkResult::DuplicateAck
         ));
 
-        // Start timeouts if the pipeline was previously empty.
+        // Start timeouts if the pipeline was previously empty. A primary that
+        // never reaches a prepare_ok quorum starts abdicating after
+        // `PRIMARY_ABDICATE_TIMEOUT` (upstream replica.zig:7434-7438).
         if self.pipeline_queue.prepare_queue.len() == 1 {
             self.prepare_timeout = Timeout::start(constants::PIPELINE_PREPARE_QUEUE_MAX);
+            if !self.primary_abdicate_timeout.active {
+                self.primary_abdicate_timeout = Timeout::start(constants::PRIMARY_ABDICATE_TIMEOUT);
+            }
         }
 
         // Replicate the prepare to every backup (upstream: `replicate` →
@@ -1454,6 +1459,7 @@ impl Replica {
             prepare.ok_quorum_received = true;
             if self.pipeline_queue.prepare_queue.len() <= 1 {
                 self.prepare_timeout.stop();
+                self.primary_abdicate_timeout.stop();
             }
             return PrepareOkResult::QuorumReached { op, checksum };
         }
@@ -2984,6 +2990,12 @@ impl Replica {
         self.join_view_quorum = false;
         self.pipeline_queue = PipelineQueue::default();
         self.ok_from_all_replicas.clear();
+        // Upstream stops the pipeline timers and drops abdication when leaving
+        // a mainline view (replica.zig:10231-10245): the successor restarts
+        // whichever it needs in `transition_to_normal_from_view_change_status`.
+        self.prepare_timeout.stop();
+        self.primary_abdicate_timeout.stop();
+        self.primary_abdicating = false;
         self.view_change_status_timeout = Timeout::start(constants::VIEW_CHANGE_STATUS_TIMEOUT);
         // Stop driving repairs while the journal may be inconsistent with the
         // new view (upstream `replica.zig:10231`).
@@ -3806,8 +3818,11 @@ impl Replica {
         self.prepare_timeout.reset(constants::PREPARE_TIMEOUT);
 
         let Some((slot, prepare)) = self.primary_pipeline_pending() else {
-            // Nothing unquorum'd is pending; stop ticking until the next prepare.
+            // Nothing unquorum'd is pending; stop ticking until the next
+            // prepare (upstream also stops the abdicate timer here,
+            // replica.zig:2336).
             self.prepare_timeout.stop();
+            self.primary_abdicate_timeout.stop();
             return;
         };
 
@@ -3918,6 +3933,9 @@ impl Replica {
         assert_eq!(self.status, Status::Normal);
         assert!(self.is_primary());
         self.primary_abdicate_timeout.reset(constants::PRIMARY_ABDICATE_TIMEOUT);
+        if self.solo() {
+            return; // Upstream `if (self.solo()) return` — nothing to abdicate to.
+        }
         self.primary_abdicating = true;
     }
 }
@@ -9183,6 +9201,73 @@ mod tests {
     }
 
     #[test]
+    fn primary_pipeline_prepare_starts_abdicate_timeout() {
+        // The first prepare arms both the prepare timeout and the abdicate
+        // timeout (upstream starts `primary_abdicate_timeout` alongside,
+        // replica.zig:7434-7438): a primary that never gets a quorum must learn
+        // to abdicate.
+        let mut r = Replica::new(0, 0, 3); // primary
+        r.status = Status::Normal;
+        assert!(!r.prepare_timeout.active);
+        assert!(!r.primary_abdicate_timeout.active);
+
+        r.primary_pipeline_prepare(1, 100, crate::Operation(6), &[], 0).unwrap();
+        assert!(r.prepare_timeout.active);
+        assert!(r.primary_abdicate_timeout.active);
+
+        // Reaching the quorum drains the pipeline and stops both timers until
+        // the next prepare (upstream replica.zig:2333-2337).
+        let checksum = r.journal.header_with_op(1).unwrap().checksum();
+        let result = r.on_prepare_ok(1, checksum, 1);
+        assert!(matches!(result, PrepareOkResult::QuorumReached { op: 1, .. }));
+        assert!(!r.prepare_timeout.active);
+        assert!(!r.primary_abdicate_timeout.active);
+    }
+
+    #[test]
+    fn primary_pipeline_prepare_keeps_timers_running_while_pending() {
+        // A second prepare while the first is still pending must not reset the
+        // timers — the primary would otherwise never observe a stall (upstream
+        // asserts both still ticking, replica.zig:7434-7436).
+        let mut r = Replica::new(0, 0, 3); // primary
+        r.status = Status::Normal;
+        let ticks_before = constants::PIPELINE_PREPARE_QUEUE_MAX;
+        r.primary_pipeline_prepare(1, 100, crate::Operation(6), &[], 0).unwrap();
+        r.primary_abdicate_timeout = Timeout::start(ticks_before);
+        r.primary_pipeline_prepare(2, 101, crate::Operation(6), &[], 0).unwrap();
+        assert_eq!(r.pipeline_queue.prepare_queue.len(), 2);
+        assert!(r.prepare_timeout.active);
+        assert!(r.primary_abdicate_timeout.active);
+        assert_eq!(r.primary_abdicate_timeout.ticks, ticks_before);
+    }
+
+    #[test]
+    fn on_primary_abdicate_timeout_flags_and_rearms() {
+        // The abdicate timeout re-arms itself and flags the primary; the flag
+        // suppresses Commit broadcasts so the backups observe a fault and start
+        // a view change (upstream replica.zig:3678).
+        let mut r = Replica::new(0, 0, 3); // primary
+        r.status = Status::Normal;
+        r.primary_abdicate_timeout = Timeout::start(10);
+        r.on_primary_abdicate_timeout();
+        assert!(r.primary_abdicating);
+        assert!(r.primary_abdicate_timeout.active);
+        assert_eq!(r.primary_abdicate_timeout.ticks, constants::PRIMARY_ABDICATE_TIMEOUT);
+    }
+
+    #[test]
+    fn on_primary_abdicate_timeout_skips_solo() {
+        // A solo replica has nobody to abdicate to — the flag stays clear
+        // (upstream `if (self.solo()) return`, replica.zig:3684).
+        let mut r = Replica::new(0, 0, 1); // solo primary
+        r.status = Status::Normal;
+        r.primary_abdicate_timeout = Timeout::start(10);
+        r.on_primary_abdicate_timeout();
+        assert!(!r.primary_abdicating);
+        assert!(r.primary_abdicate_timeout.active); // timer still re-armed
+    }
+
+    #[test]
     fn primary_pipeline_pending_tracks_unquorumed_head() {
         let mut r = Replica::new(0, 0, 3);
         r.status = Status::Normal;
@@ -10937,6 +11022,30 @@ mod tests {
             message_header::Header { view: r.view, replica: 2, ..message_header::Header::empty() };
         r.on_exit_view(&header);
         assert_eq!(r.status, Status::ViewChange);
+    }
+
+    #[test]
+    fn transition_to_view_change_status_drops_pipeline_timers() {
+        // Leaving a mainline view must stop the pipeline timers and drop the
+        // abdication flag, or the successor's `transition_to_normal` would trip
+        // its `assert!(!primary_abdicating)` (upstream replica.zig:10231-10245).
+        let mut r = Replica::new(0, 0, 3);
+        r.status = Status::ViewChange;
+        r.exit_view_from_all_replicas = 1u64 << 0;
+        r.prepare_timeout = Timeout::start(10);
+        r.primary_abdicate_timeout = Timeout::start(10);
+        r.primary_abdicating = true;
+
+        // Simulate ExitView from replica 1 — with the primary's own bit that is
+        // the ViewChange quorum for 3 replicas.
+        let header =
+            message_header::Header { view: r.view, replica: 1, ..message_header::Header::empty() };
+        r.on_exit_view(&header);
+        assert_eq!(r.status, Status::ViewChange);
+        assert_eq!(r.view, 1);
+        assert!(!r.prepare_timeout.active);
+        assert!(!r.primary_abdicate_timeout.active);
+        assert!(!r.primary_abdicating);
     }
 
     #[test]
