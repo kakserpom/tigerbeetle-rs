@@ -5156,6 +5156,16 @@ impl Replica {
     /// [`Self::on_prepare`], record the body, then ack the accepted prepare on
     /// the backup.
     ///
+    /// A backup also advances `commit_max` to the prepare's carried `commit`
+    /// (the primary's commit at prepare time) and commits whatever the journal
+    /// has up to it — a backup keeps pace with the cluster even when Commit
+    /// message retransmissions lag.
+    ///
+    /// # Panics
+    ///
+    /// Panics if an advancing-path (accepted or future) prepare did not come
+    /// from the current view's primary (upstream replica.zig:2094-2095).
+    ///
     /// Upstream: `src/vsr/replica.zig:2021` (`on_prepare`); the ack is sent
     /// from `write_prepare_callback` → `send_prepare_ok` (replica.zig:11225).
     pub fn on_prepare_message(&mut self, message: &crate::message::Message) {
@@ -5176,6 +5186,14 @@ impl Replica {
         }
         match self.on_prepare(&prepare) {
             OnPrepareResult::Accepted => {
+                // A prepare that advances the journal must come from that view's
+                // primary; stale repair prepares may come from any replica
+                // (upstream asserts only past the on_repair detour,
+                // replica.zig:2094-2095).
+                assert_eq!(
+                    u16::from(prepare.replica),
+                    Self::primary_index_for_view(prepare.view, self.replica_count)
+                );
                 // The journal records the body alongside the header, so the
                 // commit path executes the same batch as the primary. (A
                 // header-only repair message records an empty body; the `Stale`
@@ -5185,9 +5203,20 @@ impl Replica {
                 // its own prepare_ok on the pipeline path instead (we do not
                 // self-ack here).
                 if !self.is_primary() {
+                    // The prepare carries the primary's commit at prepare time:
+                    // the backup learns the cluster has committed at least that
+                    // far (upstream replica.zig:2100-2104), so the ack below and
+                    // any journal commit reflect the advanced frontier.
+                    self.advance_commit_max(prepare.commit);
+                    assert!(self.commit_max >= prepare.commit);
                     self.send_prepare_ok(&prepare);
-                    // Opportunistically repair any gaps this prepare exposed
-                    // (upstream defer: replica.zig:2111-2116).
+                    // Commit prepared ops through the journal once the prepare's
+                    // carried commit says they are safe — a backup catches up
+                    // without waiting on the Commit message retransmission
+                    // (upstream defer: `commit_journal(); repair();`,
+                    // replica.zig:2111-2116).
+                    self.commit_journal();
+                    // Opportunistically repair any gaps this prepare exposed.
                     self.repair();
                 }
             }
@@ -5203,6 +5232,22 @@ impl Replica {
                 }
             }
             OnPrepareResult::FutureOp => {
+                assert_eq!(
+                    u16::from(prepare.replica),
+                    Self::primary_index_for_view(prepare.view, self.replica_count)
+                );
+                // A future op's carried commit also advances `commit_max`
+                // (upstream replica.zig:2100-2104 runs before the jump). The
+                // upstream defer's `commit_journal`/`repair` wait for the gap to
+                // heal instead: the jumped head leaves `header_with_op(op)`
+                // null, violating the port's repair/commit-start asserts until
+                // the prepare is (re-)accepted (DEVIATION: upstream accepts the
+                // op in the same call, restoring the `replica.op` exists
+                // invariant; the sans-IO split defers that to the re-delivery).
+                if !self.is_primary() {
+                    self.advance_commit_max(prepare.commit);
+                    assert!(self.commit_max >= prepare.commit);
+                }
                 // The primary has moved more than one op past our head: advance
                 // `op` so the skipped prepares slot in as they are repaired
                 // (upstream repairs the gap concurrently via `repair()`).
@@ -5241,6 +5286,9 @@ impl Replica {
         self.op = op - 1;
         assert!(self.op >= self.commit_min);
         assert_eq!(self.op + 1, op);
+        // The jumped head must not already be journaled (upstream
+        // replica.zig:6969).
+        assert!(self.journal.header_with_op(self.op).is_none());
     }
 
     /// Whether this replica may currently repair (request or serve repairs).
@@ -9342,6 +9390,84 @@ mod tests {
         deliver_prepare(&mut r, &h2);
         assert_eq!(r.op, 3); // repairs never advance the head
         assert_eq!(r.journal.header_with_op(2).unwrap().checksum(), h2.checksum());
+    }
+
+    #[test]
+    fn on_prepare_advances_commit_max_and_commits_from_journal() {
+        // Backup r1 receives prepares held back relative to the Commit
+        // broadcasts: op 2's carried `commit` (the primary's commit at prepare
+        // time) is 1, so the backup learns the primary already committed op 1
+        // and commits it from its journal — no Commit message needed
+        // (upstream defer: advance_commit_max + commit_journal,
+        // replica.zig:2100-2116).
+        let mut r = Replica::new(0, 1, 3);
+        r.status = Status::Normal;
+        let h1 = make_prepare_for_replica(0, 0, 1, 0, 0);
+        let h2 = make_prepare_for_replica(0, 0, 2, h1.checksum(), 1);
+        deliver_prepare(&mut r, &h1);
+        assert_eq!(r.op, 1);
+        assert_eq!(r.commit_max, 0); // the first prepare carries commit 0
+        assert_eq!(r.send_queue.len(), 1);
+
+        // op 2 carries commit=1: the frontier advances and op 1 commits from
+        // the journal.
+        deliver_prepare(&mut r, &h2);
+        assert_eq!(r.commit_max, 1);
+        assert_eq!(r.commit_min, 1);
+        assert_eq!(r.op, 2);
+        assert_eq!(r.send_queue.len(), 2); // one prepare_ok per prepare
+        let ack = r.send_queue.pop().unwrap().header::<message_header::PrepareOk>().unwrap();
+        assert_eq!(ack.op, 2);
+        let ack = r.send_queue.pop().unwrap().header::<message_header::PrepareOk>().unwrap();
+        assert_eq!(ack.op, 1);
+    }
+
+    #[test]
+    fn on_prepare_future_op_advances_commit_max_and_jumps() {
+        // A future prepare (op > op + 1) still advances `commit_max` to its
+        // carried commit before the head jumps (upstream replica.zig:2100-2104
+        // runs before the jump at :2205). The jumped gap is not committed yet.
+        let mut r = Replica::new(0, 1, 3);
+        r.status = Status::Normal;
+        let h1 = make_prepare_for_replica(0, 0, 1, 0, 0);
+        let h2 = make_prepare_for_replica(0, 0, 2, h1.checksum(), 1);
+        let h4 = make_prepare_for_replica(0, 0, 4, 0, 3);
+        r.on_prepare(&h1);
+        r.on_prepare(&h2);
+        assert_eq!(r.op, 2);
+        r.commit_op(1);
+        r.commit_op(2);
+        assert_eq!(r.commit_min, 2);
+        assert_eq!(r.commit_max, 2);
+
+        // op 4 arrives: commit_max jumps to 3 (already committed, per the
+        // primary), the head jumps to op 3, and the missing op 3 stays
+        // uncommitted until it repairs in (upstream defer's commit_journal
+        // waits for the chain to heal — DEVIATION: the jump leaves the head
+        // slot empty, so the port defers it to the gap repair).
+        deliver_prepare(&mut r, &h4);
+        assert_eq!(r.commit_max, 3);
+        assert_eq!(r.op, 3);
+        assert_eq!(r.commit_min, 2);
+        assert!(r.journal.header_with_op(3).is_none());
+    }
+
+    #[test]
+    fn on_prepare_rejects_a_non_primary_source() {
+        // A prepare that advances the journal must come from the current
+        // view's primary (upstream replica.zig:2094-2095); a stale prepare may
+        // come from any replica.
+        let mut r = Replica::new(0, 1, 3);
+        r.status = Status::Normal;
+        let mut h1 = make_prepare_for_replica(0, 0, 1, 0, 0);
+        h1.replica = 1; // forged non-primary source
+        h1.set_checksum();
+        let mut message = crate::message::Message::new();
+        message.set_header(&h1);
+
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| r.on_message(&message, 100)));
+        assert!(result.is_err(), "a non-primary prepare must panic");
     }
 
     #[test]
