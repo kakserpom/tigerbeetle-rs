@@ -16,6 +16,7 @@ use tigerbeetle_core::constants;
 
 use crate::io::{self, Completion, Io, ListenOptions, SynchronousIo};
 use crate::message::Message;
+use crate::message_buffer::MessageBuffer;
 use crate::message_pool::MessagePool;
 
 // ---------------------------------------------------------------------------
@@ -55,7 +56,8 @@ pub struct Connection {
     pub peer: Peer,
     pub stream: Option<TcpStream>,
     pub send_queue: Vec<Message>,
-    pub recv_buffer: Vec<u8>,
+    /// Inbound byte stream, framed and checksum-validated by [`crate::message_buffer`].
+    pub recv_buffer: MessageBuffer,
 }
 
 use crate::Peer;
@@ -69,7 +71,7 @@ impl Connection {
             peer: Peer::Unknown,
             stream: None,
             send_queue: Vec::new(),
-            recv_buffer: Vec::with_capacity(constants::MESSAGE_SIZE_MAX as usize),
+            recv_buffer: MessageBuffer::new(),
         }
     }
 }
@@ -254,40 +256,92 @@ impl MessageBus {
 
     /// Receive pending messages from all connected peers.
     ///
-    /// Returns a list of (peer, message) pairs.
+    /// Returns a list of (peer, message) pairs. Framing and checksum validation are done by
+    /// [`MessageBuffer`] (upstream `src/message_buffer.zig`); a connection whose stream closes or
+    /// whose frame/body checksum fails is terminated like upstream `recv_buffer_consume`.
     ///
     /// DEVIATION: upstream uses async IO with completion callbacks; this stub
     /// performs blocking reads for integration testing.
     #[allow(clippy::missing_panics_doc)]
     pub fn receive_messages(&mut self) -> Vec<(Peer, Message)> {
-        for slot in 0..self.connections.len() {
-            let conn = &mut self.connections[slot];
-            if conn.state != ConnectionState::Connected {
-                continue;
-            }
-            let Some(stream) = &conn.stream else {
-                continue;
-            };
+        let mut received = Vec::new();
 
-            let mut buf = vec![0u8; constants::MESSAGE_SIZE_MAX as usize];
-            let mut comp = Completion::success(0);
-            let n = {
+        for slot in 0..self.connections.len() {
+            let read_size = {
+                let conn = &mut self.connections[slot];
+                if conn.state != ConnectionState::Connected {
+                    continue;
+                }
+                let Some(stream) = &conn.stream else {
+                    continue;
+                };
+
+                let mut comp = Completion::success(0);
                 let io = SynchronousIo;
-                io.recv(stream, &mut buf, &mut comp);
+                let slice = conn.recv_buffer.recv_slice();
+                io.recv(stream, slice, &mut comp);
                 comp.result
             };
-            if n > 0 {
-                #[allow(
-                    clippy::cast_possible_truncation,
-                    clippy::cast_sign_loss,
-                    clippy::unwrap_used
-                )]
-                let len = usize::try_from(n).unwrap();
-                conn.recv_buffer.extend_from_slice(&buf[..len]);
-                // TODO(port): parse header, verify checksum, hand off to Replica.
+
+            // Upstream `recv_callback`: 0 bytes is an orderly shutdown; any error closes too.
+            if read_size <= 0 {
+                self.terminate_connection(slot);
+                continue;
+            }
+
+            let invalid = {
+                let conn = &mut self.connections[slot];
+                let size = u32::try_from(read_size).unwrap_or_else(|_| {
+                    unreachable!("recv_slice is bounded by message_size_max and read_size > 0")
+                });
+                conn.recv_buffer.recv_advance(size);
+
+                if conn.recv_buffer.invalid().is_some() {
+                    true
+                } else {
+                    let peer = conn.peer;
+                    // Drive next_header() to completion so a trailing partial message is
+                    // back-shifted in the ring buffer (upstream replica `on_messages`).
+                    while let Some(header) = conn.recv_buffer.next_header() {
+                        received.push((peer, conn.recv_buffer.consume_message(&header)));
+                    }
+                    false
+                }
+            };
+
+            if invalid {
+                self.terminate_connection(slot);
             }
         }
-        Vec::new()
+
+        received
+    }
+
+    /// Close the connection at `slot`, returning it to the free pool.
+    ///
+    /// Upstream: `src/vsr/message_bus.zig` `terminate`.
+    fn terminate_connection(&mut self, slot: usize) {
+        let conn = &mut self.connections[slot];
+        let old_peer = conn.peer;
+        conn.state = ConnectionState::Free;
+        conn.peer = Peer::Unknown;
+        conn.stream = None;
+        conn.send_queue.clear();
+        conn.recv_buffer = MessageBuffer::new();
+        match old_peer {
+            Peer::Replica { replica } => {
+                if self.replicas.get(replica as usize) == Some(&Some(slot)) {
+                    self.replicas[replica as usize] = None;
+                }
+            }
+            Peer::Client { id } => {
+                if self.clients.get(&id) == Some(&slot) {
+                    self.clients.remove(&id);
+                }
+            }
+            // ClientLikely is a tentative client identity and has no connection-map entry.
+            Peer::ClientLikely { .. } | Peer::Unknown => {}
+        }
     }
 
     /// Drain the send queue for a connection, writing messages to the socket.
@@ -323,7 +377,10 @@ impl MessageBus {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use std::io::Write;
+
     use super::*;
+    use crate::message_header::TypedHeader;
     use crate::message_pool::{self, MessageBus as MessageBusType, Options};
 
     fn test_pool() -> MessagePool {
@@ -372,5 +429,131 @@ mod tests {
         }
         // Next should fail.
         assert!(bus.allocate_connection().is_none());
+    }
+
+    /// A connected loopback TCP pair, with the sender's writes landing in the receiver's buffer.
+    fn tcp_pair() -> (std::net::TcpStream, std::net::TcpStream) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let sender = std::net::TcpStream::connect(addr).unwrap();
+        let (receiver, _) = listener.accept().unwrap();
+        (sender, receiver)
+    }
+
+    /// A bus whose connection slot 0 is `Connected` to `receiver`.
+    fn bus_with_peer(receiver: std::net::TcpStream, peer: Peer) -> MessageBus {
+        let pool = test_pool();
+        let mut bus = MessageBus::new_replica(0, vec![], pool);
+        bus.connections[0].state = ConnectionState::Connected;
+        bus.connections[0].peer = peer;
+        bus.connections[0].stream = Some(receiver);
+        bus
+    }
+
+    /// Build a valid on-the-wire `Ping` (same shape upstream replica tests use).
+    fn valid_ping(source: u8, ping_timestamp_monotonic: u64) -> Message {
+        let mut header = crate::message_header::Ping {
+            replica: source,
+            release: crate::multiversion::Release::MINIMUM,
+            ping_timestamp_monotonic,
+            release_count: 1,
+            ..Default::default()
+        };
+
+        // Pings carry one `Release` per supported release (upstream `Ping.invalid_header`).
+        let body_len =
+            size_of::<crate::multiversion::Release>() * constants::VSR_RELEASES_MAX as usize;
+        let mut body = vec![0_u8; body_len];
+        body[..size_of::<crate::multiversion::Release>()]
+            .copy_from_slice(&crate::multiversion::Release::MINIMUM.value.to_le_bytes());
+        header.size = u32::try_from(crate::message_header::SIZE + body.len()).unwrap();
+        header.set_checksum_body(&body);
+        header.set_checksum();
+
+        let mut message = Message::new();
+        message.set_header(&header);
+        message.set_body(&body);
+        message
+    }
+
+    /// The exact wire bytes for `message` (the frame prefix up to `header.size`).
+    fn wire_bytes(message: &Message) -> Vec<u8> {
+        message.buffer()[..message.size_raw() as usize].to_vec()
+    }
+
+    #[test]
+    fn receive_messages_returns_single_message() {
+        let (mut sender, receiver) = tcp_pair();
+        sender.write_all(&wire_bytes(&valid_ping(1, 123))).unwrap();
+
+        let mut bus = bus_with_peer(receiver, Peer::Replica { replica: 1 });
+        let messages = bus.receive_messages();
+
+        assert_eq!(messages.len(), 1);
+        let (peer, message) = &messages[0];
+        assert_eq!(*peer, Peer::Replica { replica: 1 });
+        let decoded = message.header::<crate::message_header::Ping>().unwrap();
+        assert!(decoded.valid_checksum());
+        assert!(decoded.valid_checksum_body(message.body_used()));
+        assert_eq!(decoded.replica, 1);
+        assert_eq!(decoded.ping_timestamp_monotonic, 123);
+    }
+
+    #[test]
+    fn receive_messages_frames_batch() {
+        let (mut sender, receiver) = tcp_pair();
+        let mut bytes = wire_bytes(&valid_ping(1, 100));
+        bytes.extend_from_slice(&wire_bytes(&valid_ping(1, 200)));
+        sender.write_all(&bytes).unwrap();
+
+        let mut bus = bus_with_peer(receiver, Peer::Replica { replica: 1 });
+
+        // Loop to be robust against TCP segmentation; the bytes are already buffered on the
+        // loopback socket, so reads never block. The bound asserts the peer stays connected.
+        let mut messages = Vec::new();
+        let mut attempts = 0;
+        while messages.len() < 2 {
+            messages.extend(bus.receive_messages());
+            attempts += 1;
+            assert!(attempts < 10, "peer connection was terminated");
+        }
+
+        assert_eq!(messages.len(), 2);
+        let pings: Vec<_> = messages
+            .iter()
+            .map(|(_, message)| message.header::<crate::message_header::Ping>().unwrap())
+            .collect();
+        assert_eq!(pings[0].ping_timestamp_monotonic, 100);
+        assert_eq!(pings[1].ping_timestamp_monotonic, 200);
+    }
+
+    #[test]
+    fn receive_messages_terminates_on_bad_checksum() {
+        let (mut sender, receiver) = tcp_pair();
+        let mut ping = valid_ping(1, 123);
+        // Corrupt the header checksum (offset 0); the size field is untouched.
+        ping.buffer_mut()[0] ^= 0xFF;
+        sender.write_all(&wire_bytes(&ping)).unwrap();
+
+        let mut bus = bus_with_peer(receiver, Peer::Replica { replica: 1 });
+        let messages = bus.receive_messages();
+
+        assert!(messages.is_empty());
+        assert_eq!(bus.connections[0].state, ConnectionState::Free);
+        assert_eq!(bus.connections[0].peer, Peer::Unknown);
+        assert!(bus.connections[0].stream.is_none());
+    }
+
+    #[test]
+    fn receive_messages_terminates_on_eof() {
+        let (sender, receiver) = tcp_pair();
+        drop(sender); // Orderly shutdown: recv returns 0.
+
+        let mut bus = bus_with_peer(receiver, Peer::Replica { replica: 1 });
+        let messages = bus.receive_messages();
+
+        assert!(messages.is_empty());
+        assert_eq!(bus.connections[0].state, ConnectionState::Free);
+        assert_eq!(bus.connections[0].peer, Peer::Unknown);
     }
 }
