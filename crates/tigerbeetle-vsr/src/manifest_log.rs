@@ -974,6 +974,28 @@ impl ManifestLog {
         }
     }
 
+    /// The manifest blocks, oldest-first (index 0 = oldest; the newest closed-but-
+    /// unflushed `blocks_closed` blocks live at the back). Consumed by the grid
+    /// scrubber's live manifest-block tour (upstream
+    /// `manifest_log.log_block_addresses`, grid_scrubber.zig).
+    #[must_use]
+    pub(crate) fn log_block_addresses(&self) -> &VecDeque<u64> {
+        &self.log_block_addresses
+    }
+
+    /// Checksums matching [`Self::log_block_addresses`].
+    #[must_use]
+    pub(crate) fn log_block_checksums(&self) -> &VecDeque<u128> {
+        &self.log_block_checksums
+    }
+
+    /// Number of closed-but-not-yet-flushed blocks (excluded from the scrubber's
+    /// manifest tour since they are not on disk).
+    #[must_use]
+    pub(crate) fn blocks_closed(&self) -> u8 {
+        self.blocks_closed
+    }
+
     /// Return the manifest references to persist into the superblock checkpoint.
     ///
     /// # Panics

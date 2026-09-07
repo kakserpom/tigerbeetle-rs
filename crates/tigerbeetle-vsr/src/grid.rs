@@ -202,6 +202,23 @@ pub enum Event {
     CheckpointDurableDone,
 }
 
+/// Completion of a scrubber read, drained via [`Grid::take_scrub_done`].
+///
+/// DEVIATION: upstream's scrubber reads complete through a per-read callback
+/// (`grid_scrubber.zig` `read_next_callback`). The port's scrubber (owned by the
+/// `Forest`) cannot subscribe to the event queue without racing the manifest log's
+/// `take_events`, so grid-routed scrub reads resolve onto a private side-queue
+/// instead of [`Event::ReadDone`]. `data` carries a copy of the block bytes for
+/// valid results (index blocks must outlive the next poll).
+pub struct ScrubReadDone {
+    pub token: u32,
+    pub address: u64,
+    pub checksum: u128,
+    pub result: ReadBlockResult,
+    /// Block bytes, iff `result == Valid`.
+    pub data: Vec<u8>,
+}
+
 /// The `(address, checksum)` pair a read expects to find
 /// (upstream anonymous `expect` parameter of `read_block_validate`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -245,7 +262,7 @@ pub struct SuperBlockView {
 /// Upstream has two distinct `CheckpointTrailer` fields with duplicated callbacks; an
 /// index keeps the ported step functions shared.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Slot {
+pub(crate) enum Slot {
     Acquired,
     Released,
 }
@@ -365,6 +382,9 @@ struct ReadOp {
     checksum: u128,
     /// Upstream `callback == .from_local_or_global_storage`.
     coherent: bool,
+    /// Scrubber reads resolve onto [`Grid::scrub_done`] instead of [`Event::ReadDone`]
+    /// (see the [`ScrubReadDone`] deviation note).
+    scrub: bool,
     // Upstream also stamps `cache_read` here for its next-tick deferral; we resolve
     // inline (module-level deviation), so only `cache_write` survives.
     cache_write: bool,
@@ -466,6 +486,10 @@ pub struct Grid {
     /// `blocks_missing`).
     blocks_missing: GridBlocksMissing,
 
+    /// Completed scrubber reads, drained via [`Grid::take_scrub_done`] (see the
+    /// [`ScrubReadDone`] deviation note).
+    scrub_done: VecDeque<ScrubReadDone>,
+
     next_write_token: u32,
     next_read_token: u32,
 
@@ -563,6 +587,7 @@ impl Grid {
             read_global_queue: VecDeque::new(),
             read_exec_order: VecDeque::new(),
             blocks_missing: GridBlocksMissing::new(options.missing_blocks_max),
+            scrub_done: VecDeque::new(),
             next_write_token: 0,
             next_read_token: 0,
             pending_reap: Vec::new(),
@@ -761,6 +786,11 @@ impl Grid {
     #[must_use]
     pub fn repair_block_waiting(&self, address: u64, checksum: u128) -> bool {
         self.blocks_missing.block_waiting(address, checksum)
+    }
+
+    /// The grid scrubber's feed for discovered faults (see `Grid::blocks_missing`).
+    pub(crate) fn blocks_missing_mut(&mut self) -> &mut GridBlocksMissing {
+        &mut self.blocks_missing
     }
 
     /// Contents of a block (read-only view for tests and upcoming slices).
@@ -1095,6 +1125,47 @@ impl Grid {
         coherent: bool,
         options: ReadOptions,
     ) -> u32 {
+        self.read_block_impl(storage, address, checksum, coherent, options, false)
+    }
+
+    /// Issue a non-coherent, cache-disabled read on behalf of the grid scrubber
+    /// (upstream `grid_scrubber.zig` `read_next` ↔
+    /// `grid.read_block(.{ .from_local_storage, .disk }, .{
+    ///   .cache_read = false, .cache_write = false })`).
+    ///
+    /// The read shares the grid's read-queue merging and IOP machinery, but its
+    /// completion resolves onto [`Grid::take_scrub_done`] rather than
+    /// [`Event::ReadDone`].
+    ///
+    /// # Panics
+    /// Asserts `address > 0`.
+    #[must_use]
+    pub fn read_block_scrub(
+        &mut self,
+        storage: &mut dyn Storage,
+        address: u64,
+        checksum: u128,
+    ) -> u32 {
+        self.read_block_impl(
+            storage,
+            address,
+            checksum,
+            false,
+            ReadOptions { cache_read: false, cache_write: false },
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_lines)] // mirrors upstream tick_callback step for step
+    fn read_block_impl(
+        &mut self,
+        storage: &mut dyn Storage,
+        address: u64,
+        checksum: u128,
+        coherent: bool,
+        options: ReadOptions,
+        scrub: bool,
+    ) -> u32 {
         assert!(address > 0);
 
         if coherent {
@@ -1110,13 +1181,14 @@ impl Grid {
         if let Some(location) = self.read_block_from_write_queues(address, checksum) {
             let token = self.next_read_token;
             self.next_read_token += 1;
-            self.events.push_back(Event::ReadDone {
+            self.emit_read_done(
                 token,
                 address,
                 checksum,
-                result: ReadBlockResult::Valid,
-                valid_location: Some(location),
-            });
+                ReadBlockResult::Valid,
+                Some(location),
+                scrub,
+            );
             return token;
         }
 
@@ -1142,6 +1214,7 @@ impl Grid {
                 address,
                 checksum,
                 coherent,
+                scrub,
                 cache_write: options.cache_write,
                 resolves: VecDeque::new(),
                 state: ReadState::Attached,
@@ -1155,13 +1228,14 @@ impl Grid {
         if options.cache_read
             && let Some(location) = self.read_block_from_cache(address, checksum, coherent)
         {
-            self.events.push_back(Event::ReadDone {
+            self.emit_read_done(
                 token,
                 address,
                 checksum,
-                result: ReadBlockResult::Valid,
-                valid_location: Some(location),
-            });
+                ReadBlockResult::Valid,
+                Some(location),
+                scrub,
+            );
             return token;
         }
 
@@ -1171,6 +1245,7 @@ impl Grid {
             address,
             checksum,
             coherent,
+            scrub,
             cache_write: options.cache_write,
             resolves: VecDeque::new(),
             state: ReadState::RootQueued,
@@ -1185,6 +1260,35 @@ impl Grid {
             self.read_pending_queue.push_back(id);
         }
         token
+    }
+
+    /// Deliver a read result to its consumer: scrubber reads resolve onto
+    /// [`Grid::scrub_done`], everything else onto [`Event::ReadDone`].
+    fn emit_read_done(
+        &mut self,
+        token: u32,
+        address: u64,
+        checksum: u128,
+        result: ReadBlockResult,
+        valid_location: Option<u32>,
+        scrub: bool,
+    ) {
+        if scrub {
+            let data = match (result, valid_location) {
+                (ReadBlockResult::Valid, Some(location)) => self.blocks[location as usize].clone(),
+                (ReadBlockResult::Valid, None) => unreachable!("valid read must have a location"),
+                _ => Vec::new(),
+            };
+            self.scrub_done.push_back(ScrubReadDone { token, address, checksum, result, data });
+        } else {
+            self.events.push_back(Event::ReadDone {
+                token,
+                address,
+                checksum,
+                result,
+                valid_location,
+            });
+        }
     }
 
     /// Merge-decision helper for [`Grid::read_block`] (upstream inline loop).
@@ -1305,13 +1409,9 @@ impl Grid {
                 resolver.state = ReadState::ParkedGlobal;
                 self.read_global_queue.push_back(resolver_id);
             } else {
-                self.events.push_back(Event::ReadDone {
-                    token: resolver.token,
-                    address: resolver.address,
-                    checksum: resolver.checksum,
-                    result,
-                    valid_location,
-                });
+                let (token, address, checksum, scrub) =
+                    (resolver.token, resolver.address, resolver.checksum, resolver.scrub);
+                self.emit_read_done(token, address, checksum, result, valid_location, scrub);
                 self.reads[resolver_id] = None;
                 self.reads_free.push_back(resolver_id);
             }
@@ -1328,13 +1428,9 @@ impl Grid {
             self.reads[root_id] = Some(root);
             self.read_global_queue.push_back(root_id);
         } else {
-            self.events.push_back(Event::ReadDone {
-                token: root.token,
-                address: root.address,
-                checksum: root.checksum,
-                result,
-                valid_location,
-            });
+            let (token, address, checksum, scrub) =
+                (root.token, root.address, root.checksum, root.scrub);
+            self.emit_read_done(token, address, checksum, result, valid_location, scrub);
             self.reads_free.push_back(root_id);
         }
     }
@@ -1437,6 +1533,20 @@ impl Grid {
     #[must_use]
     pub fn take_events(&mut self) -> Vec<Event> {
         self.events.drain(..).collect()
+    }
+
+    /// Completed scrubber reads, drained by the [`crate::grid_scrubber`] owner
+    /// (the `Forest`). See the [`ScrubReadDone`] deviation note.
+    #[must_use]
+    pub fn take_scrub_done(&mut self) -> VecDeque<ScrubReadDone> {
+        std::mem::take(&mut self.scrub_done)
+    }
+
+    /// The free set checkpoint trailer the scrubber scans during its trailer tour
+    /// stages (upstream `grid.free_set_checkpoint_blocks_{acquired,released}`).
+    #[must_use]
+    pub(crate) fn free_set_trailer(&self, slot: Slot) -> &CheckpointTrailer {
+        self.trailer(slot)
     }
 
     /// True while `Grid::checkpoint` has been started but not yet completed

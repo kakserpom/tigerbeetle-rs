@@ -8,15 +8,22 @@
 // transfers_pending).
 
 use crate::grid::{Grid, GridOpenReferences, GridOptions, SuperBlockView};
+use crate::grid_scrubber::{BlockStatus, GridScrubber};
 use crate::groove::{
     AccountGroove, AccountGrooveScratch, TransferGroove, TransferGrooveScratch,
     TransferPendingGroove, TransferPendingGrooveScratch,
 };
 use crate::manifest_log::{ManifestLog, Pace};
 use crate::storage::Storage;
+use crate::tree::ScrubTree;
 use std::cell::RefCell;
 use std::rc::Rc;
-use tigerbeetle_core::constants::{CONFIG, LSM_COMPACTION_OPS, LSM_GROWTH_FACTOR, LSM_LEVELS};
+use tigerbeetle_core::constants::{
+    CONFIG, GRID_SCRUBBER_CYCLE_TICKS, GRID_SCRUBBER_INTERVAL_TICKS_MAX,
+    GRID_SCRUBBER_INTERVAL_TICKS_MIN, GRID_SCRUBBER_READS_MAX, LSM_COMPACTION_OPS,
+    LSM_GROWTH_FACTOR, LSM_LEVELS,
+};
+use tigerbeetle_core::stdx::prng::{Prng, Reservoir};
 use tigerbeetle_lsm::manifest::ManifestLog as ManifestLogTrait;
 use tigerbeetle_lsm::schema::manifest_node as mn;
 use tigerbeetle_lsm::tree::table_count_max_for_tree;
@@ -27,6 +34,35 @@ type SharedTableBuffer = Rc<RefCell<Vec<mn::TableInfo>>>;
 /// Number of trees in the forest: 9 (account) + 14 (transfer) + 2 (pending).
 /// Used to size the manifest log's compaction pace (upstream `tree_infos.len`).
 pub const TREE_COUNT: u32 = 25;
+
+/// Seed for the grid scrubber's tour-origin reservoir.
+///
+/// DEVIATION: upstream drives `Reservoir` with the superblock's per-replica PRNG (so each
+/// replica's origin differs); the sans-I/O forest has no such PRNG, so the origin is
+/// deterministic.
+const GRID_SCRUBBER_ORIGIN_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
+
+/// The scrubber's table-tour cursor (upstream `WrappingForestTableIterator` + origin).
+///
+/// Iterates the 25 trees level-major, tree-major (ascending `tree_id`, the sorted
+/// `forest.tree_infos` order), wrapping the cycle at the tour origin computed when the
+/// forest opens. The `after` field is the address/checksum of the last table yielded so a
+/// step can re-scan the level past it (see `ScrubTree::scrub_next_visible_table`).
+#[derive(Clone, Copy, Debug)]
+pub struct ScrubTableTour {
+    /// `(level, tree_index)` where each cycle begins/ends.
+    pub origin_level: usize,
+    pub origin_tree: usize,
+    /// Current `(level, tree_index)` scan position.
+    pub level: usize,
+    pub tree: usize,
+    /// The last-yielded table of the current level (the scan resumes after it).
+    pub after: Option<(u64, u128)>,
+    /// Set once the scan has wrapped past the last (level, tree) back to `(0, 0)`; the
+    /// cycle ends when the scan returns to the origin.
+    pub wrapped: bool,
+    pub done: bool,
+}
 
 /// The manifest log's compaction pace, sized for the forest's tree count (upstream
 /// `forest.manifest_log_compaction_pace`, forest.zig:195).
@@ -95,6 +131,11 @@ pub struct Forest {
     /// Block cache + free set shared by all trees and the manifest log
     /// (upstream `forest.grid`).
     pub grid: Grid,
+    /// The grid scrubber (upstream `replica.grid_scrubber`; see the `GridScrubber` module
+    /// docs for why it lives here).
+    pub grid_scrubber: GridScrubber,
+    /// The scrubber's table tour; `None` until the forest finishes opening.
+    pub scrub_tour: Option<ScrubTableTour>,
     /// Non-`None` while an open is in flight.
     progress: Option<ForestProgress>,
 }
@@ -125,6 +166,8 @@ impl Forest {
             // DEVIATION: upstream owns a superblock; here the view is a Copy snapshot so we
             // reuse it for both the manifest log and the grid's attached view.
             grid: Grid::new(grid_options),
+            grid_scrubber: GridScrubber::new(),
+            scrub_tour: None,
             progress: None,
         };
         forest.grid.attach_superblock_view(superblock);
@@ -178,6 +221,14 @@ impl Forest {
     ///   manifest-log flush callback), the user callback fires.
     pub fn poll(&mut self, storage: &mut dyn Storage) {
         self.grid.poll(storage);
+
+        // Route completed scrubber reads before the manifest log drains grid events (the
+        // two queues are independent — see `Grid::ScrubReadDone`).
+        let scrub_done = self.grid.take_scrub_done();
+        if !scrub_done.is_empty() {
+            self.grid_scrubber.on_read_done(scrub_done, &self.grid);
+        }
+
         self.manifest_log.poll(&mut self.grid, storage);
 
         // Checkpoint completion: sequence the manifest flush, then the grid free-set
@@ -195,7 +246,9 @@ impl Forest {
                 self.manifest_log.forfeit_grid_reservation(&mut self.grid);
                 *reservation_released = true;
                 // The free set only encodes once the previous checkpoint is durable
-                // (upstream `Grid.checkpoint_durable` before `Grid.checkpoint`).
+                // (upstream `Grid.checkpoint_durable` before `Grid.checkpoint`). The
+                // scrubber must abort reads to blocks about to be freed first.
+                self.grid_scrubber.checkpoint_durable(&self.grid);
                 self.grid.checkpoint_durable();
                 self.grid.checkpoint(storage);
                 *grid_started = true;
@@ -236,6 +289,10 @@ impl Forest {
             self.accounts.open_complete(checkpoint_op);
             self.transfers.open_complete(checkpoint_op);
             self.transfers_pending.open_complete(checkpoint_op);
+
+            // Arm the scrubber's table tour once every groove has resumed (its origin is a
+            // function of the replayed table manifests).
+            self.scrubber_open();
         }
     }
 
@@ -280,6 +337,165 @@ impl Forest {
             20 | 21 => self.transfers_pending.open_table(table),
             other => panic!("unknown tree_id in manifest: {other}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Grid scrubber
+    // -----------------------------------------------------------------------
+
+    /// Arm the scrubber: compute the table-tour origin (upstream `GridScrubber.open`), the
+    /// `(level, tree)` position each cycle begins/ends at.
+    ///
+    /// The origin is chosen with a reservoir biased toward levels with more tables and
+    /// trees with more blocks per table (upstream: `levels[level].tables.len() *
+    /// value_block_count_max`), so different data distributions shift it.
+    ///
+    /// DEVIATION: seeded from [`GRID_SCRUBBER_ORIGIN_SEED`] instead of the superblock's
+    /// per-replica PRNG.
+    fn scrubber_open(&mut self) {
+        let mut prng = Prng::from_seed(GRID_SCRUBBER_ORIGIN_SEED);
+        let mut reservoir = Reservoir::new();
+        let mut origin = (0, 0);
+        for level in 0..LSM_LEVELS as usize {
+            for tree_index in 0..TREE_COUNT as usize {
+                let tree = scrub_table_at(
+                    &self.accounts,
+                    &self.transfers,
+                    &self.transfers_pending,
+                    tree_index,
+                );
+                let weight = tree.level_table_count(level) * tree.value_block_count_max();
+                if weight > 0 && reservoir.replace(&mut prng, weight) {
+                    origin = (level, tree_index);
+                }
+            }
+        }
+        self.scrub_tour = Some(ScrubTableTour {
+            origin_level: origin.0,
+            origin_tree: origin.1,
+            level: origin.0,
+            tree: origin.1,
+            after: None,
+            wrapped: false,
+            done: false,
+        });
+    }
+
+    /// Yields the next table of the scrub tour (upstream `WrappingForestTableIterator.next`),
+    /// driving the level-major/tree-major scan and the wrap-around at the origin.
+    /// Returns `None` once every table of the cycle has been scrubbed.
+    pub(crate) fn scrub_read_next(&mut self, storage: &mut dyn Storage) -> bool {
+        assert!(self.scrub_tour.is_some(), "scrub tour starts at forest open");
+
+        // Inline so the closure captures disjoint `self` fields (the scrubber can't reach
+        // the forest's trees itself — see the `GridScrubber` module docs).
+        let mut next_table = || loop {
+            let t = self.scrub_tour.as_mut().unwrap_or_else(|| unreachable!("gated above"));
+            if t.done {
+                return None;
+            }
+            if t.wrapped && t.level == t.origin_level && t.tree == t.origin_tree {
+                t.done = true;
+                return None;
+            }
+            let (level, tree_index, after) = (t.level, t.tree, t.after);
+            let tree = scrub_table_at(
+                &self.accounts,
+                &self.transfers,
+                &self.transfers_pending,
+                tree_index,
+            );
+            if let Some((address, checksum)) = tree.scrub_next_visible_table(level, after) {
+                t.after = Some((address, checksum));
+                return Some((address, checksum));
+            }
+            t.after = None;
+            t.tree += 1;
+            if t.tree >= TREE_COUNT as usize {
+                t.tree = 0;
+                t.level += 1;
+                if t.level >= LSM_LEVELS as usize {
+                    t.level = 0;
+                    t.wrapped = true;
+                }
+            }
+        };
+
+        self.grid_scrubber.read_next(&mut self.grid, &self.manifest_log, storage, &mut next_table)
+    }
+
+    /// Restart the scrub cycle: reset the tour state machine and table cursor to the origin
+    /// (upstream `GridScrubber.wrap`, invoked from the timeout pump).
+    ///
+    /// # Panics
+    /// Panics unless the scrubber's tour is complete, or before the forest has opened.
+    pub(crate) fn scrub_wrap(&mut self) {
+        assert!(self.grid_scrubber.tour_done());
+        let t = self.scrub_tour.as_mut().unwrap_or_else(|| unreachable!("armed at open"));
+        t.level = t.origin_level;
+        t.tree = t.origin_tree;
+        t.after = None;
+        t.wrapped = false;
+        t.done = false;
+        self.grid_scrubber.wrap();
+    }
+
+    /// One grid-scrubber timeout (upstream `Replica.on_grid_scrub_timeout`):
+    ///
+    /// 1. Recompute the dynamic scrub cadence from the number of free-set blocks acquired
+    ///    (so a tiny data file isn't scrubbed embarrassingly often and a huge one stays
+    ///    within the target cycle duration), clamped to the configured interval range.
+    /// 2. Drain completed scrub reads; each block that scrubbed as corrupt is fed to
+    ///    `Grid::blocks_missing` for a repair write.
+    /// 3. Pump the read pool back up to `GRID_SCRUBBER_READS_MAX`, wrapping to the next
+    ///    cycle when the tour completes.
+    ///
+    /// Returns the dynamic interval (in ticks) for the caller to schedule the next timeout.
+    ///
+    /// The sans-I/O replica owns no forest, so this is driven by the forest's owner; wired
+    /// from the replica as part of the future replica/forest integration slice.
+    #[allow(dead_code)]
+    #[allow(clippy::cast_possible_truncation)] // `count_acquired` derives from u64 capacities
+    pub(crate) fn scrub_timeout_tick(&mut self, storage: &mut dyn Storage) -> u64 {
+        assert!(self.scrub_tour.is_some(), "scrub tour starts at forest open");
+
+        let count_acquired = self.grid.free_set().count_acquired().max(1);
+        let after_dynamic = (GRID_SCRUBBER_CYCLE_TICKS / count_acquired as u64
+            * u64::from(GRID_SCRUBBER_READS_MAX))
+        .clamp(GRID_SCRUBBER_INTERVAL_TICKS_MIN, GRID_SCRUBBER_INTERVAL_TICKS_MAX);
+
+        // Drain completed reads: each block that scrubbed as corrupt is fed to
+        // `Grid::blocks_missing` for a repair write (upstream replica.zig:3848). The order
+        // is kept exact — a `Repair` result is only skipped while the repair queue is full,
+        // never dropped: with the queue full of repairs, results that are not `.repair`
+        // still recycle their read slot.
+        loop {
+            if self.grid.blocks_missing_mut().repair_blocks_available() == 0 {
+                break;
+            }
+            let fault = loop {
+                let Some((block, status)) = self.grid_scrubber.read_result_next() else {
+                    break None;
+                };
+                if status == BlockStatus::Repair {
+                    break Some(block);
+                }
+            };
+            let Some(fault) = fault else { break };
+            assert!(!self.grid.free_set_is_free(fault.block_address));
+            self.grid.blocks_missing_mut().repair_block(fault.block_address, fault.block_checksum);
+        }
+
+        for _ in 0..=GRID_SCRUBBER_READS_MAX as usize {
+            if !self.scrub_read_next(storage) {
+                if self.grid_scrubber.tour_done() {
+                    self.scrub_wrap();
+                }
+                break;
+            }
+        }
+
+        after_dynamic
     }
 
     /// Compact every groove's mutable tables for the given op, sorting them with
@@ -597,6 +813,49 @@ impl Forest {
         // `manifest_log.checkpoint` above; for non-zero blocks it fires on a
         // later `poll`. Drive `poll` once to process either.
         self.poll(storage);
+    }
+}
+
+/// Resolve the `tree_index`-th forest tree (in ascending-`tree_id` order, the sorted
+/// upstream `forest.tree_infos`) to its [`ScrubTree`].
+///
+/// DEVIATION: upstream comptime-iterates `std.enums.values(Forest.TreeID)` (grid_scrubber.zig
+/// open); the port enumerates the three grooves' 25 trees explicitly. Tree ids 1..21 then
+/// 23..26 (there is no tree 22 in this port).
+#[allow(clippy::too_many_lines)] // explicit 25-arm dispatch mirrors the groove fields
+fn scrub_table_at<'a>(
+    accounts: &'a AccountGroove,
+    transfers: &'a TransferGroove,
+    transfers_pending: &'a TransferPendingGroove,
+    tree_index: usize,
+) -> &'a dyn ScrubTree {
+    match tree_index {
+        0 => &accounts.id,
+        1 => &accounts.user_data_128,
+        2 => &accounts.user_data_64,
+        3 => &accounts.user_data_32,
+        4 => &accounts.ledger,
+        5 => &accounts.code,
+        6 => &accounts.objects,
+        7 => &transfers.id,
+        8 => &transfers.debit_account_id,
+        9 => &transfers.credit_account_id,
+        10 => &transfers.amount,
+        11 => &transfers.pending_id,
+        12 => &transfers.user_data_128,
+        13 => &transfers.user_data_64,
+        14 => &transfers.user_data_32,
+        15 => &transfers.ledger,
+        16 => &transfers.code,
+        17 => &transfers.objects,
+        18 => &transfers.expires_at,
+        19 => &transfers_pending.objects,
+        20 => &transfers_pending.status,
+        21 => &accounts.imported,
+        22 => &transfers.imported,
+        23 => &accounts.closed,
+        24 => &transfers.closing,
+        _ => unreachable!("tree_index {tree_index} out of TREE_COUNT range"),
     }
 }
 
@@ -1788,5 +2047,241 @@ mod tests {
         assert_eq!(forest_b.accounts.objects.manifest_table_count(), 4);
         assert_eq!(forest_b.accounts.objects.manifest_ref().levels[0].table_count_visible(), 3);
         assert_eq!(forest_b.accounts.objects.manifest_ref().levels[1].table_count_visible(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Grid scrubber
+    // -----------------------------------------------------------------------
+
+    /// Build one real 1-value account-object table: index + value blocks finished with the
+    /// account-object tree id (7), like [`build_and_seed_account_table`] — but returns the
+    /// finished blocks for the tests to write to storage (the scrubber reads the disk, not
+    /// the cache) and/or corrupt.
+    fn build_account_table_blocks(
+        value: Account,
+        value_address: u64,
+        index_address: u64,
+    ) -> (Vec<u8>, Vec<u8>) {
+        use crate::groove::AccountObjectSpec;
+        use crate::multiversion::Release;
+        use crate::table::{DataFinishOptions, IndexFinishOptions, TableBuilder};
+        use crate::tree::TreeSpec;
+        let layout = AccountObjectSpec::LAYOUT;
+
+        let mut index_block = vec![0_u8; BLOCK_SIZE];
+        let mut value_block = vec![0_u8; BLOCK_SIZE];
+        let mut builder = TableBuilder::new();
+        builder.set_index_block(&mut index_block);
+        builder.set_value_block(&mut value_block);
+        builder.insert_block_value(&value, &mut value_block, &layout);
+        builder.value_block_finish::<AccountObjectSpec>(
+            &mut value_block,
+            &mut index_block,
+            &layout,
+            DataFinishOptions {
+                cluster: 0,
+                release: Release::MINIMUM,
+                address: value_address,
+                snapshot_min: 1,
+                tree_id: 7,
+            },
+        );
+        builder.index_block_finish::<u64>(
+            &mut index_block,
+            &layout,
+            IndexFinishOptions {
+                cluster: 0,
+                release: Release::MINIMUM,
+                address: index_address,
+                snapshot_min: 1,
+                tree_id: 7,
+            },
+        );
+        (value_block, index_block)
+    }
+
+    /// Write `block` (whose header addresses `address`) to the storage backing `grid`,
+    /// through the grid's write machinery, so a cache-disabled scrub read of `address`
+    /// validates against the disk.
+    fn write_block_to_storage(
+        grid: &mut Grid,
+        storage: &mut MemoryStorage,
+        address: u64,
+        block: &[u8],
+    ) {
+        let location = grid.get_block();
+        grid.block_mut(location).copy_from_slice(block);
+        grid.create_block(storage, address, location);
+        grid.poll(storage);
+        let _ = grid.take_events();
+    }
+
+    /// Seed a real 1-value account-object table into the forest: index + value blocks built
+    /// by [`build_account_table_blocks`], optionally written to storage, and inserted into
+    /// the account object tree's manifest at level 0.
+    ///
+    /// Returns `(index_checksum, value_block, index_block, value_checksum)` so a test can
+    /// corrupt and later heal the value block.
+    fn seed_account_table(
+        forest: &mut Forest,
+        storage: &mut MemoryStorage,
+        value: Account,
+        value_address: u64,
+        index_address: u64,
+        write_value: bool,
+    ) -> (u128, Vec<u8>, Vec<u8>, u128) {
+        let (value_block, index_block) =
+            build_account_table_blocks(value, value_address, index_address);
+
+        write_block_to_storage(&mut forest.grid, storage, index_address, &index_block);
+        if write_value {
+            write_block_to_storage(&mut forest.grid, storage, value_address, &value_block);
+        }
+
+        // The manifest entry is what the scrubber's table tour finds (snapshot-fresh, level 0).
+        let index_checksum = crate::schema::header_from_block(&index_block).checksum;
+        let key = value.timestamp;
+        let manifest = manifest_node::TableInfo {
+            key_min: key.to_le_bytes_padded(),
+            key_max: key.to_le_bytes_padded(),
+            checksum: index_checksum,
+            address: index_address,
+            snapshot_min: 1,
+            snapshot_max: u64::MAX,
+            value_count: 1,
+            tree_id: 7,
+            label: Label { level: 0, event: Event::Insert },
+        };
+        let table = tigerbeetle_lsm::manifest::TreeTableInfo::<u64>::decode(&manifest, 7);
+        forest.accounts.objects.manifest_mut().insert_table(&mut forest.manifest_log, 0, &table);
+
+        let value_checksum = crate::schema::header_from_block(&value_block).checksum;
+        (index_checksum, value_block, index_block, value_checksum)
+    }
+
+    /// Invoke `steps` scrubber timeouts, draining grid I/O (and completed scrub reads)
+    /// before each — the same cadence a replica tick uses once it owns the forest.
+    fn drive_scrub(forest: &mut Forest, storage: &mut MemoryStorage, steps: usize) {
+        for _ in 0..steps {
+            forest.poll(storage);
+            let interval = forest.scrub_timeout_tick(storage);
+            assert!(
+                (GRID_SCRUBBER_INTERVAL_TICKS_MIN..=GRID_SCRUBBER_INTERVAL_TICKS_MAX)
+                    .contains(&interval)
+            );
+        }
+    }
+
+    /// Reserve two grid addresses for a seeded table, restoring the manifest log's grid
+    /// reservation afterward (mirrors the level-one merge test's seeding).
+    fn acquire_table_addresses(forest: &mut Forest) -> (u64, u64) {
+        let reservation = forest.grid.reserve(2);
+        let value_address = forest.grid.acquire(reservation);
+        let index_address = forest.grid.acquire(reservation);
+        forest.grid.forfeit(reservation);
+        forest.manifest_log.forfeit_grid_reservation(&mut forest.grid);
+        forest.manifest_log.reserve_grid_blocks(&mut forest.grid);
+        (value_address, index_address)
+    }
+
+    /// A seeded account-object table's blocks scrub clean end-to-end: the tour finds them
+    /// via the table cursor, reads index + value from disk (all valid), and the cycle wraps
+    /// to the next one, repeatedly — with no blocks ever reported missing.
+    #[test]
+    fn scrub_tour_completes_and_wraps_over_seeded_table() {
+        let mut forest = Forest::init(test_superblock(), grid_options(), 32);
+        let mut storage = large_storage();
+        open_forest(&mut forest, &mut storage);
+        assert!(
+            forest.scrub_tour.is_some(),
+            "the scrub tour is armed when the forest finishes opening"
+        );
+
+        let (value_address, index_address) = acquire_table_addresses(&mut forest);
+        let (_, _, _, _) = seed_account_table(
+            &mut forest,
+            &mut storage,
+            Account { id: 7, timestamp: 7, ..Account::default() },
+            value_address,
+            index_address,
+            true,
+        );
+
+        // Drive enough steps to complete several cycles. `tour_blocks_scrubbed_count`
+        // resets to 0 each time the pump exhausts the tour (upstream wraps), so a 0 → >0
+        // → 0 transition proves a cycle completed.
+        let mut previous = u64::MAX;
+        let mut wraps = 0;
+        for _ in 0..40 {
+            forest.poll(&mut storage);
+            let _ = forest.scrub_timeout_tick(&mut storage);
+            let count = forest.grid_scrubber.tour_blocks_scrubbed_count();
+            if previous != u64::MAX && previous > 0 && count == 0 {
+                wraps += 1;
+            }
+            previous = count;
+        }
+        assert!(wraps >= 2, "the tour should complete at least twice, got {wraps}");
+        assert_eq!(
+            forest.grid.blocks_missing_count(),
+            0,
+            "seeded blocks scrub clean: no faults reported"
+        );
+    }
+
+    /// A corrupt (never-written) value block is detected by the scrub and reported as a
+    /// repair; after the good block is written back through `Grid::repair_block`, re-scrubs
+    /// validate it and the repair is pruned.
+    #[test]
+    fn scrub_reports_corrupt_block_and_heals_after_repair() {
+        let mut forest = Forest::init(test_superblock(), grid_options(), 32);
+        let mut storage = large_storage();
+        open_forest(&mut forest, &mut storage);
+
+        // Write the index block to disk but NOT the value block (it stays as 0x00 there),
+        // so its scrub resolves corrupt.
+        let (value_address, index_address) = acquire_table_addresses(&mut forest);
+        let (_, value_block, _, value_checksum) = seed_account_table(
+            &mut forest,
+            &mut storage,
+            Account { id: 7, timestamp: 7, ..Account::default() },
+            value_address,
+            index_address,
+            false,
+        );
+        assert!(
+            value_address > 0 && !forest.grid.free_set_is_free(value_address),
+            "seeded value block is acquired"
+        );
+
+        drive_scrub(&mut forest, &mut storage, 12);
+        assert_eq!(
+            forest.grid.blocks_missing_count(),
+            1,
+            "the corrupt value block is reported for repair"
+        );
+        assert!(forest.grid.repair_block_waiting(value_address, value_checksum));
+
+        // Route in-flight scrub completions into the scrubber and drain the pool (only
+        // `Forest::poll` routes `Grid::scrub_done` into `on_read_done`), so
+        // repair_block's assert_not_reading passes.
+        forest.poll(&mut storage);
+        while forest.grid_scrubber.read_result_next().is_some() {}
+
+        // Heal: the good block arrives (from the cluster) and is repair-written to disk.
+        let location = forest.grid.get_block();
+        forest.grid.block_mut(location).copy_from_slice(&value_block);
+        let _ = forest.grid.repair_block(&mut storage, location);
+        forest.poll(&mut storage);
+        let _ = forest.grid.take_events();
+        assert_eq!(forest.grid.blocks_missing_count(), 0, "repair write prunes the fault");
+
+        // Re-scrubs now validate the healed block; the tour keeps completing cleanly.
+        drive_scrub(&mut forest, &mut storage, 12);
+        assert_eq!(
+            forest.grid.blocks_missing_count(),
+            0,
+            "the healed value block validates on subsequent scrubs"
+        );
     }
 }

@@ -23,10 +23,11 @@
 
 use tigerbeetle_core::constants::{self, VERIFY};
 use tigerbeetle_lsm::compaction::{compaction_op_min, level_active, snapshot_min_for_table_output};
+use tigerbeetle_lsm::direction::Direction::Ascending;
 use tigerbeetle_lsm::manifest::{
     Manifest, ManifestLog as ManifestLogTrait, TableKey as ManifestTableKey, TreeTableInfo,
 };
-use tigerbeetle_lsm::manifest_level::{KeyRange, LevelTableInfo, ManifestLevel};
+use tigerbeetle_lsm::manifest_level::{KeyRange, LevelTableInfo, ManifestLevel, Visibility};
 use tigerbeetle_lsm::scratch_memory::ScratchMemory;
 use tigerbeetle_lsm::table_memory::{self, Mutability, TableMemory};
 use tigerbeetle_lsm::tree::{SNAPSHOT_LATEST, ScopeCloseMode, TreeConfig};
@@ -699,6 +700,93 @@ impl<S: TreeSpec> Tree<S> {
             }
             None => CachedValueSearch::NotFound,
         }
+    }
+}
+
+/// Live table-index access for the grid scrubber (upstream iterates the wrapped
+/// `ForestTableIterator` over every tree; the port lives over a per-tree
+/// "next visible table" cursor instead — see the `GridScrubber` module docs).
+pub(crate) trait ScrubTree {
+    /// Upstream `table_info.tree_id` / `tree.config.id`.
+    ///
+    /// Unused by the port's tour dispatch (which enumerates trees by index); kept for
+    /// upstream parity and future tree-sorting/verification paths.
+    #[allow(dead_code)]
+    fn tree_id(&self) -> u16;
+
+    /// The number of value blocks each table of this tree can hold
+    /// (`Table.index.value_block_count_max`), used as the scrub-origin weight.
+    fn value_block_count_max(&self) -> u64;
+
+    /// The next table in `level` visible to `SNAPSHOT_LATEST`, strictly after
+    /// `after` (in ascending manifest order); `None` once the level is exhausted.
+    ///
+    /// DEVIATION: the port re-scans the level from its start on every step,
+    /// skipping up to the previous result, so the cursor survives being stored as
+    /// scalars in the scrubber instead of a live manifest iterator. Manifest
+    /// mutation between steps is tolerated: tables added before the cursor shift
+    /// right (and may be re-scrubbed); tables removed at or before the cursor
+    /// cause the level to be re-scrubbed from its start (never missed).
+    fn scrub_next_visible_table(
+        &self,
+        level: usize,
+        after: Option<(u64, u128)>,
+    ) -> Option<(u64, u128)>;
+
+    /// The number of tables in `level` (upstream uses
+    /// `tree.manifest.levels[level].tables.len()` as the scrub-origin reservoir
+    /// weight).
+    ///
+    /// DEVIATION: upstream counts every table (including invisible ones);
+    /// the port weights with [`ManifestLevel::table_count_visible`], which only
+    /// differs transiently as tables are removed.
+    fn level_table_count(&self, level: usize) -> u64;
+}
+
+impl<S: TreeSpec> ScrubTree for Tree<S> {
+    fn tree_id(&self) -> u16 {
+        self.config.id
+    }
+
+    fn value_block_count_max(&self) -> u64 {
+        u64::from(S::LAYOUT.value_block_count_max)
+    }
+
+    fn scrub_next_visible_table(
+        &self,
+        level: usize,
+        after: Option<(u64, u128)>,
+    ) -> Option<(u64, u128)> {
+        let snapshots = [SNAPSHOT_LATEST];
+        let mut iterator = self.manifest_ref().levels[level].iterator(
+            Visibility::Visible,
+            &snapshots,
+            Ascending,
+            None,
+        );
+        let mut cursor_found = after.is_none();
+        while let Some(table) = iterator.next() {
+            if !cursor_found {
+                if Some((table.address(), table.checksum())) == after {
+                    cursor_found = true;
+                }
+                continue;
+            }
+            return Some((table.address(), table.checksum()));
+        }
+        if after.is_some() && !cursor_found {
+            // The cursor's table was removed from the manifest (e.g. released by a
+            // checkpoint mid-cycle). Restart from the level's beginning rather than
+            // losing the tables after it (upstream's live iterator omits removed
+            // tables and keeps going).
+            self.scrub_next_visible_table(level, None)
+        } else {
+            None
+        }
+    }
+
+    fn level_table_count(&self, level: usize) -> u64 {
+        u64::from(self.manifest_ref().levels[level].table_count_visible())
     }
 }
 

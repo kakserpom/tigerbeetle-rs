@@ -1905,9 +1905,9 @@ impl TransferGroove {
 /// (`CompositeKey64`, tree id 21), and the per-session objects cache keyed by timestamp.
 pub struct TransferPendingGroove {
     /// Object tree, keyed by the pending transfer's timestamp.
-    objects: Tree<TransferPendingObjectSpec>,
+    pub(crate) objects: Tree<TransferPendingObjectSpec>,
     /// Optional `status` index (field = status as u64, keyed by (status, timestamp)).
-    status: Tree<TransferPendingStatusSpec>,
+    pub(crate) status: Tree<TransferPendingStatusSpec>,
     /// Per-session objects cache, keyed by the pending transfer's timestamp.
     objects_cache: TransferPendingObjectsCache,
 }
