@@ -2134,11 +2134,18 @@ impl Replica {
 
     /// Stage: ReplySetup — ensure ClientReplies has a Write slot.
     ///
+    /// Returns `false` (pending) when every write slot is busy; the owner's
+    /// [`Self::poll_client_replies`] resumes the pipeline as soon as one frees
+    /// up (upstream's `ready(callback)` fires the callback).
+    ///
     /// Upstream: `src/vsr/replica.zig:4877` (`commit_reply_setup`).
-    fn commit_reply_setup(&self) -> bool {
+    fn commit_reply_setup(&mut self) -> bool {
         assert_eq!(self.commit_stage, CommitStage::ReplySetup);
-        // TODO(port): client_replies.ready() — async. For now, ready.
-        true
+        if self.client_replies.ready_sync() {
+            return true;
+        }
+        self.client_replies.ready();
+        false
     }
 
     /// Whether this replica is responsible for replying to the client whose op
@@ -4652,9 +4659,19 @@ impl Replica {
                         }
                     }
                 }
-                crate::client_replies::Event::Ready
-                | crate::client_replies::Event::CheckpointDone => {
-                    // These fire only when `ready()`/`checkpoint()` waiters are
+                crate::client_replies::Event::Ready => {
+                    // `ready()` is registered only by `commit_reply_setup`, so
+                    // `Event::Ready` means the parked ReplySetup stage can
+                    // resume (upstream `commit_reply_setup_callback`,
+                    // replica.zig:4885-4891).
+                    assert_eq!(self.commit_stage, CommitStage::ReplySetup);
+                    assert!(self.commit_prepare.is_some());
+                    assert_eq!(self.commit_prepare, Some(self.commit_min + 1));
+                    assert!(self.client_replies.ready_sync());
+                    self.commit_dispatch_resume();
+                }
+                crate::client_replies::Event::CheckpointDone => {
+                    // These fire only when `checkpoint()` waiters are
                     // registered, which the sans-IO replica does not do yet.
                 }
             }
@@ -13143,6 +13160,65 @@ mod tests {
         assert!(!r.commit_stall_timeout.active);
         // Commit op-2's fresh-primary parking pulse (op 3).
         commit_parking_pulse(&mut r);
+    }
+
+    #[test]
+    fn commit_reply_setup_parks_the_dispatch_until_a_write_slot_frees() {
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        r.status = Status::Normal;
+        r.grid_storage = Some(MemoryStorage::new(
+            Zone::ClientReplies.start() + 4 * crate::message::MESSAGE_SIZE_MAX as u64,
+        ));
+
+        // Two register commits (distinct clients → distinct reply slots) fill
+        // both client_replies write slots (`CLIENT_REPLIES_IOPS_WRITE_MAX == 2`
+        // under test_min) before any completion is polled.
+        register_client(&mut r, 7);
+        register_client(&mut r, 8);
+        assert!(!r.client_replies.ready_sync());
+        // `register_client` drives `commit_execute` directly, which leaves the
+        // stage/prepare for the pipeline to reset; restore them for the dispatch.
+        r.commit_stage = CommitStage::Idle;
+        r.commit_prepare = None;
+
+        // Quorum the next register (op 4); the pipeline advances through Start,
+        // Prefetch and Stall without parking (single op, zero lag, no committed
+        // successor) and stalls only at ReplySetup, with no Write slot free.
+        let op = r.primary_pipeline_prepare(9, 0, crate::Operation::REGISTER, &[], 0).unwrap();
+        assert_eq!(op, 4);
+        let checksum = r.journal.header_with_op(op).unwrap().checksum();
+        r.on_prepare_ok(op, checksum, r.checkpoint_id_for_op(op).unwrap(), r.commit_min, 1);
+
+        r.commit_dispatch_enter();
+        assert_eq!(r.commit_stage, CommitStage::ReplySetup);
+        assert!(r.commit_dispatch_entered);
+        assert_eq!(r.commit_min, 3);
+
+        // Draining the write completions frees a slot, fires `Event::Ready`,
+        // and resumes the parked pipeline through the Execute stage (the
+        // op-4 register reply writes back out).
+        r.poll_client_replies();
+        assert_eq!(r.commit_stage, CommitStage::Idle);
+        assert!(!r.commit_dispatch_entered);
+        assert_eq!(r.commit_min, 4);
+        // A second poll completes the op-4 register reply's write.
+        r.poll_client_replies();
+        let slot = r.client_sessions.get_slot_for_client(9).expect("client 9 session");
+        assert!(r.client_replies.reply_durable(slot));
+    }
+
+    #[test]
+    fn commit_reply_setup_ready_when_capacity_available() {
+        // With a free Write slot the ReplySetup stage completes synchronously
+        // and `commit_reply_setup` neither registers a wait nor parks.
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        r.status = Status::Normal;
+        r.commit_prepare = Some(1);
+        r.commit_min = 0;
+        r.commit_stage = CommitStage::ReplySetup;
+        assert!(r.client_replies.ready_sync());
+        assert!(r.commit_reply_setup());
+        assert_eq!(r.commit_stage, CommitStage::ReplySetup);
     }
 
     #[test]
