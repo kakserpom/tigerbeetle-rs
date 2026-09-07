@@ -1897,13 +1897,66 @@ impl Replica {
         self.commit_prepare = Some(head.op);
     }
 
-    /// Stage: Prefetch — load required data from LSM tree into memory.
+    /// Stage: Prefetch — load the LSM data the prepare's execution needs into
+    /// memory ahead of time.
+    ///
+    /// The stage is synchronous (sans-IO): [`StateMachine::prefetch`] validates
+    /// the body and records the prefetch inputs; the groove-level async key
+    /// resolution is deferred to the forest-backed phase (see its DEVIATION
+    /// note).
+    ///
+    /// The snapshot the LSM queries must target is the prepare's own op —
+    /// unless the op was already compacted into a persisted checkpoint, in
+    /// which case the queries target one past that checkpoint's trigger
+    /// (`vsr.Checkpoint.trigger_for_checkpoint`, upstream replica.zig:4747).
     ///
     /// Upstream: `src/vsr/replica.zig:4715` (`commit_prefetch`).
-    fn commit_prefetch(&self) -> bool {
+    fn commit_prefetch(&mut self) -> bool {
         assert_eq!(self.commit_stage, CommitStage::Prefetch);
-        assert!(self.commit_prepare.is_some());
-        // TODO(port): state_machine.prefetch — async I/O. For now, ready.
+        let Some(op) = self.commit_prepare else {
+            unreachable!("commit_prefetch requires commit_prepare");
+        };
+        let Some(prepare) = self.journal.header_with_op(op).copied() else {
+            unreachable!("the op being committed is journaled");
+        };
+        // The pipeline only stages valid, non-root, non-reserved prepares, and
+        // commits one op past `commit_min` (upstream asserts the same at
+        // replica.zig:4731-4739).
+        assert!(prepare.operation != crate::Operation::ROOT);
+        assert!(prepare.operation != crate::Operation::RESERVED);
+        assert_eq!(prepare.op, self.commit_min + 1);
+
+        // Normally caught when the prepare is accepted, but a restart may lower
+        // the batch size limit (upstream replica.zig:4727-4735). The sans-IO
+        // limit is the header plus the maximum body.
+        let size_limit = u32::try_from(message_header::SIZE + constants::MESSAGE_BODY_SIZE_MAX)
+            .unwrap_or_else(|_| unreachable!("the message size will always fit a u32"));
+        assert!(prepare.size <= size_limit, "Cannot commit prepare; batch limit too low");
+
+        // If the op has already been compacted into a checkpoint, reads must
+        // query a snapshot past that checkpoint's trigger (upstream
+        // replica.zig:4742-4750).
+        let snapshot = if self
+            .superblock
+            .as_ref()
+            .is_some_and(|superblock| superblock.working().vsr_state.op_compacted(prepare.op))
+        {
+            crate::checkpoint::trigger_for_checkpoint(self.op_checkpoint()).unwrap_or_else(|| {
+                unreachable!("a compacted op implies a non-zero checkpoint (upstream `.? + 1`)")
+            }) + 1
+        } else {
+            prepare.op
+        };
+
+        if crate::state_machine::StateMachine::executes(prepare.operation) {
+            // The prepare body may be empty when it arrived header-only (backup
+            // replication and repairs); the state machine executes it
+            // trivially (commit_execute makes the same allowance).
+            let body = self.journal.body_with_op(prepare.op).unwrap_or(&[]);
+            self.state_machine.prefetch(prepare.op, snapshot, prepare.operation, body);
+        } else {
+            assert!(prepare.operation.vsr_reserved());
+        }
         true
     }
 
@@ -12916,6 +12969,81 @@ mod tests {
             assert_eq!(sb.working().vsr_state.checkpoint.header.op, op);
         }
         (sb, storage)
+    }
+
+    #[test]
+    fn commit_prefetch_snapshot_is_the_prepare_op_when_not_compacted() {
+        // No superblock mounted, so nothing is compacted: the prefetch snapshot
+        // is the prepare's own op (upstream replica.zig:4747).
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        r.status = Status::Normal;
+
+        let op =
+            r.primary_pipeline_prepare(1, 1, crate::Operation::CREATE_ACCOUNTS, &[], 0).unwrap();
+        assert_eq!(op, 1);
+        let checksum = r.journal.header_with_op(op).unwrap().checksum();
+        r.on_prepare_ok(op, checksum, r.checkpoint_id_for_op(op).unwrap(), 1);
+        r.commit_dispatch_enter();
+
+        assert_eq!(r.commit_min, 1);
+        assert_eq!(r.commit_stage, CommitStage::Idle);
+        assert_eq!(r.state_machine.prefetch_snapshot, Some(op));
+    }
+
+    #[test]
+    fn commit_prefetch_snapshot_for_compacted_op_is_trigger_plus_one() {
+        // Once the superblock checkpoints a bar, every op up to that bar's
+        // trigger is compacted; reads for such ops must target the snapshot one
+        // past the trigger (upstream replica.zig:4742-4750).
+        let checkpoint_ops = constants::VSR_CHECKPOINT_OPS as u64;
+        let compaction_ops = constants::LSM_COMPACTION_OPS as u64;
+        let first_checkpoint = checkpoint_ops - 1;
+        let trigger = crate::checkpoint::trigger_for_checkpoint(first_checkpoint).unwrap();
+
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        r.status = Status::Normal;
+        // Mount the first checkpoint and stand the replica exactly at it, so
+        // the next prepared op (first_checkpoint + 1) is still within the
+        // checkpoint's compaction window.
+        r.commit_min = first_checkpoint;
+        r.commit_max = first_checkpoint;
+        r.op = first_checkpoint;
+        let (sb, st) = opened_superblock_at_op(first_checkpoint);
+        r.mount_superblock(sb, st);
+
+        let op =
+            r.primary_pipeline_prepare(1, 1, crate::Operation::CREATE_ACCOUNTS, &[], 0).unwrap();
+        assert_eq!(op, first_checkpoint + 1);
+        assert!(
+            r.superblock.as_ref().unwrap().working().vsr_state.op_compacted(op),
+            "op {op} is within the checkpoint's compaction window (trigger {trigger})"
+        );
+        let checksum = r.journal.header_with_op(op).unwrap().checksum();
+        r.on_prepare_ok(op, checksum, r.checkpoint_id_for_op(op).unwrap(), 1);
+        r.commit_dispatch_enter();
+
+        assert_eq!(r.commit_min, op);
+        assert_eq!(r.state_machine.prefetch_snapshot, Some(trigger + 1));
+        // Sanity: `compaction_ops` summarizes the interval algebra above.
+        assert_eq!(trigger + 1, first_checkpoint + compaction_ops + 1);
+    }
+
+    #[test]
+    fn commit_prefetch_skips_vsr_reserved_ops() {
+        // vsr-reserved ops (noop, register, ...) never reach the state machine,
+        // so no prefetch is recorded for them (upstream `Operation.from_vsr`
+        // returns null for the control plane, replica.zig:4754-4762).
+        let mut r = Replica::new(CLUSTER, 0, 3);
+        r.status = Status::Normal;
+
+        let op = r.primary_pipeline_prepare(1, 1, crate::Operation::NOOP, &[], 0).unwrap();
+        assert_eq!(op, 1);
+        let checksum = r.journal.header_with_op(op).unwrap().checksum();
+        r.on_prepare_ok(op, checksum, r.checkpoint_id_for_op(op).unwrap(), 1);
+        r.commit_dispatch_enter();
+
+        assert_eq!(r.commit_min, 1);
+        assert_eq!(r.state_machine.prefetch_snapshot, None);
     }
 
     #[test]

@@ -2037,6 +2037,16 @@ pub struct StateMachine {
     /// executed op must advance it strictly (upstream asserts the same in
     /// `Replica.execute_op`, replica.zig:5441).
     pub commit_timestamp: u64,
+    /// The snapshot recorded by the prepare's `Prefetch` stage — the LSM
+    /// snapshot that prefetched reads during execute must target (upstream
+    /// `state_machine.prefetch_snapshot`, `state_machine.zig:230`). `None`
+    /// until [`Self::prefetch`] records the first prefetch.
+    pub prefetch_snapshot: Option<u64>,
+    /// The state-machine operation recorded by the prepare's `Prefetch` stage.
+    /// Doubles as the "prefetch pending" marker: `None` means no prefetch is
+    /// outstanding (upstream `state_machine.prefetch_operation`,
+    /// `state_machine.zig:228`).
+    pub prefetch_operation: Option<Operation>,
     /// Temporary primary-key store for accounts.
     accounts: HashMap<u128, Account>,
     /// Temporary primary-key store for transfers.
@@ -2089,6 +2099,8 @@ impl Default for StateMachine {
     fn default() -> Self {
         Self {
             commit_timestamp: 0,
+            prefetch_snapshot: None,
+            prefetch_operation: None,
             accounts: HashMap::new(),
             transfers: HashMap::new(),
             transfers_orphaned: HashSet::new(),
@@ -2284,6 +2296,30 @@ impl StateMachine {
         operation == Operation::PULSE || !operation.vsr_reserved()
     }
 
+    /// Whether a prepare body decodes to a whole number of events for the
+    /// operation (upstream's `Operation.batch_valid`, `state_machine.zig:363`;
+    /// the decode helpers are the same ones [`Self::execute`] dispatches to).
+    #[must_use]
+    fn operation_body_is_valid(operation: Operation, body: &[u8]) -> bool {
+        match operation {
+            Operation::PULSE | Operation::STATE_MACHINE_PULSE => body.is_empty(),
+            Operation::CREATE_ACCOUNTS => bytes_to_account_batch(body).is_some(),
+            Operation::CREATE_TRANSFERS => bytes_to_transfer_batch(body).is_some(),
+            Operation::GET_CHANGE_EVENTS => bytes_to_change_events_filter(body).is_some(),
+            Operation::LOOKUP_ACCOUNTS | Operation::LOOKUP_TRANSFERS => {
+                bytes_to_lookup_ids(body).is_some()
+            }
+            Operation::GET_ACCOUNT_TRANSFERS | Operation::GET_ACCOUNT_BALANCES => {
+                bytes_to_account_filter(body).is_some()
+            }
+            Operation::QUERY_ACCOUNTS | Operation::QUERY_TRANSFERS => {
+                bytes_to_query_filter(body).is_some()
+            }
+            // vsr-reserved operations never reach the state machine.
+            _ => false,
+        }
+    }
+
     /// Overwrite the committed timestamp after `StateMachine::execute` returns.
     ///
     /// `Replica::commit_execute` mirrors upstream's `execute_op`
@@ -2293,6 +2329,43 @@ impl StateMachine {
     /// exactly to the prepare's timestamp as upstream does.
     pub fn set_commit_timestamp(&mut self, timestamp: u64) {
         self.commit_timestamp = timestamp;
+    }
+
+    /// Prepare the state machine to execute a committed prepare: validate the
+    /// request body and record the LSM snapshot that prefetched reads must
+    /// target.
+    ///
+    /// The stage is synchronous — there is no async I/O to wait on.
+    ///
+    /// DEVIATION: upstream leaves [`Self::prefetch_operation`] set until the
+    /// async prefetch callbacks resolve the grooves' ObjectsCaches and
+    /// `prefetch_finish` (state_machine.zig:1228) runs; without a mounted
+    /// forest there is no cache to fill, so the prefetch completes here and the
+    /// pending marker is cleared immediately. The groove-level key resolution
+    /// is deferred to the forest-backed phase — the batch orchestrators
+    /// recompute their key-sets from the body during [`Self::execute`] exactly
+    /// as they do today.
+    ///
+    /// Upstream: `src/state_machine.zig:1146` (`prefetch`).
+    ///
+    /// # Panics
+    /// Panics unless `op > 0`, `op <= snapshot`, no prefetch is already
+    /// pending, the body fits the message body limit, and the body decodes to
+    /// a whole number of events for `operation` (upstream asserts the same).
+    pub fn prefetch(&mut self, op: u64, snapshot: u64, operation: Operation, body: &[u8]) {
+        assert!(op > 0);
+        assert!(op <= snapshot);
+        assert!(self.prefetch_operation.is_none(), "prefetch already pending");
+        assert!(body.len() <= constants::MESSAGE_BODY_SIZE_MAX);
+        assert!(
+            Self::operation_body_is_valid(operation, body),
+            "prefetch body must encode a whole number of events for the operation"
+        );
+        // Upstream records `prefetch_snapshot` / `prefetch_operation` and the
+        // callback defers `prefetch_finish`; sans-IO mark the prefetch pending
+        // (captured above) and close it out immediately (see the DEVIATION).
+        self.prefetch_snapshot = Some(snapshot);
+        self.prefetch_operation = None;
     }
 
     /// Execute a banking operation's request body and return its reply body.
@@ -3504,6 +3577,61 @@ mod tests {
         let mut state_machine = StateMachine::default();
         state_machine.execute_op(2);
         state_machine.execute_op(2);
+    }
+
+    // ── prefetch tests ───────────────────────────────────────────────────
+
+    #[test]
+    fn prefetch_records_snapshot_and_completes_synchronously() {
+        let mut state_machine = StateMachine::default();
+        assert_eq!(state_machine.prefetch_snapshot, None);
+
+        state_machine.prefetch(1, 1, Operation::CREATE_ACCOUNTS, &[]);
+        assert_eq!(state_machine.prefetch_snapshot, Some(1));
+        // Sans-IO the prefetch completes (there is no cache to fill), so the
+        // pending marker is already cleared and the next prefetch is not
+        // blocked (upstream defers `prefetch_finish`, state_machine.zig:1228).
+        assert_eq!(state_machine.prefetch_operation, None);
+
+        state_machine.prefetch(2, 4, Operation::CREATE_TRANSFERS, &[]);
+        assert_eq!(state_machine.prefetch_snapshot, Some(4));
+    }
+
+    #[test]
+    #[should_panic(expected = "op > 0")]
+    fn prefetch_rejects_op_zero() {
+        let mut state_machine = StateMachine::default();
+        state_machine.prefetch(0, 8, Operation::CREATE_ACCOUNTS, &[]);
+    }
+
+    #[test]
+    #[should_panic(expected = "op <= snapshot")]
+    fn prefetch_rejects_op_after_snapshot() {
+        let mut state_machine = StateMachine::default();
+        state_machine.prefetch(5, 4, Operation::CREATE_ACCOUNTS, &[]);
+    }
+
+    #[test]
+    #[should_panic(expected = "prefetch body must encode a whole number of events")]
+    fn prefetch_rejects_malformed_body() {
+        let mut state_machine = StateMachine::default();
+        state_machine.prefetch(1, 1, Operation::CREATE_ACCOUNTS, &[0; 10]);
+    }
+
+    #[test]
+    #[should_panic(expected = "prefetch body must encode a whole number of events")]
+    fn prefetch_rejects_vsr_reserved_operation() {
+        // The replica never prefetches vsr-reserved ops (its `commit_prefetch`
+        // classifies them away); the state machine rejects them outright.
+        let mut state_machine = StateMachine::default();
+        state_machine.prefetch(1, 1, Operation::NOOP, &[]);
+    }
+
+    #[test]
+    fn prefetch_accepts_pulse_with_empty_body() {
+        let mut state_machine = StateMachine::default();
+        state_machine.prefetch(1, 1, Operation::PULSE, &[]);
+        assert_eq!(state_machine.prefetch_snapshot, Some(1));
     }
 
     // ── forest-compaction tests ─────────────────────────────────────────
