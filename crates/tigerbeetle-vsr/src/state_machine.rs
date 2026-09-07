@@ -2323,6 +2323,39 @@ impl StateMachine {
         }
     }
 
+    /// Mark the forest grid's checkpoint durable, at the point the replica commits
+    /// the `(pipeline_prepare_queue_max + 1)ᵗʰ` prepare after the checkpoint trigger:
+    /// the previous checkpoint's released blocks are freed, and the current
+    /// checkpoint's releases become eligible for the next encode. The scrubber must
+    /// abort reads to blocks about to be freed first.
+    ///
+    /// Upstream: `commit_checkpoint_durable` → `grid_scrubber.checkpoint_durable` +
+    /// `grid.checkpoint_durable`, replica.zig:4976-4983.
+    ///
+    /// # Panics
+    /// Panics if a forest is mounted but its checkpoint is already durable, or the
+    /// grid has in-flight writes (upstream asserts the same).
+    pub fn mark_checkpoint_durable(&mut self) {
+        if let Some(forest) = &mut self.forest {
+            forest.grid_scrubber.checkpoint_durable(&forest.grid);
+            forest.grid.checkpoint_durable();
+        }
+    }
+
+    /// Whether the mounted forest grid's free-set checkpoint is already durable —
+    /// `true` when no forest is mounted (sans-IO: there is no free set to make
+    /// durable, so `commit_checkpoint_durable` treats it as ready).
+    ///
+    /// DEVIATION: upstream reads `grid.free_set.checkpoint_durable` directly (the
+    /// replica owns the grid); sans-IO the grid lives inside the optional forest.
+    #[must_use]
+    pub fn grid_checkpoint_durable(&self) -> bool {
+        match &self.forest {
+            None => true,
+            Some(forest) => forest.grid.free_set().checkpoint_durable(),
+        }
+    }
+
     /// Record that a vsr-reserved (control-plane) op was executed against the
     /// state machine.
     ///

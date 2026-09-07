@@ -2651,10 +2651,49 @@ impl Replica {
 
     /// Stage: CheckpointDurable — mark the checkpoint as durable.
     ///
+    /// Acts once per checkpoint, on the `(pipeline_prepare_queue_max + 1)ᵗʰ`
+    /// prepare after the checkpoint trigger (`commit_min == trigger +
+    /// pipeline_prepare_queue_max + 1`): marks the grid free set durable (freeing
+    /// the previous checkpoint's released blocks) and, when the primary, sends a
+    /// View so lagging replicas can proactively sync to the durable checkpoint.
+    /// Already-durable, or not yet at the durable point, reads as ready.
+    ///
     /// Upstream: `src/vsr/replica.zig:4967` (`commit_checkpoint_durable`).
-    fn commit_checkpoint_durable(&self) -> bool {
+    fn commit_checkpoint_durable(&mut self) -> bool {
         assert_eq!(self.commit_stage, CommitStage::CheckpointDurable);
-        // TODO(port): grid.checkpoint_durable — async. For now, ready.
+
+        // DEVIATION: upstream reads `grid.free_set.checkpoint_durable` directly (the
+        // replica owns the grid); sans-IO the grid lives inside the optional forest, and
+        // `grid_checkpoint_durable` reads `true` when no forest is mounted — there is no
+        // free set to mark.
+        if self.state_machine.grid_checkpoint_durable() {
+            return true; // Already durable: nothing to mark.
+        }
+        if !crate::checkpoint::durable(self.op_checkpoint(), self.commit_min) {
+            return true; // Not yet at the durable point: nothing to mark.
+        }
+
+        // Send View so lagging replicas can proactively sync to this durable checkpoint.
+        if self.status == Status::Normal && self.is_primary() {
+            self.primary_send_view();
+        }
+
+        // The checkpoint is guaranteed durable on a commit quorum when a replica is
+        // committing the (pipeline + 1)ᵗʰ prepare after the checkpoint trigger. It might
+        // already be durable before this point, but storage determinism requires every
+        // replica to mark it durable at the same point.
+        if let Some(trigger) = crate::checkpoint::trigger_for_checkpoint(self.op_checkpoint()) {
+            assert_eq!(
+                self.commit_min,
+                trigger + u64::from(constants::PIPELINE_PREPARE_QUEUE_MAX) + 1,
+                "commit_checkpoint_durable: commit_min must be \
+                 trigger + PIPELINE_PREPARE_QUEUE_MAX + 1"
+            );
+        }
+
+        self.state_machine.mark_checkpoint_durable();
+        // sans-IO: `Grid::checkpoint_durable` completes synchronously (the port forbids
+        // in-flight repair writes), so upstream's async callback is never pending.
         true
     }
 
@@ -13685,6 +13724,82 @@ mod tests {
         assert!(references_2.block_count >= 1);
         assert!(references_2.oldest_address > 0);
         assert!(references_2.newest_address > 0);
+    }
+
+    /// A backup replica (index 1 — not the initial primary) with a superblock mounted at the
+    /// first real checkpoint (op `VSR_CHECKPOINT_OPS - 1`) and a freshly opened forest attached:
+    /// the checkpoint stages have a grid whose free set is open but not durable.
+    fn replica_with_forest_at_first_checkpoint() -> (Replica, u64) {
+        let mut r = Replica::new(CLUSTER, 1, 3);
+        r.status = Status::Recovering;
+        let first_checkpoint = constants::VSR_CHECKPOINT_OPS as u64 - 1;
+        let (sb, st) =
+            opened_superblock_in_storage(first_checkpoint, replica_forest_storage_size());
+        r.mount_superblock(sb, st);
+        assert_eq!(r.op_checkpoint(), first_checkpoint);
+        r.commit_min = first_checkpoint;
+        r.op = first_checkpoint;
+
+        let mut forest = Forest::init(replica_forest_view(), replica_forest_grid_options(), 32);
+        let mut storage = replica_forest_storage();
+        open_forest(&mut forest, &mut storage);
+        r.state_machine.mount_forest(forest);
+        r.grid_storage = Some(storage);
+        (r, first_checkpoint)
+    }
+
+    /// The (pipeline + 1)ᵗʰ prepare after the checkpoint trigger: the durable point at which
+    /// `commit_checkpoint_durable` marks the free set.
+    fn durable_point(first_checkpoint: u64) -> u64 {
+        first_checkpoint
+            + constants::LSM_COMPACTION_OPS as u64
+            + u64::from(constants::PIPELINE_PREPARE_QUEUE_MAX)
+            + 1
+    }
+
+    #[test]
+    fn commit_checkpoint_durable_marks_the_free_set_durable_at_the_durable_point() {
+        let (mut r, first_checkpoint) = replica_with_forest_at_first_checkpoint();
+        assert!(
+            !r.state_machine.grid_checkpoint_durable(),
+            "a freshly opened forest is not yet durable"
+        );
+
+        r.commit_min = durable_point(first_checkpoint);
+        r.commit_stage = CommitStage::CheckpointDurable;
+        assert!(r.commit_checkpoint_durable());
+        assert!(r.state_machine.grid_checkpoint_durable());
+    }
+
+    #[test]
+    fn commit_checkpoint_durable_waits_below_the_durable_point() {
+        let (mut r, first_checkpoint) = replica_with_forest_at_first_checkpoint();
+        r.commit_min = durable_point(first_checkpoint) - 1;
+        r.commit_stage = CommitStage::CheckpointDurable;
+        assert!(r.commit_checkpoint_durable()); // ready, but nothing to mark yet
+        assert!(!r.state_machine.grid_checkpoint_durable());
+    }
+
+    #[test]
+    fn commit_checkpoint_durable_is_ready_when_already_durable() {
+        let (mut r, first_checkpoint) = replica_with_forest_at_first_checkpoint();
+        r.commit_min = durable_point(first_checkpoint);
+        r.commit_stage = CommitStage::CheckpointDurable;
+        assert!(r.commit_checkpoint_durable());
+
+        // The superblock checkpoint for this bar has not landed, so the free set stays durable
+        // and the next dispatch's stage must not re-mark (`Grid::checkpoint_durable` asserts
+        // `!free_set.checkpoint_durable`).
+        r.commit_stage = CommitStage::CheckpointDurable;
+        assert!(r.commit_checkpoint_durable());
+        assert!(r.state_machine.grid_checkpoint_durable());
+    }
+
+    #[test]
+    fn commit_checkpoint_durable_ready_without_a_forest() {
+        let mut r = Replica::new(CLUSTER, 1, 3);
+        r.commit_stage = CommitStage::CheckpointDurable;
+        assert!(r.commit_checkpoint_durable()); // no grid: nothing to mark
     }
 
     #[test]

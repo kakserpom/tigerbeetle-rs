@@ -247,9 +247,14 @@ impl Forest {
                 *reservation_released = true;
                 // The free set only encodes once the previous checkpoint is durable
                 // (upstream `Grid.checkpoint_durable` before `Grid.checkpoint`). The
-                // scrubber must abort reads to blocks about to be freed first.
-                self.grid_scrubber.checkpoint_durable(&self.grid);
-                self.grid.checkpoint_durable();
+                // scrubber must abort reads to blocks about to be freed first. When
+                // the replica's `commit_checkpoint_durable` stage already marked the
+                // free set durable (at `trigger + pipeline_prepare_queue_max + 1`,
+                // upstream replica.zig:4983), this is a no-op.
+                if !self.grid.free_set().checkpoint_durable() {
+                    self.grid_scrubber.checkpoint_durable(&self.grid);
+                    self.grid.checkpoint_durable();
+                }
                 self.grid.checkpoint(storage);
                 *grid_started = true;
             } else if !self.grid.is_checkpoint_in_flight() {
