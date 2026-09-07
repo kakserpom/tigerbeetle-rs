@@ -42,10 +42,11 @@ use tigerbeetle_lsm::tree::ScopeCloseMode;
 
 use crate::Operation;
 use crate::forest::Forest;
+use crate::groove::{AccountObjectsCache, TransferObjectsCache, TransferPendingObjectsCache};
 use crate::message_header::checksum_body_empty;
-use crate::objects_cache::ObjectsCache;
 use crate::storage::Storage;
 use crate::superblock::{FreeSetReferences, ManifestReferences, TrailerReference};
+use tigerbeetle_lsm::cache_map::CacheMapOptions;
 
 // ---------------------------------------------------------------------------
 // Query reply limits
@@ -1030,11 +1031,12 @@ fn prefetch_create_transfers(
 /// `transfer_with_timestamp` resolves the transfer matching a timestamp, mirroring the cross-groove
 /// `transfers.indirect_lookup` that upstream consults for imported events.
 ///
-/// Reads go through the batch's objects cache (`accounts_objects`): the
-/// orchestrator fills it from the committed accounts resolved by `prefetch`
-/// (`prefetch_create_accounts`), each create upserts its account, and a chain
-/// opening/closing drives `scope_open`/`scope_close` so a broken chain's
-/// in-session creates are rolled back (upstream `state_machine.zig:3037-3202`).
+/// Reads go through [`StateMachine::accounts_objects`], the persistent
+/// per-groove cache: the orchestrator fills it from the committed accounts
+/// resolved by `prefetch` (`prefetch_create_accounts`), each create upserts its
+/// account, and a chain opening/closing drives `scope_open`/`scope_close` so a
+/// broken chain's in-session creates are rolled back (upstream
+/// `state_machine.zig:3037-3202`).
 /// `transfer_timestamps` holds the committed transfers whose timestamps were
 /// looked up during prefetch (upstream's `transfers.indirect_lookup` for
 /// imported events).
@@ -1044,7 +1046,7 @@ pub(crate) fn execute_create_accounts(
     events: &[Account],
     timestamp: u64,
     prefetch: &AccountPrefetchKeys,
-    accounts_objects: &mut ObjectsCache<u128, Account>,
+    accounts_objects: &mut AccountObjectsCache,
     accounts_key_max: u64,
     transfer_timestamps: &HashSet<u64>,
 ) -> Vec<CreateAccountResult> {
@@ -1103,7 +1105,7 @@ pub(crate) fn execute_create_accounts(
             // The object cache holds the prefetched committed accounts plus the
             // in-session creates; upstream reads the groove's objects cache the
             // same way (`get_account`, state_machine.zig:4467-4474).
-            let existing = accounts_objects.get(&event.id).copied();
+            let existing = accounts_objects.get(event.id).copied();
             if existing.is_none() {
                 // A cache miss must have been resolved as not-found during
                 // prefetch, i.e. the id was enqueued (`state_machine.zig:3633-3635`).
@@ -1156,7 +1158,7 @@ pub(crate) fn execute_create_accounts(
                 // Insert into the object cache so later events in the batch see
                 // this account (upstream `Accounts.objects_cache.upsert`,
                 // state_machine.zig:3667).
-                accounts_objects.upsert(stored);
+                accounts_objects.upsert(&stored);
                 running_key_max = running_key_max.max(ts);
             }
             (status, ts)
@@ -1206,11 +1208,11 @@ pub(crate) fn execute_create_accounts(
 /// resolved as not-found during prefetch (upstream's `get_account` verify
 /// asserts, `state_machine.zig:4467-4474`).
 fn read_cached_account(
-    accounts_objects: &mut ObjectsCache<u128, Account>,
+    accounts_objects: &mut AccountObjectsCache,
     prefetch: &TransferPrefetchKeys,
     id: u128,
 ) -> Option<Account> {
-    let account = accounts_objects.get(&id).copied();
+    let account = accounts_objects.get(id).copied();
     if account.is_none() {
         assert!(
             prefetch.account_ids.contains(id),
@@ -1225,12 +1227,13 @@ fn read_cached_account(
 /// Same semantics as `execute_create_accounts` but for transfers.
 ///
 /// `transfers_key_max` is the maximum committed transfer timestamp
-/// (`transfers.objects.key_range.key_max`). Reads go through the batch's object
-/// caches (`accounts_objects`, `transfers_objects`, `transfers_pending_objects`):
-/// the orchestrator fills them from the committed state resolved by `prefetch`
-/// (`prefetch_create_transfers`), creates upsert into them, and a chain
-/// opening/closing drives `scope_open`/`scope_close` so a broken chain's
-/// in-session writes are rolled back (upstream `state_machine.zig:3037-3202`).
+/// (`transfers.objects.key_range.key_max`). Reads go through the state
+/// machine's persistent object caches (`accounts_objects`, `transfers_objects`,
+/// `transfers_pending_objects`): the orchestrator fills them from the committed
+/// state resolved by `prefetch` (`prefetch_create_transfers`), creates upsert
+/// into them, and a chain opening/closing drives `scope_open`/`scope_close` so
+/// a broken chain's in-session writes are rolled back (upstream
+/// `state_machine.zig:3037-3202`).
 /// `account_timestamps` holds the committed accounts whose timestamps were
 /// looked up during prefetch (`accounts.indirect_lookup` for imported events).
 /// `working_orphaned` layers the batch's transient failures over the committed
@@ -1239,9 +1242,9 @@ fn read_cached_account(
 pub(crate) fn execute_create_transfers(
     events: &[Transfer],
     timestamp: u64,
-    accounts_objects: &mut ObjectsCache<u128, Account>,
-    transfers_objects: &mut ObjectsCache<u128, Transfer>,
-    transfers_pending_objects: &mut ObjectsCache<u64, TransferPending>,
+    accounts_objects: &mut AccountObjectsCache,
+    transfers_objects: &mut TransferObjectsCache,
+    transfers_pending_objects: &mut TransferPendingObjectsCache,
     transfers_key_max: u64,
     account_timestamps: &HashSet<u64>,
     account_timestamps_enqueued: &PrefetchKeys<u64>,
@@ -1318,7 +1321,7 @@ pub(crate) fn execute_create_transfers(
             // cache holds the prefetched committed transfers plus the in-session
             // creates; upstream reads the transfers groove's objects cache the
             // same way (`get_transfer`, state_machine.zig:4477-4479).
-            let existing = transfers_objects.get(&event.id).copied();
+            let existing = transfers_objects.get(event.id).copied();
             if existing.is_none() {
                 // A cache miss must have been resolved as not-found during
                 // prefetch, i.e. the id was enqueued
@@ -1356,7 +1359,7 @@ pub(crate) fn execute_create_transfers(
                     break 'result (CreateTransferStatus::IdMustNotBeIntMax, timestamp_event);
                 }
 
-                let pending = transfers_objects.get(&event.pending_id).copied();
+                let pending = transfers_objects.get(event.pending_id).copied();
                 if pending.is_none() {
                     assert!(
                         prefetch.transfer_ids.contains(event.pending_id),
@@ -1422,7 +1425,7 @@ pub(crate) fn execute_create_transfers(
                         .expect("post_or_void_pending_transfer: committed pending implies its credit account");
 
                     let pending_status = transfers_pending_objects
-                        .get(&p.timestamp)
+                        .get(p.timestamp)
                         .copied()
                         .map_or(TransferPendingStatus::None, |pending| pending.status);
                     if pending_status == TransferPendingStatus::None {
@@ -1452,7 +1455,7 @@ pub(crate) fn execute_create_transfers(
                         let ts =
                             if event.flags.imported() { event.timestamp } else { timestamp_event };
                         let is_post = event.flags.post_pending_transfer();
-                        transfers_pending_objects.upsert(TransferPending {
+                        transfers_pending_objects.upsert(&TransferPending {
                             timestamp: p.timestamp,
                             status: if is_post {
                                 TransferPendingStatus::Posted
@@ -1465,11 +1468,11 @@ pub(crate) fn execute_create_transfers(
                             commit_post_void_accounts(event, p, amount_actual, &dr, &cr);
                         debug_assert_eq!(dr_new.id, dr.id);
                         debug_assert_eq!(cr_new.id, cr.id);
-                        accounts_objects.upsert(dr_new);
-                        accounts_objects.upsert(cr_new);
+                        accounts_objects.upsert(&dr_new);
+                        accounts_objects.upsert(&cr_new);
 
                         let record = fold_post_void_transfer(event, p, amount_actual, ts);
-                        transfers_objects.upsert(record);
+                        transfers_objects.upsert(&record);
                         ts
                     } else {
                         timestamp_event
@@ -1554,8 +1557,8 @@ pub(crate) fn execute_create_transfers(
                         commit_transfer_accounts(event, amount_actual, &dr_account, &cr_account);
                     debug_assert_eq!(dr_new.id, dr_account.id);
                     debug_assert_eq!(cr_new.id, cr_account.id);
-                    accounts_objects.upsert(dr_new);
-                    accounts_objects.upsert(cr_new);
+                    accounts_objects.upsert(&dr_new);
+                    accounts_objects.upsert(&cr_new);
 
                     // The created transfer is visible to later batch events
                     // (upstream inserts into the transfers groove at commit); a
@@ -1563,9 +1566,9 @@ pub(crate) fn execute_create_transfers(
                     let mut record = *event;
                     record.amount = amount_actual;
                     record.timestamp = ts;
-                    transfers_objects.upsert(record);
+                    transfers_objects.upsert(&record);
                     if record.flags.pending() {
-                        transfers_pending_objects.upsert(TransferPending {
+                        transfers_pending_objects.upsert(&TransferPending {
                             timestamp: record.timestamp,
                             status: TransferPendingStatus::Pending,
                             ..TransferPending::default()
@@ -2093,6 +2096,22 @@ pub struct StateMachine {
     /// HashMap stand-ins, and a missing forest is treated as an always-ready,
     /// no-op compaction target.
     forest: Option<Forest>,
+    /// Persistent objects caches, one per groove (upstream
+    /// `Accounts.objects_cache`, `Transfers.objects_cache`,
+    /// `TransfersPending.objects_cache`, `lsm/groove.zig`). The batch
+    /// orchestrators fill these from the committed stores during prefetch, read
+    /// through them during execute (chain scoping rolls in-session writes back),
+    /// and `.compact()` them on the bar cadence alongside the forest.
+    ///
+    /// DEVIATION: upstream embeds these caches inside each groove's `ObjectsCache`
+    /// field; sans-IO the accounting stores are ephemeral HashMaps and the groove
+    /// `CacheMap`s belong to a not-yet-mounted forest. They live here instead,
+    /// standing in for the committed stores (`self.accounts`,
+    /// `self.transfers_pending`) until the forest-backed phase routes prefetch
+    /// reads through the grooves' own caches.
+    accounts_objects: AccountObjectsCache,
+    transfers_objects: TransferObjectsCache,
+    transfers_pending_objects: TransferPendingObjectsCache,
 }
 
 impl Default for StateMachine {
@@ -2113,11 +2132,50 @@ impl Default for StateMachine {
             account_events_index: HashMap::new(),
             pulse_next_timestamp: TimestampRange::TIMESTAMP_MIN,
             forest: None,
+            accounts_objects: Self::new_accounts_objects(),
+            transfers_objects: Self::new_transfers_objects(),
+            transfers_pending_objects: Self::new_transfers_pending_objects(),
         }
     }
 }
 
 impl StateMachine {
+    /// Sizing mirrors the grooves' own caches (`groove.rs`), so the state
+    /// machine's stand-in caches evict/persist on the same cadence the mounted
+    /// forest's groove caches do.
+    fn new_accounts_objects() -> AccountObjectsCache {
+        AccountObjectsCache::new(CacheMapOptions {
+            cache_value_count_max: 256,
+            stash_value_count_max: u32::try_from(constants::LSM_COMPACTION_OPS)
+                .unwrap_or_else(|_| unreachable!("LSM_COMPACTION_OPS fits in u32"))
+                * 32,
+            scope_value_count_max: 32,
+            name: "sm_accounts_objects",
+        })
+    }
+
+    fn new_transfers_objects() -> TransferObjectsCache {
+        TransferObjectsCache::new(CacheMapOptions {
+            cache_value_count_max: 256,
+            stash_value_count_max: u32::try_from(constants::LSM_COMPACTION_OPS)
+                .unwrap_or_else(|_| unreachable!("LSM_COMPACTION_OPS fits in u32"))
+                * 32,
+            scope_value_count_max: 32,
+            name: "sm_transfers_objects",
+        })
+    }
+
+    fn new_transfers_pending_objects() -> TransferPendingObjectsCache {
+        TransferPendingObjectsCache::new(CacheMapOptions {
+            cache_value_count_max: 256,
+            stash_value_count_max: u32::try_from(constants::LSM_COMPACTION_OPS)
+                .unwrap_or_else(|_| unreachable!("LSM_COMPACTION_OPS fits in u32"))
+                * 32,
+            scope_value_count_max: 32,
+            name: "sm_transfers_pending_objects",
+        })
+    }
+
     /// Mount an LSM forest for compaction.
     ///
     /// DEVIATION: upstream constructs the forest eagerly in `StateMachine.init` and compacts it
@@ -2149,12 +2207,22 @@ impl StateMachine {
     /// always returns ready. Off the bar cadence `Forest::compact` idles, matching upstream's
     /// per-beat stepping.
     ///
+    /// On the bar's last beat the state machine's persistent object caches are
+    /// compacted — upstream does the same inside each groove's `compact`
+    /// (`lsm/groove.zig:1993`, `groove.rs:1405`).
+    ///
     /// Without a mounted forest this returns ready without doing work.
     ///
     /// # Panics
     /// Panics if a forest is mounted but `storage` is `None` (the forest needs a backing store
     /// to compact against).
     pub fn compact(&mut self, op: u64, storage: Option<&mut dyn Storage>) -> bool {
+        let compaction_beat = op % (constants::LSM_COMPACTION_OPS as u64);
+        if compaction_beat == constants::LSM_COMPACTION_OPS as u64 - 1 {
+            self.accounts_objects.compact();
+            self.transfers_objects.compact();
+            self.transfers_pending_objects.compact();
+        }
         let Some(forest) = self.forest.as_mut() else {
             return true;
         };
@@ -2447,42 +2515,57 @@ impl StateMachine {
         }
     }
 
-    /// Execute a `create_accounts` batch and return the reply body.
+    /// Executes a `create_accounts` batch and returns the reply body.
+    ///
+    /// The batch's key-set is resolved through the persistent
+    /// [`Self::accounts_objects`] cache, which survives across ops (upstream's
+    /// grooves cache committed objects the same way). Each created account is
+    /// upserted into that cache, and chain scoping makes a broken chain's
+    /// in-session creates disappear from it (upstream
+    /// `state_machine.zig:3037-3202`); the committed store is updated by
+    /// [`Self::persist_accounts`] afterwards.
     #[must_use]
     pub fn create_accounts(&mut self, events: &[Account], timestamp: u64) -> Vec<u8> {
         assert!(self.commit_timestamp <= timestamp);
-        // Prefetch the batch's key-set before executing (upstream
-        // `state_machine.zig:1244`); the same key-set then fills the batch's
-        // objects cache, and every miss during execution asserts its key was
-        // enqueued (the upstream `constants.verify` asserts).
         let prefetch = prefetch_create_accounts(events);
-        // Resolve the enqueued keys against the committed stores into the
-        // batch's objects cache (upstream's prefetch callbacks fill the
-        // grooves' ObjectsCaches, state_machine.zig:1264-1309).
-        let mut accounts_objects = ObjectsCache::default();
+        self.create_accounts_prefetch(&prefetch);
+        let transfer_timestamps = self.accounts_indirect_lookup(&prefetch);
+        let results = execute_create_accounts(
+            events,
+            timestamp,
+            &prefetch,
+            &mut self.accounts_objects,
+            self.accounts_timestamp_max,
+            &transfer_timestamps,
+        );
+        self.persist_accounts(events, &results, timestamp);
+        account_results_to_bytes(&results)
+    }
+
+    /// Resolve the enqueued keys of a `create_accounts` batch against the
+    /// committed stores into [`Self::accounts_objects`]; execution then reads
+    /// the same cache and every miss asserts its key was enqueued here
+    /// (upstream's prefetch callbacks fill the groove caches,
+    /// `state_machine.zig:1264-1309`).
+    fn create_accounts_prefetch(&mut self, prefetch: &AccountPrefetchKeys) {
         for &id in prefetch.account_ids.iter() {
             if let Some(account) = self.accounts.get(&id) {
-                accounts_objects.upsert(*account);
+                self.accounts_objects.upsert(account);
             }
         }
-        // The imported-timestamp collision check needs the _found_ subset of
-        // the enqueued transfer timestamps (`transfers.indirect_lookup`).
+    }
+
+    /// The _found_ subset of the enqueued transfer timestamps that collide
+    /// with the committed transfer index for imported events
+    /// (`transfers.indirect_lookup`, state_machine.zig:1283-1309).
+    fn accounts_indirect_lookup(&self, prefetch: &AccountPrefetchKeys) -> HashSet<u64> {
         let mut transfer_timestamps = HashSet::new();
         for &ts in prefetch.transfer_timestamps.iter() {
             if self.transfers_by_timestamp.contains_key(&ts) {
                 transfer_timestamps.insert(ts);
             }
         }
-        let results = execute_create_accounts(
-            events,
-            timestamp,
-            &prefetch,
-            &mut accounts_objects,
-            self.accounts_timestamp_max,
-            &transfer_timestamps,
-        );
-        self.persist_accounts(events, &results, timestamp);
-        account_results_to_bytes(&results)
+        transfer_timestamps
     }
 
     /// Execute a `create_transfers` batch and return the reply body.
@@ -2496,32 +2579,8 @@ impl StateMachine {
     #[must_use]
     pub fn create_transfers(&mut self, events: &[Transfer], timestamp: u64) -> Vec<u8> {
         assert!(self.commit_timestamp <= timestamp);
-        // Prefetch the batch's key-set before executing (upstream
-        // `state_machine.zig:1312`); the key-set then fills the batch's object
-        // caches, and every miss during execution asserts its key was enqueued
-        // (the upstream `constants.verify` asserts).
         let prefetch = prefetch_create_transfers(events, |id| self.transfers.get(&id).copied());
-        // Resolve the enqueued keys against the committed stores into the
-        // batch's object caches (upstream's prefetch callbacks fill the
-        // grooves' ObjectsCaches, state_machine.zig:1320-1385).
-        let mut accounts_objects = ObjectsCache::default();
-        for &id in prefetch.account_ids.iter() {
-            if let Some(account) = self.accounts.get(&id) {
-                accounts_objects.upsert(*account);
-            }
-        }
-        let mut transfers_objects = ObjectsCache::default();
-        for &id in prefetch.transfer_ids.iter() {
-            if let Some(transfer) = self.transfers.get(&id) {
-                transfers_objects.upsert(*transfer);
-            }
-        }
-        let mut transfers_pending_objects = ObjectsCache::default();
-        for &ts in prefetch.pending_timestamps.iter() {
-            if let Some(pending) = self.transfers_pending.get(&ts) {
-                transfers_pending_objects.upsert(*pending);
-            }
-        }
+        self.create_transfers_prefetch(&prefetch);
         // The imported-timestamp collision check needs the _found_ subset of
         // the enqueued account timestamps (`accounts.indirect_lookup`).
         let mut account_timestamps = HashSet::new();
@@ -2536,9 +2595,9 @@ impl StateMachine {
         let results = execute_create_transfers(
             events,
             timestamp,
-            &mut accounts_objects,
-            &mut transfers_objects,
-            &mut transfers_pending_objects,
+            &mut self.accounts_objects,
+            &mut self.transfers_objects,
+            &mut self.transfers_pending_objects,
             self.transfers_timestamp_max,
             &account_timestamps,
             &prefetch.account_timestamps,
@@ -2548,6 +2607,29 @@ impl StateMachine {
         );
         self.persist_transfers(events, &results, timestamp);
         transfer_results_to_bytes(&results)
+    }
+
+    /// Resolve the enqueued keys of a `create_transfers` batch against the
+    /// committed stores into the state machine's persistent object caches;
+    /// execution reads the same caches and every miss asserts its key was
+    /// enqueued here (upstream's prefetch callbacks fill the groove caches,
+    /// `state_machine.zig:1320-1385`).
+    fn create_transfers_prefetch(&mut self, prefetch: &TransferPrefetchKeys) {
+        for &id in prefetch.account_ids.iter() {
+            if let Some(account) = self.accounts.get(&id) {
+                self.accounts_objects.upsert(account);
+            }
+        }
+        for &id in prefetch.transfer_ids.iter() {
+            if let Some(transfer) = self.transfers.get(&id) {
+                self.transfers_objects.upsert(transfer);
+            }
+        }
+        for &ts in prefetch.pending_timestamps.iter() {
+            if let Some(pending) = self.transfers_pending.get(&ts) {
+                self.transfers_pending_objects.upsert(pending);
+            }
+        }
     }
 
     /// Execute a `lookup_accounts` query and return the reply body (upstream
@@ -4313,6 +4395,75 @@ mod tests {
     }
 
     #[test]
+    fn objects_cache_rolls_back_broken_chain_across_ops() {
+        // The persistent objects cache must not leak a broken chain's in-session
+        // creates into the next op: account 1 is rolled back here, so a later
+        // re-create must report `Created`, not `Exists`.
+        let mut sm = StateMachine::default();
+        let events = vec![
+            Account {
+                id: 1,
+                ledger: 1,
+                code: 1,
+                flags: AccountFlags::LINKED,
+                ..Account::default()
+            },
+            Account { id: 2, ledger: 0, code: 1, ..Account::default() },
+        ];
+        let body = sm.create_accounts(&events, 10);
+        assert_eq!(
+            u32::from_le_bytes(body[8..12].try_into().unwrap_or([0; 4])),
+            CreateAccountStatus::LinkedEventFailed as u32
+        );
+        assert!(sm.accounts.is_empty());
+
+        let retry =
+            sm.create_accounts(&[Account { id: 1, ledger: 1, code: 1, ..Account::default() }], 20);
+        assert_eq!(
+            u32::from_le_bytes(retry[8..12].try_into().unwrap_or([0; 4])),
+            CreateAccountStatus::Created as u32
+        );
+        assert_eq!(sm.accounts.len(), 1);
+    }
+
+    #[test]
+    fn objects_cache_persists_committed_chain_across_ops() {
+        // A committed linked chain's creates stay visible in the persistent
+        // objects cache across ops: re-creating the same ids reports `Exists`.
+        let mut sm = StateMachine::default();
+        let events = vec![
+            Account {
+                id: 1,
+                ledger: 1,
+                code: 1,
+                flags: AccountFlags::LINKED,
+                ..Account::default()
+            },
+            Account { id: 2, ledger: 1, code: 1, ..Account::default() },
+        ];
+        let body = sm.create_accounts(&events, 10);
+        assert_eq!(
+            u32::from_le_bytes(body[8..12].try_into().unwrap_or([0; 4])),
+            CreateAccountStatus::Created as u32
+        );
+        assert_eq!(sm.accounts.len(), 2);
+
+        let dup = sm.create_accounts(&events, 20);
+        // The linked chain re-runs against the cached records: account 1
+        // reports `Exists` (breaking the chain), so account 2 falls to
+        // `LinkedEventFailed` (upstream `Exists` semantics).
+        assert_eq!(
+            u32::from_le_bytes(dup[8..12].try_into().unwrap_or([0; 4])),
+            CreateAccountStatus::Exists as u32
+        );
+        assert_eq!(
+            u32::from_le_bytes(dup[24..28].try_into().unwrap_or([0; 4])),
+            CreateAccountStatus::LinkedEventFailed as u32
+        );
+        assert_eq!(sm.accounts.len(), 2);
+    }
+
+    #[test]
     fn execute_accounts_discards_unclosed_trailing_chain() {
         let mut sm = StateMachine::default();
         let events = vec![
@@ -5003,12 +5154,13 @@ mod tests {
         timestamp: u64,
     ) -> Vec<CreateAccountResult> {
         let prefetch = prefetch_create_accounts(events);
-        let mut accounts_objects = ObjectsCache::default();
+        let mut state_machine = StateMachine::default();
+        state_machine.create_accounts_prefetch(&prefetch);
         execute_create_accounts(
             events,
             timestamp,
             &prefetch,
-            &mut accounts_objects,
+            &mut state_machine.accounts_objects,
             0,
             &HashSet::new(),
         )
@@ -5125,19 +5277,17 @@ mod tests {
         accounts: &[Account],
     ) -> Vec<CreateTransferResult> {
         let prefetch = prefetch_create_transfers(events, |_| None);
-        let mut accounts_objects = ObjectsCache::default();
+        let mut state_machine = StateMachine::default();
         for account in accounts {
-            accounts_objects.upsert(*account);
+            state_machine.accounts_objects.upsert(account);
         }
-        let mut transfers_objects = ObjectsCache::default();
-        let mut transfers_pending_objects = ObjectsCache::default();
         let mut working_orphaned = HashSet::new();
         execute_create_transfers(
             events,
             timestamp,
-            &mut accounts_objects,
-            &mut transfers_objects,
-            &mut transfers_pending_objects,
+            &mut state_machine.accounts_objects,
+            &mut state_machine.transfers_objects,
+            &mut state_machine.transfers_pending_objects,
             0,
             &HashSet::new(),
             &prefetch.account_timestamps,
