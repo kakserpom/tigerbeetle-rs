@@ -7,8 +7,11 @@
 //! `ObjectsCache` types. This port manually defines these for each concrete groove type
 //! (Account, Transfer) since Rust lacks comptime type generation.
 //!
-//! DEVIATION: upstream's prefetch pipeline (~480 lines) is deferred to the async I/O phase.
-//! For now `prefetch_setup`, `prefetch_enqueue`, and `prefetch` are stubs.
+//! DEVIATION: upstream's prefetch pipeline (~480 lines) is ported but resolves its reads
+//! synchronously: `prefetch()` collapses the parallel `Grid.read_iops_max` worker lookups
+//! and their `next_tick` callback into in-order [`Grid::read_block_sync`] calls (see the
+//! `Prefetch seam` section). The state machine does not call into it yet — the execute
+//! path is rewired in a later slice.
 
 //! DEVIATION: upstream's `ObjectsCache` is the full `CacheMapType` (a SetAssociativeCache
 //! on top of a HashMap stash). This port uses the same `tigerbeetle_lsm::cache_map::CacheMap`
@@ -25,7 +28,7 @@ use tigerbeetle_core::stdx::hash::{hash_inline_u64, hash_inline_u128};
 use tigerbeetle_core::types::{
     Account, AccountFlags, Transfer, TransferFlags, TransferPending, TransferPendingStatus,
 };
-use tigerbeetle_lsm::cache_map::{CacheMap, CacheMapOptions, CacheMapSpec};
+use tigerbeetle_lsm::cache_map::{CacheMap, CacheMapOptions, CacheMapSpec, GetOrTombstone};
 use tigerbeetle_lsm::composite_key::{
     self, CompositeKey, CompositeKey64, CompositeKey128, CompositeKeyUnit, U256,
 };
@@ -33,13 +36,140 @@ use tigerbeetle_lsm::manifest::ManifestLog;
 use tigerbeetle_lsm::scratch_memory::ScratchMemory;
 use tigerbeetle_lsm::set_associative_cache::{Layout, SetAssociativeCacheSpec};
 use tigerbeetle_lsm::table_memory::{self, Usage};
+use tigerbeetle_lsm::timestamp_range::TimestampRange;
+use tigerbeetle_lsm::tree::SNAPSHOT_LATEST;
 use tigerbeetle_lsm::tree::ScopeCloseMode;
 use tigerbeetle_lsm::tree::TreeConfig;
 use tigerbeetle_lsm::unique_key::{UniqueKey, UniqueKey128};
 
 use crate::grid::Grid;
+use crate::storage::Storage;
 use crate::table::{self, BlockValue, IndexBlocks, TableLayout, TableSpec, TableUsage};
 use crate::tree::{LookupMemoryResult, Options, Tree};
+
+// ---------------------------------------------------------------------------
+// Prefetch seam
+// ---------------------------------------------------------------------------
+//
+// Upstream's groove prefetch pipeline (`groove.zig:984-1690`) resolves every key enqueued
+// via `prefetch_enqueue` into the objects cache before the state machine reads it, so the
+// execute path never blocks on disk I/O. Keys resolved from the objects cache, mutable
+// table, or the grid cache are settled when enqueued; keys whose index/value block is
+// missing from the grid cache are recorded as `.prefetching` with the level to resume the
+// read from. `prefetch()` then completes those reads (upstream asynchronously, parked in
+// the grid; this port synchronously through [`Grid::read_block_sync`] + the sans-I/O
+// [`Tree::lookup_from_levels_storage`]).
+//
+// The keys, statuses, and resolution rules are ported 1:1; only the completion is
+// synchronous, and the three grooves implement the same comptime-generated upstream logic
+// concretely (see the DEVIATION on `GrooveType` above).
+
+/// A prefetch key for the account/transfer grooves: the `id` unique key (also the primary
+/// key) plus the `timestamp` key, mirroring upstream's `UniqueKey` union.
+// Used only from the groove tests today; the state-machine execute path consumes this
+// prefetch seam in a later slice.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum IdTimestampPrefetchKey {
+    Id(u128),
+    Timestamp(u64),
+}
+
+/// A prefetch key for the transfers-pending groove: upstream's `UniqueKey` for a groove
+/// with no unique keys is just `{ timestamp }`, which is also the primary key.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum TimestampPrefetchKey {
+    Timestamp(u64),
+}
+
+/// Status of an enqueued prefetch key, ported 1:1 from upstream's `PrefetchKeys` value
+/// union (`groove.zig:608-630`).
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrefetchStatus<P: Copy> {
+    /// Enqueued but not yet resolved.
+    Enqueued,
+    /// The key's index/value block was missing from the grid cache when enqueued. `level`
+    /// is the level from which the storage read resumes (upstream `prefetching.level`);
+    /// `timestamp_hint` is `Some` when the object tree is the remaining hop and `None`
+    /// when the unique-key tree must be read first (upstream `prefetching.timestamp_hint`).
+    Prefetching { level: u8, timestamp_hint: Option<u64> },
+    /// The key resolved to an object; `P` is its primary key.
+    Found(P),
+    /// The key resolved to an orphaned primary key (a transfer whose id exists but whose
+    /// timestamp is zero — only possible when `primary_key_orphaned`).
+    FoundOrphaned,
+    /// The key is (provably) absent.
+    NotFound,
+}
+
+/// Result of the mutable-table search (`sort_and_search_table_mutable`, upstream
+/// `groove.zig:1295-1335` return union).
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrefetchMutable<P> {
+    Found(P),
+    Tombstone,
+    NotFound,
+}
+
+/// An insertion-ordered status map for prefetch keys, mirroring upstream's `PrefetchKeys`
+/// (an `ArrayHashMapUnmanaged` keyed by `UniqueKey`). The `Vec` preserves first-seen order
+/// so the prefetch pass is deterministic; the `HashMap` only answers status lookups.
+#[allow(dead_code)]
+struct PrefetchKeys<K, P>
+where
+    P: Copy,
+{
+    ordered: Vec<K>,
+    statuses: std::collections::HashMap<K, PrefetchStatus<P>>,
+}
+
+impl<K, P> Default for PrefetchKeys<K, P>
+where
+    P: Copy,
+{
+    fn default() -> Self {
+        Self { ordered: Vec::new(), statuses: std::collections::HashMap::new() }
+    }
+}
+
+impl<K, P> PrefetchKeys<K, P>
+where
+    K: Eq + std::hash::Hash + Copy,
+    P: Copy,
+{
+    fn clear(&mut self) {
+        self.ordered.clear();
+        self.statuses.clear();
+    }
+
+    /// Insert `key` with `Enqueued` status. Returns `false` when the key was already
+    /// enqueued (duplicates are tolerated upstream — `groove.zig:1000-1005`).
+    fn enqueue(&mut self, key: K) -> bool {
+        if self.statuses.contains_key(&key) {
+            return false;
+        }
+        self.ordered.push(key);
+        self.statuses.insert(key, PrefetchStatus::Enqueued);
+        true
+    }
+
+    /// Overwrite the status of an enqueued key.
+    fn set(&mut self, key: K, status: PrefetchStatus<P>) {
+        let entry = self
+            .statuses
+            .get_mut(&key)
+            .unwrap_or_else(|| unreachable!("prefetch key must be enqueued before resolving"));
+        *entry = status;
+    }
+
+    /// The status of `key`, if enqueued.
+    fn get(&self, key: K) -> Option<PrefetchStatus<P>> {
+        self.statuses.get(&key).copied()
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Groove objects-cache specs
@@ -1085,6 +1215,15 @@ pub struct AccountGroove {
     /// Invariant with the object tree holds (groove.zig:725-728): anything visible
     /// in-session lives here first.
     objects_cache: AccountObjectsCache,
+
+    /// Snapshot target for the current prefetch pass (set by [`Self::prefetch_setup`]),
+    /// mirrored in [`Self::prefetch`]. Clear between passes.
+    #[allow(dead_code)] // used by the prefetch seam; state-machine wiring is a later slice
+    prefetch_snapshot: Option<u64>,
+    /// Keys enqueued by [`Self::prefetch_enqueue`] and their resolution status (upstream
+    /// `groove.prefetch_keys`).
+    #[allow(dead_code)] // used by the prefetch seam; state-machine wiring is a later slice
+    prefetch_keys: PrefetchKeys<IdTimestampPrefetchKey, u128>,
 }
 
 /// Radix-sort scratch buffers for [`AccountGroove`]'s trees, owned by the forest.
@@ -1142,6 +1281,14 @@ pub struct TransferGroove {
     pub closing: Tree<CompositeKeyUnitSpec>,
     /// Per-session objects cache, keyed by the transfer's primary key (id).
     objects_cache: TransferObjectsCache,
+
+    /// Snapshot target for the current prefetch pass (see [`AccountGroove`]).
+    #[allow(dead_code)] // used by the prefetch seam; state-machine wiring is a later slice
+    prefetch_snapshot: Option<u64>,
+    /// Keys enqueued by [`Self::prefetch_enqueue`] and their resolution status (upstream
+    /// `groove.prefetch_keys`).
+    #[allow(dead_code)] // used by the prefetch seam; state-machine wiring is a later slice
+    prefetch_keys: PrefetchKeys<IdTimestampPrefetchKey, u128>,
 }
 
 /// Radix-sort scratch buffers for [`TransferGroove`]'s trees, owned by the forest.
@@ -1207,6 +1354,8 @@ impl AccountGroove {
                 scope_value_count_max: batch_value_count_limit,
                 name: "accounts_objects",
             }),
+            prefetch_snapshot: None,
+            prefetch_keys: PrefetchKeys::default(),
         }
     }
 
@@ -1256,6 +1405,364 @@ impl AccountGroove {
         let compaction_beat = op % (constants::LSM_COMPACTION_OPS as u64);
         if compaction_beat == constants::LSM_COMPACTION_OPS as u64 - 1 {
             self.objects_cache.compact();
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Prefetch seam (`groove.zig:984-1690`)
+    // ------------------------------------------------------------------
+    //
+    // The account groove has the primary key `id`, one unique key (`id`), and
+    // `primary_key_orphaned == false`, so there is no orphan path.
+
+    /// Begin a prefetch pass for `snapshot_target`, clearing every previously-enqueued key.
+    ///
+    /// Mirrors `groove.prefetch_setup` (groove.zig:984-989).
+    ///
+    /// # Panics
+    /// Panics unless `snapshot_target < SNAPSHOT_LATEST` (upstream asserts).
+    #[allow(dead_code)] // used by the prefetch seam; state-machine wiring is a later slice
+    pub(crate) fn prefetch_setup(&mut self, snapshot_target: u64) {
+        assert!(snapshot_target < SNAPSHOT_LATEST);
+        self.prefetch_snapshot = Some(snapshot_target);
+        self.prefetch_keys.clear();
+    }
+
+    /// Enqueue a unique key (`id` or `timestamp`) to resolve into the objects cache,
+    /// settling it now if it is already determinable from the objects cache, the mutable
+    /// object table, or the grid cache; otherwise it is left `.prefetching` until
+    /// [`Self::prefetch`] completes the tree reads.
+    ///
+    /// Mirrors `groove.prefetch_enqueue` (groove.zig:996-1147): the primary key bypasses
+    /// the (expensive) mutable-table search; duplicate keys are tolerated.
+    ///
+    /// # Panics
+    /// Panics if called before [`Self::prefetch_setup`].
+    #[allow(dead_code)] // used by the prefetch seam; state-machine wiring is a later slice
+    pub(crate) fn prefetch_enqueue(
+        &mut self,
+        grid: &mut Grid,
+        objects_scratch: &mut ScratchMemory<Account>,
+        key: IdTimestampPrefetchKey,
+    ) {
+        let snapshot = self
+            .prefetch_snapshot
+            .unwrap_or_else(|| unreachable!("prefetch_setup must precede prefetch_enqueue"));
+
+        if !self.prefetch_keys.enqueue(key) {
+            return;
+        }
+
+        let timestamp_hint: Option<u64> = match key {
+            IdTimestampPrefetchKey::Timestamp(ts) => {
+                // Allow and ignore invalid timestamps — the prefetch step does not need to
+                // verify the data's validity (upstream groove.zig:1011-1017).
+                if !TimestampRange::valid(ts) {
+                    self.prefetch_keys.set(key, PrefetchStatus::NotFound);
+                    return;
+                }
+                // `timestamp` is not the primary key of this groove (`id` is), so there is
+                // no `objects_cache` fast path here.
+                if !self.objects.key_range_contains(snapshot, ts) {
+                    self.prefetch_keys.set(key, PrefetchStatus::NotFound);
+                    return;
+                }
+                Some(ts)
+            }
+            IdTimestampPrefetchKey::Id(id) => {
+                // Allow and ignore zero keys (upstream groove.zig:1040-1045).
+                if id == 0 {
+                    self.prefetch_keys.set(key, PrefetchStatus::NotFound);
+                    return;
+                }
+                // Primary key: check the objects cache first — a hit settles the key, and a
+                // tombstone settles it as not found (groove.zig:1047-1069).
+                match self.objects_cache.get_or_tombstone(id) {
+                    GetOrTombstone::Found(object) => {
+                        assert!(TimestampRange::valid(object.timestamp));
+                        self.prefetch_keys.set(key, PrefetchStatus::Found(object.id));
+                        return;
+                    }
+                    GetOrTombstone::Tombstone => {
+                        self.prefetch_keys.set(key, PrefetchStatus::NotFound);
+                        return;
+                    }
+                    GetOrTombstone::NotFound => {}
+                }
+                if !self.id.key_range_contains(snapshot, id) {
+                    self.prefetch_keys.set(key, PrefetchStatus::NotFound);
+                    return;
+                }
+                // Primary key: skip the mutable-table search (groove.zig:1079-1097).
+                None
+            }
+        };
+
+        if let Some(ts) = timestamp_hint {
+            assert!(TimestampRange::valid(ts));
+            if !matches!(key, IdTimestampPrefetchKey::Id(_)) {
+                // Search the objects mutable table (groove.zig:1113-1131): the search by a
+                // non-primary key requires sorting the table first.
+                match self.sort_and_search_table_mutable(key, ts, objects_scratch) {
+                    PrefetchMutable::Found(primary) => {
+                        self.prefetch_keys.set(key, PrefetchStatus::Found(primary));
+                        return;
+                    }
+                    PrefetchMutable::Tombstone => {
+                        self.prefetch_keys.set(key, PrefetchStatus::NotFound);
+                        return;
+                    }
+                    PrefetchMutable::NotFound => {}
+                }
+            }
+            self.prefetch_from_memory_by_timestamp(grid, snapshot, key, ts);
+        } else {
+            assert!(matches!(key, IdTimestampPrefetchKey::Id(_)));
+            self.prefetch_from_memory_by_unique_key(grid, snapshot, key);
+        }
+    }
+
+    /// Resolve every `.prefetching` key, reading any missing index/value blocks from
+    /// storage, then assert every key is settled consistently with the objects cache.
+    ///
+    /// Mirrors `groove.prefetch` + the `PrefetchWorker`/`finish` callbacks
+    /// (groove.zig:1339-1491): upstream runs `grid.read_iops_max` lookups in parallel and
+    /// fires the callback when all complete; this port resolves the same reads
+    /// synchronously and returns in their place.
+    ///
+    /// # Panics
+    /// Panics if called before [`Self::prefetch_setup`], or if a settled status is
+    /// inconsistent with the objects cache (upstream `constants.verify` asserts).
+    #[allow(dead_code)] // used by the prefetch seam; state-machine wiring is a later slice
+    pub(crate) fn prefetch(&mut self, grid: &mut Grid, storage: &mut dyn Storage) {
+        let snapshot = self
+            .prefetch_snapshot
+            .unwrap_or_else(|| unreachable!("prefetch_setup must precede prefetch"));
+
+        for key in self.prefetch_keys.ordered.clone() {
+            match self.prefetch_keys.get(key) {
+                Some(PrefetchStatus::Prefetching { level, timestamp_hint }) => {
+                    if let Some(ts) = timestamp_hint {
+                        self.lookup_object_by_timestamp(grid, storage, snapshot, key, ts, level);
+                    } else {
+                        let IdTimestampPrefetchKey::Id(id) = key else {
+                            unreachable!("timestamp keys always carry a timestamp hint");
+                        };
+                        match self.id.lookup_from_levels_storage(grid, storage, snapshot, id, level)
+                        {
+                            None => {
+                                self.prefetch_keys.set(key, PrefetchStatus::NotFound);
+                            }
+                            Some(tree_value) => {
+                                assert_eq!(tree_value.field, id);
+                                // The account groove has no orphaned primary keys, so a
+                                // zeroed timestamp is unreachable (upstream
+                                // groove.zig:1645-1657).
+                                assert!(tree_value.timestamp != 0);
+                                assert!(!UniqueKey128Spec::tombstone(&tree_value));
+                                assert!(TimestampRange::valid(tree_value.timestamp));
+                                self.lookup_object_by_timestamp(
+                                    grid,
+                                    storage,
+                                    snapshot,
+                                    key,
+                                    tree_value.timestamp,
+                                    0,
+                                );
+                            }
+                        }
+                    }
+                }
+                Some(_) => {}
+                None => unreachable!("every prefetched key must be enqueued"),
+            }
+        }
+
+        self.prefetch_snapshot = None;
+        self.verify_prefetch();
+        self.prefetch_keys.clear();
+    }
+
+    /// The object-tree lookup completing a `.prefetching` key (upstream
+    /// `lookup_by_timestamp` + `lookup_object_callback`, groove.zig:1704-1762): re-check
+    /// the grid cache, falling back to a storage read when the object block is still not
+    /// cached. `level_min` comes from the `.prefetching` entry (the unique-key tree's
+    /// level) and is only a lower bound — the object hops resume from the cache lookup's
+    /// own `Possible` level.
+    #[allow(dead_code)] // used by the prefetch seam; state-machine wiring is a later slice
+    fn lookup_object_by_timestamp(
+        &mut self,
+        grid: &mut Grid,
+        storage: &mut dyn Storage,
+        snapshot: u64,
+        key: IdTimestampPrefetchKey,
+        ts: u64,
+        _level_min: u8,
+    ) {
+        assert!(TimestampRange::valid(ts));
+        match self.objects.lookup_from_levels_cache(grid, snapshot, ts) {
+            LookupMemoryResult::Negative => {
+                self.prefetch_keys.set(key, PrefetchStatus::NotFound);
+            }
+            LookupMemoryResult::Positive(object) => {
+                assert!(!AccountObjectSpec::tombstone(&object));
+                assert_eq!(object.timestamp, ts);
+                match key {
+                    IdTimestampPrefetchKey::Id(id) => assert_eq!(object.id, id),
+                    IdTimestampPrefetchKey::Timestamp(_) => {}
+                }
+                self.objects_cache.upsert(&object);
+                self.prefetch_keys.set(key, PrefetchStatus::Found(object.id));
+            }
+            LookupMemoryResult::Possible { level } => {
+                match self.objects.lookup_from_levels_storage(grid, storage, snapshot, ts, level) {
+                    Some(object) => {
+                        assert!(!AccountObjectSpec::tombstone(&object));
+                        assert_eq!(object.timestamp, ts);
+                        match key {
+                            IdTimestampPrefetchKey::Id(id) => assert_eq!(object.id, id),
+                            IdTimestampPrefetchKey::Timestamp(_) => {}
+                        }
+                        self.objects_cache.upsert(&object);
+                        self.prefetch_keys.set(key, PrefetchStatus::Found(object.id));
+                    }
+                    None => {
+                        self.prefetch_keys.set(key, PrefetchStatus::NotFound);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Port of `prefetch_from_memory_by_timestamp` (groove.zig:1240-1287): resolve a key
+    /// whose timestamp is known from the objects tree's grid-cache blocks, or record it as
+    /// `.prefetching` with a timestamp hint when the object block is not cached.
+    #[allow(dead_code)] // used by the prefetch seam; state-machine wiring is a later slice
+    fn prefetch_from_memory_by_timestamp(
+        &mut self,
+        grid: &mut Grid,
+        snapshot: u64,
+        key: IdTimestampPrefetchKey,
+        ts: u64,
+    ) {
+        assert!(TimestampRange::valid(ts));
+        match self.objects.lookup_from_levels_cache(grid, snapshot, ts) {
+            LookupMemoryResult::Negative => {
+                self.prefetch_keys.set(key, PrefetchStatus::NotFound);
+            }
+            LookupMemoryResult::Positive(object) => {
+                assert!(!AccountObjectSpec::tombstone(&object));
+                assert_eq!(object.timestamp, ts);
+                match key {
+                    IdTimestampPrefetchKey::Id(id) => assert_eq!(object.id, id),
+                    IdTimestampPrefetchKey::Timestamp(_) => {}
+                }
+                self.objects_cache.upsert(&object);
+                self.prefetch_keys.set(key, PrefetchStatus::Found(object.id));
+            }
+            LookupMemoryResult::Possible { level } => {
+                self.prefetch_keys
+                    .set(key, PrefetchStatus::Prefetching { level, timestamp_hint: Some(ts) });
+            }
+        }
+    }
+
+    /// Port of `prefetch_from_memory_by_unique_key` (groove.zig:1152-1236): resolve a key
+    /// via the `id` unique-key tree (the primary key skips the mutable-table search),
+    /// then hop to the objects tree through the resolved timestamp.
+    #[allow(dead_code)] // used by the prefetch seam; state-machine wiring is a later slice
+    fn prefetch_from_memory_by_unique_key(
+        &mut self,
+        grid: &mut Grid,
+        snapshot: u64,
+        key: IdTimestampPrefetchKey,
+    ) {
+        let IdTimestampPrefetchKey::Id(id) = key else {
+            unreachable!("prefetch_from_memory_by_unique_key only handles id keys");
+        };
+        match self.id.lookup_from_levels_cache(grid, snapshot, id) {
+            LookupMemoryResult::Negative => {
+                self.prefetch_keys.set(key, PrefetchStatus::NotFound);
+            }
+            LookupMemoryResult::Positive(tree_value) => {
+                assert_eq!(tree_value.field, id);
+                assert!(!UniqueKey128Spec::tombstone(&tree_value));
+                // No orphaned primary keys in the account groove.
+                assert!(tree_value.timestamp != 0);
+                assert!(TimestampRange::valid(tree_value.timestamp));
+                self.prefetch_from_memory_by_timestamp(grid, snapshot, key, tree_value.timestamp);
+            }
+            LookupMemoryResult::Possible { level } => {
+                self.prefetch_keys
+                    .set(key, PrefetchStatus::Prefetching { level, timestamp_hint: None });
+            }
+        }
+    }
+
+    /// Port of `sort_and_search_table_mutable` (groove.zig:1295-1335): search the objects
+    /// mutable table for a non-primary key's timestamps, after sorting it.
+    #[allow(dead_code)] // used by the prefetch seam; state-machine wiring is a later slice
+    fn sort_and_search_table_mutable(
+        &mut self,
+        key: IdTimestampPrefetchKey,
+        timestamp: u64,
+        objects_scratch: &mut ScratchMemory<Account>,
+    ) -> PrefetchMutable<u128> {
+        assert!(matches!(key, IdTimestampPrefetchKey::Timestamp(_)));
+
+        let found = {
+            let mutable = self.objects.table_mutable_mut();
+            mutable.sort(objects_scratch);
+            mutable.get(timestamp).copied()
+        };
+        let Some(object) = found else {
+            return PrefetchMutable::NotFound;
+        };
+        if AccountObjectSpec::tombstone(&object) {
+            assert_eq!(AccountObjectSpec::key_from_value(&object), timestamp);
+            return PrefetchMutable::Tombstone;
+        }
+        assert_eq!(object.timestamp, timestamp);
+        assert!(self.objects_cache.has(object.id));
+        PrefetchMutable::Found(object.id)
+    }
+
+    /// Port of `prefetch`'s `finish`-time verify block (groove.zig:1431-1485).
+    #[allow(dead_code)] // used by the prefetch seam; state-machine wiring is a later slice
+    fn verify_prefetch(&mut self) {
+        for key in self.prefetch_keys.ordered.clone() {
+            match self.prefetch_keys.get(key) {
+                Some(PrefetchStatus::Enqueued | PrefetchStatus::Prefetching { .. }) => {
+                    unreachable!("every enqueued key must be settled by prefetch");
+                }
+                Some(PrefetchStatus::Found(primary)) => {
+                    assert!(primary != 0);
+                    // A primary-key key must be found with its own value (groove.zig:1440-1446).
+                    if matches!(key, IdTimestampPrefetchKey::Id(_)) {
+                        let IdTimestampPrefetchKey::Id(value) = key else { unreachable!() };
+                        assert_eq!(primary, value);
+                    }
+                    let Some(object) = self.objects_cache.get(primary) else {
+                        unreachable!("found key must be in the objects cache")
+                    };
+                    assert!(object.timestamp != 0);
+                    match key {
+                        IdTimestampPrefetchKey::Id(value) => assert_eq!(object.id, value),
+                        IdTimestampPrefetchKey::Timestamp(value) => {
+                            assert_eq!(object.timestamp, value);
+                        }
+                    }
+                }
+                Some(PrefetchStatus::FoundOrphaned) => {
+                    unreachable!("the account groove has no orphaned primary keys");
+                }
+                Some(PrefetchStatus::NotFound) => {
+                    if let IdTimestampPrefetchKey::Id(value) = key {
+                        assert!(!self.objects_cache.has(value));
+                    }
+                }
+                None => unreachable!("every prefetched key must be enqueued"),
+            }
         }
     }
 
@@ -1530,6 +2037,8 @@ impl TransferGroove {
                 scope_value_count_max: batch_value_count_limit,
                 name: "transfers_objects",
             }),
+            prefetch_snapshot: None,
+            prefetch_keys: PrefetchKeys::default(),
         }
     }
 
@@ -1658,6 +2167,373 @@ impl TransferGroove {
         let compaction_beat = op % (constants::LSM_COMPACTION_OPS as u64);
         if compaction_beat == constants::LSM_COMPACTION_OPS as u64 - 1 {
             self.objects_cache.compact();
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Prefetch seam (`groove.zig:984-1766`)
+    //
+    // The transfer groove has the primary key `id`, one unique key (`id`), and
+    // `primary_key_orphaned == true`: a zeroed `id`-tree timestamp means the id is a
+    // "used, deleted" marker, resolved to [`PrefetchStatus::FoundOrphaned`] and tagged in
+    // the objects cache with a zeroed object.
+    // ------------------------------------------------------------------
+
+    /// Begin a prefetch pass for `snapshot_target`, clearing every previously-enqueued key.
+    ///
+    /// Mirrors `groove.prefetch_setup` (groove.zig:984-989).
+    ///
+    /// # Panics
+    /// Panics unless `snapshot_target < SNAPSHOT_LATEST` (upstream asserts).
+    #[allow(dead_code)] // used by the prefetch seam; state-machine wiring is a later slice
+    pub(crate) fn prefetch_setup(&mut self, snapshot_target: u64) {
+        assert!(snapshot_target < SNAPSHOT_LATEST);
+        self.prefetch_snapshot = Some(snapshot_target);
+        self.prefetch_keys.clear();
+    }
+
+    /// Enqueue a key to resolve into the objects cache (see the documentation of
+    /// [`AccountGroove::prefetch_enqueue`] for the shared flow).
+    ///
+    /// Mirrors `groove.prefetch_enqueue` (groove.zig:996-1147) for
+    /// `primary_key_orphaned = true`.
+    ///
+    /// # Panics
+    /// Panics if called before [`Self::prefetch_setup`].
+    #[allow(dead_code)] // used by the prefetch seam; state-machine wiring is a later slice
+    pub(crate) fn prefetch_enqueue(
+        &mut self,
+        grid: &mut Grid,
+        objects_scratch: &mut ScratchMemory<Transfer>,
+        key: IdTimestampPrefetchKey,
+    ) {
+        let snapshot = self
+            .prefetch_snapshot
+            .unwrap_or_else(|| unreachable!("prefetch_setup must precede prefetch_enqueue"));
+
+        if !self.prefetch_keys.enqueue(key) {
+            return;
+        }
+
+        let timestamp_hint: Option<u64> = match key {
+            IdTimestampPrefetchKey::Timestamp(ts) => {
+                if !TimestampRange::valid(ts) {
+                    self.prefetch_keys.set(key, PrefetchStatus::NotFound);
+                    return;
+                }
+                if !self.objects.key_range_contains(snapshot, ts) {
+                    self.prefetch_keys.set(key, PrefetchStatus::NotFound);
+                    return;
+                }
+                Some(ts)
+            }
+            IdTimestampPrefetchKey::Id(id) => {
+                if id == 0 {
+                    self.prefetch_keys.set(key, PrefetchStatus::NotFound);
+                    return;
+                }
+                match self.objects_cache.get_or_tombstone(id) {
+                    GetOrTombstone::Found(object) => {
+                        if object.timestamp == 0 {
+                            // The id was used and deleted (groove.zig:1050-1054).
+                            self.prefetch_keys.set(key, PrefetchStatus::FoundOrphaned);
+                            return;
+                        }
+                        assert!(TimestampRange::valid(object.timestamp));
+                        self.prefetch_keys.set(key, PrefetchStatus::Found(object.id));
+                        return;
+                    }
+                    GetOrTombstone::Tombstone => {
+                        self.prefetch_keys.set(key, PrefetchStatus::NotFound);
+                        return;
+                    }
+                    GetOrTombstone::NotFound => {}
+                }
+                if !self.id.key_range_contains(snapshot, id) {
+                    self.prefetch_keys.set(key, PrefetchStatus::NotFound);
+                    return;
+                }
+                None
+            }
+        };
+
+        if let Some(ts) = timestamp_hint {
+            assert!(TimestampRange::valid(ts));
+            if !matches!(key, IdTimestampPrefetchKey::Id(_)) {
+                match self.sort_and_search_table_mutable(key, ts, objects_scratch) {
+                    PrefetchMutable::Found(primary) => {
+                        self.prefetch_keys.set(key, PrefetchStatus::Found(primary));
+                        return;
+                    }
+                    PrefetchMutable::Tombstone => {
+                        self.prefetch_keys.set(key, PrefetchStatus::NotFound);
+                        return;
+                    }
+                    PrefetchMutable::NotFound => {}
+                }
+            }
+            self.prefetch_from_memory_by_timestamp(grid, snapshot, key, ts);
+        } else {
+            assert!(matches!(key, IdTimestampPrefetchKey::Id(_)));
+            self.prefetch_from_memory_by_unique_key(grid, snapshot, key);
+        }
+    }
+
+    /// Resolve every `.prefetching` key, reading any missing index/value blocks from
+    /// storage, then assert every key is settled consistently with the objects cache.
+    ///
+    /// Mirrors `groove.prefetch` + the `PrefetchWorker`/`finish` callbacks
+    /// (groove.zig:1339-1491, 1513-1766).
+    ///
+    /// # Panics
+    /// Panics if called before [`Self::prefetch_setup`], or if a settled status is
+    /// inconsistent with the objects cache (upstream `constants.verify` asserts).
+    #[allow(dead_code)] // used by the prefetch seam; state-machine wiring is a later slice
+    pub(crate) fn prefetch(&mut self, grid: &mut Grid, storage: &mut dyn Storage) {
+        let snapshot = self
+            .prefetch_snapshot
+            .unwrap_or_else(|| unreachable!("prefetch_setup must precede prefetch"));
+
+        for key in self.prefetch_keys.ordered.clone() {
+            match self.prefetch_keys.get(key) {
+                Some(PrefetchStatus::Prefetching { level, timestamp_hint }) => {
+                    if let Some(ts) = timestamp_hint {
+                        self.lookup_object_by_timestamp(grid, storage, snapshot, key, ts);
+                    } else {
+                        let IdTimestampPrefetchKey::Id(id) = key else {
+                            unreachable!("timestamp keys always carry a timestamp hint");
+                        };
+                        match self.id.lookup_from_levels_storage(grid, storage, snapshot, id, level)
+                        {
+                            None => {
+                                self.prefetch_keys.set(key, PrefetchStatus::NotFound);
+                            }
+                            Some(tree_value) => {
+                                // A zeroed timestamp marks an orphaned primary key:
+                                // the id was used and deleted (groove.zig:1642-1657).
+                                if tree_value.timestamp == 0 {
+                                    self.insert_orphaned_object(id);
+                                    self.prefetch_keys.set(key, PrefetchStatus::FoundOrphaned);
+                                    continue;
+                                }
+                                // Query order matches upstream: the orphan check precedes
+                                // the tombstone check (groove.zig:1659-1665).
+                                assert!(!UniqueKey128Spec::tombstone(&tree_value));
+                                assert!(TimestampRange::valid(tree_value.timestamp));
+                                self.lookup_object_by_timestamp(
+                                    grid,
+                                    storage,
+                                    snapshot,
+                                    key,
+                                    tree_value.timestamp,
+                                );
+                            }
+                        }
+                    }
+                }
+                Some(_) => {}
+                None => unreachable!("every prefetched key must be enqueued"),
+            }
+        }
+
+        self.prefetch_snapshot = None;
+        self.verify_prefetch();
+        self.prefetch_keys.clear();
+    }
+
+    /// The object-tree lookup completing a `.prefetching` key (upstream
+    /// `lookup_by_timestamp` + `lookup_object_callback`, groove.zig:1704-1762).
+    #[allow(dead_code)] // used by the prefetch seam; state-machine wiring is a later slice
+    fn lookup_object_by_timestamp(
+        &mut self,
+        grid: &mut Grid,
+        storage: &mut dyn Storage,
+        snapshot: u64,
+        key: IdTimestampPrefetchKey,
+        ts: u64,
+    ) {
+        assert!(TimestampRange::valid(ts));
+        match self.objects.lookup_from_levels_cache(grid, snapshot, ts) {
+            LookupMemoryResult::Negative => {
+                self.prefetch_keys.set(key, PrefetchStatus::NotFound);
+            }
+            LookupMemoryResult::Positive(object) => {
+                assert!(!TransferObjectSpec::tombstone(&object));
+                assert_eq!(object.timestamp, ts);
+                match key {
+                    IdTimestampPrefetchKey::Id(id) => assert_eq!(object.id, id),
+                    IdTimestampPrefetchKey::Timestamp(_) => {}
+                }
+                self.objects_cache.upsert(&object);
+                let primary_key = object.id;
+                self.prefetch_keys.set(key, PrefetchStatus::Found(primary_key));
+            }
+            LookupMemoryResult::Possible { level } => {
+                match self.objects.lookup_from_levels_storage(grid, storage, snapshot, ts, level) {
+                    Some(object) => {
+                        assert!(!TransferObjectSpec::tombstone(&object));
+                        assert_eq!(object.timestamp, ts);
+                        match key {
+                            IdTimestampPrefetchKey::Id(id) => assert_eq!(object.id, id),
+                            IdTimestampPrefetchKey::Timestamp(_) => {}
+                        }
+                        self.objects_cache.upsert(&object);
+                        let primary_key = object.id;
+                        self.prefetch_keys.set(key, PrefetchStatus::Found(primary_key));
+                    }
+                    None => {
+                        self.prefetch_keys.set(key, PrefetchStatus::NotFound);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Port of `prefetch_from_memory_by_timestamp` (groove.zig:1240-1287).
+    #[allow(dead_code)] // used by the prefetch seam; state-machine wiring is a later slice
+    fn prefetch_from_memory_by_timestamp(
+        &mut self,
+        grid: &mut Grid,
+        snapshot: u64,
+        key: IdTimestampPrefetchKey,
+        ts: u64,
+    ) {
+        assert!(TimestampRange::valid(ts));
+        match self.objects.lookup_from_levels_cache(grid, snapshot, ts) {
+            LookupMemoryResult::Negative => {
+                self.prefetch_keys.set(key, PrefetchStatus::NotFound);
+            }
+            LookupMemoryResult::Positive(object) => {
+                assert!(!TransferObjectSpec::tombstone(&object));
+                assert_eq!(object.timestamp, ts);
+                match key {
+                    IdTimestampPrefetchKey::Id(id) => assert_eq!(object.id, id),
+                    IdTimestampPrefetchKey::Timestamp(_) => {}
+                }
+                self.objects_cache.upsert(&object);
+                let primary_key = object.id;
+                self.prefetch_keys.set(key, PrefetchStatus::Found(primary_key));
+            }
+            LookupMemoryResult::Possible { level } => {
+                self.prefetch_keys
+                    .set(key, PrefetchStatus::Prefetching { level, timestamp_hint: Some(ts) });
+            }
+        }
+    }
+
+    /// Port of `prefetch_from_memory_by_unique_key` (groove.zig:1152-1236): resolve an
+    /// `id` key via the unique-key tree, then hop to the objects tree.
+    #[allow(dead_code)] // used by the prefetch seam; state-machine wiring is a later slice
+    fn prefetch_from_memory_by_unique_key(
+        &mut self,
+        grid: &mut Grid,
+        snapshot: u64,
+        key: IdTimestampPrefetchKey,
+    ) {
+        let IdTimestampPrefetchKey::Id(id) = key else {
+            unreachable!("prefetch_from_memory_by_unique_key only handles id keys");
+        };
+        match self.id.lookup_from_levels_cache(grid, snapshot, id) {
+            LookupMemoryResult::Negative => {
+                self.prefetch_keys.set(key, PrefetchStatus::NotFound);
+            }
+            LookupMemoryResult::Positive(tree_value) => {
+                assert_eq!(tree_value.field, id);
+                // Zeroed timestamp marks an orphaned primary key (groove.zig:1181-1191).
+                if tree_value.timestamp == 0 {
+                    self.insert_orphaned_object(id);
+                    self.prefetch_keys.set(key, PrefetchStatus::FoundOrphaned);
+                    return;
+                }
+                assert!(!UniqueKey128Spec::tombstone(&tree_value));
+                assert!(TimestampRange::valid(tree_value.timestamp));
+                self.prefetch_from_memory_by_timestamp(grid, snapshot, key, tree_value.timestamp);
+            }
+            LookupMemoryResult::Possible { level } => {
+                self.prefetch_keys
+                    .set(key, PrefetchStatus::Prefetching { level, timestamp_hint: None });
+            }
+        }
+    }
+
+    /// Port of `sort_and_search_table_mutable` (groove.zig:1295-1335): search the objects
+    /// mutable table for a non-primary key's timestamps, after sorting it.
+    #[allow(dead_code)] // used by the prefetch seam; state-machine wiring is a later slice
+    fn sort_and_search_table_mutable(
+        &mut self,
+        key: IdTimestampPrefetchKey,
+        timestamp: u64,
+        objects_scratch: &mut ScratchMemory<Transfer>,
+    ) -> PrefetchMutable<u128> {
+        assert!(matches!(key, IdTimestampPrefetchKey::Timestamp(_)));
+
+        let found = {
+            let mutable = self.objects.table_mutable_mut();
+            mutable.sort(objects_scratch);
+            mutable.get(timestamp).copied()
+        };
+        let Some(object) = found else {
+            return PrefetchMutable::NotFound;
+        };
+        if TransferObjectSpec::tombstone(&object) {
+            assert_eq!(TransferObjectSpec::key_from_value(&object), timestamp);
+            return PrefetchMutable::Tombstone;
+        }
+        assert_eq!(object.timestamp, timestamp);
+        assert!(self.objects_cache.has(object.id));
+        PrefetchMutable::Found(object.id)
+    }
+
+    /// Tag the objects cache with a zeroed object so an orphaned id is findable by the
+    /// primary key (upstream `groove.zig:1935-1949`).
+    #[allow(dead_code)] // used by the prefetch seam; state-machine wiring is a later slice
+    fn insert_orphaned_object(&mut self, id: u128) {
+        assert!(id != 0);
+        assert!(id != u128::MAX);
+        self.objects_cache.upsert(&Transfer { id, timestamp: 0, ..Transfer::default() });
+    }
+
+    /// Port of `prefetch`'s `finish`-time verify block (groove.zig:1431-1485).
+    #[allow(dead_code)] // used by the prefetch seam; state-machine wiring is a later slice
+    fn verify_prefetch(&mut self) {
+        for key in self.prefetch_keys.ordered.clone() {
+            match self.prefetch_keys.get(key) {
+                Some(PrefetchStatus::Enqueued | PrefetchStatus::Prefetching { .. }) => {
+                    unreachable!("every enqueued key must be settled by prefetch");
+                }
+                Some(PrefetchStatus::Found(primary)) => {
+                    assert!(primary != 0);
+                    if matches!(key, IdTimestampPrefetchKey::Id(_)) {
+                        let IdTimestampPrefetchKey::Id(value) = key else { unreachable!() };
+                        assert_eq!(primary, value);
+                    }
+                    let Some(object) = self.objects_cache.get(primary) else {
+                        unreachable!("found key must be in the objects cache")
+                    };
+                    assert!(object.timestamp != 0);
+                    match key {
+                        IdTimestampPrefetchKey::Id(value) => assert_eq!(object.id, value),
+                        IdTimestampPrefetchKey::Timestamp(value) => {
+                            assert_eq!(object.timestamp, value);
+                        }
+                    }
+                }
+                Some(PrefetchStatus::FoundOrphaned) => {
+                    assert!(matches!(key, IdTimestampPrefetchKey::Id(_)));
+                    let IdTimestampPrefetchKey::Id(value) = key else { unreachable!() };
+                    let Some(object) = self.objects_cache.get(value) else {
+                        unreachable!("found-orphaned key must be in the objects cache")
+                    };
+                    assert_eq!(object.timestamp, 0);
+                    assert_eq!(object.id, value);
+                }
+                Some(PrefetchStatus::NotFound) => {
+                    if let IdTimestampPrefetchKey::Id(value) = key {
+                        assert!(!self.objects_cache.has(value));
+                    }
+                }
+                None => unreachable!("every prefetched key must be enqueued"),
+            }
         }
     }
 
@@ -1910,6 +2786,14 @@ pub struct TransferPendingGroove {
     pub(crate) status: Tree<TransferPendingStatusSpec>,
     /// Per-session objects cache, keyed by the pending transfer's timestamp.
     objects_cache: TransferPendingObjectsCache,
+
+    /// Snapshot target for the current prefetch pass (see [`AccountGroove`]).
+    #[allow(dead_code)] // used by the prefetch seam; state-machine wiring is a later slice
+    prefetch_snapshot: Option<u64>,
+    /// Keys enqueued by [`Self::prefetch_enqueue`] and their resolution status (upstream
+    /// `groove.prefetch_keys`).
+    #[allow(dead_code)] // used by the prefetch seam; state-machine wiring is a later slice
+    prefetch_keys: PrefetchKeys<TimestampPrefetchKey, u64>,
 }
 
 /// Radix-sort scratch buffers for [`TransferPendingGroove`]'s trees, owned by the forest.
@@ -1959,6 +2843,8 @@ impl TransferPendingGroove {
                 scope_value_count_max: batch_value_count_limit,
                 name: "transfers_pending_objects",
             }),
+            prefetch_snapshot: None,
+            prefetch_keys: PrefetchKeys::default(),
         }
     }
 
@@ -2061,6 +2947,204 @@ impl TransferPendingGroove {
         let compaction_beat = op % (constants::LSM_COMPACTION_OPS as u64);
         if compaction_beat == constants::LSM_COMPACTION_OPS as u64 - 1 {
             self.objects_cache.compact();
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Prefetch seam (`groove.zig:984-1491`)
+    //
+    // The pending groove's primary key *is* the timestamp (`primary_key_orphaned =
+    // false`, no other unique keys), so the prefetch is a single-hop object-tree lookup:
+    // there is no unique-key tree to resolve through and no mutable-table search.
+    // ------------------------------------------------------------------
+
+    /// Begin a prefetch pass for `snapshot_target`, clearing every previously-enqueued key.
+    ///
+    /// Mirrors `groove.prefetch_setup` (groove.zig:984-989).
+    ///
+    /// # Panics
+    /// Panics unless `snapshot_target < SNAPSHOT_LATEST` (upstream asserts).
+    #[allow(dead_code)] // used by the prefetch seam; state-machine wiring is a later slice
+    pub(crate) fn prefetch_setup(&mut self, snapshot_target: u64) {
+        assert!(snapshot_target < SNAPSHOT_LATEST);
+        self.prefetch_snapshot = Some(snapshot_target);
+        self.prefetch_keys.clear();
+    }
+
+    /// Enqueue a pending timestamp to resolve into the objects cache, settling it now if
+    /// it is determinable from the cache or the grid cache, otherwise leaving it
+    /// `.prefetching` until [`Self::prefetch`].
+    ///
+    /// Mirrors `groove.prefetch_enqueue` (groove.zig:996-1147) for the
+    /// `(.timestamp)`-primary-key case (groove.zig:1019-1036): the primary key checks the
+    /// objects cache directly and skips the mutable-table search.
+    ///
+    /// # Panics
+    /// Panics if called before [`Self::prefetch_setup`].
+    #[allow(dead_code)] // used by the prefetch seam; state-machine wiring is a later slice
+    pub(crate) fn prefetch_enqueue(&mut self, grid: &mut Grid, key: TimestampPrefetchKey) {
+        let snapshot = self
+            .prefetch_snapshot
+            .unwrap_or_else(|| unreachable!("prefetch_setup must precede prefetch_enqueue"));
+
+        if !self.prefetch_keys.enqueue(key) {
+            return;
+        }
+
+        let TimestampPrefetchKey::Timestamp(ts) = key;
+        if !TimestampRange::valid(ts) {
+            self.prefetch_keys.set(key, PrefetchStatus::NotFound);
+            return;
+        }
+        // The timestamp is this groove's primary key and skips the mutable-table search,
+        // checking the objects cache directly (groove.zig:1019-1026).
+        if self.objects_cache.has(ts) {
+            self.prefetch_keys.set(key, PrefetchStatus::Found(ts));
+            return;
+        }
+
+        if !self.objects.key_range_contains(snapshot, ts) {
+            self.prefetch_keys.set(key, PrefetchStatus::NotFound);
+            return;
+        }
+
+        self.prefetch_from_memory_by_timestamp(grid, snapshot, key, ts);
+    }
+
+    /// Resolve every `.prefetching` key, reading any missing index/value blocks from
+    /// storage, then assert every key is settled consistently with the objects cache.
+    ///
+    /// Mirrors `groove.prefetch` + the `PrefetchWorker`/`finish` callbacks
+    /// (groove.zig:1339-1491): upstream parallelizes `grid.read_iops_max` lookups; this
+    /// port resolves the same reads synchronously.
+    ///
+    /// # Panics
+    /// Panics if called before [`Self::prefetch_setup`], or if a settled status is
+    /// inconsistent with the objects cache (upstream `constants.verify` asserts).
+    #[allow(dead_code)] // used by the prefetch seam; state-machine wiring is a later slice
+    pub(crate) fn prefetch(&mut self, grid: &mut Grid, storage: &mut dyn Storage) {
+        let snapshot = self
+            .prefetch_snapshot
+            .unwrap_or_else(|| unreachable!("prefetch_setup must precede prefetch"));
+
+        for key in self.prefetch_keys.ordered.clone() {
+            match self.prefetch_keys.get(key) {
+                Some(PrefetchStatus::Prefetching { level, timestamp_hint: Some(ts) }) => {
+                    self.lookup_object_by_timestamp(grid, storage, snapshot, key, ts, level);
+                }
+                Some(PrefetchStatus::Prefetching { timestamp_hint: None, .. }) => {
+                    unreachable!("the pending groove has no unique-key tree");
+                }
+                Some(_) => {}
+                None => unreachable!("every prefetched key must be enqueued"),
+            }
+        }
+
+        self.prefetch_snapshot = None;
+        self.verify_prefetch();
+        self.prefetch_keys.clear();
+    }
+
+    /// The object-tree lookup completing a `.prefetching` key (upstream
+    /// `lookup_object_callback`, groove.zig:1748-1762): re-check the grid cache, falling
+    /// back to a storage read when the object block is still not cached.
+    #[allow(dead_code)] // used by the prefetch seam; state-machine wiring is a later slice
+    fn lookup_object_by_timestamp(
+        &mut self,
+        grid: &mut Grid,
+        storage: &mut dyn Storage,
+        snapshot: u64,
+        key: TimestampPrefetchKey,
+        ts: u64,
+        level: u8,
+    ) {
+        assert!(TimestampRange::valid(ts));
+        let TimestampPrefetchKey::Timestamp(value) = key;
+        assert_eq!(value, ts);
+        match self.objects.lookup_from_levels_cache(grid, snapshot, ts) {
+            LookupMemoryResult::Negative => {
+                self.prefetch_keys.set(key, PrefetchStatus::NotFound);
+            }
+            LookupMemoryResult::Positive(object) => {
+                assert!(!TransferPendingObjectSpec::tombstone(&object));
+                assert_eq!(object.timestamp, ts);
+                self.objects_cache.upsert(&object);
+                let primary_key = object.timestamp;
+                self.prefetch_keys.set(key, PrefetchStatus::Found(primary_key));
+            }
+            LookupMemoryResult::Possible { .. } => {
+                match self.objects.lookup_from_levels_storage(grid, storage, snapshot, ts, level) {
+                    Some(object) => {
+                        assert!(!TransferPendingObjectSpec::tombstone(&object));
+                        assert_eq!(object.timestamp, ts);
+                        self.objects_cache.upsert(&object);
+                        let primary_key = object.timestamp;
+                        self.prefetch_keys.set(key, PrefetchStatus::Found(primary_key));
+                    }
+                    None => {
+                        self.prefetch_keys.set(key, PrefetchStatus::NotFound);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Port of `prefetch_from_memory_by_timestamp` (groove.zig:1240-1287): resolve a
+    /// timestamp key from the objects tree's grid-cache blocks, or record it as
+    /// `.prefetching` when the object block is not cached.
+    #[allow(dead_code)] // used by the prefetch seam; state-machine wiring is a later slice
+    fn prefetch_from_memory_by_timestamp(
+        &mut self,
+        grid: &mut Grid,
+        snapshot: u64,
+        key: TimestampPrefetchKey,
+        ts: u64,
+    ) {
+        assert!(TimestampRange::valid(ts));
+        match self.objects.lookup_from_levels_cache(grid, snapshot, ts) {
+            LookupMemoryResult::Negative => {
+                self.prefetch_keys.set(key, PrefetchStatus::NotFound);
+            }
+            LookupMemoryResult::Positive(object) => {
+                assert!(!TransferPendingObjectSpec::tombstone(&object));
+                assert_eq!(object.timestamp, ts);
+                self.objects_cache.upsert(&object);
+                let primary_key = object.timestamp;
+                self.prefetch_keys.set(key, PrefetchStatus::Found(primary_key));
+            }
+            LookupMemoryResult::Possible { level } => {
+                self.prefetch_keys
+                    .set(key, PrefetchStatus::Prefetching { level, timestamp_hint: Some(ts) });
+            }
+        }
+    }
+
+    /// Port of `prefetch`'s `finish`-time verify block (groove.zig:1431-1485).
+    #[allow(dead_code)] // used by the prefetch seam; state-machine wiring is a later slice
+    fn verify_prefetch(&mut self) {
+        for key in self.prefetch_keys.ordered.clone() {
+            match self.prefetch_keys.get(key) {
+                Some(PrefetchStatus::Enqueued | PrefetchStatus::Prefetching { .. }) => {
+                    unreachable!("every enqueued key must be settled by prefetch");
+                }
+                Some(PrefetchStatus::Found(primary)) => {
+                    assert!(primary != 0);
+                    let TimestampPrefetchKey::Timestamp(value) = key;
+                    assert_eq!(primary, value);
+                    let Some(object) = self.objects_cache.get(primary) else {
+                        unreachable!("found key must be in the objects cache")
+                    };
+                    assert!(object.timestamp != 0);
+                    assert_eq!(object.timestamp, value);
+                }
+                Some(PrefetchStatus::FoundOrphaned) => {
+                    unreachable!("the pending groove has no orphaned primary keys");
+                }
+                Some(PrefetchStatus::NotFound) => unreachable!(
+                    "timestamp keys are primary keys of the pending groove and settle `.not_found` only when absent"
+                ),
+                None => unreachable!("every prefetched key must be enqueued"),
+            }
         }
     }
 
@@ -2541,6 +3625,8 @@ mod tests {
                 Options { batch_value_count_limit: 32 },
             ),
             objects_cache: new_transfer_pending_objects_cache(),
+            prefetch_snapshot: None,
+            prefetch_keys: PrefetchKeys::default(),
         }
     }
 
@@ -2559,6 +3645,8 @@ mod tests {
             imported: tree(23, "accounts_imported"),
             closed: tree(25, "accounts_closed"),
             objects_cache: new_account_objects_cache(),
+            prefetch_snapshot: None,
+            prefetch_keys: PrefetchKeys::default(),
         }
     }
 
@@ -2582,6 +3670,8 @@ mod tests {
             imported: tree(24, "transfers_imported"),
             closing: tree(26, "transfers_closing"),
             objects_cache: new_transfer_objects_cache(),
+            prefetch_snapshot: None,
+            prefetch_keys: PrefetchKeys::default(),
         }
     }
 
@@ -3217,5 +4307,397 @@ mod tests {
             groove.lookup(&mut grid, SNAPSHOT_LATEST, 3),
             LookupMemoryResult::Negative
         ));
+    }
+
+    // ------------------------------------------------------------------
+    // Prefetch seam tests: `prefetch_setup`/`prefetch_enqueue` settle keys from the
+    // objects cache, mutable table, and grid cache; `prefetch` completes the remaining
+    // `.prefetching` reads synchronously from storage (`groove.zig:984-1766`).
+    // ------------------------------------------------------------------
+
+    use crate::Zone;
+    use crate::grid::block_offset;
+    use crate::storage::{MemoryStorage, WriteRequest};
+
+    /// Grid storage sized comfortably above the set-associative cache's capacity.
+    fn new_cold_storage() -> MemoryStorage {
+        MemoryStorage::new(Zone::Grid.start() + 1024 * constants::BLOCK_SIZE as u64)
+    }
+
+    /// Copy a finished table block into storage, bypassing the grid cache so `prefetch`
+    /// has to read it from disk.
+    fn copy_block_to_storage(storage: &mut MemoryStorage, address: u64, block: &[u8]) {
+        storage.write_sectors(WriteRequest {
+            zone: Zone::Grid,
+            offset_in_zone: block_offset(address),
+            buffer: block.to_vec(),
+        });
+        // The write applied to the image synchronously; drop its completion so the grid's
+        // write path (its own write-exec slots) never consumes it.
+        while storage.next_completion().is_some() {}
+    }
+
+    #[test]
+    fn account_groove_prefetch_primary_cache_settles_and_duplicates_are_tolerated() {
+        let mut groove = new_account_groove();
+        groove.insert(&Account { timestamp: 1, id: 101, ..Account::default() });
+
+        let (mut grid, _) = new_groove_grid(1);
+        let mut storage = new_cold_storage();
+        let mut sc = ScratchMemory::<Account>::new(GROOVE_VALUE_COUNT_MAX);
+
+        groove.prefetch_setup(SNAPSHOT_LATEST - 1);
+        let id101 = IdTimestampPrefetchKey::Id(101);
+        groove.prefetch_enqueue(&mut grid, &mut sc, id101);
+        // Primary key hit in the objects cache settles immediately (groove.zig:1047-1062).
+        assert_eq!(groove.prefetch_keys.get(id101), Some(PrefetchStatus::Found(101)));
+
+        // A duplicate enqueue is tolerated and settles nothing new (groove.zig:1000-1005).
+        groove.prefetch_enqueue(&mut grid, &mut sc, id101);
+        assert_eq!(groove.prefetch_keys.get(id101), Some(PrefetchStatus::Found(101)));
+
+        groove.prefetch(&mut grid, &mut storage);
+        assert!(groove.prefetch_keys.ordered.is_empty());
+        assert_eq!(groove.prefetch_snapshot, None);
+        assert_eq!(groove.get(101), Some(&Account { timestamp: 1, id: 101, ..Account::default() }));
+    }
+
+    #[test]
+    fn account_groove_prefetch_invalid_keys_settle_not_found() {
+        let mut groove = new_account_groove();
+        let (mut grid, _) = new_groove_grid(1);
+        let mut storage = new_cold_storage();
+        let mut sc = ScratchMemory::<Account>::new(GROOVE_VALUE_COUNT_MAX);
+
+        groove.prefetch_setup(SNAPSHOT_LATEST - 1);
+        // Zero id / invalid timestamps are allowed through and settle NotFound
+        // (groove.zig:1011-1017, 1040-1045).
+        let zero = IdTimestampPrefetchKey::Id(0);
+        let invalid_ts = IdTimestampPrefetchKey::Timestamp(0);
+        let overflow_ts = IdTimestampPrefetchKey::Timestamp(u64::MAX);
+        groove.prefetch_enqueue(&mut grid, &mut sc, zero);
+        groove.prefetch_enqueue(&mut grid, &mut sc, invalid_ts);
+        groove.prefetch_enqueue(&mut grid, &mut sc, overflow_ts);
+
+        assert_eq!(groove.prefetch_keys.get(zero), Some(PrefetchStatus::NotFound));
+        assert_eq!(groove.prefetch_keys.get(invalid_ts), Some(PrefetchStatus::NotFound));
+        assert_eq!(groove.prefetch_keys.get(overflow_ts), Some(PrefetchStatus::NotFound));
+
+        groove.prefetch(&mut grid, &mut storage);
+        assert!(groove.prefetch_keys.ordered.is_empty());
+    }
+
+    #[test]
+    fn account_groove_prefetch_cache_tombstone_settles_not_found() {
+        let mut groove = new_account_groove();
+        groove.insert(&Account { timestamp: 1, id: 101, ..Account::default() });
+        groove.remove(101);
+
+        let (mut grid, _) = new_groove_grid(1);
+        let mut storage = new_cold_storage();
+        let mut sc = ScratchMemory::<Account>::new(GROOVE_VALUE_COUNT_MAX);
+
+        groove.prefetch_setup(SNAPSHOT_LATEST - 1);
+        let id101 = IdTimestampPrefetchKey::Id(101);
+        groove.prefetch_enqueue(&mut grid, &mut sc, id101);
+        assert_eq!(groove.prefetch_keys.get(id101), Some(PrefetchStatus::NotFound));
+
+        groove.prefetch(&mut grid, &mut storage);
+        assert!(!groove.has(101));
+    }
+
+    #[test]
+    fn account_groove_prefetch_timestamp_settles_from_mutable_table() {
+        let mut groove = new_account_groove();
+        // Don't place accounts at every timestamp: the gap exercises the mutable-table
+        // search missing path too.
+        groove.insert(&Account { timestamp: 5, id: 201, ..Account::default() });
+        groove.insert(&Account { timestamp: 7, id: 202, ..Account::default() });
+
+        let (mut grid, _) = new_groove_grid(1);
+        let mut storage = new_cold_storage();
+        let mut sc = ScratchMemory::<Account>::new(GROOVE_VALUE_COUNT_MAX);
+
+        groove.prefetch_setup(SNAPSHOT_LATEST - 1);
+        let ts5 = IdTimestampPrefetchKey::Timestamp(5);
+        let ts6 = IdTimestampPrefetchKey::Timestamp(6);
+        let ts7 = IdTimestampPrefetchKey::Timestamp(7);
+        groove.prefetch_enqueue(&mut grid, &mut sc, ts5);
+        groove.prefetch_enqueue(&mut grid, &mut sc, ts6);
+        groove.prefetch_enqueue(&mut grid, &mut sc, ts7);
+
+        // Present in the sorted mutable table → primary key, tracking the cache's copy
+        // (groove.zig:1113-1131).
+        assert_eq!(groove.prefetch_keys.get(ts5), Some(PrefetchStatus::Found(201)));
+        assert_eq!(groove.prefetch_keys.get(ts7), Some(PrefetchStatus::Found(202)));
+        // In-range gap → the mutable search misses, then the (empty) LSM cache is negative
+        // (groove.zig:1129-1139).
+        assert_eq!(groove.prefetch_keys.get(ts6), Some(PrefetchStatus::NotFound));
+
+        groove.prefetch(&mut grid, &mut storage);
+        assert!(groove.prefetch_keys.ordered.is_empty());
+        assert_eq!(groove.get(201), Some(&Account { timestamp: 5, id: 201, ..Account::default() }));
+        assert_eq!(groove.get(202), Some(&Account { timestamp: 7, id: 202, ..Account::default() }));
+        assert!(!groove.has(0));
+    }
+
+    #[test]
+    fn account_groove_prefetch_two_hop_from_cold_storage() {
+        // Open both trees without seeding the grid cache: both unresolved hops resolve
+        // synchronously through `prefetch`'s storage reads.
+        let (mut grid, addresses) = new_groove_grid(4);
+        let (objects_value, objects_index, id_value, id_index) =
+            (addresses[0], addresses[1], addresses[2], addresses[3]);
+
+        let (obj_index_block, obj_value_block, obj_info) =
+            build_table_with::<AccountObjectSpec>(&accounts(), 7, objects_value, objects_index);
+        let (id_index_block, id_value_block, id_info) =
+            build_table_with::<UniqueKey128Spec>(&IDS, 1, id_value, id_index);
+
+        let mut storage = new_cold_storage();
+        copy_block_to_storage(&mut storage, objects_value, &obj_value_block);
+        copy_block_to_storage(&mut storage, objects_index, &obj_index_block);
+        copy_block_to_storage(&mut storage, id_value, &id_value_block);
+        copy_block_to_storage(&mut storage, id_index, &id_index_block);
+
+        let mut groove = new_account_groove();
+        open_tree(
+            &mut groove.objects,
+            &obj_info,
+            objects_index,
+            block_checksum(&obj_index_block),
+            7,
+        );
+        open_tree(&mut groove.id, &id_info, id_index, block_checksum(&id_index_block), 1);
+
+        let mut sc = ScratchMemory::<Account>::new(GROOVE_VALUE_COUNT_MAX);
+        groove.prefetch_setup(SNAPSHOT_LATEST - 1);
+
+        // The unique-key hop is not cached → `prefetching` with no timestamp hint.
+        let id102 = IdTimestampPrefetchKey::Id(102);
+        groove.prefetch_enqueue(&mut grid, &mut sc, id102);
+        assert_eq!(
+            groove.prefetch_keys.get(id102),
+            Some(PrefetchStatus::Prefetching { level: 0, timestamp_hint: None })
+        );
+
+        // The timestamp hop's object block is not cached → `prefetching` with a hint.
+        let ts1 = IdTimestampPrefetchKey::Timestamp(1);
+        groove.prefetch_enqueue(&mut grid, &mut sc, ts1);
+        assert_eq!(
+            groove.prefetch_keys.get(ts1),
+            Some(PrefetchStatus::Prefetching { level: 0, timestamp_hint: Some(1) })
+        );
+
+        groove.prefetch(&mut grid, &mut storage);
+        assert!(groove.prefetch_keys.ordered.is_empty());
+        assert_eq!(groove.get(102), Some(&accounts()[1]));
+        assert_eq!(groove.get(101), Some(&accounts()[0]));
+    }
+
+    #[test]
+    fn account_groove_prefetch_object_tombstone_resolves_not_found_from_storage() {
+        // An id-tree tombstone short-circuits the prefetch to NotFound even over storage
+        // (upstream asserts `Tree.Value.tombstone(tree_value)` inside `prefetch`).
+        let id_entries = [
+            UniqueKey128 { field: 101, timestamp: 1, padding: 0 },
+            UniqueKey128::tombstone_from_key(102),
+            UniqueKey128 { field: 103, timestamp: 3, padding: 0 },
+        ];
+        let (mut grid, addresses) = new_groove_grid(4);
+        let (objects_value, objects_index, id_value, id_index) =
+            (addresses[0], addresses[1], addresses[2], addresses[3]);
+
+        let (obj_index_block, obj_value_block, obj_info) =
+            build_table_with::<AccountObjectSpec>(&accounts(), 7, objects_value, objects_index);
+        let (id_index_block, id_value_block, id_info) =
+            build_table_with::<UniqueKey128Spec>(&id_entries, 1, id_value, id_index);
+
+        let mut storage = new_cold_storage();
+        copy_block_to_storage(&mut storage, objects_value, &obj_value_block);
+        copy_block_to_storage(&mut storage, objects_index, &obj_index_block);
+        copy_block_to_storage(&mut storage, id_value, &id_value_block);
+        copy_block_to_storage(&mut storage, id_index, &id_index_block);
+
+        let mut groove = new_account_groove();
+        open_tree(
+            &mut groove.objects,
+            &obj_info,
+            objects_index,
+            block_checksum(&obj_index_block),
+            7,
+        );
+        open_tree(&mut groove.id, &id_info, id_index, block_checksum(&id_index_block), 1);
+
+        let mut sc = ScratchMemory::<Account>::new(GROOVE_VALUE_COUNT_MAX);
+        groove.prefetch_setup(SNAPSHOT_LATEST - 1);
+        groove.prefetch_enqueue(&mut grid, &mut sc, IdTimestampPrefetchKey::Id(102));
+        assert_eq!(
+            groove.prefetch_keys.get(IdTimestampPrefetchKey::Id(102)),
+            Some(PrefetchStatus::Prefetching { level: 0, timestamp_hint: None })
+        );
+
+        groove.prefetch(&mut grid, &mut storage);
+        assert!(!groove.has(102));
+        assert_eq!(groove.get(102), None);
+    }
+
+    #[test]
+    fn transfer_groove_prefetch_orphan_and_found() {
+        // An id-tree entry with a zeroed timestamp is a "used, deleted" id: it settles
+        // `FoundOrphaned` and tags the cache with a zeroed object (groove.zig:1642-1657).
+        let transfers = [
+            Transfer {
+                timestamp: 1,
+                id: 11,
+                debit_account_id: 1,
+                credit_account_id: 2,
+                amount: 100,
+                ledger: 1,
+                code: 1,
+                ..Transfer::default()
+            },
+            Transfer {
+                timestamp: 2,
+                id: 12,
+                debit_account_id: 1,
+                credit_account_id: 2,
+                amount: 50,
+                ledger: 1,
+                code: 1,
+                ..Transfer::default()
+            },
+        ];
+        let transfer_ids = [
+            UniqueKey128 { field: 11, timestamp: 1, padding: 0 },
+            UniqueKey128 { field: 12, timestamp: 2, padding: 0 },
+            UniqueKey128 { field: 91, timestamp: 0, padding: 0 }, // orphaned
+        ];
+        let (mut grid, addresses) = new_groove_grid(4);
+        let (objects_value, objects_index, id_value, id_index) =
+            (addresses[0], addresses[1], addresses[2], addresses[3]);
+
+        let (obj_index_block, obj_value_block, obj_info) =
+            build_table_with::<TransferObjectSpec>(&transfers, 18, objects_value, objects_index);
+        let (id_index_block, id_value_block, id_info) =
+            build_table_with::<UniqueKey128Spec>(&transfer_ids, 8, id_value, id_index);
+
+        let mut storage = new_cold_storage();
+        copy_block_to_storage(&mut storage, objects_value, &obj_value_block);
+        copy_block_to_storage(&mut storage, objects_index, &obj_index_block);
+        copy_block_to_storage(&mut storage, id_value, &id_value_block);
+        copy_block_to_storage(&mut storage, id_index, &id_index_block);
+
+        let mut groove = new_transfer_groove();
+        open_tree(
+            &mut groove.objects,
+            &obj_info,
+            objects_index,
+            block_checksum(&obj_index_block),
+            18,
+        );
+        open_tree(&mut groove.id, &id_info, id_index, block_checksum(&id_index_block), 8);
+
+        let mut sc = ScratchMemory::<Transfer>::new(GROOVE_VALUE_COUNT_MAX);
+        groove.prefetch_setup(SNAPSHOT_LATEST - 1);
+        let orphan = IdTimestampPrefetchKey::Id(91);
+        let present = IdTimestampPrefetchKey::Id(12);
+        groove.prefetch_enqueue(&mut grid, &mut sc, orphan);
+        groove.prefetch_enqueue(&mut grid, &mut sc, present);
+
+        groove.prefetch(&mut grid, &mut storage);
+
+        // The orphan is tagged in the cache with a zeroed object (and settled FoundOrphaned)
+        // while the live id resolved through both storage hops.
+        let orphaned = groove.get(91).expect("orphan is tagged in the objects cache");
+        assert_eq!(orphaned.id, 91);
+        assert_eq!(orphaned.timestamp, 0);
+        assert_eq!(groove.get(12), Some(&transfers[1]));
+    }
+
+    #[test]
+    fn pending_groove_prefetch_cache_and_storage() {
+        let mut groove = new_transfer_pending_groove();
+        groove.insert(&TransferPending {
+            timestamp: 5,
+            status: TransferPendingStatus::Pending,
+            padding: [0; 7],
+        });
+
+        let (mut grid, _) = new_groove_grid(1);
+        let mut storage = new_cold_storage();
+
+        groove.prefetch_setup(SNAPSHOT_LATEST - 1);
+        let ts5 = TimestampPrefetchKey::Timestamp(5);
+        groove.prefetch_enqueue(&mut grid, ts5);
+        // The primary-key (timestamp) objects-cache check settles immediately.
+        assert_eq!(groove.prefetch_keys.get(ts5), Some(PrefetchStatus::Found(5)));
+
+        groove.prefetch(&mut grid, &mut storage);
+        assert!(groove.prefetch_keys.ordered.is_empty());
+        assert_eq!(
+            groove.get(5),
+            Some(&TransferPending {
+                timestamp: 5,
+                status: TransferPendingStatus::Pending,
+                padding: [0; 7]
+            })
+        );
+        assert!(!groove.has(9));
+
+        // Cold-storage single-hop resolve for a distinct built table.
+        let (mut grid, addresses) = new_groove_grid(2);
+        let pending_values = [
+            TransferPending {
+                timestamp: 1,
+                status: TransferPendingStatus::Pending,
+                padding: [0; 7],
+            },
+            TransferPending {
+                timestamp: 2,
+                status: TransferPendingStatus::Posted,
+                padding: [0; 7],
+            },
+        ];
+        let (objects_index, objects_value) = (addresses[0], addresses[1]);
+        let (obj_index_block, obj_value_block, obj_info) =
+            build_table_with::<TransferPendingObjectSpec>(
+                &pending_values,
+                20,
+                objects_value,
+                objects_index,
+            );
+
+        let mut storage = new_cold_storage();
+        copy_block_to_storage(&mut storage, objects_value, &obj_value_block);
+        copy_block_to_storage(&mut storage, objects_index, &obj_index_block);
+
+        let mut groove = new_transfer_pending_groove();
+        open_tree(
+            &mut groove.objects,
+            &obj_info,
+            objects_index,
+            block_checksum(&obj_index_block),
+            20,
+        );
+
+        groove.prefetch_setup(SNAPSHOT_LATEST - 1);
+        let ts1 = TimestampPrefetchKey::Timestamp(1);
+        groove.prefetch_enqueue(&mut grid, ts1);
+        assert_eq!(
+            groove.prefetch_keys.get(ts1),
+            Some(PrefetchStatus::Prefetching { level: 0, timestamp_hint: Some(1) })
+        );
+
+        groove.prefetch(&mut grid, &mut storage);
+        assert!(groove.prefetch_keys.ordered.is_empty());
+        assert_eq!(
+            groove.get(1),
+            Some(&TransferPending {
+                timestamp: 1,
+                status: TransferPendingStatus::Pending,
+                padding: [0; 7]
+            })
+        );
     }
 }

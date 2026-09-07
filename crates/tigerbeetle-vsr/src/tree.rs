@@ -366,6 +366,57 @@ impl<S: TreeSpec> Tree<S> {
         LookupMemoryResult::Negative
     }
 
+    /// Port of upstream `Tree.lookup_from_levels_storage` (`tree.zig:341-531`): the disk
+    /// (sans-I/O) counterpart to [`Self::lookup_from_levels_cache`]. Reads the index and
+    /// value blocks that may contain `key` — starting at `level_min` — synchronously off
+    /// storage and returns the matching non-tombstone value, or `None` if the key is not
+    /// present (or is a tombstone) across all candidate levels.
+    ///
+    /// Upstream is asynchronous: it issues a read per candidate level, parking in the grid,
+    /// and only calls back when every candidate level has been read. This port collapses
+    /// the whole flow into [`Grid::read_block_sync`], so the storage reads are issued and
+    /// completed here (upstream's `read_index_block_callback`/`read_value_block_callback`
+    /// advance the same level loop). The value is returned by copy rather than as a pointer.
+    ///
+    /// # Panics
+    /// Panics if manifest table assertions fail (key range, visibility).
+    #[must_use]
+    pub fn lookup_from_levels_storage(
+        &mut self,
+        grid: &mut Grid,
+        storage: &mut dyn Storage,
+        snapshot: u64,
+        key: S::Key,
+        level_min: u8,
+    ) -> Option<S::Value> {
+        let tables: Vec<TreeTableInfo<S::Key>> =
+            self.manifest.lookup(snapshot, key, level_min).collect();
+        for table in tables {
+            assert!(table.visible(snapshot));
+            assert!(table.key_min <= key);
+            assert!(key <= table.key_max);
+
+            let index_block = grid.read_block_sync(storage, table.address, table.checksum);
+            let Some(key_blocks) = S::index_blocks_for_key(&index_block, key) else {
+                continue;
+            };
+
+            let value_block = grid.read_block_sync(
+                storage,
+                key_blocks.value_block_address,
+                key_blocks.value_block_checksum,
+            );
+            if let Some(value) = S::value_block_search(&value_block, key) {
+                if S::tombstone(&value) {
+                    return None;
+                }
+                assert_eq!(S::key_from_value(&value), key);
+                return Some(value);
+            }
+        }
+        None
+    }
+
     /// Port of upstream `Tree.block_value_count_max`.
     #[must_use]
     pub fn block_value_count_max(&self) -> u32 {
@@ -641,6 +692,12 @@ impl<S: TreeSpec> Tree<S> {
     #[must_use]
     pub fn table_mutable_ref(&self) -> &table_memory::TableMemory<S> {
         &self.table_mutable
+    }
+
+    /// Mutable table reference (mutable, for sorting/searching during prefetch).
+    #[must_use]
+    pub fn table_mutable_mut(&mut self) -> &mut table_memory::TableMemory<S> {
+        &mut self.table_mutable
     }
 
     /// Immutable table reference (mutable, for `set_flushed`).
