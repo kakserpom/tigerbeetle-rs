@@ -15,7 +15,7 @@
 
 use tigerbeetle_core::constants;
 use tigerbeetle_core::stdx::Instant;
-use tigerbeetle_core::stdx::prng::Prng;
+use tigerbeetle_core::stdx::prng::{Prng, Ratio};
 
 use crate::command::Command;
 use crate::grid::{Event, Grid, ReadBlockResult, ReadOptions};
@@ -100,6 +100,31 @@ pub struct Replica {
     pub commit_stage: CommitStage,
     /// Whether commit_dispatch is currently executing (reentrancy guard).
     pub commit_dispatch_entered: bool,
+
+    // ── Commit stall (primary backpressure) ──────────────────────────────
+    /// Per-replica latest `prepare_ok` `commit_min` (upstream `commit_mins`).
+    pub commit_mins: Vec<u64>,
+    /// Per-replica latest prepared op acked (`prepare_ok.op`; upstream
+    /// `head_ops`).
+    pub head_ops: Vec<u64>,
+    /// Times the injected stall before resuming the commit pipeline (upstream
+    /// `commit_stall_timeout`).
+    pub commit_stall_timeout: Timeout,
+    /// Below this commit-lag the primary stalls only probabilistically
+    /// (upstream `commit_stall_lag_min`).
+    pub commit_stall_lag_min: u32,
+    /// Replicas lagging more than this many ops are assumed down/partitioned
+    /// and ignored — the stall would never help them (upstream
+    /// `commit_stall_lag_max`).
+    pub commit_stall_lag_max: u32,
+    /// Cap on the stall duration, `multiple * 10` ms (upstream
+    /// `commit_stall_multiple_max`).
+    pub commit_stall_multiple_max: u16,
+    /// Probability of a single-tick stall while another committed prepare is
+    /// queued and the lag is below `commit_stall_lag_min` (upstream
+    /// `commit_stall_probability`).
+    pub commit_stall_probability: Ratio,
+
     /// Checkpoint references produced by `commit_checkpoint_data` (the state-machine
     /// / forest checkpoint) for `commit_checkpoint_superblock` to persist. `None`
     /// until a checkpoint-boundary commit reaches the CheckpointData stage.
@@ -541,6 +566,15 @@ impl Replica {
         assert!(quorum.replication > 0);
         assert!(quorum.view_change > 0);
 
+        // Upstream initializes the commit-stall thresholds in `ReplicaType.init`
+        // (replica.zig:1188-1195) and asserts their invariants.
+        let commit_stall_lag_min = constants::PIPELINE_PREPARE_QUEUE_MAX;
+        let commit_stall_lag_max = u32::try_from(3 * constants::VSR_CHECKPOINT_OPS)
+            .unwrap_or_else(|_| unreachable!("3 * vsr_checkpoint_ops fits u32"));
+        let commit_stall_multiple_max = 4_u16;
+        assert!(commit_stall_lag_min <= commit_stall_lag_max);
+        assert!(commit_stall_multiple_max > 0);
+
         Self {
             cluster,
             replica_index,
@@ -558,6 +592,13 @@ impl Replica {
             commit_prepare: None,
             commit_stage: CommitStage::Idle,
             commit_dispatch_entered: false,
+            commit_mins: vec![0; usize::from(replica_count)],
+            head_ops: vec![0; usize::from(replica_count)],
+            commit_stall_timeout: Timeout::default(),
+            commit_stall_lag_min,
+            commit_stall_lag_max,
+            commit_stall_multiple_max,
+            commit_stall_probability: tigerbeetle_core::stdx::prng::ratio(2, 5),
             checkpoint_manifest_references: None,
             checkpoint_free_set_references: None,
             ping_timeout: Timeout::default(),
@@ -1324,8 +1365,13 @@ impl Replica {
         // prepare_oks ("including ourself", replica.zig:2293): the primary's
         // journal write completes on the loopback as `write_prepare_callback`
         // → `send_prepare_ok`. Contribute that self-ack here.
-        let result =
-            self.on_prepare_ok(op, header.checksum(), header.checkpoint_id, self.replica_index);
+        let result = self.on_prepare_ok(
+            op,
+            header.checksum(),
+            header.checkpoint_id,
+            self.commit_min,
+            self.replica_index,
+        );
         assert!(matches!(
             result,
             PrepareOkResult::AckCounted
@@ -1464,6 +1510,7 @@ impl Replica {
         op: u64,
         checksum: u128,
         checkpoint_id: u128,
+        commit_min: u64,
         replica: u16,
     ) -> PrepareOkResult {
         if !self.is_primary() {
@@ -1472,6 +1519,15 @@ impl Replica {
         if self.status != Status::Normal {
             return PrepareOkResult::Ignored;
         }
+        assert!(usize::from(replica) < self.commit_mins.len());
+
+        // Track the sender's progress for commit-stall decisions, even when the
+        // op is no longer in the pipeline: the prepare_ok may come from a
+        // lagging replica that withheld its acks, or arrive after the op fell
+        // out of the primary's pipeline (upstream replica.zig:2263-2271).
+        self.commit_mins[usize::from(replica)] =
+            self.commit_mins[usize::from(replica)].max(commit_min);
+        self.head_ops[usize::from(replica)] = self.head_ops[usize::from(replica)].max(op);
 
         // Find the pipeline slot for this op.
         let Some(slot) = self.pipeline_queue.prepare_queue.iter().position(|p| p.op == op) else {
@@ -1521,6 +1577,9 @@ impl Replica {
         if self.ok_from_all_replicas[slot] >= (1u64 << quorum) - 1 {
             // Quorum reached! Stop prepare timeout if pipeline is drained.
             prepare.ok_quorum_received = true;
+            // First time this replica has acked the op: its commit_min is now
+            // known to be current (upstream replica.zig:2315-2316).
+            self.commit_mins[usize::from(replica)] = commit_min;
             if self.pipeline_queue.prepare_queue.len() <= 1 {
                 self.prepare_timeout.stop();
                 self.primary_abdicate_timeout.stop();
@@ -1559,6 +1618,7 @@ impl Replica {
             prepare_ok.op,
             prepare_ok.prepare_checksum,
             prepare_ok.checkpoint_id,
+            prepare_ok.commit_min,
             u16::from(prepare_ok.replica),
         ) {
             PrepareOkResult::Ignored
@@ -1566,7 +1626,13 @@ impl Replica {
             | PrepareOkResult::ChecksumMismatch
             | PrepareOkResult::DuplicateAck => {}
             PrepareOkResult::AckCounted | PrepareOkResult::QuorumReached { .. } => {
-                if self.status == Status::Normal && self.is_primary() {
+                // Upstream finishes `on_prepare_ok` with `commit_pipeline()`
+                // (replica.zig:2338), which skips the enter while a dispatch is
+                // already parked (e.g. awaiting a commit-stall timeout).
+                if self.status == Status::Normal
+                    && self.is_primary()
+                    && self.commit_stage == CommitStage::Idle
+                {
                     self.commit_dispatch_enter();
                 }
             }
@@ -1962,11 +2028,108 @@ impl Replica {
 
     /// Stage: Stall — primary backpressure to let backups catch up.
     ///
+    /// The primary stalls the commit pipeline when a commit-lag builds up
+    /// against it: while another committed prepare is queued and the lag is
+    /// below `commit_stall_lag_min` it injects a single-tick stall with
+    /// `commit_stall_probability` (sub-tick average backpressure); once a
+    /// replica falls `commit_stall_lag_min` ops behind it stalls for
+    /// `multiple * 10` ms per quarter-checkpoint of lag, up to
+    /// `commit_stall_multiple_max` multiples. Backups and a solo primary never
+    /// stall.
+    ///
+    /// Returns `false` (pending) only when a stall timeout has been armed;
+    /// [`Self::on_commit_stall_timeout`] resumes the pipeline.
+    ///
     /// Upstream: `src/vsr/replica.zig:4777` (`commit_stall`).
-    fn commit_stall(&self) -> bool {
+    fn commit_stall(&mut self) -> bool {
         assert_eq!(self.commit_stage, CommitStage::Stall);
-        // TODO(port): commit_stall_timeout — async backpressure. For now, ready.
-        true
+        assert!(!self.commit_stall_timeout.active);
+        let Some(op) = self.commit_prepare else {
+            panic!("commit_stall requires commit_prepare");
+        };
+        assert_eq!(op, self.commit_min + 1);
+
+        if self.status != Status::Normal || !self.is_primary() || self.solo() {
+            return true;
+        }
+
+        // How far behind the primary's commit each tracked replica is. Replicas
+        // more than `commit_stall_lag_max` behind are skipped — they may be
+        // down or partitioned and must state-sync rather than WAL-repair, so a
+        // stall would never help them (upstream replica.zig:4782-4800). The
+        // primary contributes its own quorum'd ops (counted via the self-ack),
+        // which track the commit itself and contribute zero lag.
+        let mut commit_lag = 0_u64;
+        for replica in 0..usize::from(self.replica_count) {
+            let commit_min_i = self.commit_mins[replica];
+            let head_op_i = self.head_ops[replica].min(self.commit_min);
+            if self.commit_min.saturating_sub(commit_min_i) <= u64::from(self.commit_stall_lag_max)
+            {
+                commit_lag = commit_lag.max(head_op_i.saturating_sub(commit_min_i));
+            }
+        }
+
+        // The current commit is the pipeline head; a "committed successor" is
+        // a later prepare whose quorum was already received.
+        let Some(head) = self.pipeline_queue.prepare_queue.first() else {
+            unreachable!("the pipeline holds the commit being stalled");
+        };
+        assert_eq!(head.op, op, "the stalled prepare is the pipeline head");
+        let quorum = u64::from(self.quorum().replication);
+        let has_committed_successor = self
+            .pipeline_queue
+            .prepare_queue
+            .iter()
+            .enumerate()
+            .skip(1)
+            .any(|(slot, _)| u64::from(self.ok_from_all_replicas[slot].count_ones()) >= quorum);
+
+        let stall_ms: u64 = if commit_lag < u64::from(self.commit_stall_lag_min) {
+            if !has_committed_successor {
+                // No other committed prepares queued: backups get their
+                // breathing room from the primary having no more work.
+                return true;
+            }
+            // Probabilistic single-tick stall: the probability, not the stall,
+            // achieves a slower-than-tick commit rate on average (upstream
+            // replica.zig:4839-4846).
+            if self.prng.chance(self.commit_stall_probability) {
+                constants::TICK_MS
+            } else {
+                return true;
+            }
+        } else {
+            // "Stall 10ms for every quarter-checkpoint of commits lagged, but
+            // no longer than 40ms" (upstream replica.zig:4848-4871).
+            let checkpoint_ratio = u64::try_from(constants::VSR_CHECKPOINT_OPS)
+                .unwrap_or_else(|_| unreachable!("vsr_checkpoint_ops fits u64"))
+                / u64::from(self.commit_stall_multiple_max);
+            let stall_multiple =
+                (commit_lag / checkpoint_ratio).clamp(1, u64::from(self.commit_stall_multiple_max));
+            stall_multiple * 10
+        };
+
+        assert!(stall_ms == 0 || stall_ms >= constants::TICK_MS);
+        let stall_ticks = stall_ms / constants::TICK_MS;
+        if stall_ticks == 0 {
+            return true;
+        }
+        self.commit_stall_timeout.reset(
+            u32::try_from(stall_ticks).unwrap_or_else(|_| unreachable!("stall ticks fit u32")),
+        );
+        false
+    }
+
+    /// Resume the commit pipeline after a commit-stall tick (upstream
+    /// `src/vsr/replica.zig:4037`).
+    fn on_commit_stall_timeout(&mut self) {
+        // DEVIATION: upstream asserts `commit_stall_timeout.ticking`; the
+        // port's `Timeout::tick` fuses tick + `fired()` and clears `active`
+        // before returning, so only the dispatch is entered [asserted by
+        // `commit_dispatch_resume`].
+        assert_eq!(self.commit_stage, CommitStage::Stall);
+        self.commit_stall_timeout.stop();
+        self.commit_dispatch_resume();
     }
 
     /// Stage: ReplySetup — ensure ClientReplies has a Write slot.
@@ -3222,9 +3385,13 @@ impl Replica {
             assert!(self.pipeline_queue.prepare_queue.is_empty());
         }
 
-        // DEVIATION: upstream additionally starts repair_sync_timeout, and resets
-        // `commit_mins` / `head_ops` EWMA history.
+        // DEVIATION: upstream additionally starts repair_sync_timeout.
         self.journal_repair_timeout = Timeout::start(constants::JOURNAL_REPAIR_TIMEOUT);
+        // Upstream resets the `commit_mins` / `head_ops` commit-stall history on
+        // a view change (replica.zig:10149-10150): the previous primary's
+        // prepare_oks no longer describe this cluster's progress.
+        self.commit_mins.fill(0);
+        self.head_ops.fill(0);
         // Upstream starts the grid repair timeout with `100 / tick_ms` ticks
         // (replica.zig:9921); sans-IO ticks are unitless, so it uses the same
         // fixed cadence as the journal repair timeout.
@@ -3324,7 +3491,13 @@ impl Replica {
             .map(|prepare| (prepare.op, prepare.checksum, prepare.checkpoint_id))
             .collect();
         for (op, checksum, checkpoint_id) in survivors {
-            let result = self.on_prepare_ok(op, checksum, checkpoint_id, self.replica_index);
+            let result = self.on_prepare_ok(
+                op,
+                checksum,
+                checkpoint_id,
+                self.commit_min,
+                self.replica_index,
+            );
             assert!(
                 matches!(result, PrepareOkResult::AckCounted | PrepareOkResult::DuplicateAck),
                 "self prepare_ok cannot quorum a survivor op"
@@ -3889,6 +4062,9 @@ impl Replica {
         }
         if self.pulse_timeout.tick() {
             self.on_pulse_timeout(now);
+        }
+        if self.commit_stall_timeout.tick() {
+            self.on_commit_stall_timeout();
         }
     }
 
@@ -8347,6 +8523,24 @@ mod tests {
         r.commit_execute();
     }
 
+    /// Drive the primary's commit pipeline to idle, pumping any commit stalls
+    /// the primary injected (upstream: the owner's tick loop fires the armed
+    /// `commit_stall_timeout` and `on_commit_stall_timeout` resumes the
+    /// pipeline).
+    fn commit_dispatch_until_idle(r: &mut Replica) {
+        r.commit_dispatch_enter();
+        while r.commit_stage != CommitStage::Idle {
+            assert_eq!(
+                r.commit_stage,
+                CommitStage::Stall,
+                "the sans-IO commit pipeline waits only for commit-stall timeouts"
+            );
+            assert!(r.commit_stall_timeout.active);
+            assert!(r.commit_stall_timeout.tick());
+            r.on_commit_stall_timeout();
+        }
+    }
+
     /// Commits the "parking" pulse a fresh primary injects after its very
     /// first commit: `pulse_next_timestamp` starts at `TIMESTAMP_MIN`, so the
     /// expiry pump owes one immediately (upstream replica.zig:4906-4911).
@@ -9467,11 +9661,13 @@ mod tests {
         assert!(r.pipeline_queue.prepare_queue[0].acks_received >= 1);
 
         // Replica 1 acks → quorum reached (primary + one backup).
-        let result = r.on_prepare_ok(1, checksum, r.checkpoint_id_for_op(1).unwrap(), 1);
+        let result =
+            r.on_prepare_ok(1, checksum, r.checkpoint_id_for_op(1).unwrap(), r.commit_min, 1);
         assert!(matches!(result, PrepareOkResult::QuorumReached { op: 1, .. }));
 
         // A repeated ack is not re-counted.
-        let result = r.on_prepare_ok(1, checksum, r.checkpoint_id_for_op(1).unwrap(), 1);
+        let result =
+            r.on_prepare_ok(1, checksum, r.checkpoint_id_for_op(1).unwrap(), r.commit_min, 1);
         assert_eq!(result, PrepareOkResult::DuplicateAck);
     }
 
@@ -9482,8 +9678,9 @@ mod tests {
         r.primary_pipeline_prepare(1, 100, crate::Operation(6), &[], 0).unwrap();
         let checksum = r.journal.header_with_op(1).unwrap().checksum();
 
-        let _ = r.on_prepare_ok(1, checksum, r.checkpoint_id_for_op(1).unwrap(), 1);
-        let result = r.on_prepare_ok(1, checksum, r.checkpoint_id_for_op(1).unwrap(), 1); // duplicate
+        let _ = r.on_prepare_ok(1, checksum, r.checkpoint_id_for_op(1).unwrap(), r.commit_min, 1);
+        let result =
+            r.on_prepare_ok(1, checksum, r.checkpoint_id_for_op(1).unwrap(), r.commit_min, 1); // duplicate
         assert_eq!(result, PrepareOkResult::DuplicateAck);
     }
 
@@ -9499,7 +9696,7 @@ mod tests {
         let checksum = r.journal.header_with_op(1).unwrap().checksum();
 
         let wrong = r.checkpoint_id_for_op(1).unwrap() ^ 0xDEAD_BEEF;
-        let _ = r.on_prepare_ok(1, checksum, wrong, 1);
+        let _ = r.on_prepare_ok(1, checksum, wrong, r.commit_min, 1);
     }
 
     #[test]
@@ -9517,7 +9714,7 @@ mod tests {
         let checkpoint_id = r.checkpoint_id_for_op(1).unwrap();
 
         r.pipeline_queue.prepare_queue[0].checkpoint_id = checkpoint_id ^ 0xDEAD_BEEF;
-        let _ = r.on_prepare_ok(1, checksum, checkpoint_id ^ 0xDEAD_BEEF, 1);
+        let _ = r.on_prepare_ok(1, checksum, checkpoint_id ^ 0xDEAD_BEEF, r.commit_min, 1);
     }
 
     #[test]
@@ -9562,7 +9759,8 @@ mod tests {
         // Reaching the quorum drains the pipeline and stops both timers until
         // the next prepare (upstream replica.zig:2333-2337).
         let checksum = r.journal.header_with_op(1).unwrap().checksum();
-        let result = r.on_prepare_ok(1, checksum, r.checkpoint_id_for_op(1).unwrap(), 1);
+        let result =
+            r.on_prepare_ok(1, checksum, r.checkpoint_id_for_op(1).unwrap(), r.commit_min, 1);
         assert!(matches!(result, PrepareOkResult::QuorumReached { op: 1, .. }));
         assert!(!r.prepare_timeout.active);
         assert!(!r.primary_abdicate_timeout.active);
@@ -9626,14 +9824,14 @@ mod tests {
 
         // Quorum op 1 (self + replica 1): the new head is op 2.
         let checksum = r.journal.header_with_op(1).unwrap().checksum();
-        r.on_prepare_ok(1, checksum, r.checkpoint_id_for_op(1).unwrap(), 1);
+        r.on_prepare_ok(1, checksum, r.checkpoint_id_for_op(1).unwrap(), r.commit_min, 1);
         let (slot, pending) = r.primary_pipeline_pending().unwrap();
         assert_eq!(slot, 1);
         assert_eq!(pending.op, 2);
 
         // Quorum op 2 too: nothing left pending.
         let checksum = r.journal.header_with_op(2).unwrap().checksum();
-        r.on_prepare_ok(2, checksum, r.checkpoint_id_for_op(2).unwrap(), 1);
+        r.on_prepare_ok(2, checksum, r.checkpoint_id_for_op(2).unwrap(), r.commit_min, 1);
         assert!(r.primary_pipeline_pending().is_none());
     }
 
@@ -9658,7 +9856,7 @@ mod tests {
         r.send_queue.clear();
 
         // Once a backup acks, retransmission stops.
-        r.on_prepare_ok(op, checksum, r.checkpoint_id_for_op(op).unwrap(), 1);
+        r.on_prepare_ok(op, checksum, r.checkpoint_id_for_op(op).unwrap(), r.commit_min, 1);
         r.commit_dispatch_enter();
         commit_parking_pulse(&mut r);
         r.send_queue.clear(); // the commit-tail pulse broadcast is not under test
@@ -9678,7 +9876,7 @@ mod tests {
         // Quorum op 1 and commit it; op 2 remains pending, and the commit-tail
         // adds the fresh primary's parking pulse behind it (op 3).
         let checksum = r.journal.header_with_op(1).unwrap().checksum();
-        r.on_prepare_ok(1, checksum, r.checkpoint_id_for_op(1).unwrap(), 1);
+        r.on_prepare_ok(1, checksum, r.checkpoint_id_for_op(1).unwrap(), r.commit_min, 1);
         r.commit_dispatch_enter();
         assert_eq!(r.commit_min, 1);
         assert_eq!(r.pipeline_queue.prepare_queue.len(), 2);
@@ -12809,7 +13007,7 @@ mod tests {
         // Quorum = 2 (replica_count 3): the primary's own prepare_ok was
         // contributed on prepare, so one backup ack completes the quorum.
         let checksum = r.journal.header_with_op(op).unwrap().checksum();
-        r.on_prepare_ok(op, checksum, r.checkpoint_id_for_op(op).unwrap(), 1); // replica 1 → quorum
+        r.on_prepare_ok(op, checksum, r.checkpoint_id_for_op(op).unwrap(), r.commit_min, 1); // replica 1 → quorum
 
         assert!(r.pipeline_queue.prepare_queue[0].ok_quorum_received);
         assert_eq!(r.commit_min, 0);
@@ -12838,15 +13036,113 @@ mod tests {
         // quorum with a single backup ack.
         for op in [op1, op2, op3] {
             let checksum = r.journal.header_with_op(op).unwrap().checksum();
-            r.on_prepare_ok(op, checksum, r.checkpoint_id_for_op(op).unwrap(), 1);
+            r.on_prepare_ok(op, checksum, r.checkpoint_id_for_op(op).unwrap(), r.commit_min, 1);
         }
 
-        r.commit_dispatch_enter();
-        assert_eq!(r.commit_stage, CommitStage::Idle);
+        // The batch quorum leaves a lagging backup behind (its `commit_mins`
+        // never advances past 0), so the primary injects commit stalls between
+        // the queued prepares; pump them to completion.
+        commit_dispatch_until_idle(&mut r);
         assert_eq!(r.commit_min, op3);
         // The third commit's tail injected a parking pulse; consume it.
         commit_parking_pulse(&mut r);
         assert!(r.pipeline_queue.prepare_queue.is_empty());
+    }
+
+    #[test]
+    fn commit_stall_lagging_backup_injects_deterministic_stall() {
+        // A backup that is at least `commit_stall_lag_min` ops behind the
+        // primary's commit elicits an *unconditional* stall (no probability
+        // draw) of `multiple * 10` ms per quarter-checkpoint of lag.
+        let mut r = Replica::new(0, 0, 3);
+        r.status = Status::Normal;
+        // Upstream defaults (replica.zig:1188-1195).
+        assert_eq!(r.commit_stall_lag_min, constants::PIPELINE_PREPARE_QUEUE_MAX);
+        assert_eq!(
+            r.commit_stall_lag_max,
+            u32::try_from(3 * constants::VSR_CHECKPOINT_OPS)
+                .unwrap_or_else(|_| unreachable!("3 * vsr_checkpoint_ops fits u32"))
+        );
+        assert_eq!(r.commit_stall_multiple_max, 4);
+        r.commit_min = 5; // Simulate a running cluster; the backup has stalled behind it.
+        r.commit_max = 5;
+        r.op = 5;
+
+        let op = r.primary_pipeline_prepare(1, 1, crate::Operation::NOOP, &[], 0).unwrap();
+        assert_eq!(op, 6);
+        let checksum = r.journal.header_with_op(op).unwrap().checksum();
+        // A lagging backup acks with `commit_min` exactly `commit_stall_lag_min`
+        // ops behind: lag = min(head_ops=6, commit_min=5) -| commit_mins=1 = 4.
+        r.on_prepare_ok(
+            op,
+            checksum,
+            r.checkpoint_id_for_op(op).unwrap(),
+            r.commit_min - u64::from(r.commit_stall_lag_min),
+            1,
+        );
+        assert!(r.pipeline_queue.prepare_queue[0].ok_quorum_received);
+
+        // The stall is unconditional (meets lag_min): `multiple = clamp(commit_lag
+        // / checkpoint_ratio, 1, multiple_max)`, stalled `multiple * 10` ms.
+        r.commit_dispatch_enter();
+        assert_eq!(r.commit_stage, CommitStage::Stall);
+        assert!(r.commit_dispatch_entered);
+        assert_eq!(r.commit_min, 5);
+        assert!(r.commit_stall_timeout.active);
+        let checkpoint_ratio = u64::try_from(constants::VSR_CHECKPOINT_OPS)
+            .unwrap_or_else(|_| unreachable!("vsr_checkpoint_ops fits u64"))
+            / u64::from(r.commit_stall_multiple_max);
+        let expected_multiple =
+            (4_u64 / checkpoint_ratio).clamp(1, u64::from(r.commit_stall_multiple_max));
+        let expected_ticks = expected_multiple * 10 / constants::TICK_MS;
+        assert_eq!(u64::from(r.commit_stall_timeout.ticks), expected_ticks);
+
+        // The stall fires and the op commits; nothing is queued behind it, so
+        // the pipeline drains to idle (state-machine pulse aside).
+        assert!(r.commit_stall_timeout.tick());
+        r.on_commit_stall_timeout();
+        assert_eq!(r.commit_stage, CommitStage::Idle);
+        assert_eq!(r.commit_min, 6);
+        assert!(!r.commit_stall_timeout.active);
+        // Commit op-6's fresh-primary parking pulse (op 7).
+        commit_parking_pulse(&mut r);
+    }
+
+    #[test]
+    fn commit_stall_single_tick_when_committed_successor_queued() {
+        // When the primary lags below `commit_stall_lag_min` but already holds
+        // another quorum'd prepare behind the current commit, it throttles with
+        // a *probabilistic* single-tick stall.
+        let mut r = Replica::new(0, 0, 3);
+        r.status = Status::Normal;
+        r.commit_stall_probability = tigerbeetle_core::stdx::prng::ratio(1, 1); // always stall
+
+        let op1 = r.primary_pipeline_prepare(1, 1, crate::Operation::NOOP, &[], 0).unwrap();
+        let op2 = r.primary_pipeline_prepare(2, 2, crate::Operation::NOOP, &[], 0).unwrap();
+        for op in [op1, op2] {
+            let checksum = r.journal.header_with_op(op).unwrap().checksum();
+            r.on_prepare_ok(op, checksum, r.checkpoint_id_for_op(op).unwrap(), r.commit_min, 1);
+        }
+
+        // Committing op 1: backups have zero lag (commit_min still 0), but a
+        // committed successor (op 2) is queued → stall exactly one tick.
+        r.commit_dispatch_enter();
+        assert_eq!(r.commit_stage, CommitStage::Stall);
+        assert!(r.commit_dispatch_entered);
+        assert_eq!(r.commit_min, 0);
+        assert!(r.commit_stall_timeout.active);
+        assert_eq!(r.commit_stall_timeout.ticks, 1);
+
+        // After the tick, op 1 commits; op 2 commits with no successor left and
+        // no built-up lag, so the pipeline drains to idle without another stall.
+        assert!(r.commit_stall_timeout.tick());
+        r.on_commit_stall_timeout();
+        assert_eq!(r.commit_stage, CommitStage::Idle);
+        assert!(!r.commit_dispatch_entered);
+        assert_eq!(r.commit_min, 2);
+        assert!(!r.commit_stall_timeout.active);
+        // Commit op-2's fresh-primary parking pulse (op 3).
+        commit_parking_pulse(&mut r);
     }
 
     #[test]
@@ -12869,7 +13165,7 @@ mod tests {
         r.status = Status::Normal;
         let op = r.primary_pipeline_prepare(1, 1, crate::Operation::NOOP, &[], 0).unwrap();
         let checksum = r.journal.header_with_op(op).unwrap().checksum();
-        r.on_prepare_ok(op, checksum, r.checkpoint_id_for_op(op).unwrap(), 1); // replica 1 → quorum (with the self-ack)
+        r.on_prepare_ok(op, checksum, r.checkpoint_id_for_op(op).unwrap(), r.commit_min, 1); // replica 1 → quorum (with the self-ack)
 
         // Enter dispatch (sets commit_dispatch_entered via internal state).
         r.commit_dispatch_enter();
@@ -12982,7 +13278,7 @@ mod tests {
             r.primary_pipeline_prepare(1, 1, crate::Operation::CREATE_ACCOUNTS, &[], 0).unwrap();
         assert_eq!(op, 1);
         let checksum = r.journal.header_with_op(op).unwrap().checksum();
-        r.on_prepare_ok(op, checksum, r.checkpoint_id_for_op(op).unwrap(), 1);
+        r.on_prepare_ok(op, checksum, r.checkpoint_id_for_op(op).unwrap(), r.commit_min, 1);
         r.commit_dispatch_enter();
 
         assert_eq!(r.commit_min, 1);
@@ -13019,7 +13315,7 @@ mod tests {
             "op {op} is within the checkpoint's compaction window (trigger {trigger})"
         );
         let checksum = r.journal.header_with_op(op).unwrap().checksum();
-        r.on_prepare_ok(op, checksum, r.checkpoint_id_for_op(op).unwrap(), 1);
+        r.on_prepare_ok(op, checksum, r.checkpoint_id_for_op(op).unwrap(), r.commit_min, 1);
         r.commit_dispatch_enter();
 
         assert_eq!(r.commit_min, op);
@@ -13039,7 +13335,7 @@ mod tests {
         let op = r.primary_pipeline_prepare(1, 1, crate::Operation::NOOP, &[], 0).unwrap();
         assert_eq!(op, 1);
         let checksum = r.journal.header_with_op(op).unwrap().checksum();
-        r.on_prepare_ok(op, checksum, r.checkpoint_id_for_op(op).unwrap(), 1);
+        r.on_prepare_ok(op, checksum, r.checkpoint_id_for_op(op).unwrap(), r.commit_min, 1);
         r.commit_dispatch_enter();
 
         assert_eq!(r.commit_min, 1);
@@ -13345,7 +13641,7 @@ mod tests {
             1
         );
         let checksum = r.journal.header_with_op(1).expect("prepare").checksum();
-        r.on_prepare_ok(1, checksum, r.checkpoint_id_for_op(1).unwrap(), 1);
+        r.on_prepare_ok(1, checksum, r.checkpoint_id_for_op(1).unwrap(), r.commit_min, 1);
         r.commit_dispatch_enter();
         assert_eq!(r.commit_min, 1);
         assert!(r.client_sessions.get(41).is_some());
@@ -13374,7 +13670,7 @@ mod tests {
         // a backup quorum and commit it through the dispatch pipeline so the
         // client ops below stay contiguous (op 3, op 4).
         let pulse_checksum = r.journal.header_with_op(2).expect("parking pulse").checksum();
-        r.on_prepare_ok(2, pulse_checksum, r.checkpoint_id_for_op(2).unwrap(), 1);
+        r.on_prepare_ok(2, pulse_checksum, r.checkpoint_id_for_op(2).unwrap(), r.commit_min, 1);
         r.commit_dispatch_enter();
         assert_eq!(r.commit_min, 2);
 
@@ -13389,7 +13685,7 @@ mod tests {
             3,
         );
         let checksum = r.journal.header_with_op(3).expect("prepare").checksum();
-        r.on_prepare_ok(3, checksum, r.checkpoint_id_for_op(3).unwrap(), 1);
+        r.on_prepare_ok(3, checksum, r.checkpoint_id_for_op(3).unwrap(), r.commit_min, 1);
         r.commit_dispatch_enter();
         assert_eq!(r.commit_min, 3);
         assert_eq!(r.state_machine.commit_timestamp(), 3);
@@ -13415,7 +13711,7 @@ mod tests {
             4,
         );
         let checksum = r.journal.header_with_op(4).expect("prepare").checksum();
-        r.on_prepare_ok(4, checksum, r.checkpoint_id_for_op(4).unwrap(), 1);
+        r.on_prepare_ok(4, checksum, r.checkpoint_id_for_op(4).unwrap(), r.commit_min, 1);
         r.commit_dispatch_enter();
         assert_eq!(r.commit_min, 4);
         assert_eq!(r.state_machine.commit_timestamp(), 4);
@@ -13574,7 +13870,7 @@ mod tests {
             1
         );
         let checksum = r.journal.header_with_op(1).expect("prepare").checksum();
-        r.on_prepare_ok(1, checksum, r.checkpoint_id_for_op(1).unwrap(), 1);
+        r.on_prepare_ok(1, checksum, r.checkpoint_id_for_op(1).unwrap(), r.commit_min, 1);
         r.commit_dispatch_enter();
         assert_eq!(r.commit_min, 1);
         r.poll_client_replies();
@@ -13582,7 +13878,7 @@ mod tests {
         // The register's commit injected the fresh primary's parking pulse; give
         // it a backup quorum and commit it so the reconfiguration is op 3.
         let pulse_checksum = r.journal.header_with_op(2).expect("parking pulse").checksum();
-        r.on_prepare_ok(2, pulse_checksum, r.checkpoint_id_for_op(2).unwrap(), 1);
+        r.on_prepare_ok(2, pulse_checksum, r.checkpoint_id_for_op(2).unwrap(), r.commit_min, 1);
         r.commit_dispatch_enter();
         assert_eq!(r.commit_min, 2);
 
@@ -13606,7 +13902,7 @@ mod tests {
             3
         );
         let checksum = r.journal.header_with_op(3).expect("prepare").checksum();
-        r.on_prepare_ok(3, checksum, r.checkpoint_id_for_op(3).unwrap(), 1);
+        r.on_prepare_ok(3, checksum, r.checkpoint_id_for_op(3).unwrap(), r.commit_min, 1);
         r.commit_dispatch_enter();
         assert_eq!(r.commit_min, 3);
         r.poll_client_replies();
@@ -13742,7 +14038,7 @@ mod tests {
         body[..4].copy_from_slice(&release.value.to_le_bytes());
         let op = r.primary_pipeline_prepare(0, 0, crate::Operation::UPGRADE, &body, 0).unwrap();
         let checksum = r.journal.header_with_op(op).expect("prepare").checksum();
-        r.on_prepare_ok(op, checksum, r.checkpoint_id_for_op(op).unwrap(), 1);
+        r.on_prepare_ok(op, checksum, r.checkpoint_id_for_op(op).unwrap(), r.commit_min, 1);
         r.commit_dispatch_enter();
         r.poll_client_replies();
 
