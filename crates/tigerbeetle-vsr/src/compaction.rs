@@ -1974,6 +1974,7 @@ mod tests {
             write_iops_max: 0,
             free_set_blocks_count: Some(4096),
             free_set_blocks_capacity: None,
+            missing_blocks_max: constants::GRID_MISSING_BLOCKS_MAX as usize,
         })
     }
 
@@ -1988,6 +1989,7 @@ mod tests {
             write_iops_max: 2,
             free_set_blocks_count: Some(4096),
             free_set_blocks_capacity: None,
+            missing_blocks_max: constants::GRID_MISSING_BLOCKS_MAX as usize,
         });
         grid.attach_superblock_view(SuperBlockView {
             cluster: 0xDEAD_BEEF_u128,

@@ -10,9 +10,10 @@
 //! Remaining upstream surface:
 //!
 //! TODO(port): `src/vsr/grid.zig` — `cancel` (needs storage next-tick machinery),
-//! `blocks_missing` repair bookkeeping (currently `repair_block`/`checkpoint_durable`
-//! skip its hooks), `checkpoint_id`/`checkpoint_durable` stamps on reads/writes,
-//! `verify_table`/`assert_coherent`/`madv_dont_dump`.
+//! `checkpoint_id`/`checkpoint_durable` stamps on reads/writes,
+//! `verify_table`/`assert_coherent`/`madv_dont_dump`. `blocks_missing` single-block
+//! repair bookkeeping is ported (see `crate::grid_blocks_missing`); the table-sync half
+//! (_sync_table_, scrubber) is deferred with state-sync.
 //!
 //! DEVIATION: the grid does not own a superblock; the owner pushes a
 //! [`SuperBlockView`] snapshot (`cluster`/`release`/`storage_size`) via
@@ -55,6 +56,7 @@ use crate::checkpoint_trailer::{
     Callback, CheckpointTrailer, Chunk, TrailerType, block_count_for_trailer_size,
 };
 use crate::command::Command;
+use crate::grid_blocks_missing::GridBlocksMissing;
 use crate::message_header::{self, TypedHeader};
 use crate::multiversion::Release;
 use crate::schema;
@@ -141,6 +143,10 @@ pub struct GridOptions {
     /// `superblock.working.vsr_state.checkpoint.storage_size`; our grid does not own
     /// the superblock (see the module docs), so the owner passes the capacity in.
     pub free_set_blocks_capacity: Option<usize>,
+    /// Maximum concurrent single-block repairs tracked in [`Grid::blocks_missing`]
+    /// (upstream `missing_blocks_max`, `constants.grid_missing_blocks_max`). Zero disables
+    /// faulty-block tracking (the grid-equivalent of an empty capacity).
+    pub missing_blocks_max: usize,
 }
 
 /// Whether an address is currently being written, and why
@@ -456,6 +462,10 @@ pub struct Grid {
     /// `(arena index, IOP slot)` of reads executing on storage, FIFO.
     read_exec_order: VecDeque<(usize, usize)>,
 
+    /// Corrupt/missing blocks awaiting repair from the cluster (upstream
+    /// `blocks_missing`).
+    blocks_missing: GridBlocksMissing,
+
     next_write_token: u32,
     next_read_token: u32,
 
@@ -552,6 +562,7 @@ impl Grid {
             read_pending_queue: VecDeque::new(),
             read_global_queue: VecDeque::new(),
             read_exec_order: VecDeque::new(),
+            blocks_missing: GridBlocksMissing::new(options.missing_blocks_max),
             next_write_token: 0,
             next_read_token: 0,
             pending_reap: Vec::new(),
@@ -731,6 +742,27 @@ impl Grid {
             .collect()
     }
 
+    /// Number of blocks tracked as missing/corrupt (upstream
+    /// `grid.blocks_missing.faulty_blocks.count()`).
+    #[must_use]
+    pub fn blocks_missing_count(&self) -> usize {
+        self.blocks_missing.count()
+    }
+
+    /// The `BlockRequest` for the fault at `fault_index`, `None` while it is being
+    /// written/aborted (upstream `grid.blocks_missing.fault_at_index`).
+    #[must_use]
+    pub fn fault_at_index(&self, fault_index: usize) -> Option<crate::BlockRequest> {
+        self.blocks_missing.fault_at_index(fault_index)
+    }
+
+    /// Whether `address`/`checksum` is queued as a waiting repair (upstream
+    /// `Grid.repair_block_waiting`, grid.zig:866).
+    #[must_use]
+    pub fn repair_block_waiting(&self, address: u64, checksum: u128) -> bool {
+        self.blocks_missing.block_waiting(address, checksum)
+    }
+
     /// Contents of a block (read-only view for tests and upcoming slices).
     #[must_use]
     pub fn block(&self, location: u32) -> &[u8] {
@@ -844,13 +876,15 @@ impl Grid {
     ///
     /// # Panics
     /// Asserts the block carries `address` in its header, the address is neither being
-    /// written, read nor free.
+    /// written, read nor free, and is not queued for repair (upstream
+    /// `src/vsr/grid.zig:907`).
     pub fn create_block(&mut self, storage: &mut dyn Storage, address: u64, location: u32) -> u32 {
         let header = schema::header_from_block(&self.blocks[location as usize]);
         assert_eq!(header.address, address);
 
         // TODO(port): src/vsr/grid.zig create_block — checkpoint/free-set block-type
-        // coupling, cluster/release checks, blocks_missing hooks.
+        // coupling, cluster/release checks.
+        assert!(!self.blocks_missing.block_waiting(address, header.checksum));
         assert_eq!(
             self.writing(address, Some(location)),
             Writing::NotWriting,
@@ -871,10 +905,14 @@ impl Grid {
     /// Write a block that should already exist but maybe doesn't (disk fault or state
     /// sync miss). Consumes the caller's reference like [`Grid::create_block`].
     ///
-    /// TODO(port): src/vsr/grid.zig repair_block — `blocks_missing` bookkeeping.
+    /// The block must already be recorded in [`Grid::blocks_missing`] as `waiting`
+    /// (queued by a faulting read, upstream grid.zig:1506); `write_commence` moves it to
+    /// `writing` for the duration of the repair, and [`Grid::complete_write`] removes it
+    /// on completion.
     ///
     /// # Panics
-    /// Same asserts as [`Grid::create_block`] (the address must not be free either).
+    /// Asserts the address is not being written/free, is not actively read, and is queued
+    /// for repair (`block_waiting`).
     pub fn repair_block(&mut self, storage: &mut dyn Storage, location: u32) -> u32 {
         let header = schema::header_from_block(&self.blocks[location as usize]);
         let address = header.address;
@@ -886,6 +924,15 @@ impl Grid {
         );
         assert!(!self.free_set.is_free(address));
         self.assert_not_reading(address);
+
+        // Upstream grid.zig:887-890: only blocks known to be faulty may be repaired,
+        // and the repair begins the moment the write is queued.
+        let checksum = header.checksum;
+        assert!(
+            self.blocks_missing.block_waiting(address, checksum),
+            "repair_block requires a tracked faulty block (address={address})"
+        );
+        self.blocks_missing.write_commence(address, checksum);
 
         let token = self.next_write_token;
         self.next_write_token += 1;
@@ -939,9 +986,18 @@ impl Grid {
 
         // Insert the written block into the cache, then hand the caller a fresh block:
         self.cache_upsert(op.address, op.location);
+        // Capture the written checksum while the location is still stable (grid.zig:1047
+        // reads it off the written block before unref).
+        let written_checksum =
+            schema::header_from_block(&self.blocks[op.location as usize]).checksum;
         // Usually references=1, but reading from the write queue keeps it higher.
         self.block_unref(op.location);
         let fresh_location = self.get_block();
+
+        // A completed repairing write heals the tracked fault.
+        if op.repair {
+            self.blocks_missing.write_complete(op.address, written_checksum);
+        }
 
         // Start a queued write before delivering the event, so the queue is never
         // preempted (upstream ordering).
@@ -1262,6 +1318,12 @@ impl Grid {
         }
 
         if root.coherent && result != ReadBlockResult::Valid {
+            // grid.zig:1506 — a faulting coherent read also enqueues a persistent
+            // repair (stored back to disk when the block arrives), not just a
+            // transient fulfill.
+            if self.blocks_missing.repair_blocks_available() > 0 {
+                self.blocks_missing.repair_block(root.address, root.checksum);
+            }
             root.state = ReadState::ParkedGlobal;
             self.reads[root_id] = Some(root);
             self.read_global_queue.push_back(root_id);
@@ -1526,8 +1588,9 @@ impl Grid {
     /// Mark the current checkpoint durable (upstream
     /// `GridType.checkpoint_durable`, which awaits repair writes first).
     ///
-    /// TODO(port): src/vsr/grid.zig checkpoint_durable — upstream waits for outstanding
-    /// repair writes (`blocks_missing`) here; we require quiet write queues instead.
+    /// Upstream waits for outstanding repair writes to blocks about to be freed; this
+    /// port guarantees the write queues are idle (asserted below), so at most waiting
+    /// faults to-be-freed are dropped and no write is ever `aborting`.
     ///
     /// Completes with [`Event::CheckpointDurableDone`].
     ///
@@ -1537,6 +1600,13 @@ impl Grid {
         assert!(!self.free_set.checkpoint_durable());
         assert!(self.write_queue.is_empty());
         assert!(self.writes_exec.iter().all(Option::is_none));
+        // Upstream grid.zig:548-561: release waiting faults to blocks about to be freed,
+        // then (absent any aborting writes) complete immediately.
+        self.blocks_missing.checkpoint_durable_commence(&self.free_set);
+        assert!(
+            self.blocks_missing.checkpoint_durable_complete(),
+            "the port forbids in-flight repair writes at checkpoint-durable"
+        );
         self.free_set.mark_checkpoint_durable();
         self.events.push_back(Event::CheckpointDurableDone);
     }
@@ -2128,6 +2198,9 @@ mod tests {
     /// `SHARD_BITS`).
     const FREE_SET_BLOCKS: usize = 2 * SHARD_BITS;
 
+    /// Faulty-block repair capacity for the test grids.
+    const MISSING_BLOCKS_MAX: usize = 8;
+
     /// Storage image size for the single-block-trailer round trip.
     const STORAGE_BLOCKS_CAPACITY: u64 = 256;
 
@@ -2142,6 +2215,7 @@ mod tests {
             write_iops_max,
             free_set_blocks_count: Some(FREE_SET_BLOCKS),
             free_set_blocks_capacity: None,
+            missing_blocks_max: MISSING_BLOCKS_MAX,
         }
     }
 
@@ -2157,6 +2231,7 @@ mod tests {
             write_iops_max: 0,
             free_set_blocks_count: None,
             free_set_blocks_capacity: None,
+            missing_blocks_max: MISSING_BLOCKS_MAX,
         })
     }
 
@@ -2644,6 +2719,58 @@ mod tests {
         }
     }
 
+    #[test]
+    fn coherent_fault_is_repair_written_and_pruned() {
+        let mut env = Env::new(READ_IOPS_MAX, WRITE_IOPS_MAX);
+        let address = acquire_address(&mut env.grid);
+        let (location, expected, checksum) = build_block(&mut env.grid, address);
+        env.grid.create_block(&mut env.storage, address, location);
+        env.grid.poll(&mut env.storage);
+        let _ = env.grid.take_events();
+
+        // Latent sector error: the coherent read parks role=global (nothing to
+        // serve) and the grid records a persistent repair for `address`.
+        env.storage.faulty_sectors.extend(Env::sectors(address));
+        env.grid.read_block(&mut env.storage, address, checksum, true, read_options(false));
+        env.grid.poll(&mut env.storage);
+        assert!(env.grid.take_events().is_empty(), "parked for remote repair");
+        assert_eq!(env.grid.blocks_missing_count(), 1);
+        let request = env.grid.fault_at_index(0).expect("tracked fault");
+        assert_eq!((request.block_address, request.block_checksum), (address, checksum));
+        assert!(env.grid.repair_block_waiting(address, checksum));
+        assert!(!env.grid.repair_block_waiting(address, checksum + 1));
+
+        // The remote block arrives. First resolve the parked reader (`on_block` order),
+        // then store the block back to disk via `repair_block` — which consumes a caller
+        // block ref like `create_block`.
+        assert!(env.grid.fulfill_block(&expected));
+        let (grid, storage) = (&mut env.grid, &mut env.storage);
+        let destination = grid.get_block();
+        grid.block_mut(destination).copy_from_slice(&expected);
+        let token = grid.repair_block(storage, destination);
+        grid.poll(storage);
+        let events = grid.take_events();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, Event::WriteDone { token: done_token, .. } if *done_token == token)),
+            "repair write completes"
+        );
+
+        // The fault is pruned (grid.zig:1047 `write_complete`), so a later
+        // coherent read no longer tracks a repair. The disk now holds the good
+        // bytes: unfault the sector the way upstream storage tests do, and the
+        // read resolves from storage.
+        assert_eq!(env.grid.blocks_missing_count(), 0);
+        assert!(!env.grid.repair_block_waiting(address, checksum));
+        env.storage.faulty_sectors.clear();
+        env.grid.read_block(&mut env.storage, address, checksum, true, read_options(false));
+        env.grid.poll(&mut env.storage);
+        let events = env.grid.take_events();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], Event::ReadDone { result: ReadBlockResult::Valid, .. }));
+    }
+
     #[should_panic(expected = "already being written")]
     #[test]
     fn create_twice_same_address_panics() {
@@ -2711,6 +2838,7 @@ mod tests {
             write_iops_max: WRITE_IOPS_MAX,
             free_set_blocks_count: None,
             free_set_blocks_capacity: Some(blocks_capacity),
+            missing_blocks_max: MISSING_BLOCKS_MAX,
         })
     }
 
@@ -2950,6 +3078,7 @@ mod tests {
             write_iops_max: WRITE_IOPS_MAX,
             free_set_blocks_count: None,
             free_set_blocks_capacity: Some(CAPACITY),
+            missing_blocks_max: MISSING_BLOCKS_MAX,
         });
         grid.attach_superblock_view(super::SuperBlockView {
             cluster,
@@ -3003,6 +3132,7 @@ mod tests {
             write_iops_max: WRITE_IOPS_MAX,
             free_set_blocks_count: None,
             free_set_blocks_capacity: Some(CAPACITY),
+            missing_blocks_max: MISSING_BLOCKS_MAX,
         });
         reopened.attach_superblock_view(super::SuperBlockView {
             cluster,

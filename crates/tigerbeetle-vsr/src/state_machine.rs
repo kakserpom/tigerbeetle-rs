@@ -3536,6 +3536,7 @@ mod tests {
             write_iops_max: WRITE_IOPS_MAX,
             free_set_blocks_count: None,
             free_set_blocks_capacity: Some(FREE_SET_BLOCKS),
+            missing_blocks_max: constants::GRID_MISSING_BLOCKS_MAX as usize,
         }
     }
 

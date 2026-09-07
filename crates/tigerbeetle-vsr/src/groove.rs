@@ -2443,6 +2443,7 @@ mod tests {
             write_iops_max: 2,
             free_set_blocks_count: Some(FREE_SET_BLOCKS),
             free_set_blocks_capacity: None,
+            missing_blocks_max: constants::GRID_MISSING_BLOCKS_MAX as usize,
         });
         let addresses = acquire_addresses(&mut grid, blocks);
         (grid, addresses)

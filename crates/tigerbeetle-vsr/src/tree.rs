@@ -1219,6 +1219,7 @@ mod tests {
             write_iops_max: 2,
             free_set_blocks_count: Some(FREE_SET_BLOCKS),
             free_set_blocks_capacity: None,
+            missing_blocks_max: constants::GRID_MISSING_BLOCKS_MAX as usize,
         });
         let reservation = grid.reserve(blocks);
         let addresses = (0..blocks).map(|_| grid.acquire(reservation)).collect();

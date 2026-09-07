@@ -17,6 +17,7 @@ pub mod compaction;
 pub mod fault_detector;
 pub mod forest;
 pub mod grid;
+pub mod grid_blocks_missing;
 pub mod groove;
 pub mod io;
 pub mod journal;
