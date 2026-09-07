@@ -3480,9 +3480,11 @@ mod tests {
 
     use crate::Zone;
     use crate::grid::{GridOpenReferences, GridOptions, SuperBlockView};
+    use crate::groove::{IdTimestampPrefetchKey, TimestampPrefetchKey};
     use crate::multiversion::Release;
     use crate::storage::MemoryStorage;
     use crate::superblock::DATA_FILE_SIZE_MIN;
+    use tigerbeetle_lsm::tree::SNAPSHOT_LATEST;
 
     // ── StateMachine tests ───────────────────────────────────────────────
 
@@ -3635,6 +3637,310 @@ mod tests {
             }
         }
         assert!(done, "open must complete");
+    }
+
+    // ── groove prefetch seam ↔ state-machine store cross-validation ──────
+    //
+    // `StateMachine` executes against the temporary HashMap stores until the
+    // forest wiring lands; the groove prefetch seam resolves its key-set
+    // through the objects caches + mutable tables. The tests below prove the
+    // seam and the stores agree: mirror the same committed state into both and
+    // assert every key `prefetch_create_accounts`/`prefetch_create_transfers`
+    // would enqueue resolves to the identical objects.
+
+    /// Mirror a state machine's committed stores into the grooves of a fresh
+    /// (unopened) [`Forest`]: every live account/transfer/pending row plus each
+    /// orphaned transfer id (tagged in the transfers objects cache with a
+    /// zeroed object, upstream `groove.zig:1935-1949`).
+    fn mirror_committed_state(forest: &mut Forest, sm: &StateMachine) {
+        for account in sm.accounts.values() {
+            forest.accounts.insert(account);
+        }
+        for transfer in sm.transfers.values() {
+            forest.transfers.insert(transfer);
+        }
+        for pending in sm.transfers_pending.values() {
+            forest.transfers_pending.insert(pending);
+        }
+        for &id in &sm.transfers_orphaned {
+            forest.transfers.insert_orphaned_object(id);
+        }
+    }
+
+    fn ids(keys: &PrefetchKeys<u128>) -> Vec<IdTimestampPrefetchKey> {
+        keys.iter().copied().map(IdTimestampPrefetchKey::Id).collect()
+    }
+
+    fn timestamps(keys: &PrefetchKeys<u64>) -> Vec<IdTimestampPrefetchKey> {
+        keys.iter().copied().map(IdTimestampPrefetchKey::Timestamp).collect()
+    }
+
+    /// Assert the transfers groove's settled objects cache agrees with the
+    /// `transfers`/`transfers_orphaned` stores for every enqueued id: a live
+    /// committed transfer resolves to the identical object, an orphaned id to
+    /// a zeroed (used-and-deleted) object, and an absent id to nothing.
+    fn assert_transfers_parity(forest: &mut Forest, sm: &StateMachine, ids: &PrefetchKeys<u128>) {
+        for &id in ids.iter() {
+            match forest.transfers.get(id) {
+                Some(object) if object.timestamp == 0 => {
+                    assert!(sm.transfers_orphaned.contains(&id), "orphan id {id:#x}");
+                    assert_eq!(object.id, id);
+                    assert!(!sm.transfers.contains_key(&id), "orphans are disjoint from transfers");
+                }
+                Some(object) => {
+                    let store = sm.transfers.get(&id).expect("found transfer must be committed");
+                    assert_eq!(object, store);
+                }
+                None => {
+                    assert!(!sm.transfers.contains_key(&id), "missing id {id:#x}");
+                    assert!(!sm.transfers_orphaned.contains(&id), "missing id {id:#x}");
+                }
+            }
+        }
+    }
+
+    /// For a timestamp key enqueued into the transfers groove (an imported
+    /// account batch looking for a transfer with the same timestamp), the seam's
+    /// resolution must name exactly the transfer the store's timestamp index does.
+    fn assert_transfers_by_timestamp_parity(
+        forest: &mut Forest,
+        sm: &StateMachine,
+        timestamps: &PrefetchKeys<u64>,
+    ) {
+        for &ts in timestamps.iter() {
+            match sm.transfers_by_timestamp.get(&ts) {
+                Some(&id) => {
+                    assert_eq!(forest.transfers.get(id), sm.transfers.get(&id), "ts {ts}");
+                }
+                None => assert!(!sm.transfers_by_timestamp.contains_key(&ts), "ts {ts}"),
+            }
+        }
+    }
+
+    /// Assert the accounts groove's settled objects cache agrees with the `accounts`
+    /// store for every enqueued id.
+    fn assert_accounts_parity(forest: &mut Forest, sm: &StateMachine, ids: &PrefetchKeys<u128>) {
+        for &id in ids.iter() {
+            assert_eq!(forest.accounts.get(id), sm.accounts.get(&id), "id {id:#x}");
+        }
+    }
+
+    /// For a timestamp key enqueued into the accounts groove (an imported
+    /// transfers batch looking for an account with the same timestamp), the seam's
+    /// resolution must name exactly the account the store's timestamp index does.
+    fn assert_accounts_by_timestamp_parity(
+        forest: &mut Forest,
+        sm: &StateMachine,
+        timestamps: &PrefetchKeys<u64>,
+    ) {
+        for &ts in timestamps.iter() {
+            match sm.accounts_by_timestamp.get(&ts) {
+                Some(&id) => {
+                    assert_eq!(forest.accounts.get(id), sm.accounts.get(&id), "ts {ts}");
+                }
+                None => assert!(!sm.accounts_by_timestamp.contains_key(&ts), "ts {ts}"),
+            }
+        }
+    }
+
+    /// The seam resolves every id a `create_transfers` batch enqueues — a post/
+    /// void's id plus its pending id, a retried (orphaned) id, a regular
+    /// transfer's accounts and a missing account — to exactly what the state
+    /// machine's stores hold. Mirrors the upstream prefetch order
+    /// (state_machine.zig:1323-1329 for the transfers groove, 1352-1371 for
+    /// the accounts + transfers_pending grooves).
+    #[test]
+    fn prefetch_seam_matches_state_machine_store_for_create_transfers_batch() {
+        let mut sm = StateMachine::default();
+        pending_setup(&mut sm, 50, TransferFlags::default());
+
+        // Poison id 300: a transfer whose credit account is missing fails
+        // transiently and orphans its id (state_machine.zig:3215-3252).
+        let body = sm.create_transfers(
+            &[Transfer {
+                id: 300,
+                debit_account_id: 1,
+                credit_account_id: 3,
+                amount: 5,
+                ledger: 1,
+                code: 1,
+                ..Transfer::default()
+            }],
+            30,
+        );
+        assert_eq!(reply_status(&body), CreateTransferStatus::CreditAccountNotFound as u32);
+        assert!(sm.transfers_orphaned.contains(&300));
+
+        let mut forest = Forest::init(test_superblock(), forest_grid_options(), 32);
+        mirror_committed_state(&mut forest, &sm);
+
+        // A batch mixing a post of the committed pending, a retry of the
+        // poisoned id 300, and a transfer naming a missing account (id 3).
+        let post = post_event(201, 50);
+        let retry = Transfer { id: 300, ..t(1, 2, 1) };
+        let missing_account = t(3, 2, 1);
+        let keys = prefetch_create_transfers(&[post, retry, missing_account], |id| {
+            sm.transfers.get(&id).copied()
+        });
+        assert!(keys.transfer_ids.contains(201));
+        assert!(keys.transfer_ids.contains(1002));
+        assert!(keys.transfer_ids.contains(300));
+        assert!(keys.transfer_ids.contains(3002));
+        assert!(keys.pending_timestamps.contains(20));
+        assert!(keys.account_ids.contains(1));
+        assert!(keys.account_ids.contains(2));
+        assert!(keys.account_ids.contains(3));
+
+        let mut storage = forest_storage();
+
+        // Phase 1: the transfers groove.
+        forest.transfers.prefetch_setup(SNAPSHOT_LATEST - 1);
+        for key in ids(&keys.transfer_ids) {
+            forest.transfers.prefetch_enqueue(
+                &mut forest.grid,
+                &mut forest.transfers_scratch.objects,
+                key,
+            );
+        }
+        forest.transfers.prefetch(&mut forest.grid, &mut storage);
+        assert_transfers_parity(&mut forest, &sm, &keys.transfer_ids);
+
+        // Phase 2: the accounts groove.
+        forest.accounts.prefetch_setup(SNAPSHOT_LATEST - 1);
+        for key in ids(&keys.account_ids) {
+            forest.accounts.prefetch_enqueue(
+                &mut forest.grid,
+                &mut forest.accounts_scratch.objects,
+                key,
+            );
+        }
+        forest.accounts.prefetch(&mut forest.grid, &mut storage);
+        assert_accounts_parity(&mut forest, &sm, &keys.account_ids);
+
+        // Phase 2: the transfers_pending groove (pending timestamp keys).
+        forest.transfers_pending.prefetch_setup(SNAPSHOT_LATEST - 1);
+        for &ts in keys.pending_timestamps.iter() {
+            forest
+                .transfers_pending
+                .prefetch_enqueue(&mut forest.grid, TimestampPrefetchKey::Timestamp(ts));
+        }
+        forest.transfers_pending.prefetch(&mut forest.grid, &mut storage);
+        for &ts in keys.pending_timestamps.iter() {
+            assert_eq!(
+                forest.transfers_pending.get(ts),
+                sm.transfers_pending.get(&ts),
+                "pending row {ts}"
+            );
+        }
+
+        // The missing account and the two missing transfer ids leave nothing
+        // behind in the seams' caches (the store has nothing either).
+        assert!(!forest.accounts.has(3));
+        assert!(!forest.transfers.has(201));
+        assert!(!forest.transfers.has(3002));
+    }
+
+    /// Imported batches enqueue *timestamp* keys into the opposing groove (an
+    /// imported account looks for a transfer with the same timestamp and a
+    /// non-imported transfer batch looks for accounts, state_machine.zig:
+    /// 1283-1288, 1374-1385). The seam's timestamp resolution must name the
+    /// same object the stores' timestamp indexes do, including an in-range gap
+    /// and an out-of-range key.
+    #[test]
+    fn prefetch_seam_matches_state_machine_store_for_imported_timestamp_keys() {
+        let mut sm = StateMachine::default();
+        // Native accounts 1/2 (ts 10, 11) for the imported transfers to name.
+        let _ = sm.create_accounts(
+            &[
+                Account { id: 1, ledger: 1, code: 1, ..Account::default() },
+                Account { id: 2, ledger: 1, code: 1, ..Account::default() },
+            ],
+            10,
+        );
+        // Imported accounts 7 (ts 100) and 8 (ts 200).
+        let _ = sm.create_accounts(&[imported_account(7, 100)], 20);
+        let _ = sm.create_accounts(&[imported_account(8, 200)], 30);
+        // Imported transfers 5 (ts 21) and 6 (ts 500), both postdating the accounts.
+        let _ = sm.create_transfers(
+            &[
+                imported_transfer(5, 21, TransferFlags::IMPORTED),
+                imported_transfer(6, 500, TransferFlags::IMPORTED),
+            ],
+            40,
+        );
+
+        let mut forest = Forest::init(test_superblock(), forest_grid_options(), 32);
+        mirror_committed_state(&mut forest, &sm);
+        let mut storage = forest_storage();
+
+        // An imported create_accounts batch keys the account ids and — because
+        // it is imported — the account timestamps, resolved against the
+        // *transfers* groove. ts 21 collides with transfer 5; ts 150 falls in
+        // the transfers key range but is absent; ts 600 is out of range.
+        let account_events =
+            [imported_account(70, 21), imported_account(71, 150), imported_account(72, 600)];
+        let account_keys = prefetch_create_accounts(&account_events);
+
+        forest.accounts.prefetch_setup(SNAPSHOT_LATEST - 1);
+        for key in ids(&account_keys.account_ids) {
+            forest.accounts.prefetch_enqueue(
+                &mut forest.grid,
+                &mut forest.accounts_scratch.objects,
+                key,
+            );
+        }
+        forest.accounts.prefetch(&mut forest.grid, &mut storage);
+        assert_accounts_parity(&mut forest, &sm, &account_keys.account_ids);
+
+        forest.transfers.prefetch_setup(SNAPSHOT_LATEST - 1);
+        for key in timestamps(&account_keys.transfer_timestamps) {
+            forest.transfers.prefetch_enqueue(
+                &mut forest.grid,
+                &mut forest.transfers_scratch.objects,
+                key,
+            );
+        }
+        forest.transfers.prefetch(&mut forest.grid, &mut storage);
+        assert_transfers_by_timestamp_parity(&mut forest, &sm, &account_keys.transfer_timestamps);
+
+        // An imported create_transfers batch keys the transfer ids, their
+        // accounts, and — because it is imported — their timestamps, resolved
+        // against the *accounts* groove. ts 100 collides with account 7; ts
+        // 150 is an in-range gap; ts 550 is out of the accounts key range
+        // [10, 200].
+        let transfer_events = [
+            imported_transfer(90, 100, TransferFlags::IMPORTED),
+            imported_transfer(91, 150, TransferFlags::IMPORTED),
+            imported_transfer(92, 550, TransferFlags::IMPORTED),
+        ];
+        let transfer_keys =
+            prefetch_create_transfers(&transfer_events, |id| sm.transfers.get(&id).copied());
+
+        forest.transfers.prefetch_setup(SNAPSHOT_LATEST - 1);
+        for key in ids(&transfer_keys.transfer_ids) {
+            forest.transfers.prefetch_enqueue(
+                &mut forest.grid,
+                &mut forest.transfers_scratch.objects,
+                key,
+            );
+        }
+        forest.transfers.prefetch(&mut forest.grid, &mut storage);
+        assert_transfers_parity(&mut forest, &sm, &transfer_keys.transfer_ids);
+
+        forest.accounts.prefetch_setup(SNAPSHOT_LATEST - 1);
+        for key in ids(&transfer_keys.account_ids)
+            .into_iter()
+            .chain(timestamps(&transfer_keys.account_timestamps))
+        {
+            forest.accounts.prefetch_enqueue(
+                &mut forest.grid,
+                &mut forest.accounts_scratch.objects,
+                key,
+            );
+        }
+        forest.accounts.prefetch(&mut forest.grid, &mut storage);
+        assert_accounts_parity(&mut forest, &sm, &transfer_keys.account_ids);
+        assert_accounts_by_timestamp_parity(&mut forest, &sm, &transfer_keys.account_timestamps);
     }
 
     /// `StateMachine::checkpoint` flushes a mounted forest's manifest log and free set, and

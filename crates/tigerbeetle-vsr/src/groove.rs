@@ -2487,7 +2487,7 @@ impl TransferGroove {
     /// Tag the objects cache with a zeroed object so an orphaned id is findable by the
     /// primary key (upstream `groove.zig:1935-1949`).
     #[allow(dead_code)] // used by the prefetch seam; state-machine wiring is a later slice
-    fn insert_orphaned_object(&mut self, id: u128) {
+    pub(crate) fn insert_orphaned_object(&mut self, id: u128) {
         assert!(id != 0);
         assert!(id != u128::MAX);
         self.objects_cache.upsert(&Transfer { id, timestamp: 0, ..Transfer::default() });
