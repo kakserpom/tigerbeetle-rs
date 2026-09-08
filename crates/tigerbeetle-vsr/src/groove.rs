@@ -26,7 +26,8 @@
 use tigerbeetle_core::constants;
 use tigerbeetle_core::stdx::hash::{hash_inline_u64, hash_inline_u128};
 use tigerbeetle_core::types::{
-    Account, AccountFlags, Transfer, TransferFlags, TransferPending, TransferPendingStatus,
+    Account, AccountEvent, AccountFlags, Transfer, TransferFlags, TransferPending,
+    TransferPendingStatus,
 };
 use tigerbeetle_lsm::cache_map::{CacheMap, CacheMapOptions, CacheMapSpec, GetOrTombstone};
 use tigerbeetle_lsm::composite_key::{
@@ -480,6 +481,74 @@ impl BlockValue for TransferPending {
                 let mut padding = [0u8; 7];
                 padding.copy_from_slice(&bytes[9..16]);
                 padding
+            },
+        }
+    }
+}
+
+impl BlockValue for AccountEvent {
+    fn write_bytes(&self, buf: &mut [u8]) {
+        assert!(buf.len() >= 256);
+        buf[..16].copy_from_slice(&self.dr_account_id.to_le_bytes());
+        buf[16..32].copy_from_slice(&self.dr_debits_pending.to_le_bytes());
+        buf[32..48].copy_from_slice(&self.dr_debits_posted.to_le_bytes());
+        buf[48..64].copy_from_slice(&self.dr_credits_pending.to_le_bytes());
+        buf[64..80].copy_from_slice(&self.dr_credits_posted.to_le_bytes());
+        buf[80..96].copy_from_slice(&self.cr_account_id.to_le_bytes());
+        buf[96..112].copy_from_slice(&self.cr_debits_pending.to_le_bytes());
+        buf[112..128].copy_from_slice(&self.cr_debits_posted.to_le_bytes());
+        buf[128..144].copy_from_slice(&self.cr_credits_pending.to_le_bytes());
+        buf[144..160].copy_from_slice(&self.cr_credits_posted.to_le_bytes());
+        buf[160..168].copy_from_slice(&self.timestamp.to_le_bytes());
+        buf[168..176].copy_from_slice(&self.dr_account_timestamp.to_le_bytes());
+        buf[176..184].copy_from_slice(&self.cr_account_timestamp.to_le_bytes());
+        buf[184..186].copy_from_slice(&self.dr_account_flags.as_raw().to_le_bytes());
+        buf[186..188].copy_from_slice(&self.cr_account_flags.as_raw().to_le_bytes());
+        buf[188..190].copy_from_slice(&self.transfer_flags.as_raw().to_le_bytes());
+        buf[190..192].copy_from_slice(&self.transfer_pending_flags.as_raw().to_le_bytes());
+        buf[192..208].copy_from_slice(&self.transfer_pending_id.to_le_bytes());
+        buf[208..224].copy_from_slice(&self.amount_requested.to_le_bytes());
+        buf[224..240].copy_from_slice(&self.amount.to_le_bytes());
+        buf[240..244].copy_from_slice(&self.ledger.to_le_bytes());
+        buf[244] = self.transfer_pending_status as u8;
+        buf[245..256].copy_from_slice(&self.reserved);
+    }
+
+    fn from_bytes(bytes: &[u8]) -> Self {
+        Self {
+            dr_account_id: read_u128(bytes, 0),
+            dr_debits_pending: read_u128(bytes, 16),
+            dr_debits_posted: read_u128(bytes, 32),
+            dr_credits_pending: read_u128(bytes, 48),
+            dr_credits_posted: read_u128(bytes, 64),
+            cr_account_id: read_u128(bytes, 80),
+            cr_debits_pending: read_u128(bytes, 96),
+            cr_debits_posted: read_u128(bytes, 112),
+            cr_credits_pending: read_u128(bytes, 128),
+            cr_credits_posted: read_u128(bytes, 144),
+            timestamp: read_u64(bytes, 160),
+            dr_account_timestamp: read_u64(bytes, 168),
+            cr_account_timestamp: read_u64(bytes, 176),
+            dr_account_flags: AccountFlags::from_raw(read_u16(bytes, 184)),
+            cr_account_flags: AccountFlags::from_raw(read_u16(bytes, 186)),
+            transfer_flags: TransferFlags::from_raw(read_u16(bytes, 188)),
+            transfer_pending_flags: TransferFlags::from_raw(read_u16(bytes, 190)),
+            transfer_pending_id: read_u128(bytes, 192),
+            amount_requested: read_u128(bytes, 208),
+            amount: read_u128(bytes, 224),
+            ledger: read_u32(bytes, 240),
+            transfer_pending_status: match bytes[244] {
+                0 => TransferPendingStatus::None,
+                1 => TransferPendingStatus::Pending,
+                2 => TransferPendingStatus::Posted,
+                3 => TransferPendingStatus::Voided,
+                4 => TransferPendingStatus::Expired,
+                _ => panic!("invalid TransferPendingStatus byte {}", bytes[244]),
+            },
+            reserved: {
+                let mut reserved = [0u8; 11];
+                reserved.copy_from_slice(&bytes[245..256]);
+                reserved
             },
         }
     }
@@ -3233,6 +3302,405 @@ impl TransferPendingGroove {
     }
 }
 
+// ===== AccountEvents (CDC) groove =====
+
+/// The AccountEvents objects tree, keyed by the event's `timestamp`.
+///
+/// Upstream `tree_ids.AccountEvents.timestamp` = 22 (state_machine.zig:79).
+pub struct AccountEventObjectSpec;
+
+impl table_memory::Table for AccountEventObjectSpec {
+    type Key = u64;
+    type Value = AccountEvent;
+    const VALUE_COUNT_MAX: usize = GROOVE_VALUE_COUNT_MAX;
+    const USAGE: Usage = Usage::General;
+
+    fn key_from_value(value: &AccountEvent) -> u64 {
+        value.timestamp & !composite_key::TOMBSTONE_BIT
+    }
+
+    fn tombstone(value: &AccountEvent) -> bool {
+        value.timestamp & composite_key::TOMBSTONE_BIT != 0
+    }
+}
+
+impl TableSpec for AccountEventObjectSpec {
+    type Key = u64;
+    type Value = AccountEvent;
+
+    fn key_from_value(value: &AccountEvent) -> u64 {
+        value.timestamp & !composite_key::TOMBSTONE_BIT
+    }
+
+    const SENTINEL_KEY: u64 = u64::MAX;
+
+    fn tombstone(value: &AccountEvent) -> bool {
+        value.timestamp & composite_key::TOMBSTONE_BIT != 0
+    }
+
+    fn tombstone_from_key(key: u64) -> AccountEvent {
+        AccountEvent { timestamp: key | composite_key::TOMBSTONE_BIT, ..AccountEvent::default() }
+    }
+
+    const VALUE_COUNT_MAX: usize = GROOVE_VALUE_COUNT_MAX;
+    const USAGE: TableUsage = TableUsage::General;
+}
+
+impl crate::tree::TreeSpec for AccountEventObjectSpec {
+    const LAYOUT: TableLayout = TableLayout::compute_for::<Self>();
+
+    fn index_blocks_for_key(index_block: &[u8], key: u64) -> Option<IndexBlocks<u64>> {
+        table::index_blocks_for_key::<u64>(index_block, &Self::LAYOUT.index, key)
+    }
+
+    fn value_block_search(value_block: &[u8], key: u64) -> Option<AccountEvent> {
+        table::value_block_search::<Self>(value_block, &Self::LAYOUT.data, key)
+    }
+
+    fn tombstone_from_key(key: u64) -> AccountEvent {
+        AccountEvent { timestamp: key | composite_key::TOMBSTONE_BIT, ..AccountEvent::default() }
+    }
+}
+
+// ===== AccountEvents derived index extractors =====
+//
+// Upstream `AccountEventsGroove` indexes (state_machine.zig:534-607): the
+// `account_timestamp` index is a placeholder in the config (always `null`) and is
+// inserted explicitly during `account_event` for HISTORY accounts
+// (state_machine.zig:4450-4463); the `transfer_pending_status` tree id (28) is declared
+// but never written (the derived config omits it — `config.derived` has exactly 6
+// entries, state_machine.zig:322); the five "expired" indexes are produced by the
+// generic insert machinery only when the event records an expiry.
+
+/// Derived: `dr_account_id` for expired events only ("all expired debits where account=X").
+pub struct AccountEventDrAccountIdExpiredIndex;
+impl IndexExtractor<AccountEvent> for AccountEventDrAccountIdExpiredIndex {
+    type IndexPrefix = u128;
+    fn index_from_object(object: &AccountEvent) -> Option<u128> {
+        if object.transfer_pending_status == TransferPendingStatus::Expired {
+            Some(object.dr_account_id)
+        } else {
+            None
+        }
+    }
+}
+
+/// Derived: `cr_account_id` for expired events only.
+pub struct AccountEventCrAccountIdExpiredIndex;
+impl IndexExtractor<AccountEvent> for AccountEventCrAccountIdExpiredIndex {
+    type IndexPrefix = u128;
+    fn index_from_object(object: &AccountEvent) -> Option<u128> {
+        if object.transfer_pending_status == TransferPendingStatus::Expired {
+            Some(object.cr_account_id)
+        } else {
+            None
+        }
+    }
+}
+
+/// Derived: the referenced pending transfer's id for expired events only.
+pub struct AccountEventTransferPendingIdExpiredIndex;
+impl IndexExtractor<AccountEvent> for AccountEventTransferPendingIdExpiredIndex {
+    type IndexPrefix = u128;
+    fn index_from_object(object: &AccountEvent) -> Option<u128> {
+        if object.transfer_pending_status == TransferPendingStatus::Expired {
+            Some(object.transfer_pending_id)
+        } else {
+            None
+        }
+    }
+}
+
+/// Derived: the shared `ledger` for expired events only.
+pub struct AccountEventLedgerExpiredIndex;
+impl IndexExtractor<AccountEvent> for AccountEventLedgerExpiredIndex {
+    type IndexPrefix = u128;
+    fn index_from_object(object: &AccountEvent) -> Option<u128> {
+        if object.transfer_pending_status == TransferPendingStatus::Expired {
+            Some(u128::from(object.ledger))
+        } else {
+            None
+        }
+    }
+}
+
+/// Derived: void index present when neither account advertises `HISTORY`, enabling a
+/// cleanup job to prune events after CDC.
+pub struct AccountEventPrunableIndex;
+impl IndexExtractor<AccountEvent> for AccountEventPrunableIndex {
+    type IndexPrefix = ();
+    fn index_from_object(object: &AccountEvent) -> Option<()> {
+        if object.dr_account_flags.history() || object.cr_account_flags.history() {
+            None
+        } else {
+            Some(())
+        }
+    }
+}
+
+/// The AccountEvents (CDC) groove: one object tree plus the derived index trees of the
+/// upstream `AccountEventsGroove` (state_machine.zig:492-614).
+///
+/// Unlike the account/transfer/pending grooves there is no objects cache upstream
+/// (`objects_cache = false`); the events are only ever read back through scans, so no
+/// `ObjectsCache` field exists here either. `unique_keys` is empty (no `id` index).
+pub struct AccountEventsGroove {
+    /// Object tree (`tree_ids.AccountEvents.timestamp`), keyed by the event timestamp.
+    pub(crate) objects: Tree<AccountEventObjectSpec>,
+    /// Derived `account_timestamp` index (CompositeKey64: `(account timestamp, event
+    /// timestamp)`, tree id 27). Upstream inserts it explicitly during `account_event`
+    /// for each HISTORY account, so there is no `IndexExtractor`-based writer here.
+    pub(crate) account_timestamp: Tree<CompositeKey64Spec>,
+    /// Tree id 28 is declared upstream (`tree_ids.AccountEvents.transfer_pending_status`)
+    /// but never written — the upstream derived config omits it. Kept for tree-id parity.
+    #[allow(dead_code)] // upstream declares but never writes this tree
+    pub(crate) transfer_pending_status: Tree<CompositeKey64Spec>,
+    /// Derived: debit account id of expired events, tree id 29.
+    pub(crate) dr_account_id_expired: Tree<CompositeKey128Spec>,
+    /// Derived: credit account id of expired events, tree id 30.
+    pub(crate) cr_account_id_expired: Tree<CompositeKey128Spec>,
+    /// Derived: pending transfer id of expired events, tree id 31.
+    pub(crate) transfer_pending_id_expired: Tree<CompositeKey128Spec>,
+    /// Derived: ledger of expired events, tree id 32.
+    pub(crate) ledger_expired: Tree<CompositeKey128Spec>,
+    /// Derived: void index for events with no HISTORY account (CDC cleanup), tree id 33.
+    pub(crate) prunable: Tree<CompositeKeyUnitSpec>,
+}
+
+/// Radix-sort scratch buffers for [`AccountEventsGroove`]'s trees, owned by the forest.
+///
+/// See the DEVIATION note on [`AccountGrooveScratch`].
+pub struct AccountEventsGrooveScratch {
+    pub objects: ScratchMemory<AccountEvent>,
+    pub composite_key_128: ScratchMemory<CompositeKey128>,
+    pub composite_key_64: ScratchMemory<CompositeKey64>,
+    pub composite_key_unit: ScratchMemory<CompositeKeyUnit>,
+}
+
+/// Builds fresh scratch buffers for an [`AccountEventsGroove`], each sized to the groove's
+/// maximum tree value count (forest.zig:290-299).
+impl AccountEventsGrooveScratch {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            objects: ScratchMemory::new(GROOVE_VALUE_COUNT_MAX),
+            composite_key_128: ScratchMemory::new(GROOVE_VALUE_COUNT_MAX),
+            composite_key_64: ScratchMemory::new(GROOVE_VALUE_COUNT_MAX),
+            composite_key_unit: ScratchMemory::new(GROOVE_VALUE_COUNT_MAX),
+        }
+    }
+}
+
+impl Default for AccountEventsGrooveScratch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AccountEventsGroove {
+    /// Build a fresh [`AccountEventsGroove`] with all eight trees, sized for
+    /// `batch_value_count_limit` values per beat (forest.zig:290-302).
+    ///
+    /// Tree ids mirror upstream `tree_ids.AccountEvents` (state_machine.zig:79-88).
+    #[must_use]
+    pub fn new(batch_value_count_limit: u32) -> Self {
+        fn tree<S: crate::tree::TreeSpec>(id: u16, name: &'static str, limit: u32) -> Tree<S> {
+            Tree::<S>::new(TreeConfig { id, name }, Options { batch_value_count_limit: limit })
+        }
+        AccountEventsGroove {
+            objects: tree(22, "account_events_objects", batch_value_count_limit),
+            account_timestamp: tree(
+                27,
+                "account_events_account_timestamp",
+                batch_value_count_limit,
+            ),
+            transfer_pending_status: tree(
+                28,
+                "account_events_transfer_pending_status",
+                batch_value_count_limit,
+            ),
+            dr_account_id_expired: tree(
+                29,
+                "account_events_dr_account_id_expired",
+                batch_value_count_limit,
+            ),
+            cr_account_id_expired: tree(
+                30,
+                "account_events_cr_account_id_expired",
+                batch_value_count_limit,
+            ),
+            transfer_pending_id_expired: tree(
+                31,
+                "account_events_transfer_pending_id_expired",
+                batch_value_count_limit,
+            ),
+            ledger_expired: tree(32, "account_events_ledger_expired", batch_value_count_limit),
+            prunable: tree(33, "account_events_prunable", batch_value_count_limit),
+        }
+    }
+
+    pub fn scope_open(&mut self) {
+        self.objects.scope_open();
+        self.account_timestamp.scope_open();
+        self.transfer_pending_status.scope_open();
+        self.dr_account_id_expired.scope_open();
+        self.cr_account_id_expired.scope_open();
+        self.transfer_pending_id_expired.scope_open();
+        self.ledger_expired.scope_open();
+        self.prunable.scope_open();
+    }
+
+    pub fn scope_close(&mut self, mode: ScopeCloseMode) {
+        self.objects.scope_close(mode);
+        self.account_timestamp.scope_close(mode);
+        self.transfer_pending_status.scope_close(mode);
+        self.dr_account_id_expired.scope_close(mode);
+        self.cr_account_id_expired.scope_close(mode);
+        self.transfer_pending_id_expired.scope_close(mode);
+        self.ledger_expired.scope_close(mode);
+        self.prunable.scope_close(mode);
+    }
+
+    /// Lookup an `AccountEvent` by its primary key (timestamp) from the object tree over the
+    /// grid cache. Mirrors the pending groove's `lookup`: the primary key *is* the timestamp.
+    #[must_use]
+    pub fn lookup(
+        &mut self,
+        grid: &mut Grid,
+        snapshot: u64,
+        timestamp: u64,
+    ) -> LookupMemoryResult<AccountEvent> {
+        self.objects.lookup_from_levels_cache(grid, snapshot, timestamp)
+    }
+
+    /// Insert an account event into the object tree and derived indexes.
+    ///
+    /// Mirrors the generic `GrooveType` insert path (groove.zig): the object tree is
+    /// written unconditionally (CDC ignores `AccountFlags::HISTORY`), and the "expired"
+    /// indexes are produced only when the event records an expiry. The `account_timestamp`
+    /// index is *not* written here — upstream's placeholder extractor always returns null,
+    /// so it is inserted explicitly via [`Self::insert_account_timestamp`] for HISTORY
+    /// accounts.
+    ///
+    /// # Panics
+    /// Panics if the event timestamp is zero or the tombstone bit is set.
+    pub fn insert(&mut self, event: &AccountEvent) {
+        assert!(event.timestamp != 0);
+        assert_eq!(event.timestamp & composite_key::TOMBSTONE_BIT, 0);
+
+        self.objects.put(event);
+        self.objects.key_range_update(event.timestamp);
+
+        if let Some(v) = AccountEventDrAccountIdExpiredIndex::index_from_object(event) {
+            self.dr_account_id_expired.put(&CompositeKey128 {
+                field: v,
+                timestamp: event.timestamp,
+                padding: 0,
+            });
+        }
+        if let Some(v) = AccountEventCrAccountIdExpiredIndex::index_from_object(event) {
+            self.cr_account_id_expired.put(&CompositeKey128 {
+                field: v,
+                timestamp: event.timestamp,
+                padding: 0,
+            });
+        }
+        if let Some(v) = AccountEventTransferPendingIdExpiredIndex::index_from_object(event) {
+            self.transfer_pending_id_expired.put(&CompositeKey128 {
+                field: v,
+                timestamp: event.timestamp,
+                padding: 0,
+            });
+        }
+        if let Some(v) = AccountEventLedgerExpiredIndex::index_from_object(event) {
+            self.ledger_expired.put(&CompositeKey128 {
+                field: v,
+                timestamp: event.timestamp,
+                padding: 0,
+            });
+        }
+        if let Some(v) = AccountEventPrunableIndex::index_from_object(event) {
+            self.prunable.put(&CompositeKeyUnit { field: v, timestamp: event.timestamp });
+        }
+    }
+
+    /// Index the event at `event_timestamp` under the account whose *state* timestamp is
+    /// `account_timestamp` (upstream `account_events.indexes.account_timestamp.put`,
+    /// state_machine.zig:4450-4463). Called for each HISTORY account of an event.
+    ///
+    /// # Panics
+    /// Panics if either timestamp is zero.
+    pub fn insert_account_timestamp(&mut self, account_timestamp: u64, event_timestamp: u64) {
+        assert!(account_timestamp != 0);
+        assert!(event_timestamp != 0);
+        self.account_timestamp
+            .put(&CompositeKey64 { field: account_timestamp, timestamp: event_timestamp });
+    }
+
+    /// Port of upstream `groove.compact` (groove.zig:1981-2021). See
+    /// [`AccountGroove::compact`]. No objects cache to compact (upstream
+    /// `objects_cache = false`); the beat index only drives the cache compaction there.
+    pub fn compact(&mut self, _op: u64, sc: &mut AccountEventsGrooveScratch) {
+        self.objects.compact(&mut sc.objects);
+        self.account_timestamp.compact(&mut sc.composite_key_64);
+        self.transfer_pending_status.compact(&mut sc.composite_key_64);
+        self.dr_account_id_expired.compact(&mut sc.composite_key_128);
+        self.cr_account_id_expired.compact(&mut sc.composite_key_128);
+        self.transfer_pending_id_expired.compact(&mut sc.composite_key_128);
+        self.ledger_expired.compact(&mut sc.composite_key_128);
+        self.prunable.compact(&mut sc.composite_key_unit);
+    }
+
+    pub fn open_commence(&mut self, manifest_log: &mut impl ManifestLog) {
+        self.objects.open_commence(manifest_log);
+        self.account_timestamp.open_commence(manifest_log);
+        self.transfer_pending_status.open_commence(manifest_log);
+        self.dr_account_id_expired.open_commence(manifest_log);
+        self.cr_account_id_expired.open_commence(manifest_log);
+        self.transfer_pending_id_expired.open_commence(manifest_log);
+        self.ledger_expired.open_commence(manifest_log);
+        self.prunable.open_commence(manifest_log);
+    }
+
+    /// Replay a manifest entry into the owning tree during open.
+    ///
+    /// The forest routes manifest entries by `tree_id`; the CDC groove's trees (upstream
+    /// `tree_ids.AccountEvents`, ids 22 and 27..33) are routed here.
+    ///
+    /// # Panics
+    /// Panics if the entry's `tree_id` is outside the CDC groove's id range.
+    pub fn open_table(&mut self, table: &tigerbeetle_lsm::schema::manifest_node::TableInfo) {
+        match table.tree_id {
+            22 => self.objects.open_table(table),
+            27 => self.account_timestamp.open_table(table),
+            28 => self.transfer_pending_status.open_table(table),
+            29 => self.dr_account_id_expired.open_table(table),
+            30 => self.cr_account_id_expired.open_table(table),
+            31 => self.transfer_pending_id_expired.open_table(table),
+            32 => self.ledger_expired.open_table(table),
+            33 => self.prunable.open_table(table),
+            other => panic!("tree_id {other} does not belong to the account_events groove"),
+        }
+    }
+
+    pub fn open_complete(&mut self, checkpoint_op: u64) {
+        self.objects.open_complete(checkpoint_op);
+        self.account_timestamp.open_complete(checkpoint_op);
+        self.transfer_pending_status.open_complete(checkpoint_op);
+        self.dr_account_id_expired.open_complete(checkpoint_op);
+        self.cr_account_id_expired.open_complete(checkpoint_op);
+        self.transfer_pending_id_expired.open_complete(checkpoint_op);
+        self.ledger_expired.open_complete(checkpoint_op);
+        self.prunable.open_complete(checkpoint_op);
+    }
+
+    /// Number of visible manifest tables in the CDC objects tree.
+    #[must_use]
+    pub fn objects_table_count(&self) -> u32 {
+        self.objects.manifest_table_count()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Write-path / read-path block accessor tests
 //
@@ -3706,6 +4174,22 @@ mod tests {
             objects_cache: new_transfer_objects_cache(),
             prefetch_snapshot: None,
             prefetch_keys: PrefetchKeys::default(),
+        }
+    }
+
+    fn new_account_events_groove() -> AccountEventsGroove {
+        fn tree<S: crate::tree::TreeSpec>(id: u16, name: &'static str) -> Tree<S> {
+            Tree::<S>::new(TreeConfig { id, name }, Options { batch_value_count_limit: 32 })
+        }
+        AccountEventsGroove {
+            objects: tree(22, "account_events_objects"),
+            account_timestamp: tree(27, "account_events_account_timestamp"),
+            transfer_pending_status: tree(28, "account_events_transfer_pending_status"),
+            dr_account_id_expired: tree(29, "account_events_dr_account_id_expired"),
+            cr_account_id_expired: tree(30, "account_events_cr_account_id_expired"),
+            transfer_pending_id_expired: tree(31, "account_events_transfer_pending_id_expired"),
+            ledger_expired: tree(32, "account_events_ledger_expired"),
+            prunable: tree(33, "account_events_prunable"),
         }
     }
 
@@ -4343,6 +4827,311 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn account_events_groove_insert_and_indexes() {
+        // Exercise the CDC groove's write path (`insert` + `insert_account_timestamp`)
+        // and read the results back from the mutable tables: object tree (22) holds every
+        // event; the "expired" indexes (29-32) only the expired one; the prunable index
+        // (33) only events whose accounts advertise no HISTORY; and the `account_timestamp`
+        // index (27) the explicitly-inserted per-HISTORY-account entries.
+        let mut groove = new_account_events_groove();
+
+        let history_dr = AccountFlags::HISTORY;
+        let event = |timestamp: u64,
+                     dr_account_id: u128,
+                     cr_account_id: u128,
+                     transfer_pending_id: u128,
+                     ledger: u32,
+                     status: TransferPendingStatus,
+                     dr_history: bool,
+                     cr_history: bool|
+         -> AccountEvent {
+            AccountEvent {
+                timestamp,
+                dr_account_id,
+                cr_account_id,
+                transfer_pending_id,
+                ledger,
+                transfer_pending_status: status,
+                dr_account_flags: if dr_history { history_dr } else { AccountFlags::default() },
+                cr_account_flags: if cr_history { history_dr } else { AccountFlags::default() },
+                ..AccountEvent::default()
+            }
+        };
+
+        let e1 = event(1, 10, 20, 0, 1, TransferPendingStatus::None, true, true);
+        let e2 = event(2, 30, 40, 500, 5, TransferPendingStatus::Expired, false, false);
+        let e3 = event(3, 50, 60, 0, 9, TransferPendingStatus::None, false, false);
+
+        groove.insert(&e1);
+        groove.insert(&e2);
+        groove.insert(&e3);
+        // History accounts of e1 (upstream index the DR and CR account separately):
+        groove.insert_account_timestamp(100, 1);
+        groove.insert_account_timestamp(200, 1);
+
+        let mut scratch = AccountEventsGrooveScratch::new();
+
+        // Objects tree (single hop; nothing dropped by the extractors).
+        assert_eq!(groove.objects.lookup_from_memory(1, &mut scratch.objects), Some(&e1));
+        assert_eq!(groove.objects.lookup_from_memory(2, &mut scratch.objects), Some(&e2));
+        assert_eq!(groove.objects.lookup_from_memory(3, &mut scratch.objects), Some(&e3));
+
+        // `account_timestamp` (CompositeKey64: account timestamp << 64 | event timestamp).
+        let ck64 = |account_timestamp: u64, event_timestamp: u64| {
+            (u128::from(account_timestamp) << 64) | u128::from(event_timestamp)
+        };
+        assert!(
+            groove
+                .account_timestamp
+                .lookup_from_memory(ck64(100, 1), &mut scratch.composite_key_64)
+                .is_some()
+        );
+        assert!(
+            groove
+                .account_timestamp
+                .lookup_from_memory(ck64(200, 1), &mut scratch.composite_key_64)
+                .is_some()
+        );
+        assert!(
+            groove
+                .account_timestamp
+                .lookup_from_memory(ck64(100, 2), &mut scratch.composite_key_64)
+                .is_none()
+        );
+
+        // Expired indexes (CompositeKey128: field << 64 | event timestamp), only e2.
+        let ck128 = |field: u128, event_timestamp: u64| {
+            U256::from_parts(field, event_timestamp & !composite_key::TOMBSTONE_BIT)
+        };
+        assert!(
+            groove
+                .dr_account_id_expired
+                .lookup_from_memory(ck128(30, 2), &mut scratch.composite_key_128)
+                .is_some()
+        );
+        assert!(
+            groove
+                .cr_account_id_expired
+                .lookup_from_memory(ck128(40, 2), &mut scratch.composite_key_128)
+                .is_some()
+        );
+        assert!(
+            groove
+                .transfer_pending_id_expired
+                .lookup_from_memory(ck128(500, 2), &mut scratch.composite_key_128)
+                .is_some()
+        );
+        assert!(
+            groove
+                .ledger_expired
+                .lookup_from_memory(ck128(5, 2), &mut scratch.composite_key_128)
+                .is_some()
+        );
+        // Non-expired events are not indexed.
+        assert!(
+            groove
+                .dr_account_id_expired
+                .lookup_from_memory(ck128(10, 1), &mut scratch.composite_key_128)
+                .is_none()
+        );
+        assert!(
+            groove
+                .transfer_pending_id_expired
+                .lookup_from_memory(ck128(500, 1), &mut scratch.composite_key_128)
+                .is_none()
+        );
+
+        // Prunable (CompositeKeyUnit: the event timestamp alone), only for no-HISTORY events.
+        assert!(groove.prunable.lookup_from_memory(2, &mut scratch.composite_key_unit).is_some());
+        assert!(groove.prunable.lookup_from_memory(3, &mut scratch.composite_key_unit).is_some());
+        assert!(groove.prunable.lookup_from_memory(1, &mut scratch.composite_key_unit).is_none());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // 7-tree table build/seed/open mirror (pending_groove_tree_read_path)
+    fn account_events_groove_tree_read_path() {
+        // Build the CDC groove's object tree (22) and the account_timestamp (27) + expired
+        // (29-32) + prunable (33) index tables through `TableBuilder`, seed their blocks into
+        // the grid, open the trees, and read them back via the level-cache lookup — proving
+        // the `BlockValue`/`TreeSpec` accessors line up with the object layout (mirrors
+        // pending_groove_tree_read_path).
+        let expired = AccountEvent {
+            timestamp: 1,
+            dr_account_id: 10,
+            cr_account_id: 20,
+            transfer_pending_id: 500,
+            ledger: 5,
+            transfer_pending_status: TransferPendingStatus::Expired,
+            ..AccountEvent::default()
+        };
+        let open = AccountEvent {
+            timestamp: 2,
+            dr_account_id: 11,
+            cr_account_id: 21,
+            transfer_pending_status: TransferPendingStatus::None,
+            ..AccountEvent::default()
+        };
+        let object_values = [expired, open];
+        let dr_values = [CompositeKey128 { field: 10, timestamp: 1, padding: 0 }];
+        let cr_values = [CompositeKey128 { field: 20, timestamp: 1, padding: 0 }];
+        let pending_values = [CompositeKey128 { field: 500, timestamp: 1, padding: 0 }];
+        let ledger_values = [CompositeKey128 { field: 5, timestamp: 1, padding: 0 }];
+        let account_timestamp_values = [CompositeKey64 { field: 100, timestamp: 2 }];
+        let prunable_values = [CompositeKeyUnit { field: (), timestamp: 2 }];
+
+        // Stash sized for the 14 seeded table blocks (new_groove_grid's 12 would underflow).
+        let mut grid = Grid::new(GridOptions {
+            cache_blocks_count: 64,
+            stash_blocks_count: 32,
+            read_iops_max: 2,
+            write_iops_max: 2,
+            free_set_blocks_count: Some(FREE_SET_BLOCKS),
+            free_set_blocks_capacity: None,
+            missing_blocks_max: constants::GRID_MISSING_BLOCKS_MAX as usize,
+        });
+        let mut address = acquire_addresses(&mut grid, 16).into_iter();
+
+        // Object tree (tree 22).
+        let (obj_value_address, obj_index_address) =
+            (address.next().unwrap(), address.next().unwrap());
+        let (obj_idx, obj_val, obj_info) = build_table_with::<AccountEventObjectSpec>(
+            &object_values,
+            22,
+            obj_value_address,
+            obj_index_address,
+        );
+        let obj_checksum = seed_grid_block(&mut grid, obj_index_address, &obj_idx);
+        seed_grid_block(&mut grid, obj_value_address, &obj_val);
+
+        let (at_info, at_index, at_checksum) = {
+            let (value_address, index_address) = (address.next().unwrap(), address.next().unwrap());
+            let (idx, val, info) = build_table_with::<CompositeKey64Spec>(
+                &account_timestamp_values,
+                27,
+                value_address,
+                index_address,
+            );
+            let checksum = seed_grid_block(&mut grid, index_address, &idx);
+            seed_grid_block(&mut grid, value_address, &val);
+            (info, index_address, checksum)
+        };
+        let (dr_value_address, dr_index_address) =
+            (address.next().unwrap(), address.next().unwrap());
+        let (dr_idx, dr_val, dr_info) = build_table_with::<CompositeKey128Spec>(
+            &dr_values,
+            29,
+            dr_value_address,
+            dr_index_address,
+        );
+        let dr_checksum = seed_grid_block(&mut grid, dr_index_address, &dr_idx);
+        seed_grid_block(&mut grid, dr_value_address, &dr_val);
+        let (cr_value_address, cr_index_address) =
+            (address.next().unwrap(), address.next().unwrap());
+        let (cr_idx, cr_val, cr_info) = build_table_with::<CompositeKey128Spec>(
+            &cr_values,
+            30,
+            cr_value_address,
+            cr_index_address,
+        );
+        let cr_checksum = seed_grid_block(&mut grid, cr_index_address, &cr_idx);
+        seed_grid_block(&mut grid, cr_value_address, &cr_val);
+        let (tp_value_address, tp_index_address) =
+            (address.next().unwrap(), address.next().unwrap());
+        let (tp_idx, tp_val, tp_info) = build_table_with::<CompositeKey128Spec>(
+            &pending_values,
+            31,
+            tp_value_address,
+            tp_index_address,
+        );
+        let tp_checksum = seed_grid_block(&mut grid, tp_index_address, &tp_idx);
+        seed_grid_block(&mut grid, tp_value_address, &tp_val);
+        let (le_value_address, le_index_address) =
+            (address.next().unwrap(), address.next().unwrap());
+        let (le_idx, le_val, le_info) = build_table_with::<CompositeKey128Spec>(
+            &ledger_values,
+            32,
+            le_value_address,
+            le_index_address,
+        );
+        let le_checksum = seed_grid_block(&mut grid, le_index_address, &le_idx);
+        seed_grid_block(&mut grid, le_value_address, &le_val);
+        let (pr_value_address, pr_index_address) =
+            (address.next().unwrap(), address.next().unwrap());
+        let (pr_idx, pr_val, pr_info) = build_table_with::<CompositeKeyUnitSpec>(
+            &prunable_values,
+            33,
+            pr_value_address,
+            pr_index_address,
+        );
+        let pr_checksum = seed_grid_block(&mut grid, pr_index_address, &pr_idx);
+        seed_grid_block(&mut grid, pr_value_address, &pr_val);
+
+        let mut groove = new_account_events_groove();
+        open_tree(&mut groove.objects, &obj_info, obj_index_address, obj_checksum, 22);
+        open_tree(&mut groove.account_timestamp, &at_info, at_index, at_checksum, 27);
+        open_tree(&mut groove.dr_account_id_expired, &dr_info, dr_index_address, dr_checksum, 29);
+        open_tree(&mut groove.cr_account_id_expired, &cr_info, cr_index_address, cr_checksum, 30);
+        open_tree(
+            &mut groove.transfer_pending_id_expired,
+            &tp_info,
+            tp_index_address,
+            tp_checksum,
+            31,
+        );
+        open_tree(&mut groove.ledger_expired, &le_info, le_index_address, le_checksum, 32);
+        open_tree(&mut groove.prunable, &pr_info, pr_index_address, pr_checksum, 33);
+
+        assert!(
+            matches!(
+                groove.objects.lookup_from_levels_cache(&mut grid, SNAPSHOT_LATEST, 1),
+                LookupMemoryResult::Positive(AccountEvent { timestamp: 1, dr_account_id: 10, .. })
+            ),
+            "expired event is read back from its object table"
+        );
+        assert!(
+            matches!(
+                groove.objects.lookup_from_levels_cache(&mut grid, SNAPSHOT_LATEST, 2),
+                LookupMemoryResult::Positive(AccountEvent { timestamp: 2, .. })
+            ),
+            "open event is read back from its object table"
+        );
+        let key128 = |field: u128, timestamp: u64| {
+            U256::from_parts(field, timestamp & !composite_key::TOMBSTONE_BIT)
+        };
+        assert!(
+            matches!(
+                groove.dr_account_id_expired.lookup_from_levels_cache(
+                    &mut grid,
+                    SNAPSHOT_LATEST,
+                    key128(10, 1)
+                ),
+                LookupMemoryResult::Positive(CompositeKey128 { field: 10, timestamp: 1, .. })
+            ),
+            "expired DR index is read back"
+        );
+        let key64 = |account_timestamp: u64, event_timestamp: u64| {
+            (u128::from(account_timestamp) << 64) | u128::from(event_timestamp)
+        };
+        assert!(
+            matches!(
+                groove.account_timestamp.lookup_from_levels_cache(
+                    &mut grid,
+                    SNAPSHOT_LATEST,
+                    key64(100, 2)
+                ),
+                LookupMemoryResult::Positive(CompositeKey64 { field: 100, timestamp: 2 })
+            ),
+            "account_timestamp index is read back"
+        );
+        assert!(
+            matches!(
+                groove.prunable.lookup_from_levels_cache(&mut grid, SNAPSHOT_LATEST, 2),
+                LookupMemoryResult::Positive(CompositeKeyUnit { timestamp: 2, .. })
+            ),
+            "prunable index is read back"
+        );
+    }
     // ------------------------------------------------------------------
     // Prefetch seam tests: `prefetch_setup`/`prefetch_enqueue` settle keys from the
     // objects cache, mutable table, and grid cache; `prefetch` completes the remaining

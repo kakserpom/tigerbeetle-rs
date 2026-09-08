@@ -4,14 +4,14 @@
 //
 // Ported from `src/lsm/forest.zig`. The Zig version uses comptime codegen to
 // auto-generate a `Grooves` struct from a config. In Rust, we define the fields
-// explicitly since there are only three grooves (accounts + transfers +
-// transfers_pending).
+// explicitly since there are only four grooves (accounts + transfers +
+// transfers_pending + account_events).
 
 use crate::grid::{Grid, GridOpenReferences, GridOptions, SuperBlockView};
 use crate::grid_scrubber::{BlockStatus, GridScrubber};
 use crate::groove::{
-    AccountGroove, AccountGrooveScratch, TransferGroove, TransferGrooveScratch,
-    TransferPendingGroove, TransferPendingGrooveScratch,
+    AccountEventsGroove, AccountEventsGrooveScratch, AccountGroove, AccountGrooveScratch,
+    TransferGroove, TransferGrooveScratch, TransferPendingGroove, TransferPendingGrooveScratch,
 };
 use crate::manifest_log::{ManifestLog, Pace};
 use crate::storage::Storage;
@@ -31,9 +31,9 @@ use tigerbeetle_lsm::tree::table_count_max_for_tree;
 /// Shared buffer for collecting manifest entries during `ManifestLog::open`.
 type SharedTableBuffer = Rc<RefCell<Vec<mn::TableInfo>>>;
 
-/// Number of trees in the forest: 9 (account) + 14 (transfer) + 2 (pending).
+/// Number of trees in the forest: 9 (account) + 14 (transfer) + 2 (pending) + 8 (account_events).
 /// Used to size the manifest log's compaction pace (upstream `tree_infos.len`).
-pub const TREE_COUNT: u32 = 25;
+pub const TREE_COUNT: u32 = 33;
 
 /// Seed for the grid scrubber's tour-origin reservoir.
 ///
@@ -44,7 +44,7 @@ const GRID_SCRUBBER_ORIGIN_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
 
 /// The scrubber's table-tour cursor (upstream `WrappingForestTableIterator` + origin).
 ///
-/// Iterates the 25 trees level-major, tree-major (ascending `tree_id`, the sorted
+/// Iterates the 33 trees level-major, tree-major (ascending `tree_id`, the sorted
 /// `forest.tree_infos` order), wrapping the cycle at the tour origin computed when the
 /// forest opens. The `after` field is the address/checksum of the last table yielded so a
 /// step can re-scan the level past it (see `ScrubTree::scrub_next_visible_table`).
@@ -120,12 +120,17 @@ pub struct Forest {
     pub accounts: AccountGroove,
     pub transfers: TransferGroove,
     pub transfers_pending: TransferPendingGroove,
+    /// Account-events (CDC) groove: `GetChangeEvents`-style object history plus the derived
+    /// expiry/prunable index trees (upstream `AccountEventsGroove`, state_machine.zig:492).
+    pub account_events: AccountEventsGroove,
     /// Radix-sort scratch buffers for the account groove's trees.
     pub accounts_scratch: AccountGrooveScratch,
     /// Radix-sort scratch buffers for the transfer groove's trees.
     pub transfers_scratch: TransferGrooveScratch,
     /// Radix-sort scratch buffers for the pending-transfer groove's trees.
     pub transfers_pending_scratch: TransferPendingGrooveScratch,
+    /// Radix-sort scratch buffers for the account-events groove's trees.
+    pub account_events_scratch: AccountEventsGrooveScratch,
     /// Durable manifest of every tree's tables (upstream `forest.manifest_log`).
     pub manifest_log: ManifestLog,
     /// Block cache + free set shared by all trees and the manifest log
@@ -142,7 +147,7 @@ pub struct Forest {
 
 /// Drive one tree's `level_active` compactions for one op/beat, reconciling the free
 /// set's reservation state first (see `reconcile_free_set_reservation`). Defined as a
-/// module-level macro because the 25 trees of the three grooves are enumerated explicitly —
+/// module-level macro because the 33 trees of the four grooves are enumerated explicitly —
 /// upstream comptime-generates this loop (`forest.compact_trees_start`), but Rust has no
 /// comptime iteration, and each tree has a different `S: TableSpec`/scratch buffer type.
 macro_rules! compact_tree {
@@ -171,9 +176,11 @@ impl Forest {
             accounts: AccountGroove::new(batch_value_count_limit),
             transfers: TransferGroove::new(batch_value_count_limit),
             transfers_pending: TransferPendingGroove::new(batch_value_count_limit),
+            account_events: AccountEventsGroove::new(batch_value_count_limit),
             accounts_scratch: AccountGrooveScratch::default(),
             transfers_scratch: TransferGrooveScratch::default(),
             transfers_pending_scratch: TransferPendingGrooveScratch::default(),
+            account_events_scratch: AccountEventsGrooveScratch::new(),
             manifest_log: ManifestLog::new(superblock, pace, None),
             // DEVIATION: upstream owns a superblock; here the view is a Copy snapshot so we
             // reuse it for both the manifest log and the grid's attached view.
@@ -204,6 +211,7 @@ impl Forest {
         self.accounts.open_commence(&mut self.manifest_log);
         self.transfers.open_commence(&mut self.manifest_log);
         self.transfers_pending.open_commence(&mut self.manifest_log);
+        self.account_events.open_commence(&mut self.manifest_log);
 
         self.grid.open(storage, references);
         // Port of upstream `manifest_log_open_event` (forest.zig:381): the manifest log
@@ -306,6 +314,7 @@ impl Forest {
             self.accounts.open_complete(checkpoint_op);
             self.transfers.open_complete(checkpoint_op);
             self.transfers_pending.open_complete(checkpoint_op);
+            self.account_events.open_complete(checkpoint_op);
 
             // Arm the scrubber's table tour once every groove has resumed (its origin is a
             // function of the replayed table manifests).
@@ -352,6 +361,15 @@ impl Forest {
             26 => self.transfers.closing.open_table(table),
             // TransferPending groove.
             20 | 21 => self.transfers_pending.open_table(table),
+            // AccountEvents groove (upstream `tree_ids.AccountEvents`, state_machine.zig:79-88).
+            22 => self.account_events.objects.open_table(table),
+            27 => self.account_events.account_timestamp.open_table(table),
+            28 => self.account_events.transfer_pending_status.open_table(table),
+            29 => self.account_events.dr_account_id_expired.open_table(table),
+            30 => self.account_events.cr_account_id_expired.open_table(table),
+            31 => self.account_events.transfer_pending_id_expired.open_table(table),
+            32 => self.account_events.ledger_expired.open_table(table),
+            33 => self.account_events.prunable.open_table(table),
             other => panic!("unknown tree_id in manifest: {other}"),
         }
     }
@@ -379,6 +397,7 @@ impl Forest {
                     &self.accounts,
                     &self.transfers,
                     &self.transfers_pending,
+                    &self.account_events,
                     tree_index,
                 );
                 let weight = tree.level_table_count(level) * tree.value_block_count_max();
@@ -420,6 +439,7 @@ impl Forest {
                 &self.accounts,
                 &self.transfers,
                 &self.transfers_pending,
+                &self.account_events,
                 tree_index,
             );
             if let Some((address, checksum)) = tree.scrub_next_visible_table(level, after) {
@@ -539,6 +559,7 @@ impl Forest {
         self.accounts.compact(op, &mut self.accounts_scratch);
         self.transfers.compact(op, &mut self.transfers_scratch);
         self.transfers_pending.compact(op, &mut self.transfers_pending_scratch);
+        self.account_events.compact(op, &mut self.account_events_scratch);
 
         // DEVIATION: upstream plans and reserves grid blocks per beat for the whole forest
         // (`forest.compact_trees_reserve_grid_blocks` + `ResourcePool`); this port drives each
@@ -564,7 +585,7 @@ impl Forest {
     /// Drive each tree's `level_active` compactions (all levels) for one op/beat.
     ///
     /// DEVIATION: upstream comptime-generates this loop (`inline for (std.enums.values(TreeID))`,
-    /// forest.zig:567); here the 25 trees of the three grooves are enumerated explicitly, each
+    /// forest.zig:567); here the 33 trees of the four grooves are enumerated explicitly, each
     /// with its own radix-sort scratch buffer (see the `*GrooveScratch` DEVIATION notes).
     #[allow(clippy::too_many_lines)]
     fn compact_levels_trees(&mut self, op: u64, storage: &mut dyn Storage) {
@@ -734,6 +755,63 @@ impl Forest {
             op,
             storage
         );
+
+        compact_tree!(
+            self,
+            self.account_events.objects,
+            &mut self.account_events_scratch.objects,
+            op,
+            storage
+        );
+        compact_tree!(
+            self,
+            self.account_events.account_timestamp,
+            &mut self.account_events_scratch.composite_key_64,
+            op,
+            storage
+        );
+        compact_tree!(
+            self,
+            self.account_events.transfer_pending_status,
+            &mut self.account_events_scratch.composite_key_64,
+            op,
+            storage
+        );
+        compact_tree!(
+            self,
+            self.account_events.dr_account_id_expired,
+            &mut self.account_events_scratch.composite_key_128,
+            op,
+            storage
+        );
+        compact_tree!(
+            self,
+            self.account_events.cr_account_id_expired,
+            &mut self.account_events_scratch.composite_key_128,
+            op,
+            storage
+        );
+        compact_tree!(
+            self,
+            self.account_events.transfer_pending_id_expired,
+            &mut self.account_events_scratch.composite_key_128,
+            op,
+            storage
+        );
+        compact_tree!(
+            self,
+            self.account_events.ledger_expired,
+            &mut self.account_events_scratch.composite_key_128,
+            op,
+            storage
+        );
+        compact_tree!(
+            self,
+            self.account_events.prunable,
+            &mut self.account_events_scratch.composite_key_unit,
+            op,
+            storage
+        );
     }
 
     /// Re-establish the free set's `Reserving` state before driving the next tree's beat
@@ -840,13 +918,15 @@ impl Forest {
 /// upstream `forest.tree_infos`) to its [`ScrubTree`].
 ///
 /// DEVIATION: upstream comptime-iterates `std.enums.values(Forest.TreeID)` (grid_scrubber.zig
-/// open); the port enumerates the three grooves' 25 trees explicitly. Tree ids 1..21 then
-/// 23..26 (there is no tree 22 in this port).
-#[allow(clippy::too_many_lines)] // explicit 25-arm dispatch mirrors the groove fields
+/// open); the port enumerates the four grooves' 33 trees explicitly, using the same tree
+/// indices as a `*_fuzz.zig`: accounts occupy tree ids 1..7 + 23/25, transfers 8..19 + 24/26,
+/// transfers_pending 20/21, account_events 22 + 27..33.
+#[allow(clippy::too_many_lines)] // explicit 33-arm dispatch mirrors the groove fields
 fn scrub_table_at<'a>(
     accounts: &'a AccountGroove,
     transfers: &'a TransferGroove,
     transfers_pending: &'a TransferPendingGroove,
+    account_events: &'a AccountEventsGroove,
     tree_index: usize,
 ) -> &'a dyn ScrubTree {
     match tree_index {
@@ -875,6 +955,14 @@ fn scrub_table_at<'a>(
         22 => &transfers.imported,
         23 => &accounts.closed,
         24 => &transfers.closing,
+        25 => &account_events.objects,
+        26 => &account_events.account_timestamp,
+        27 => &account_events.transfer_pending_status,
+        28 => &account_events.dr_account_id_expired,
+        29 => &account_events.cr_account_id_expired,
+        30 => &account_events.transfer_pending_id_expired,
+        31 => &account_events.ledger_expired,
+        32 => &account_events.prunable,
         _ => unreachable!("tree_index {tree_index} out of TREE_COUNT range"),
     }
 }

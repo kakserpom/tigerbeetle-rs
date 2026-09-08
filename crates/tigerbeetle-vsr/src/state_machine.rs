@@ -2107,7 +2107,7 @@ pub struct StateMachine {
     /// time (`groove.insert_*`, `state_machine.zig`). The HashMap stores above
     /// remain the golden resolution source for execute until the forest-backed
     /// phase routes prefetch reads through the grooves.
-    forest: Option<Forest>,
+    forest: Option<Box<Forest>>,
     /// Persistent objects caches, one per groove (upstream
     /// `Accounts.objects_cache`, `Transfers.objects_cache`,
     /// `TransfersPending.objects_cache`, `lsm/groove.zig`). The batch
@@ -2195,7 +2195,7 @@ impl StateMachine {
     /// storage layers are available.
     pub fn mount_forest(&mut self, forest: Forest) {
         assert!(self.forest.is_none());
-        self.forest = Some(forest);
+        self.forest = Some(Box::new(forest));
     }
 
     /// Look up a committed account by id (the temporary primary-key store that
@@ -3596,18 +3596,11 @@ impl StateMachine {
     /// Record a change-data-capture event for a committed transfer mutation
     /// (upstream `state_machine.zig:4384-4465`).
     ///
-    /// DEVIATION: upstream writes the event into the `account_events` groove
-    /// (a state-machine-level CDC groove); this port has no `AccountEventGroove`
-    /// yet (see AGENTS.md "No `account_event` CDC"), so the event stays in the
-    /// ephemeral [`Self::account_events`] store and — unlike the account /
-    /// transfer / pending / orphaned mirrors — is not written into the mounted
-    /// forest.
-    ///
     /// `dr_account` and `cr_account` are the accounts *after* the mutation
     /// applies. `transfer_pending_status` describes the event (`None` for a
     /// plain transfer, `Pending`/`Posted`/`Voided` for the corresponding
-    /// pending-transfer lifecycle); `transfer_pending` is the referenced
-    /// pending transfer for post/void (and later, expiry) events.
+    /// pending-transfer lifecycle, `Expired` for an expiry pump); `transfer_pending`
+    /// is the referenced pending transfer for post/void/expiry events.
     ///
     /// The event is inserted unconditionally (CDC is written regardless of
     /// `AccountFlags::HISTORY`); the account index is populated only for
@@ -3678,6 +3671,25 @@ impl StateMachine {
                 .entry(cr_account.timestamp)
                 .or_default()
                 .push(timestamp_event);
+        }
+
+        // Mirror the event into the mounted forest's CDC groove (upstream
+        // `account_event`, state_machine.zig:4445-4463): the object row is written
+        // unconditionally, and the `account_timestamp` index is populated only for
+        // HISTORY accounts (upstream inserts the derived index explicitly, outside the
+        // generic groove `insert`).
+        if let Some(forest) = self.forest.as_mut() {
+            forest.account_events.insert(&event);
+            if dr_account.flags.history() {
+                forest
+                    .account_events
+                    .insert_account_timestamp(dr_account.timestamp, timestamp_event);
+            }
+            if cr_account.flags.history() {
+                forest
+                    .account_events
+                    .insert_account_timestamp(cr_account.timestamp, timestamp_event);
+            }
         }
     }
 
@@ -4838,7 +4850,7 @@ mod tests {
             forest_b.accounts.objects.manifest_table_count() >= 1,
             "the reopened forest restores the flushed L0 tables"
         );
-        sm.forest = Some(forest_b);
+        sm.forest = Some(Box::new(forest_b));
 
         // The bare (unmounted) twin replays the same seed + follow-on through the committed
         // stores; the mounted machine must produce byte-identical replies from disk.
@@ -4949,7 +4961,7 @@ mod tests {
             forest_c.accounts.objects.manifest_table_count() >= 1,
             "the third generation restores both checkpoint generations' L0 tables"
         );
-        sm.forest = Some(forest_c);
+        sm.forest = Some(Box::new(forest_c));
 
         // Generation-3 verification through the disk tables: (a) a fresh single-phase
         // transfer re-reads the account object trees, validating balances that include the
@@ -5000,6 +5012,39 @@ mod tests {
             forest_c.transfers_pending.get(70).copied(),
             Some(sm.transfers_pending[&70]),
             "generation-3 pending mirror"
+        );
+        // The CDC groove mirrored *every* committed transfer into the account_events object
+        // tree: the gen-2 writes (pending 600@70, post 601@80) were flushed to disk tables
+        // before the gen-2 checkpoint and replayed into this third forest's manifest, while
+        // the gen-3 write (transfer 650@90) landed in its mutable table. `sm.account_events`
+        // is the authoritative store — assert the forest holds the same event set. (The
+        // accounts advertise no `HISTORY`, so `account_timestamp` stays empty and `prunable`
+        // accumulates one entry per event.)
+        let event_scratch = &mut forest_c.account_events_scratch.objects;
+        assert_eq!(
+            forest_c.account_events.objects.lookup_from_memory(90, event_scratch).copied(),
+            sm.account_events.get(&90).copied(),
+            "the gen-3 account_event is mirrored into the reopened forest's mutable object table"
+        );
+        for timestamp in sm.account_events.keys() {
+            assert_eq!(
+                forest_c
+                    .account_events
+                    .objects
+                    .lookup_from_memory(*timestamp, event_scratch)
+                    .is_none(),
+                timestamp != &90,
+                "gen-1/gen-2 account_events replay into disk tables, only the gen-3 event \
+                 stays in the reopened forest's memory"
+            );
+        }
+        assert!(
+            forest_c.account_events.objects_table_count() >= 1,
+            "the gen-1/gen-2 CDC object tables reach the third forest's manifest"
+        );
+        assert!(
+            forest_c.account_events.prunable.manifest_table_count() >= 1,
+            "the prunable index tables survive the checkpoint and reach the third forest"
         );
     }
 
