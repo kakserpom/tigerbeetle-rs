@@ -546,7 +546,14 @@ impl Grid {
         } else {
             let capacity_blocks =
                 options.free_set_blocks_capacity.unwrap_or(options.cache_blocks_count);
-            FreeSet::new(capacity_blocks * BLOCK_SIZE, 0)
+            let free_set_block_count = FreeSet::block_count_max(capacity_blocks * BLOCK_SIZE);
+            // Upstream sizes `blocks_released_prior_checkpoint_durability` to the most
+            // blocks a pipeline can release before the current checkpoint becomes durable
+            // (`replica.init`: `Forest.compaction_blocks_released_per_pipeline_max()` +
+            // client-sessions trailer blocks). The absolute upper bound is the free set's
+            // block count — no more than that many distinct blocks can be released — so
+            // size to it (the port has no client-sessions trailer yet to add).
+            FreeSet::new(capacity_blocks * BLOCK_SIZE, free_set_block_count)
         };
 
         // Upstream sizes the trailers with `free_set.encode_size_max()`.

@@ -278,6 +278,13 @@ impl<S: ManifestLevelSpec> ManifestLevel<S> {
         self.key_range_latest
     }
 
+    /// The level's current generation — the generation new [`TableInfoReference`]s to tables
+    /// in this level must carry to be accepted by [`ManifestLevel::set_snapshot_max`].
+    #[must_use]
+    pub fn generation(&self) -> u32 {
+        self.generation
+    }
+
     /// The number of tables visible to `SNAPSHOT_LATEST`.
     pub fn table_count_visible(&self) -> u32 {
         self.table_count_visible

@@ -552,6 +552,13 @@ impl<K: TableKey> Manifest<K> {
         let manifest_level = &self.levels[level_b as usize];
         assert!(manifest_level.table_count_visible() <= constants::LSM_GROWTH_FACTOR);
 
+        // Refs to the coalesced tables must carry the level's current generation: the level
+        // has already been mutated (inserts) to include them, so a stamped `0` would be
+        // rejected by `set_snapshot_max` once the level generation has advanced (e.g. after a
+        // reopen replays L0 tables). The generation is stable until this op's half-bar, which
+        // is the only time the level is mutated again.
+        let level_b_generation = manifest_level.generation();
+
         let range_overlap = manifest_level
             .tables_overlapping_with_key_range(
                 key_min,
@@ -620,7 +627,10 @@ impl<K: TableKey> Manifest<K> {
                         Direction::Ascending => range.key_max = table_next.key_max(),
                     }
 
-                    let tref = TableInfoReference { table_info: table_next, generation: 0 };
+                    let tref = TableInfoReference {
+                        table_info: table_next,
+                        generation: level_b_generation,
+                    };
                     match direction {
                         Direction::Descending => range.tables.insert_at(0, tref),
                         Direction::Ascending => range.tables.push(tref),

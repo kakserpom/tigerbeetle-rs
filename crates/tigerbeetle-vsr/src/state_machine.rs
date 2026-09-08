@@ -4875,6 +4875,132 @@ mod tests {
         // status went Pending → Posted through the groove `update` seam against the disk
         // state, and account 1's balance mutation diffed into the objects tree).
         audit_mirror(&mut sm);
+
+        // ── Generation 2: write into the reopened forest, flush, checkpoint, and verify a
+        // third reopen resolves the generation-2 writes from disk. The generation-2 mirrors
+        // land in the reopened forest's (empty) mutable tables, so the flushes below move
+        // them to new L0 tables with fresh snapshot ranges (ops 12..20, past gen-1's 4..12).
+        let _ = sm.create_transfers_with_storage(
+            &[Transfer { id: 600, flags: TransferFlags::PENDING, timeout: 60, ..t(1, 2, 50) }],
+            70,
+            Some(&mut storage),
+        );
+        let _ = bare.create_transfers_with_storage(
+            &[Transfer { id: 600, flags: TransferFlags::PENDING, timeout: 60, ..t(1, 2, 50) }],
+            70,
+            None,
+        );
+        let post2 = [Transfer {
+            id: 601,
+            pending_id: 600,
+            flags: TransferFlags::POST_PENDING_TRANSFER,
+            amount: 50,
+            ..t(1, 2, 0)
+        }];
+        assert_eq!(
+            sm.create_transfers_with_storage(&post2, 80, Some(&mut storage)),
+            bare.create_transfers_with_storage(&post2, 80, None),
+            "generation-2 writes resolve through the reopened forest's mutable tables"
+        );
+
+        let gen2_start = bar_start + bar_ops * 2;
+        for _bar in 0..2 {
+            for op in gen2_start..gen2_start + bar_ops {
+                sm.compact(op, Some(&mut storage));
+            }
+        }
+        let (manifest_refs2, free_set_refs2) = sm.checkpoint(Some(&mut storage));
+        assert!(manifest_refs2.block_count >= 1);
+        assert!(!free_set_refs2.blocks_acquired.empty());
+
+        // Reopen a third forest generation over the same storage.
+        let highest_address2 = free_set_refs2
+            .blocks_acquired
+            .last_block_address
+            .max(free_set_refs2.blocks_released.last_block_address);
+        let reopen_view = SuperBlockView {
+            storage_size: DATA_FILE_SIZE_MIN as u64 + highest_address2 * BLOCK_SIZE as u64,
+            manifest_block_count: manifest_refs2.block_count,
+            manifest_oldest_address: manifest_refs2.oldest_address,
+            manifest_oldest_checksum: manifest_refs2.oldest_checksum,
+            manifest_newest_address: manifest_refs2.newest_address,
+            manifest_newest_checksum: manifest_refs2.newest_checksum,
+            ..test_superblock()
+        };
+        let mut forest_c = Forest::init(reopen_view, forest_grid_options(), 32);
+        forest_c.open(
+            GridOpenReferences {
+                blocks_acquired: free_set_refs2.blocks_acquired,
+                blocks_released: free_set_refs2.blocks_released,
+            },
+            &mut storage,
+            0,
+        );
+        let mut done = false;
+        for _ in 0..1000 {
+            forest_c.poll(&mut storage);
+            if forest_c.accounts.objects.is_opened() && forest_c.is_idle() {
+                done = true;
+                break;
+            }
+        }
+        assert!(done, "third-generation reopen must complete");
+        assert!(
+            forest_c.accounts.objects.manifest_table_count() >= 1,
+            "the third generation restores both checkpoint generations' L0 tables"
+        );
+        sm.forest = Some(forest_c);
+
+        // Generation-3 verification through the disk tables: (a) a fresh single-phase
+        // transfer re-reads the account object trees, validating balances that include the
+        // gen-1/gen-2 mutations; (b) a void of the already-posted pending 600 re-reads the
+        // transfers + pending trees.
+        let fresh = [Transfer { id: 650, ..t(1, 2, 10) }];
+        assert_eq!(
+            sm.create_transfers_with_storage(&fresh, 90, Some(&mut storage)),
+            bare.create_transfers_with_storage(&fresh, 90, None),
+            "generation-3 balances resolve from the restored disk tables"
+        );
+        let void = [Transfer {
+            id: 602,
+            pending_id: 600,
+            flags: TransferFlags::VOID_PENDING_TRANSFER,
+            amount: 50,
+            ..t(1, 2, 0)
+        }];
+        assert_eq!(
+            sm.create_transfers_with_storage(&void, 91, Some(&mut storage)),
+            bare.create_transfers_with_storage(&void, 91, None),
+            "generation-3 pending status resolves from the restored disk tables"
+        );
+        // The generation-3 writes mirrored into the third forest's grooves too (transfer 650
+        // landed in its mutable tables, accounts 1/2 re-diffed; the void 602 was rejected —
+        // `pending_transfer_already_posted` — so it broke no new mirrors). Gen-1/2 objects are
+        // no longer in this forest's object cache — only the keys this generation prefetched
+        // are — so audit the generation-3 keys directly.
+        let forest_c = sm.forest.as_mut().expect("forest mounted");
+        assert_eq!(
+            forest_c.transfers.get(650).copied(),
+            Some(sm.transfers[&650]),
+            "generation-3 transfer mirror"
+        );
+        assert_eq!(
+            forest_c.accounts.get(1).copied(),
+            Some(sm.accounts[&1]),
+            "generation-3 account balance mirror"
+        );
+        assert_eq!(
+            forest_c.accounts.get(2).copied(),
+            Some(sm.accounts[&2]),
+            "generation-3 account balance mirror"
+        );
+        // The void 602 re-read pending 600's row (keyed by its original pending timestamp 70)
+        // as already posted.
+        assert_eq!(
+            forest_c.transfers_pending.get(70).copied(),
+            Some(sm.transfers_pending[&70]),
+            "generation-3 pending mirror"
+        );
     }
 
     /// Without a mounted forest (the default), `StateMachine::checkpoint` is a no-op that
