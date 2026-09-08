@@ -2060,6 +2060,7 @@ pub struct StateMachine {
     /// `state_machine.zig:3248`); `create_transfer` reports `id_already_failed`
     /// for ids in this set (`state_machine.zig:3736`), and it is disjoint from
     /// [`Self::transfers`] because a transient failure never commits a record.
+    /// Mirrored into the mounted forest's transfer-groove orphaned set.
     transfers_orphaned: HashSet<u128>,
     /// Maximum committed account timestamp — mirrors `accounts.objects.key_range.key_max`.
     accounts_timestamp_max: u64,
@@ -2072,7 +2073,8 @@ pub struct StateMachine {
     transfers_by_timestamp: HashMap<u64, u128>,
     /// Pending transfer index: timestamp → status, written at pending creation
     /// and updated when the pending is posted, voided, or expired. Mirrors
-    /// upstream's `transfers_pending.objects` groove.
+    /// upstream's `transfers_pending.objects` groove (mirrored into the mounted
+    /// forest's pending groove alongside).
     transfers_pending: HashMap<u64, TransferPending>,
     /// Change-data-capture store of account balance changes, keyed by event
     /// timestamp. Mirrors upstream's `account_events.objects` groove (written
@@ -2095,6 +2097,13 @@ pub struct StateMachine {
     /// (Phase 2/3). `None` until then: the accounting stores above are ephemeral
     /// HashMap stand-ins, and a missing forest is treated as an always-ready,
     /// no-op compaction target.
+    ///
+    /// Once mounted, the committed object stream (accounts, transfers, pending
+    /// status rows, orphaned ids) is mirrored into the forest's grooves at
+    /// persist time, exactly where upstream writes its grooves' trees at commit
+    /// time (`groove.insert_*`, `state_machine.zig`). The HashMap stores above
+    /// remain the golden resolution source for execute until the forest-backed
+    /// phase routes prefetch reads through the grooves.
     forest: Option<Forest>,
     /// Persistent objects caches, one per groove (upstream
     /// `Accounts.objects_cache`, `Transfers.objects_cache`,
@@ -3176,6 +3185,24 @@ impl StateMachine {
         }
         self.accounts_timestamp_max = self.accounts_timestamp_max.max(account.timestamp);
         self.accounts.insert(id, account);
+        if let Some(forest) = &mut self.forest {
+            forest.accounts.insert(&account);
+        }
+    }
+
+    /// Committed-balance mutation of an existing account: the timestamp (and
+    /// therefore the timestamp index) is unchanged, only the balances moved.
+    /// Mirrored into the mounted forest's account groove via its `update`
+    /// seam (the object-tree entry is overwritten and only changed index trees
+    /// are diffed — the id unique key is asserted untouched), matching
+    /// upstream's `grooves.accounts.update` at commit time (`groove.zig:1801`).
+    fn update_account(&mut self, account: Account) {
+        let old = self.accounts.get(&account.id).copied().expect("updated account is committed");
+        assert_eq!(old.timestamp, account.timestamp);
+        self.accounts.insert(account.id, account);
+        if let Some(forest) = &mut self.forest {
+            forest.accounts.update(&old, &account);
+        }
     }
 
     /// Persist the transfers that upstream would write under the chain scope,
@@ -3202,6 +3229,9 @@ impl StateMachine {
         for (event, result) in events.iter().zip(results) {
             if result.status.transient() {
                 self.transfers_orphaned.insert(event.id);
+                if let Some(forest) = &mut self.forest {
+                    forest.transfers.insert_orphaned_object(event.id);
+                }
             }
         }
 
@@ -3264,10 +3294,7 @@ impl StateMachine {
                 status: TransferPendingStatus::Pending,
                 padding: [0; 7],
             };
-            assert!(
-                self.transfers_pending.insert(event.timestamp, transfer_pending).is_none(),
-                "each pending transfer has a unique timestamp"
-            );
+            self.insert_transfer_pending(transfer_pending);
             self.commit_transfer(&event, amount_actual, amount_requested);
         } else if event.flags.post_pending_transfer() || event.flags.void_pending_transfer() {
             self.persist_post_void(event, amount_actual);
@@ -3294,17 +3321,12 @@ impl StateMachine {
         let record = fold_post_void_transfer(&event, &p, amount_actual, event.timestamp);
         self.insert_transfer(record.id, record);
 
-        let transfer_pending = self
-            .transfers_pending
-            .get_mut(&p.timestamp)
-            .expect("posting/voiding a pending transfer implies its pending status row");
-        assert_eq!(transfer_pending.status, TransferPendingStatus::Pending);
-        transfer_pending.status = if record.flags.post_pending_transfer() {
+        let pending_status = if record.flags.post_pending_transfer() {
             TransferPendingStatus::Posted
         } else {
             TransferPendingStatus::Voided
         };
-        let pending_status = transfer_pending.status;
+        self.update_transfer_pending_status(p.timestamp, pending_status);
 
         let dr = self
             .accounts
@@ -3317,8 +3339,8 @@ impl StateMachine {
             .copied()
             .expect("credit account exists: post_or_void_pending_transfer validated it");
         let (dr, cr) = commit_post_void_accounts(&record, &p, amount_actual, &dr, &cr);
-        self.accounts.insert(dr.id, dr);
-        self.accounts.insert(cr.id, cr);
+        self.update_account(dr);
+        self.update_account(cr);
         self.account_event(
             event.timestamp,
             &dr,
@@ -3338,6 +3360,13 @@ impl StateMachine {
 
     /// Record a change-data-capture event for a committed transfer mutation
     /// (upstream `state_machine.zig:4384-4465`).
+    ///
+    /// DEVIATION: upstream writes the event into the `account_events` groove
+    /// (a state-machine-level CDC groove); this port has no `AccountEventGroove`
+    /// yet (see AGENTS.md "No `account_event` CDC"), so the event stays in the
+    /// ephemeral [`Self::account_events`] store and — unlike the account /
+    /// transfer / pending / orphaned mirrors — is not written into the mounted
+    /// forest.
     ///
     /// `dr_account` and `cr_account` are the accounts *after* the mutation
     /// applies. `transfer_pending_status` describes the event (`None` for a
@@ -3561,19 +3590,13 @@ impl StateMachine {
             let dr_updated = p.amount > 0 || dr_new.flags.closed() != dr.flags.closed();
             let cr_updated = p.amount > 0 || cr_new.flags.closed() != cr.flags.closed();
             if dr_updated {
-                self.accounts.insert(dr_new.id, dr_new);
+                self.update_account(dr_new);
             }
             if cr_updated {
-                self.accounts.insert(cr_new.id, cr_new);
+                self.update_account(cr_new);
             }
 
-            let transfer_pending = self
-                .transfers_pending
-                .get_mut(&p.timestamp)
-                .expect("due pending transfer has a pending status row");
-            assert_eq!(transfer_pending.timestamp, p.timestamp);
-            assert_eq!(transfer_pending.status, TransferPendingStatus::Pending);
-            transfer_pending.status = TransferPendingStatus::Expired;
+            self.update_transfer_pending_status(p.timestamp, TransferPendingStatus::Expired);
 
             self.account_event(
                 timestamp_event,
@@ -3615,8 +3638,8 @@ impl StateMachine {
             );
 
         let (dr, cr) = commit_transfer_accounts(event, amount_actual, &dr, &cr);
-        self.accounts.insert(dr.id, dr);
-        self.accounts.insert(cr.id, cr);
+        self.update_account(dr);
+        self.update_account(cr);
         self.account_event(
             event.timestamp,
             &dr,
@@ -3656,6 +3679,53 @@ impl StateMachine {
         }
         self.transfers_timestamp_max = self.transfers_timestamp_max.max(transfer.timestamp);
         self.transfers.insert(id, transfer);
+        if let Some(forest) = &mut self.forest {
+            forest.transfers.insert(&transfer);
+        }
+    }
+
+    /// Record a pending transfer's status row at `timestamp` (created `Pending`).
+    ///
+    /// Mirrors upstream writing the transfer-pending groove on pending creation
+    /// (`transfers_pending.put`, state_machine.zig:3963-3982); the mounted
+    /// forest's pending groove is driven identically.
+    fn insert_transfer_pending(&mut self, pending: TransferPending) {
+        assert!(
+            self.transfers_pending.insert(pending.timestamp, pending).is_none(),
+            "each pending transfer has a unique timestamp"
+        );
+        if let Some(forest) = &mut self.forest {
+            forest.transfers_pending.insert(&pending);
+        }
+    }
+
+    /// Update the pending transfer status row at `timestamp` (posted / voided /
+    /// expired), replacing the creation-status `Pending`.
+    ///
+    /// Upstream re-puts the status row for the same pending timestamp and diffs
+    /// the status index (`state_machine.zig:4240-4298`, `4871-4890`); the
+    /// mounted forest's pending groove is driven through its `update` seam,
+    /// which removes the stale `Pending` status-index entry before writing the
+    /// new one.
+    fn update_transfer_pending_status(&mut self, timestamp: u64, status: TransferPendingStatus) {
+        let transfer_pending = self
+            .transfers_pending
+            .get(&timestamp)
+            .copied()
+            .expect("updating a pending status implies its status row exists");
+        assert_eq!(
+            transfer_pending.status,
+            TransferPendingStatus::Pending,
+            "a pending status only advances once, from `Pending`"
+        );
+        let pending = TransferPending { timestamp, status, padding: transfer_pending.padding };
+        assert!(
+            self.transfers_pending.insert(timestamp, pending).is_some(),
+            "updating a pending status replaces its existing status row"
+        );
+        if let Some(forest) = &mut self.forest {
+            forest.transfers_pending.update(&transfer_pending, &pending);
+        }
     }
 }
 
@@ -3833,6 +3903,123 @@ mod tests {
             values.iter().map(|account| account.timestamp).collect::<Vec<_>>(),
             vec![3, 5, 9]
         );
+    }
+
+    /// Drive a scripted commit sequence and return the reply bodies.
+    ///
+    /// Exercises every committed-write seam: plain transfers, pending transfers,
+    /// a posted pending, a voided pending, an expired pending, and a transient
+    /// failure that poisons its id into the orphaned set.
+    fn run_mirror_script(sm: &mut StateMachine) -> Vec<Vec<u8>> {
+        // Accounts 1, 2. Plain transfer, pendings, post/void, and an orphaned id (see
+        // below) — every committed-write seam a forest mirror must absorb.
+        let replies = vec![
+            sm.create_accounts(
+                &[
+                    Account { id: 1, ledger: 1, code: 1, ..Account::default() },
+                    Account { id: 2, ledger: 1, code: 1, ..Account::default() },
+                ],
+                10,
+            ),
+            // Plain (posted) transfer.
+            sm.create_transfers(&[t(1, 2, 100)], 20),
+            // Two pending transfers that stay pending for now.
+            sm.create_transfers(
+                &[Transfer { id: 200, flags: TransferFlags::PENDING, timeout: 60, ..t(1, 2, 50) }],
+                30,
+            ),
+            sm.create_transfers(
+                &[Transfer { id: 300, flags: TransferFlags::PENDING, timeout: 999, ..t(1, 2, 30) }],
+                40,
+            ),
+            sm.create_transfers(
+                &[Transfer { id: 400, flags: TransferFlags::PENDING, timeout: 40, ..t(1, 2, 40) }],
+                50,
+            ),
+            // Post / void two of them (the third, 400, expires at its timeout below).
+            sm.create_transfers(
+                &[Transfer {
+                    id: 310,
+                    pending_id: 200,
+                    flags: TransferFlags::POST_PENDING_TRANSFER,
+                    ..t(1, 2, 0)
+                }],
+                60,
+            ),
+            sm.create_transfers(
+                &[Transfer {
+                    id: 320,
+                    pending_id: 300,
+                    flags: TransferFlags::VOID_PENDING_TRANSFER,
+                    ..t(1, 2, 0)
+                }],
+                70,
+            ),
+            // Transient failure (missing credit account 3) poisons id 500.
+            sm.create_transfers(&[Transfer { id: 500, credit_account_id: 3, ..t(1, 2, 10) }], 80),
+        ];
+        assert_eq!(
+            reply_status(replies.last().expect("last reply")),
+            CreateTransferStatus::CreditAccountNotFound as u32
+        );
+        // Expire the outstanding pending (400, timeout 40 → due at 90).
+        sm.expire_pending_transfers(111);
+        replies
+    }
+
+    /// Assert the mounted forest's grooves mirror the committed stores exactly:
+    /// every committed account / transfer / pending-status / orphaned id is
+    /// visible through the corresponding groove's object cache.
+    fn audit_mirror(sm: &mut StateMachine) {
+        let accounts: Vec<(u128, Account)> = sm.accounts.iter().map(|(&id, &a)| (id, a)).collect();
+        let transfers: Vec<(u128, Transfer)> =
+            sm.transfers.iter().map(|(&id, &t)| (id, t)).collect();
+        let pendings: Vec<(u64, TransferPending)> =
+            sm.transfers_pending.iter().map(|(&ts, &p)| (ts, p)).collect();
+        let orphaned: Vec<u128> = sm.transfers_orphaned.iter().copied().collect();
+
+        let forest = sm.forest.as_mut().expect("a forest is mounted");
+        for (id, account) in accounts {
+            assert_eq!(forest.accounts.get(id).copied(), Some(account), "account {id}");
+        }
+        for (id, transfer) in transfers {
+            assert_eq!(forest.transfers.get(id).copied(), Some(transfer), "transfer {id}");
+        }
+        for (timestamp, pending) in pendings {
+            assert_eq!(
+                forest.transfers_pending.get(timestamp).copied(),
+                Some(pending),
+                "pending status at {timestamp}"
+            );
+        }
+        for id in orphaned {
+            let orphan =
+                forest.transfers.get(id).copied().expect("orphaned id mirrored to the groove");
+            assert_eq!(orphan.id, id);
+            assert_eq!(orphan.timestamp, 0);
+        }
+    }
+
+    /// The committed object stream mirrors into a mounted forest's grooves.
+    ///
+    /// Accounts, transfers (including posted/voided pending transfers), pending
+    /// status rows (through posted/voided/expired transitions), and orphaned ids
+    /// are written to the forest's grooves at persist time, exactly where
+    /// upstream writes its groove trees at commit time (`groove.insert_*`,
+    /// `state_machine.zig`). The HashMap stores remain the golden resolution
+    /// source, so an unmounted twin produces byte-identical replies — this test
+    /// pins that the mirror is behavior-neutral.
+    #[test]
+    fn committed_stream_mirrors_mounted_forest_grooves() {
+        let mut mounted = StateMachine::default();
+        mounted.mount_forest(Forest::init(test_superblock(), forest_grid_options(), 32));
+        let mut bare = StateMachine::default();
+
+        let mounted_replies = run_mirror_script(&mut mounted);
+        let bare_replies = run_mirror_script(&mut bare);
+        assert_eq!(mounted_replies, bare_replies);
+
+        audit_mirror(&mut mounted);
     }
 
     /// Compacting across a full bar through the state machine (including the last-beat
