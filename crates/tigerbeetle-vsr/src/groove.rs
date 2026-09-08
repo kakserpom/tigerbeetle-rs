@@ -1421,7 +1421,7 @@ impl AccountGroove {
     ///
     /// # Panics
     /// Panics unless `snapshot_target < SNAPSHOT_LATEST` (upstream asserts).
-    #[allow(dead_code)] // used by the prefetch seam; state-machine wiring is a later slice
+    #[allow(dead_code)] // consumed by the state-machine prefetch wiring
     pub(crate) fn prefetch_setup(&mut self, snapshot_target: u64) {
         assert!(snapshot_target < SNAPSHOT_LATEST);
         self.prefetch_snapshot = Some(snapshot_target);
@@ -1438,7 +1438,7 @@ impl AccountGroove {
     ///
     /// # Panics
     /// Panics if called before [`Self::prefetch_setup`].
-    #[allow(dead_code)] // used by the prefetch seam; state-machine wiring is a later slice
+    #[allow(dead_code)] // consumed by the state-machine prefetch wiring
     pub(crate) fn prefetch_enqueue(
         &mut self,
         grid: &mut Grid,
@@ -1528,12 +1528,14 @@ impl AccountGroove {
     /// Mirrors `groove.prefetch` + the `PrefetchWorker`/`finish` callbacks
     /// (groove.zig:1339-1491): upstream runs `grid.read_iops_max` lookups in parallel and
     /// fires the callback when all complete; this port resolves the same reads
-    /// synchronously and returns in their place.
+    /// synchronously and returns in their place. Settled key statuses persist until the
+    /// next [`Self::prefetch_setup`] clears them, as upstream's state machine consults
+    /// them during execution (the imported-timestamp `indirect_lookup`).
     ///
     /// # Panics
     /// Panics if called before [`Self::prefetch_setup`], or if a settled status is
     /// inconsistent with the objects cache (upstream `constants.verify` asserts).
-    #[allow(dead_code)] // used by the prefetch seam; state-machine wiring is a later slice
+    #[allow(dead_code)] // consumed by the state-machine prefetch wiring
     pub(crate) fn prefetch(&mut self, grid: &mut Grid, storage: &mut dyn Storage) {
         let snapshot = self
             .prefetch_snapshot
@@ -1580,7 +1582,6 @@ impl AccountGroove {
 
         self.prefetch_snapshot = None;
         self.verify_prefetch();
-        self.prefetch_keys.clear();
     }
 
     /// The object-tree lookup completing a `.prefetching` key (upstream
@@ -1782,6 +1783,21 @@ impl AccountGroove {
     #[must_use]
     pub fn has(&mut self, id: u128) -> bool {
         self.objects_cache.has(id)
+    }
+
+    /// Whether a prefetch-enqueued key settled to an object (the primary-key form of
+    /// upstream's `indirect_lookup`: the timestamps the grooves actually resolved,
+    /// state_machine.zig:1283-1309 for create_accounts and 1374-1385 for create_transfers).
+    ///
+    /// Only meaningful for a key enqueued since the last [`Self::prefetch_setup`] and
+    /// after [`Self::prefetch`] completed. Orphaned resolutions (transfers groove only)
+    /// count as found.
+    #[must_use]
+    pub(crate) fn prefetch_key_found(&self, key: IdTimestampPrefetchKey) -> bool {
+        matches!(
+            self.prefetch_keys.get(key),
+            Some(PrefetchStatus::Found(_) | PrefetchStatus::FoundOrphaned)
+        )
     }
 
     /// Remove `id` from the primary-key view by placing a tombstone in the cache.
@@ -2060,6 +2076,20 @@ impl TransferGroove {
         self.objects_cache.has(id)
     }
 
+    /// Whether a prefetch-enqueued key settled to an object (the primary-key form of
+    /// upstream's `indirect_lookup`: the timestamps the grooves actually resolved,
+    /// state_machine.zig:1374-1385).
+    ///
+    /// Only meaningful for a key enqueued since the last [`Self::prefetch_setup`] and
+    /// after [`Self::prefetch`] completed. Orphaned resolutions count as found.
+    #[must_use]
+    pub(crate) fn prefetch_key_found(&self, key: IdTimestampPrefetchKey) -> bool {
+        matches!(
+            self.prefetch_keys.get(key),
+            Some(PrefetchStatus::Found(_) | PrefetchStatus::FoundOrphaned)
+        )
+    }
+
     /// Remove `id` from the primary-key view by placing a tombstone in the cache.
     ///
     /// Mirrors `groove.remove` (groove.zig:1876-1920).
@@ -2185,7 +2215,7 @@ impl TransferGroove {
     ///
     /// # Panics
     /// Panics unless `snapshot_target < SNAPSHOT_LATEST` (upstream asserts).
-    #[allow(dead_code)] // used by the prefetch seam; state-machine wiring is a later slice
+    #[allow(dead_code)] // consumed by the state-machine prefetch wiring
     pub(crate) fn prefetch_setup(&mut self, snapshot_target: u64) {
         assert!(snapshot_target < SNAPSHOT_LATEST);
         self.prefetch_snapshot = Some(snapshot_target);
@@ -2200,7 +2230,7 @@ impl TransferGroove {
     ///
     /// # Panics
     /// Panics if called before [`Self::prefetch_setup`].
-    #[allow(dead_code)] // used by the prefetch seam; state-machine wiring is a later slice
+    #[allow(dead_code)] // consumed by the state-machine prefetch wiring
     pub(crate) fn prefetch_enqueue(
         &mut self,
         grid: &mut Grid,
@@ -2283,12 +2313,16 @@ impl TransferGroove {
     /// storage, then assert every key is settled consistently with the objects cache.
     ///
     /// Mirrors `groove.prefetch` + the `PrefetchWorker`/`finish` callbacks
-    /// (groove.zig:1339-1491, 1513-1766).
+    /// (groove.zig:1339-1491): upstream runs `grid.read_iops_max` lookups in parallel and
+    /// fires the callback when all complete; this port resolves the same reads
+    /// synchronously and returns in their place. Settled key statuses persist until the
+    /// next [`Self::prefetch_setup`] clears them, as upstream's state machine consults
+    /// them during execution (the imported-timestamp `indirect_lookup`).
     ///
     /// # Panics
     /// Panics if called before [`Self::prefetch_setup`], or if a settled status is
     /// inconsistent with the objects cache (upstream `constants.verify` asserts).
-    #[allow(dead_code)] // used by the prefetch seam; state-machine wiring is a later slice
+    #[allow(dead_code)] // consumed by the state-machine prefetch wiring
     pub(crate) fn prefetch(&mut self, grid: &mut Grid, storage: &mut dyn Storage) {
         let snapshot = self
             .prefetch_snapshot
@@ -2338,7 +2372,6 @@ impl TransferGroove {
 
         self.prefetch_snapshot = None;
         self.verify_prefetch();
-        self.prefetch_keys.clear();
     }
 
     /// The object-tree lookup completing a `.prefetching` key (upstream
@@ -2964,7 +2997,7 @@ impl TransferPendingGroove {
     ///
     /// # Panics
     /// Panics unless `snapshot_target < SNAPSHOT_LATEST` (upstream asserts).
-    #[allow(dead_code)] // used by the prefetch seam; state-machine wiring is a later slice
+    #[allow(dead_code)] // consumed by the state-machine prefetch wiring
     pub(crate) fn prefetch_setup(&mut self, snapshot_target: u64) {
         assert!(snapshot_target < SNAPSHOT_LATEST);
         self.prefetch_snapshot = Some(snapshot_target);
@@ -2981,7 +3014,7 @@ impl TransferPendingGroove {
     ///
     /// # Panics
     /// Panics if called before [`Self::prefetch_setup`].
-    #[allow(dead_code)] // used by the prefetch seam; state-machine wiring is a later slice
+    #[allow(dead_code)] // consumed by the state-machine prefetch wiring
     pub(crate) fn prefetch_enqueue(&mut self, grid: &mut Grid, key: TimestampPrefetchKey) {
         let snapshot = self
             .prefetch_snapshot
@@ -3016,12 +3049,14 @@ impl TransferPendingGroove {
     ///
     /// Mirrors `groove.prefetch` + the `PrefetchWorker`/`finish` callbacks
     /// (groove.zig:1339-1491): upstream parallelizes `grid.read_iops_max` lookups; this
-    /// port resolves the same reads synchronously.
+    /// port resolves the same reads synchronously. Settled key statuses persist until the
+    /// next [`Self::prefetch_setup`] clears them, as upstream's state machine consults
+    /// them during execution (the imported-timestamp `indirect_lookup`).
     ///
     /// # Panics
     /// Panics if called before [`Self::prefetch_setup`], or if a settled status is
     /// inconsistent with the objects cache (upstream `constants.verify` asserts).
-    #[allow(dead_code)] // used by the prefetch seam; state-machine wiring is a later slice
+    #[allow(dead_code)] // consumed by the state-machine prefetch wiring
     pub(crate) fn prefetch(&mut self, grid: &mut Grid, storage: &mut dyn Storage) {
         let snapshot = self
             .prefetch_snapshot
@@ -3042,7 +3077,6 @@ impl TransferPendingGroove {
 
         self.prefetch_snapshot = None;
         self.verify_prefetch();
-        self.prefetch_keys.clear();
     }
 
     /// The object-tree lookup completing a `.prefetching` key (upstream
@@ -4357,7 +4391,10 @@ mod tests {
         assert_eq!(groove.prefetch_keys.get(id101), Some(PrefetchStatus::Found(101)));
 
         groove.prefetch(&mut grid, &mut storage);
-        assert!(groove.prefetch_keys.ordered.is_empty());
+        // Settled statuses survive `prefetch` until the next `prefetch_setup`
+        // clears them — upstream's state machine consults them during execution
+        // (the imported-timestamp `indirect_lookup`, groove.zig:986-992).
+        assert_eq!(groove.prefetch_keys.get(id101), Some(PrefetchStatus::Found(101)));
         assert_eq!(groove.prefetch_snapshot, None);
         assert_eq!(groove.get(101), Some(&Account { timestamp: 1, id: 101, ..Account::default() }));
     }
@@ -4384,7 +4421,10 @@ mod tests {
         assert_eq!(groove.prefetch_keys.get(overflow_ts), Some(PrefetchStatus::NotFound));
 
         groove.prefetch(&mut grid, &mut storage);
-        assert!(groove.prefetch_keys.ordered.is_empty());
+        // Settled statuses survive `prefetch` until the next `prefetch_setup`.
+        assert_eq!(groove.prefetch_keys.get(zero), Some(PrefetchStatus::NotFound));
+        assert_eq!(groove.prefetch_keys.get(invalid_ts), Some(PrefetchStatus::NotFound));
+        assert_eq!(groove.prefetch_keys.get(overflow_ts), Some(PrefetchStatus::NotFound));
     }
 
     #[test]
@@ -4435,7 +4475,10 @@ mod tests {
         assert_eq!(groove.prefetch_keys.get(ts6), Some(PrefetchStatus::NotFound));
 
         groove.prefetch(&mut grid, &mut storage);
-        assert!(groove.prefetch_keys.ordered.is_empty());
+        // Settled statuses survive `prefetch` until the next `prefetch_setup`.
+        assert_eq!(groove.prefetch_keys.get(ts5), Some(PrefetchStatus::Found(201)));
+        assert_eq!(groove.prefetch_keys.get(ts6), Some(PrefetchStatus::NotFound));
+        assert_eq!(groove.prefetch_keys.get(ts7), Some(PrefetchStatus::Found(202)));
         assert_eq!(groove.get(201), Some(&Account { timestamp: 5, id: 201, ..Account::default() }));
         assert_eq!(groove.get(202), Some(&Account { timestamp: 7, id: 202, ..Account::default() }));
         assert!(!groove.has(0));
@@ -4490,7 +4533,9 @@ mod tests {
         );
 
         groove.prefetch(&mut grid, &mut storage);
-        assert!(groove.prefetch_keys.ordered.is_empty());
+        // Settled statuses survive `prefetch` until the next `prefetch_setup`.
+        assert_eq!(groove.prefetch_keys.get(id102), Some(PrefetchStatus::Found(102)));
+        assert_eq!(groove.prefetch_keys.get(ts1), Some(PrefetchStatus::Found(101)));
         assert_eq!(groove.get(102), Some(&accounts()[1]));
         assert_eq!(groove.get(101), Some(&accounts()[0]));
     }
@@ -4634,7 +4679,8 @@ mod tests {
         assert_eq!(groove.prefetch_keys.get(ts5), Some(PrefetchStatus::Found(5)));
 
         groove.prefetch(&mut grid, &mut storage);
-        assert!(groove.prefetch_keys.ordered.is_empty());
+        // Settled statuses survive `prefetch` until the next `prefetch_setup`.
+        assert_eq!(groove.prefetch_keys.get(ts5), Some(PrefetchStatus::Found(5)));
         assert_eq!(
             groove.get(5),
             Some(&TransferPending {
@@ -4690,7 +4736,8 @@ mod tests {
         );
 
         groove.prefetch(&mut grid, &mut storage);
-        assert!(groove.prefetch_keys.ordered.is_empty());
+        // Settled statuses survive `prefetch` until the next `prefetch_setup`.
+        assert_eq!(groove.prefetch_keys.get(ts1), Some(PrefetchStatus::Found(1)));
         assert_eq!(
             groove.get(1),
             Some(&TransferPending {

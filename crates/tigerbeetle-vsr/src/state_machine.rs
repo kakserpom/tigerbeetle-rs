@@ -2612,8 +2612,7 @@ impl StateMachine {
     ) -> Vec<u8> {
         assert!(self.commit_timestamp <= timestamp);
         let prefetch = prefetch_create_accounts(events);
-        self.create_accounts_prefetch(&prefetch, storage);
-        let transfer_timestamps = self.accounts_indirect_lookup(&prefetch);
+        let transfer_timestamps = self.create_accounts_prefetch(&prefetch, storage);
         let results = execute_create_accounts(
             events,
             timestamp,
@@ -2635,7 +2634,7 @@ impl StateMachine {
         &mut self,
         prefetch: &AccountPrefetchKeys,
         storage: Option<&mut dyn Storage>,
-    ) {
+    ) -> HashSet<u64> {
         // When a forest is mounted with backing storage, resolve the batch
         // key-set through the grooves' LSM prefetch seams, assert the
         // resolutions equal the committed stores, and fill the embedded object
@@ -2656,9 +2655,9 @@ impl StateMachine {
             }
             // Imported accounts probe the transfers groove for a colliding
             // transfer timestamp (upstream `transfers.indirect_lookup`); the
-            // found-subset still comes from the committed
-            // [`Self::transfers_by_timestamp`] store (the groove `Timestamp(key)`
-            // resolution is not yet consulted for the imported regress decision).
+            // found-subset below comes from the grooves' resolved Timestamp
+            // keys, parity-checked against the committed
+            // [`Self::transfers_by_timestamp`] store.
             forest.transfers.prefetch_setup(snapshot);
             for &ts in prefetch.transfer_timestamps.iter() {
                 forest.transfers.prefetch_enqueue(
@@ -2686,19 +2685,31 @@ impl StateMachine {
                     ),
                 }
             }
-            return;
+
+            // The groove-resolved found-subset of the imported transfer
+            // timestamps, parity-asserted against the committed timestamp index.
+            let mut transfer_timestamps = HashSet::new();
+            for &ts in prefetch.transfer_timestamps.iter() {
+                let found =
+                    forest.transfers.prefetch_key_found(IdTimestampPrefetchKey::Timestamp(ts));
+                assert_eq!(
+                    found,
+                    self.transfers_by_timestamp.contains_key(&ts),
+                    "transfers-groove timestamp resolution must match the committed index"
+                );
+                if found {
+                    transfer_timestamps.insert(ts);
+                }
+            }
+            return transfer_timestamps;
         }
         for &id in prefetch.account_ids.iter() {
             if let Some(account) = self.accounts.get(&id) {
                 self.accounts_objects.upsert(account);
             }
         }
-    }
-
-    /// The _found_ subset of the enqueued transfer timestamps that collide
-    /// with the committed transfer index for imported events
-    /// (`transfers.indirect_lookup`, state_machine.zig:1283-1309).
-    fn accounts_indirect_lookup(&self, prefetch: &AccountPrefetchKeys) -> HashSet<u64> {
+        // No forest (or no backing storage): the committed timestamp index is the
+        // resolution (`transfers.indirect_lookup`, state_machine.zig:1283-1309).
         let mut transfer_timestamps = HashSet::new();
         for &ts in prefetch.transfer_timestamps.iter() {
             if self.transfers_by_timestamp.contains_key(&ts) {
@@ -2732,15 +2743,9 @@ impl StateMachine {
     ) -> Vec<u8> {
         assert!(self.commit_timestamp <= timestamp);
         let prefetch = prefetch_create_transfers(events, |id| self.transfers.get(&id).copied());
-        self.create_transfers_prefetch(&prefetch, storage);
         // The imported-timestamp collision check needs the _found_ subset of
         // the enqueued account timestamps (`accounts.indirect_lookup`).
-        let mut account_timestamps = HashSet::new();
-        for &ts in prefetch.account_timestamps.iter() {
-            if self.accounts_by_timestamp.contains_key(&ts) {
-                account_timestamps.insert(ts);
-            }
-        }
+        let account_timestamps = self.create_transfers_prefetch(&prefetch, storage);
         // In-session orphaned ids (upstream writes these outside the chain
         // scope, state_machine.zig:3215-3252).
         let mut working_orphaned = HashSet::new();
@@ -2770,13 +2775,12 @@ impl StateMachine {
         &mut self,
         prefetch: &TransferPrefetchKeys,
         storage: Option<&mut dyn Storage>,
-    ) {
+    ) -> HashSet<u64> {
         // Mounted with backing storage: resolve through the grooves' LSM
-        // prefetch seams, assert parity with the committed stores, and fill the
-        // embedded caches from the grooves' resolved caches (the imported
-        // accounts-by-timestamp found-subset still derives from the committed
-        // [`Self::accounts_by_timestamp`] store — see
-        // [`Self::create_accounts_prefetch`]'s DEVIATION).
+        // prefetch seams, assert parity with the committed stores, fill the
+        // embedded caches from the grooves' resolved caches, and return the
+        // accounts-by-timestamp found-subset from the grooves' resolved
+        // Timestamp keys (parity-checked against [`Self::accounts_by_timestamp`]).
         if let (Some(forest), Some(storage)) = (self.forest.as_mut(), storage) {
             let snapshot = self.prefetch_snapshot.unwrap_or(SNAPSHOT_LATEST - 1);
 
@@ -2861,7 +2865,23 @@ impl StateMachine {
                     ),
                 }
             }
-            return;
+
+            // The groove-resolved found-subset of the imported account
+            // timestamps, parity-asserted against the committed timestamp index.
+            let mut account_timestamps = HashSet::new();
+            for &ts in prefetch.account_timestamps.iter() {
+                let found =
+                    forest.accounts.prefetch_key_found(IdTimestampPrefetchKey::Timestamp(ts));
+                assert_eq!(
+                    found,
+                    self.accounts_by_timestamp.contains_key(&ts),
+                    "accounts-groove timestamp resolution must match the committed index"
+                );
+                if found {
+                    account_timestamps.insert(ts);
+                }
+            }
+            return account_timestamps;
         }
         for &id in prefetch.account_ids.iter() {
             if let Some(account) = self.accounts.get(&id) {
@@ -2878,6 +2898,15 @@ impl StateMachine {
                 self.transfers_pending_objects.upsert(pending);
             }
         }
+        // No forest (or no backing storage): the committed timestamp index is
+        // the resolution (`accounts.indirect_lookup`, state_machine.zig:1374-1385).
+        let mut account_timestamps = HashSet::new();
+        for &ts in prefetch.account_timestamps.iter() {
+            if self.accounts_by_timestamp.contains_key(&ts) {
+                account_timestamps.insert(ts);
+            }
+        }
+        account_timestamps
     }
 
     /// Execute a `lookup_accounts` query and return the reply body (upstream
@@ -4114,8 +4143,11 @@ mod tests {
     /// Drive a scripted commit sequence and return the reply bodies.
     ///
     /// Exercises every committed-write seam: plain transfers, pending transfers,
-    /// a posted pending, a voided pending, an expired pending, and a transient
-    /// failure that poisons its id into the orphaned set.
+    /// a posted pending, a voided pending, an expired pending, a transient
+    /// failure that poisons its id into the orphaned set, and imported
+    /// create_accounts / create_transfers batches whose imported-timestamp
+    /// regression checks read the grooves' resolved timestamp found-subsets
+    /// (`transfers`/`accounts` indirect lookups).
     ///
     /// `storage` (when `Some`) routes the batch prefetch step through the mounted
     /// grooves' LSM prefetch seams, so the seam test doubles as an end-to-end
@@ -4124,7 +4156,7 @@ mod tests {
     fn run_mirror_script(sm: &mut StateMachine, storage: &mut dyn Storage) -> Vec<Vec<u8>> {
         // Accounts 1, 2. Plain transfer, pendings, post/void, and an orphaned id (see
         // below) — every committed-write seam a forest mirror must absorb.
-        let replies = vec![
+        let mut replies = vec![
             sm.create_accounts_with_storage(
                 &[
                     Account { id: 1, ledger: 1, code: 1, ..Account::default() },
@@ -4185,6 +4217,56 @@ mod tests {
         );
         // Expire the outstanding pending (400, timeout 40 → due at 90).
         sm.expire_pending_transfers(111);
+
+        // Imported batches: the imported-timestamp checks consult the groove
+        // timestamp found-subsets. `accounts_timestamp_max` is 10 (accounts 1/2)
+        // and `transfers_timestamp_max` is 70 (transfer 1002@20 .. void 320@70)
+        // after expiry.
+        replies.push(sm.create_accounts_with_storage(
+            &[
+                // ts 20 collides with transfer 1002@20 (transfers indirect lookup).
+                imported_account(7, 20),
+                imported_account(8, 25),
+            ],
+            120,
+            Some(&mut *storage),
+        ));
+        assert_eq!(
+            reply_status_at(replies.last().expect("imported accounts reply"), 0),
+            CreateAccountStatus::ImportedEventTimestampMustNotRegress as u32
+        );
+        assert_eq!(
+            reply_status_at(replies.last().expect("imported accounts reply"), 1),
+            CreateAccountStatus::Created as u32
+        );
+        replies.push(sm.create_accounts_with_storage(
+            &[imported_account(9, 80)],
+            130,
+            Some(&mut *storage),
+        ));
+        assert_eq!(
+            reply_status(replies.last().expect("second imported accounts reply")),
+            CreateAccountStatus::Created as u32
+        );
+        replies.push(sm.create_transfers_with_storage(
+            &[
+                // ts 80 collides with account 9@80 (accounts indirect lookup).
+                imported_transfer(5, 80, TransferFlags::IMPORTED),
+                // ts 90 postdates the transfers (max 70) and the accounts key
+                // range's found-subset ({80}), and precedes the commit slot (140).
+                imported_transfer(6, 90, TransferFlags::IMPORTED),
+            ],
+            140,
+            Some(&mut *storage),
+        ));
+        assert_eq!(
+            reply_status_at(replies.last().expect("imported transfers reply"), 0),
+            CreateTransferStatus::ImportedEventTimestampMustNotRegress as u32
+        );
+        assert_eq!(
+            reply_status_at(replies.last().expect("imported transfers reply"), 1),
+            CreateTransferStatus::Created as u32
+        );
         replies
     }
 
