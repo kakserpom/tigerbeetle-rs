@@ -3728,11 +3728,19 @@ impl StateMachine {
     /// `:4227`), driving the `expires_at` index scan on the next pulse. Sans-IO
     /// the pending map is authoritative and cheap to scan, so recomputing is
     /// exact and always leaves `pulse_needed` pointing at the true next expiry.
-    /// A `Pending` transfer with `timeout == 0` (allowed upstream) never
-    /// derives an `expires_at` entry, so it is skipped here exactly as the
-    /// upstream scan skips it.
+    /// When a forest is mounted (and its `expires_at` index is un-flushed) the
+    /// value is re-derived from the index tree's memory-table scan instead,
+    /// asserted equal to the recompute. A `Pending` transfer with `timeout == 0`
+    /// (allowed upstream) never derives an `expires_at` entry, so it is skipped
+    /// exactly as the upstream scan skips it.
     fn update_pulse_next_timestamp(&mut self) {
         self.pulse_next_timestamp = TimestampRange::TIMESTAMP_MAX;
+        // The authoritative recompute over the pending store, `(expires_at,
+        // pending_ts)` ascending. Each `Pending` row with `timeout != 0` derives
+        // exactly one `expires_at` entry (upstream `TransferExpiresAtIndex`,
+        // state_machine.zig:445); a `timeout == 0` pending is skipped here
+        // exactly as the index scan skips it.
+        let mut by_map: Vec<(u64, u64)> = Vec::new();
         for (&pending_ts, pending_status) in &self.transfers_pending {
             if pending_status.status != TransferPendingStatus::Pending {
                 continue;
@@ -3752,7 +3760,35 @@ impl StateMachine {
                 continue;
             }
             let expires_at = p.timestamp + p.timeout_ns();
-            self.pulse_next_timestamp = self.pulse_next_timestamp.min(expires_at);
+            by_map.push((expires_at, pending_ts));
+        }
+        by_map.sort_unstable();
+
+        // When a forest is mounted and the `expires_at` index tree is wholly in
+        // memory (`manifest_table_count() == 0` — nothing flushed to disk), the
+        // next expiry comes from the index tree itself, the derived-index scan
+        // the upstream pulse steps over; the scan is proved equal to the
+        // authoritative pending-store recompute (upstream's
+        // `expire_pending_transfers.finish`, state_machine.zig:4984-4996).
+        // Otherwise (unmounted, or the index was compacted to disk) the
+        // recompute above is authoritative.
+        let by_index = if let Some(forest) = self.forest.as_ref() {
+            if forest.transfers.expires_at.manifest_table_count() == 0 {
+                let scan = forest.transfers.scan_expires_at_memory();
+                assert_eq!(
+                    scan, by_map,
+                    "the forest's expires_at index must mirror the pending store"
+                );
+                scan
+            } else {
+                by_map
+            }
+        } else {
+            by_map
+        };
+
+        if let Some(&(expires_at, _)) = by_index.first() {
+            self.pulse_next_timestamp = expires_at;
         }
     }
 
@@ -3777,11 +3813,13 @@ impl StateMachine {
     /// expiry timestamp rather than through the VSR pulse/beat machinery, and
     /// the due set is recomputed sans-I/O instead of scanning the `expires_at`
     /// derived index; the caller is responsible for calling it once the next
-    /// pending is due. The forest's `expires_at` mirror entries are nonetheless
-    /// reaped on expiry/post/void exactly where upstream removes them
-    /// (`state_machine.zig:4220` and `:4606-4612`), so the index tree stays a
-    /// faithful scan source when the forest lands. This operation produces no
-    /// reply body.
+    /// pending is due. When a forest is mounted (and its `expires_at` index is
+    /// un-flushed) the due set comes from the index tree's memory-table scan
+    /// instead, asserted equal to the recompute. The forest's `expires_at`
+    /// mirror entries are reaped on expiry/post/void exactly where upstream
+    /// removes them (`state_machine.zig:4220` and `:4606-4612`), so the index
+    /// tree stays a faithful scan source when the forest lands. This operation
+    /// produces no reply body.
     pub fn expire_pending_transfers(&mut self, timestamp: u64) {
         assert!(
             timestamp > self.commit_timestamp,
@@ -3792,9 +3830,10 @@ impl StateMachine {
             "expiry timestamps are assigned from a positive base and cannot overflow"
         );
 
-        // Collect due pendings in the order the `expires_at` derived index would
-        // scan them: ascending `expires_at`, then ascending pending timestamp.
-        let mut due: Vec<(u64, u64, u128)> = Vec::new(); // (expires_at, pending_ts, pending_id)
+        // The authoritative due set over the pending store, `(expires_at,
+        // pending_ts, pending_id)` in the order the `expires_at` derived index
+        // scans them: ascending `expires_at`, then ascending pending timestamp.
+        let mut due_map: Vec<(u64, u64, u128)> = Vec::new();
         for (&pending_ts, pending_status) in &self.transfers_pending {
             if pending_status.status != TransferPendingStatus::Pending {
                 continue;
@@ -3818,10 +3857,43 @@ impl StateMachine {
             }
             let expires_at = p.timestamp + p.timeout_ns();
             if expires_at <= timestamp {
-                due.push((expires_at, pending_ts, id));
+                due_map.push((expires_at, pending_ts, id));
             }
         }
-        due.sort_unstable();
+        due_map.sort_unstable();
+
+        // When a forest is mounted and the `expires_at` index tree is wholly in
+        // memory (nothing flushed to disk), the due set comes from the index
+        // tree itself — the derived-index scan upstream's expiry pump steps over
+        // — resolved to pending ids via the timestamp index, and is proved equal
+        // to the authoritative pending-store recompute. Otherwise the recompute
+        // above is the driver (unmounted, or the index was compacted to disk).
+        let due: Vec<(u64, u64, u128)> = match self
+            .forest
+            .as_ref()
+            .filter(|forest| forest.transfers.expires_at.manifest_table_count() == 0)
+        {
+            Some(forest) => {
+                let due_index: Vec<(u64, u64, u128)> = forest
+                    .transfers
+                    .scan_expires_at_memory()
+                    .into_iter()
+                    .filter(|&(expires_at, _)| expires_at <= timestamp)
+                    .map(|(expires_at, pending_ts)| {
+                        let id = self.transfers_by_timestamp.get(&pending_ts).copied().expect(
+                            "an expires_at index entry implies a committed pending transfer",
+                        );
+                        (expires_at, pending_ts, id)
+                    })
+                    .collect();
+                assert_eq!(
+                    due_index, due_map,
+                    "the forest's expires_at index must mirror the pending store"
+                );
+                due_index
+            }
+            None => due_map,
+        };
 
         for (index, (_, _, id)) in due.iter().enumerate() {
             let timestamp_event = timestamp - due.len() as u64 + index as u64 + 1;
@@ -4470,7 +4542,110 @@ mod tests {
         audit_mirror(&mut sm);
     }
 
-    /// The mounted grooves can only resolve accounts the committed stream has
+    /// Expiry and pulse scheduling consult the mounted forest's `expires_at`
+    /// index tree (memory tables) when the index is un-flushed, proving the
+    /// mirror is a faithful scan source (upstream's expiry pump scans the
+    /// `expires_at` derived index, `state_machine.zig:4516`). The index-driven
+    /// due set and next expiry are each asserted equal to the authoritative
+    /// pending-store recompute.
+    #[test]
+    fn expire_and_pulse_arm_from_the_expires_at_index_mirror() {
+        let mut sm = StateMachine::default();
+        let mut forest = Forest::init(test_superblock(), forest_grid_options(), 32);
+        let mut storage = forest_storage();
+        open_forest(&mut forest, &mut storage);
+        sm.mount_forest(forest);
+
+        let _ = sm.create_accounts_with_storage(
+            &[
+                Account { id: 1, ledger: 1, code: 1, ..Account::default() },
+                Account { id: 2, ledger: 1, code: 1, ..Account::default() },
+            ],
+            10,
+            Some(&mut storage),
+        );
+        // ts 23..24: p3 (timeout 2s, expires 23+2s) and p4 (timeout 1s,
+        // expires 24+1s). p4 expires first despite its later timestamp.
+        let _ = sm.create_transfers_with_storage(
+            &[
+                Transfer { id: 300, flags: TransferFlags::PENDING, timeout: 2, ..t(1, 2, 30) },
+                Transfer { id: 400, flags: TransferFlags::PENDING, timeout: 1, ..t(1, 2, 40) },
+            ],
+            24,
+            Some(&mut storage),
+        );
+        let ns = tigerbeetle_core::types::NS_PER_S;
+        let p3_expires = 23 + 2 * ns;
+        let p4_expires = 24 + ns;
+
+        // The memory-table scan on the groove returns the live index in
+        // ascending `(expires_at, pending_ts)` order.
+        assert_eq!(
+            sm.forest.as_ref().expect("forest").transfers.scan_expires_at_memory(),
+            vec![(p4_expires, 24), (p3_expires, 23)]
+        );
+
+        // The first pulse is a "scan owed": `pulse_next_timestamp` starts at
+        // `timestamp_min` and the first expiry call (even a no-op that expires
+        // nothing) re-arms it at the soonest index expiry.
+        assert_eq!(sm.pulse_next_timestamp(), TimestampRange::TIMESTAMP_MIN);
+        sm.expire_pending_transfers(p4_expires - 1);
+        assert_eq!(sm.pulse_next_timestamp(), p4_expires);
+
+        // Expire p4 (the sooner one) at its exact expires_at; p3 stays
+        // outstanding and the pulse re-arms at its expiry.
+        sm.expire_pending_transfers(p4_expires);
+        assert_eq!(sm.pulse_next_timestamp(), p3_expires);
+        assert_eq!(
+            sm.forest.as_ref().expect("forest").transfers.scan_expires_at_memory(),
+            vec![(p3_expires, 23)]
+        );
+
+        // Expire p3 too; nothing remains and the pulse parks at `timestamp_max`.
+        sm.expire_pending_transfers(p3_expires);
+        assert_eq!(sm.pulse_next_timestamp(), TimestampRange::TIMESTAMP_MAX);
+        assert!(sm.forest.as_ref().expect("forest").transfers.scan_expires_at_memory().is_empty());
+
+        audit_mirror(&mut sm);
+    }
+
+    /// The expiry parity assert is live: if the forest's `expires_at` index
+    /// ever disagreed with the pending store (here, an entry reaped while its
+    /// pending is still outstanding — the state machine never does this;
+    /// post/void/expiry are the only reapers), the index-driven due set aborts
+    /// loudly rather than silently diverging.
+    #[test]
+    #[should_panic(expected = "the forest's expires_at index must mirror the pending store")]
+    fn stale_expires_at_index_entry_panics_the_expiry_parity_assert() {
+        let mut sm = StateMachine::default();
+        let mut forest = Forest::init(test_superblock(), forest_grid_options(), 32);
+        let mut storage = forest_storage();
+        open_forest(&mut forest, &mut storage);
+        sm.mount_forest(forest);
+
+        let _ = sm.create_accounts_with_storage(
+            &[
+                Account { id: 1, ledger: 1, code: 1, ..Account::default() },
+                Account { id: 2, ledger: 1, code: 1, ..Account::default() },
+            ],
+            10,
+            Some(&mut storage),
+        );
+        let _ = sm.create_transfers_with_storage(
+            &[Transfer { id: 200, flags: TransferFlags::PENDING, timeout: 2, ..t(1, 2, 50) }],
+            20,
+            Some(&mut storage),
+        );
+
+        // Manually reap the index entry while the pending is still outstanding.
+        let p = sm.transfer(200).expect("pending committed").to_owned();
+        sm.forest.as_mut().expect("forest").transfers.remove_expires_at(&p);
+
+        // Expiring the pending is legal (it is due), but the index-driven due
+        // set is now missing it — the parity assert fires.
+        sm.expire_pending_transfers(20 + 2 * tigerbeetle_core::types::NS_PER_S);
+    }
+
     /// actually mirrored into them. A forest that mounts after committed state
     /// already exists must never resolve a half-visible world: the prefetch
     /// parity asserts make the inconsistency loud instead of silently

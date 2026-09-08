@@ -2849,6 +2849,55 @@ impl TransferGroove {
         }
     }
 
+    /// Enumerate the live `expires_at` derived-index entries held in the index
+    /// tree's memory tables (mutable + immutable), ascending by
+    /// `(expires_at, pending_timestamp)` — the order the derived index scan
+    /// yields an un-flushed index in (upstream's expiry pump scans the
+    /// `expires_at` index; `state_machine.zig:4516`).
+    ///
+    /// Mirror of the read path's shadowing semantics: appends are chronological
+    /// (mutable is newer than immutable), so later occurrences of a key
+    /// overwrite earlier ones; a reaped entry (its `remove_expires_at`
+    /// tombstone appended after the live put) therefore disappears exactly as
+    /// `TableMemory::sort`'s `dedup_values` cancels the put/remove pair for
+    /// secondary-index tables. A `timeout == 0` pending derives no entry
+    /// (`state_machine.zig:445`), so it never appears.
+    ///
+    /// DEVIATION: entries compacted to disk are not included — reading them
+    /// needs the LSM disk-scan iterator (deferred until the forest becomes the
+    /// authoritative store). The state machine only consults this seam while
+    /// the tree is wholly in memory (`manifest_table_count() == 0`) and asserts
+    /// the scan equals the authoritative pending-store recompute.
+    #[must_use]
+    pub fn scan_expires_at_memory(&self) -> Vec<(u64, u64)> {
+        // Race-free stand-in for a sort: a per-key map, iterated in append order
+        // (immutable's older values first, then the mutable's newer ones), so the
+        // newest value for each key wins and a key reaped since its put vanishes.
+        let mut newest: std::collections::HashMap<u128, CompositeKey64> =
+            std::collections::HashMap::with_capacity(
+                self.expires_at.table_mutable_ref().count() as usize
+                    + self.expires_at.table_immutable_ref().count() as usize,
+            );
+        for table in [self.expires_at.table_immutable_ref(), self.expires_at.table_mutable_ref()] {
+            for value in table.values_used() {
+                let key = CompositeKey64Spec::key_from_value(value);
+                if let Some(entry) = newest.get_mut(&key) {
+                    *entry = *value;
+                } else {
+                    newest.insert(key, *value);
+                }
+            }
+        }
+
+        let mut entries: Vec<(u64, u64)> = newest
+            .into_values()
+            .filter(|value| !value.tombstone())
+            .map(|value| (value.field, value.timestamp))
+            .collect();
+        entries.sort_unstable();
+        entries
+    }
+
     pub fn open_commence(&mut self, manifest_log: &mut impl ManifestLog) {
         self.objects.open_commence(manifest_log);
         self.id.open_commence(manifest_log);
