@@ -3563,6 +3563,13 @@ impl StateMachine {
         };
         self.update_transfer_pending_status(p.timestamp, pending_status);
 
+        // Reap the pending's `expires_at` derived-index entry (upstream
+        // `state_machine.zig:4211-4223`): the posted/voided pending must no
+        // longer surface on the expiry scan.
+        if let Some(forest) = &mut self.forest {
+            forest.transfers.remove_expires_at(&p);
+        }
+
         let dr = self
             .accounts
             .get(&record.debit_account_id)
@@ -3760,9 +3767,14 @@ impl StateMachine {
     /// [`AccountEvent`] is recorded.
     ///
     /// DEVIATION: `expire_pending_transfers` is invoked directly with the next
-    /// expiry timestamp rather than through the VSR pulse/beat machinery and
-    /// the `expires_at` derived index; the caller is responsible for calling it
-    /// once the next pending is due. This operation produces no reply body.
+    /// expiry timestamp rather than through the VSR pulse/beat machinery, and
+    /// the due set is recomputed sans-I/O instead of scanning the `expires_at`
+    /// derived index; the caller is responsible for calling it once the next
+    /// pending is due. The forest's `expires_at` mirror entries are nonetheless
+    /// reaped on expiry/post/void exactly where upstream removes them
+    /// (`state_machine.zig:4220` and `:4606-4612`), so the index tree stays a
+    /// faithful scan source when the forest lands. This operation produces no
+    /// reply body.
     pub fn expire_pending_transfers(&mut self, timestamp: u64) {
         assert!(
             timestamp > self.commit_timestamp,
@@ -3844,6 +3856,13 @@ impl StateMachine {
             }
 
             self.update_transfer_pending_status(p.timestamp, TransferPendingStatus::Expired);
+
+            // Reap the expired pending's `expires_at` derived-index entry
+            // (upstream `state_machine.zig:4604-4612`): the expiry scan must
+            // not yield it again on a later pulse.
+            if let Some(forest) = &mut self.forest {
+                forest.transfers.remove_expires_at(&p);
+            }
 
             self.account_event(
                 timestamp_event,
@@ -4342,6 +4361,101 @@ mod tests {
         assert_eq!(mounted_replies, bare_replies);
 
         audit_mirror(&mut mounted);
+    }
+
+    /// Whether a live (non-tombstone) `expires_at` entry `(pending_ts, expires_at)`
+    /// sits in the mounted forest's transfers groove.
+    fn expires_at_present(sm: &mut StateMachine, (pending_ts, expires_at): (u64, u64)) -> bool {
+        use tigerbeetle_lsm::composite_key::CompositeKey;
+        let forest = sm.forest.as_mut().expect("a forest is mounted");
+        let key = (u128::from(expires_at) << 64) | u128::from(pending_ts);
+        forest
+            .transfers
+            .expires_at
+            .lookup_from_memory(key, &mut forest.transfers_scratch.composite_key_64)
+            .is_some_and(|v| !CompositeKey::tombstone(v))
+    }
+
+    /// Posting, voiding and expiring a pending transfer reap its `expires_at`
+    /// derived-index entry from the mounted forest's transfers groove — exactly
+    /// where upstream removes it (`state_machine.zig:4220` on post/void,
+    /// `:4606-4612` on expiry) — so the `expires_at` scan never yields a pending
+    /// that has left the `Pending` set. A pending with `timeout == 0` derives no
+    /// entry in the first place.
+    #[test]
+    fn post_void_and_expire_reap_the_expires_at_index_mirror() {
+        let mut sm = StateMachine::default();
+        let mut forest = Forest::init(test_superblock(), forest_grid_options(), 32);
+        let mut storage = forest_storage();
+        open_forest(&mut forest, &mut storage);
+        sm.mount_forest(forest);
+
+        let _ = sm.create_accounts_with_storage(
+            &[
+                Account { id: 1, ledger: 1, code: 1, ..Account::default() },
+                Account { id: 2, ledger: 1, code: 1, ..Account::default() },
+            ],
+            10,
+            Some(&mut storage),
+        );
+        // A plain transfer (ts 20) with no timeout derives no `expires_at` entry.
+        let _ = sm.create_transfers_with_storage(
+            &[Transfer { id: 100, ..t(1, 2, 100) }],
+            20,
+            Some(&mut storage),
+        );
+        // ts 28..30: p200 (timeout 60), p400 (timeout 60), p500 (timeout 5).
+        let _ = sm.create_transfers_with_storage(
+            &[
+                Transfer { id: 200, flags: TransferFlags::PENDING, timeout: 60, ..t(1, 2, 50) },
+                Transfer { id: 400, flags: TransferFlags::PENDING, timeout: 60, ..t(1, 2, 40) },
+                Transfer { id: 500, flags: TransferFlags::PENDING, timeout: 5, ..t(1, 2, 20) },
+            ],
+            30,
+            Some(&mut storage),
+        );
+
+        let ns = tigerbeetle_core::types::NS_PER_S;
+        // (pending_ts, expires_at)
+        let p200 = (28u64, 28 + 60 * ns);
+        let p400 = (29u64, 29 + 60 * ns);
+        let p500 = (30u64, 30 + 5 * ns);
+        assert!(!expires_at_present(&mut sm, (20, 42)), "a plain transfer derives no entry");
+        assert!(expires_at_present(&mut sm, p200), "pending issues an expires_at entry");
+        assert!(expires_at_present(&mut sm, p400), "pending issues an expires_at entry");
+        assert!(expires_at_present(&mut sm, p500), "pending issues an expires_at entry");
+
+        // Post 200 and void 400 while both are still outstanding.
+        let _ = sm.create_transfers_with_storage(
+            &[Transfer {
+                id: 210,
+                pending_id: 200,
+                flags: TransferFlags::POST_PENDING_TRANSFER,
+                ..t(1, 2, 0)
+            }],
+            31,
+            Some(&mut storage),
+        );
+        let _ = sm.create_transfers_with_storage(
+            &[Transfer {
+                id: 410,
+                pending_id: 400,
+                flags: TransferFlags::VOID_PENDING_TRANSFER,
+                ..t(1, 2, 0)
+            }],
+            32,
+            Some(&mut storage),
+        );
+        assert!(!expires_at_present(&mut sm, p200), "a posted pending is reaped");
+        assert!(!expires_at_present(&mut sm, p400), "a voided pending is reaped");
+        assert!(expires_at_present(&mut sm, p500), "an outstanding pending keeps its entry");
+
+        // Expire the last outstanding pending at its exact expires_at.
+        sm.expire_pending_transfers(p500.1);
+        assert!(!expires_at_present(&mut sm, p500), "an expired pending is reaped");
+        assert_eq!(sm.commit_timestamp, p500.1);
+
+        audit_mirror(&mut sm);
     }
 
     /// The mounted grooves can only resolve accounts the committed stream has

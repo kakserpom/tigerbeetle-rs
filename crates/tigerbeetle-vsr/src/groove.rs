@@ -2837,6 +2837,18 @@ impl TransferGroove {
         self.objects_cache.upsert(new);
     }
 
+    /// Remove a pending transfer's `expires_at` derived-index entry.
+    ///
+    /// The post/void and expiry paths tombstone the index entry exactly where
+    /// upstream does (`state_machine.zig:4220` / `:4606-4612`): once a pending
+    /// is posted, voided or expired the `expires_at` scan must no longer yield
+    /// it. No-op for a pending with `timeout == 0` (its entry was never derived).
+    pub fn remove_expires_at(&mut self, pending: &Transfer) {
+        if let Some(v) = TransferExpiresAtIndex::index_from_object(pending) {
+            self.expires_at.remove(&CompositeKey64 { field: v, timestamp: pending.timestamp });
+        }
+    }
+
     pub fn open_commence(&mut self, manifest_log: &mut impl ManifestLog) {
         self.objects.open_commence(manifest_log);
         self.id.open_commence(manifest_log);
