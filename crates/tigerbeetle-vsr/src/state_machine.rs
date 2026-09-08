@@ -4740,6 +4740,143 @@ mod tests {
         assert!(!free_set_references.blocks_acquired.empty());
     }
 
+    /// The committed stream survives a forest checkpoint + reopen: a follow-on batch
+    /// resolves its *entire* prefetch key-set from the reopened disk state.
+    ///
+    /// The seed mirrors accounts 1/2 + a pending transfer into the mounted forest's grooves
+    /// (their mutable tables); two full bars flush those mutables to real L0 tables on disk
+    /// (bar 1 gets the data into the immutable table on its last-beat swap, bar 2's level-0
+    /// driver writes it); the checkpoint persists the manifest + free set; a fresh forest
+    /// reopens from the durable references and is mounted back into the same state machine.
+    /// The follow-on post-of-pending-200 batch then resolves account ids 1/2, transfer id
+    /// 200, and pending timestamp 20 through the grooves' prefetch seam — every key now
+    /// served by a real `lookup_from_levels_storage` over the L0 tables, not the in-memory
+    /// mirror — and produces byte-identical replies to a bare unmounted twin.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn reopened_forest_resolves_execution_from_durable_disk() {
+        let mut storage = forest_storage();
+        let mut sm = StateMachine::default();
+        {
+            let mut forest = Forest::init(test_superblock(), forest_grid_options(), 32);
+            open_forest(&mut forest, &mut storage);
+            sm.mount_forest(forest);
+        }
+        // Seed accounts 1,2 + pending 200 (mirrored into the grooves' mutable tables).
+        let _ = sm.create_accounts_with_storage(
+            &[
+                Account { id: 1, ledger: 1, code: 1, ..Account::default() },
+                Account { id: 2, ledger: 1, code: 1, ..Account::default() },
+            ],
+            10,
+            Some(&mut storage),
+        );
+        let _ = sm.create_transfers_with_storage(
+            &[Transfer { id: 200, flags: TransferFlags::PENDING, timeout: 60, ..t(1, 2, 50) }],
+            20,
+            Some(&mut storage),
+        );
+
+        // Flush the mirrored mutables to real L0 tables (two bars, see above).
+        let bar_ops = constants::LSM_COMPACTION_OPS as u64;
+        let bar_start = compaction::HALF_BAR_BEAT_COUNT as u64 * 2;
+        for _bar in 0..2 {
+            for op in bar_start..bar_start + bar_ops {
+                sm.compact(op, Some(&mut storage));
+            }
+        }
+        {
+            let forest = sm.forest.as_ref().expect("forest mounted");
+            assert!(forest.accounts.objects.manifest_table_count() >= 1);
+            assert!(forest.transfers.objects.manifest_table_count() >= 1);
+            assert!(forest.transfers_pending.objects_table_count() >= 1);
+        }
+
+        // Checkpoint durably, then capture the references a reopen consumes.
+        let (manifest_refs, free_set_refs) = sm.checkpoint(Some(&mut storage));
+        assert!(manifest_refs.block_count >= 1);
+        assert!(!free_set_refs.blocks_acquired.empty());
+
+        // The recovered free set lives above the initial zone, so the reopened view's storage
+        // size must cover the highest recorded address (as the superblock records it).
+        let highest_address = free_set_refs
+            .blocks_acquired
+            .last_block_address
+            .max(free_set_refs.blocks_released.last_block_address);
+        let reopen_view = SuperBlockView {
+            storage_size: DATA_FILE_SIZE_MIN as u64 + highest_address * BLOCK_SIZE as u64,
+            manifest_block_count: manifest_refs.block_count,
+            manifest_oldest_address: manifest_refs.oldest_address,
+            manifest_oldest_checksum: manifest_refs.oldest_checksum,
+            manifest_newest_address: manifest_refs.newest_address,
+            manifest_newest_checksum: manifest_refs.newest_checksum,
+            ..test_superblock()
+        };
+
+        // A fresh forest over the same storage, reopened with the recovered free set and
+        // manifest. It restores the flushed L0 tables; the trees' mutable tables are empty,
+        // so every prefetch key must resolve from disk.
+        let mut forest_b = Forest::init(reopen_view, forest_grid_options(), 32);
+        forest_b.open(
+            GridOpenReferences {
+                blocks_acquired: free_set_refs.blocks_acquired,
+                blocks_released: free_set_refs.blocks_released,
+            },
+            &mut storage,
+            0,
+        );
+        let mut done = false;
+        for _ in 0..1000 {
+            forest_b.poll(&mut storage);
+            if forest_b.accounts.objects.is_opened() && forest_b.is_idle() {
+                done = true;
+                break;
+            }
+        }
+        assert!(done, "reopen must complete");
+        assert!(
+            forest_b.accounts.objects.manifest_table_count() >= 1,
+            "the reopened forest restores the flushed L0 tables"
+        );
+        sm.forest = Some(forest_b);
+
+        // The bare (unmounted) twin replays the same seed + follow-on through the committed
+        // stores; the mounted machine must produce byte-identical replies from disk.
+        let mut bare = StateMachine::default();
+        let _ = bare.create_accounts_with_storage(
+            &[
+                Account { id: 1, ledger: 1, code: 1, ..Account::default() },
+                Account { id: 2, ledger: 1, code: 1, ..Account::default() },
+            ],
+            10,
+            None,
+        );
+        let _ = bare.create_transfers_with_storage(
+            &[Transfer { id: 200, flags: TransferFlags::PENDING, timeout: 60, ..t(1, 2, 50) }],
+            20,
+            None,
+        );
+
+        // Post pending 200: resolves account ids 1/2 + transfer id 200 + pending timestamp 20
+        // from the reopened grooves' disk-backed trees.
+        let post = [Transfer {
+            id: 310,
+            pending_id: 200,
+            flags: TransferFlags::POST_PENDING_TRANSFER,
+            amount: 50,
+            ..t(1, 2, 0)
+        }];
+        assert_eq!(
+            sm.create_transfers_with_storage(&post, 60, Some(&mut storage)),
+            bare.create_transfers_with_storage(&post, 60, None),
+            "the reopened disk-backed grooves resolve identically to the committed stores"
+        );
+        // The post's write-side mirrored into the reopened grooves too (the pending row's
+        // status went Pending → Posted through the groove `update` seam against the disk
+        // state, and account 1's balance mutation diffed into the objects tree).
+        audit_mirror(&mut sm);
+    }
+
     /// Without a mounted forest (the default), `StateMachine::checkpoint` is a no-op that
     /// returns empty references — the superblock's "nothing to persist" checkpoint.
     #[test]

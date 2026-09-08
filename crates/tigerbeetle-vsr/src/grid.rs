@@ -747,6 +747,14 @@ impl Grid {
         self.free_set.is_free(address)
     }
 
+    /// Whether the free set is in `Reserving` state; `reserve()` asserts on this state.
+    /// The forest reconciles the free set back to `Reserving` before driving each tree's
+    /// beat compensation when a previous tree's forfeit left it `Forfeiting`.
+    #[must_use]
+    pub fn free_set_is_reserving(&self) -> bool {
+        self.free_set.is_reserving()
+    }
+
     /// Number of coherent reads parked awaiting a block from a remote replica
     /// (upstream `grid.read_global_queue.count()`).
     #[must_use]

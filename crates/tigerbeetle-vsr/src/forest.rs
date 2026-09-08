@@ -140,6 +140,18 @@ pub struct Forest {
     progress: Option<ForestProgress>,
 }
 
+/// Drive one tree's `level_active` compactions for one op/beat, reconciling the free
+/// set's reservation state first (see `reconcile_free_set_reservation`). Defined as a
+/// module-level macro because the 25 trees of the three grooves are enumerated explicitly —
+/// upstream comptime-generates this loop (`forest.compact_trees_start`), but Rust has no
+/// comptime iteration, and each tree has a different `S: TableSpec`/scratch buffer type.
+macro_rules! compact_tree {
+    ($self:ident, $tree:expr, $scratch:expr, $op:expr, $storage:expr) => {
+        $self.reconcile_free_set_reservation();
+        $tree.compact_levels($op, &mut $self.grid, $storage, &mut $self.manifest_log, $scratch);
+    };
+}
+
 impl Forest {
     /// Construct a fresh [`Forest`] from a superblock snapshot, sizing the grid and the
     /// manifest log's compaction pace for the configured table count.
@@ -555,183 +567,185 @@ impl Forest {
     /// with its own radix-sort scratch buffer (see the `*GrooveScratch` DEVIATION notes).
     #[allow(clippy::too_many_lines)]
     fn compact_levels_trees(&mut self, op: u64, storage: &mut dyn Storage) {
-        self.accounts.objects.compact_levels(
-            op,
-            &mut self.grid,
-            storage,
-            &mut self.manifest_log,
-            &mut self.accounts_scratch.objects,
-        );
-        self.accounts.id.compact_levels(
-            op,
-            &mut self.grid,
-            storage,
-            &mut self.manifest_log,
-            &mut self.accounts_scratch.id,
-        );
-        self.accounts.user_data_128.compact_levels(
-            op,
-            &mut self.grid,
-            storage,
-            &mut self.manifest_log,
+        // Reconcile the free set before every tree: each tree's `compact_levels` reserves
+        // and forfeits its own per-beat output reservation, so with the manifest log's
+        // long-lived grid reservation still outstanding the previous tree's forfeit leaves
+        // the free set `Forfeiting` and the next tree's `reserve` would assert. The
+        // reconcile is a no-op unless the free set was left `Forfeiting` (upstream avoids
+        // this by holding a single per-beat forest-level reservation — see the
+        // `Tree::compact_levels` DEVIATION).
+        compact_tree!(self, self.accounts.objects, &mut self.accounts_scratch.objects, op, storage);
+        compact_tree!(self, self.accounts.id, &mut self.accounts_scratch.id, op, storage);
+        compact_tree!(
+            self,
+            self.accounts.user_data_128,
             &mut self.accounts_scratch.user_data_128,
-        );
-        self.accounts.user_data_64.compact_levels(
             op,
-            &mut self.grid,
-            storage,
-            &mut self.manifest_log,
+            storage
+        );
+        compact_tree!(
+            self,
+            self.accounts.user_data_64,
             &mut self.accounts_scratch.composite_key_64,
-        );
-        self.accounts.user_data_32.compact_levels(
             op,
-            &mut self.grid,
-            storage,
-            &mut self.manifest_log,
+            storage
+        );
+        compact_tree!(
+            self,
+            self.accounts.user_data_32,
             &mut self.accounts_scratch.composite_key_64,
-        );
-        self.accounts.ledger.compact_levels(
             op,
-            &mut self.grid,
-            storage,
-            &mut self.manifest_log,
+            storage
+        );
+        compact_tree!(
+            self,
+            self.accounts.ledger,
             &mut self.accounts_scratch.composite_key_64,
-        );
-        self.accounts.code.compact_levels(
             op,
-            &mut self.grid,
-            storage,
-            &mut self.manifest_log,
+            storage
+        );
+        compact_tree!(
+            self,
+            self.accounts.code,
             &mut self.accounts_scratch.composite_key_64,
-        );
-        self.accounts.imported.compact_levels(
             op,
-            &mut self.grid,
-            storage,
-            &mut self.manifest_log,
+            storage
+        );
+        compact_tree!(
+            self,
+            self.accounts.imported,
             &mut self.accounts_scratch.composite_key_unit,
-        );
-        self.accounts.closed.compact_levels(
             op,
-            &mut self.grid,
-            storage,
-            &mut self.manifest_log,
+            storage
+        );
+        compact_tree!(
+            self,
+            self.accounts.closed,
             &mut self.accounts_scratch.composite_key_unit,
+            op,
+            storage
         );
 
-        self.transfers.objects.compact_levels(
-            op,
-            &mut self.grid,
-            storage,
-            &mut self.manifest_log,
+        compact_tree!(
+            self,
+            self.transfers.objects,
             &mut self.transfers_scratch.objects,
-        );
-        self.transfers.id.compact_levels(
             op,
-            &mut self.grid,
-            storage,
-            &mut self.manifest_log,
-            &mut self.transfers_scratch.id,
+            storage
         );
-        self.transfers.debit_account_id.compact_levels(
-            op,
-            &mut self.grid,
-            storage,
-            &mut self.manifest_log,
+        compact_tree!(self, self.transfers.id, &mut self.transfers_scratch.id, op, storage);
+        compact_tree!(
+            self,
+            self.transfers.debit_account_id,
             &mut self.transfers_scratch.composite_key_128,
-        );
-        self.transfers.credit_account_id.compact_levels(
             op,
-            &mut self.grid,
-            storage,
-            &mut self.manifest_log,
+            storage
+        );
+        compact_tree!(
+            self,
+            self.transfers.credit_account_id,
             &mut self.transfers_scratch.composite_key_128,
-        );
-        self.transfers.amount.compact_levels(
             op,
-            &mut self.grid,
-            storage,
-            &mut self.manifest_log,
+            storage
+        );
+        compact_tree!(
+            self,
+            self.transfers.amount,
             &mut self.transfers_scratch.composite_key_128,
-        );
-        self.transfers.pending_id.compact_levels(
             op,
-            &mut self.grid,
-            storage,
-            &mut self.manifest_log,
+            storage
+        );
+        compact_tree!(
+            self,
+            self.transfers.pending_id,
             &mut self.transfers_scratch.composite_key_128,
-        );
-        self.transfers.user_data_128.compact_levels(
             op,
-            &mut self.grid,
-            storage,
-            &mut self.manifest_log,
+            storage
+        );
+        compact_tree!(
+            self,
+            self.transfers.user_data_128,
             &mut self.transfers_scratch.composite_key_128,
-        );
-        self.transfers.user_data_64.compact_levels(
             op,
-            &mut self.grid,
-            storage,
-            &mut self.manifest_log,
+            storage
+        );
+        compact_tree!(
+            self,
+            self.transfers.user_data_64,
             &mut self.transfers_scratch.composite_key_64,
-        );
-        self.transfers.user_data_32.compact_levels(
             op,
-            &mut self.grid,
-            storage,
-            &mut self.manifest_log,
+            storage
+        );
+        compact_tree!(
+            self,
+            self.transfers.user_data_32,
             &mut self.transfers_scratch.composite_key_64,
-        );
-        self.transfers.ledger.compact_levels(
             op,
-            &mut self.grid,
-            storage,
-            &mut self.manifest_log,
+            storage
+        );
+        compact_tree!(
+            self,
+            self.transfers.ledger,
             &mut self.transfers_scratch.composite_key_64,
-        );
-        self.transfers.code.compact_levels(
             op,
-            &mut self.grid,
-            storage,
-            &mut self.manifest_log,
+            storage
+        );
+        compact_tree!(
+            self,
+            self.transfers.code,
             &mut self.transfers_scratch.composite_key_64,
-        );
-        self.transfers.expires_at.compact_levels(
             op,
-            &mut self.grid,
-            storage,
-            &mut self.manifest_log,
+            storage
+        );
+        compact_tree!(
+            self,
+            self.transfers.expires_at,
             &mut self.transfers_scratch.composite_key_64,
-        );
-        self.transfers.imported.compact_levels(
             op,
-            &mut self.grid,
-            storage,
-            &mut self.manifest_log,
+            storage
+        );
+        compact_tree!(
+            self,
+            self.transfers.imported,
             &mut self.transfers_scratch.composite_key_unit,
-        );
-        self.transfers.closing.compact_levels(
             op,
-            &mut self.grid,
-            storage,
-            &mut self.manifest_log,
+            storage
+        );
+        compact_tree!(
+            self,
+            self.transfers.closing,
             &mut self.transfers_scratch.composite_key_unit,
+            op,
+            storage
         );
 
-        self.transfers_pending.objects_mut().compact_levels(
-            op,
-            &mut self.grid,
-            storage,
-            &mut self.manifest_log,
+        compact_tree!(
+            self,
+            self.transfers_pending.objects_mut(),
             &mut self.transfers_pending_scratch.objects,
-        );
-        self.transfers_pending.status_mut().compact_levels(
             op,
-            &mut self.grid,
-            storage,
-            &mut self.manifest_log,
-            &mut self.transfers_pending_scratch.status,
+            storage
         );
+        compact_tree!(
+            self,
+            self.transfers_pending.status_mut(),
+            &mut self.transfers_pending_scratch.status,
+            op,
+            storage
+        );
+    }
+
+    /// Re-establish the free set's `Reserving` state before driving the next tree's beat
+    /// compensation. With the manifest log's long-lived grid reservation outstanding, a
+    /// tree's per-beat output reservation forfeit leaves the free set `Forfeiting`; cycling
+    /// the manifest reservation to zero and back returns the free set to `Reserving` so the
+    /// next tree's `reserve` succeeds. The manifest log re-points its `grid_reservation` in
+    /// the process, so subsequent manifest appends keep working.
+    fn reconcile_free_set_reservation(&mut self) {
+        if !self.grid.free_set_is_reserving() && self.manifest_log.has_grid_reservation() {
+            self.manifest_log.forfeit_grid_reservation(&mut self.grid);
+            self.manifest_log.reserve_grid_blocks(&mut self.grid);
+        }
     }
 
     /// Compact the manifest log, re-appending live entries from old log blocks.

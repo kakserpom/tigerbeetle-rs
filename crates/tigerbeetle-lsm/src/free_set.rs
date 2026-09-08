@@ -304,6 +304,15 @@ impl FreeSet {
         self.reservation_count
     }
 
+    /// Whether the free set is in `Reserving` state (i.e. every reservation was either
+    /// acquired or forfeited back to the free set). `reserve()` asserts on this state:
+    /// a forfeited reservation that left one or more reservations outstanding moves the
+    /// free set to `Forfeiting` until the count drops to zero or is reconciled.
+    #[must_use]
+    pub fn is_reserving(&self) -> bool {
+        self.reservation_state == ReservationState::Reserving
+    }
+
     /// Returns the number of free blocks.
     ///
     /// # Panics
