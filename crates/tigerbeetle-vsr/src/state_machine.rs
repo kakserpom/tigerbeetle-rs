@@ -38,11 +38,14 @@ use tigerbeetle_core::types::{
     QueryFilter, QueryFilterFlags, Transfer, TransferFlags, TransferPending, TransferPendingStatus,
 };
 use tigerbeetle_lsm::timestamp_range::TimestampRange;
-use tigerbeetle_lsm::tree::ScopeCloseMode;
+use tigerbeetle_lsm::tree::{SNAPSHOT_LATEST, ScopeCloseMode};
 
 use crate::Operation;
 use crate::forest::Forest;
-use crate::groove::{AccountObjectsCache, TransferObjectsCache, TransferPendingObjectsCache};
+use crate::groove::{
+    AccountObjectsCache, IdTimestampPrefetchKey, TimestampPrefetchKey, TransferObjectsCache,
+    TransferPendingObjectsCache,
+};
 use crate::message_header::checksum_body_empty;
 use crate::storage::Storage;
 use crate::superblock::{FreeSetReferences, ManifestReferences, TrailerReference};
@@ -2488,7 +2491,34 @@ impl StateMachine {
     /// Panics unless `operation` is a state-machine operation this port
     /// executes, or the body does not decode to a whole number of events.
     #[must_use]
+    /// Execute a committed operation against the state machine (no forest
+    /// storage: the standalone/HashMap path — see [`Self::execute_with_storage`]).
     pub fn execute(&mut self, operation: Operation, timestamp: u64, body: &[u8]) -> Vec<u8> {
+        self.execute_with_storage(operation, timestamp, body, None)
+    }
+
+    /// Execute a committed operation against the state machine, threading the
+    /// forest's backing storage when a forest is mounted.
+    ///
+    /// When `storage` is `Some` and a forest is mounted, the batch prefetch step
+    /// resolves its key-set through the mounted grooves' LSM prefetch seams
+    /// (filling the embedded object caches from the grooves' resolved caches,
+    /// asserting parity with the committed stores). `None` (or an unmounted
+    /// state machine) takes the committed-HashMap resolution path — byte
+    /// identical, as proven by the parity asserts and the `committed_stream_*`
+    /// tests.
+    ///
+    /// # Panics
+    /// Panics if the forest is mounted but `storage` is `None` and a batch
+    /// actually needs to resolve through the grooves (the forest needs a backing
+    /// store to complete any grid reads).
+    pub fn execute_with_storage(
+        &mut self,
+        operation: Operation,
+        timestamp: u64,
+        body: &[u8],
+        storage: Option<&mut dyn Storage>,
+    ) -> Vec<u8> {
         match operation {
             Operation::PULSE | Operation::STATE_MACHINE_PULSE => {
                 if !body.is_empty() {
@@ -2503,13 +2533,13 @@ impl StateMachine {
                 let Some(events) = bytes_to_account_batch(body) else {
                     unreachable!("create_accounts body must encode whole Account events");
                 };
-                self.create_accounts(&events, timestamp)
+                self.create_accounts_with_storage(&events, timestamp, storage)
             }
             Operation::CREATE_TRANSFERS => {
                 let Some(events) = bytes_to_transfer_batch(body) else {
                     unreachable!("create_transfers body must encode whole Transfer events");
                 };
-                self.create_transfers(&events, timestamp)
+                self.create_transfers_with_storage(&events, timestamp, storage)
             }
             Operation::GET_CHANGE_EVENTS => {
                 let Some(filter) = bytes_to_change_events_filter(body) else {
@@ -2568,9 +2598,21 @@ impl StateMachine {
     /// [`Self::persist_accounts`] afterwards.
     #[must_use]
     pub fn create_accounts(&mut self, events: &[Account], timestamp: u64) -> Vec<u8> {
+        self.create_accounts_with_storage(events, timestamp, None)
+    }
+
+    /// Execute a `create_accounts` batch, threading the forest's backing storage
+    /// (see [`Self::execute_with_storage`] for the mounted-path semantics).
+    #[must_use]
+    pub fn create_accounts_with_storage(
+        &mut self,
+        events: &[Account],
+        timestamp: u64,
+        storage: Option<&mut dyn Storage>,
+    ) -> Vec<u8> {
         assert!(self.commit_timestamp <= timestamp);
         let prefetch = prefetch_create_accounts(events);
-        self.create_accounts_prefetch(&prefetch);
+        self.create_accounts_prefetch(&prefetch, storage);
         let transfer_timestamps = self.accounts_indirect_lookup(&prefetch);
         let results = execute_create_accounts(
             events,
@@ -2589,7 +2631,63 @@ impl StateMachine {
     /// the same cache and every miss asserts its key was enqueued here
     /// (upstream's prefetch callbacks fill the groove caches,
     /// `state_machine.zig:1264-1309`).
-    fn create_accounts_prefetch(&mut self, prefetch: &AccountPrefetchKeys) {
+    fn create_accounts_prefetch(
+        &mut self,
+        prefetch: &AccountPrefetchKeys,
+        storage: Option<&mut dyn Storage>,
+    ) {
+        // When a forest is mounted with backing storage, resolve the batch
+        // key-set through the grooves' LSM prefetch seams, assert the
+        // resolutions equal the committed stores, and fill the embedded object
+        // caches from the grooves' resolved caches. (Field-disjoint borrows:
+        // `forest` aliases `self.forest`; the committed stores and embedded
+        // caches are read/written by direct field access, never through `&mut
+        // self` methods.)
+        if let (Some(forest), Some(storage)) = (self.forest.as_mut(), storage) {
+            let snapshot = self.prefetch_snapshot.unwrap_or(SNAPSHOT_LATEST - 1);
+
+            forest.accounts.prefetch_setup(snapshot);
+            for &id in prefetch.account_ids.iter() {
+                forest.accounts.prefetch_enqueue(
+                    &mut forest.grid,
+                    &mut forest.accounts_scratch.objects,
+                    IdTimestampPrefetchKey::Id(id),
+                );
+            }
+            // Imported accounts probe the transfers groove for a colliding
+            // transfer timestamp (upstream `transfers.indirect_lookup`); the
+            // found-subset still comes from the committed
+            // [`Self::transfers_by_timestamp`] store (the groove `Timestamp(key)`
+            // resolution is not yet consulted for the imported regress decision).
+            forest.transfers.prefetch_setup(snapshot);
+            for &ts in prefetch.transfer_timestamps.iter() {
+                forest.transfers.prefetch_enqueue(
+                    &mut forest.grid,
+                    &mut forest.transfers_scratch.objects,
+                    IdTimestampPrefetchKey::Timestamp(ts),
+                );
+            }
+            forest.accounts.prefetch(&mut forest.grid, storage);
+            forest.transfers.prefetch(&mut forest.grid, storage);
+
+            for &id in prefetch.account_ids.iter() {
+                match forest.accounts.get(id) {
+                    Some(account) => {
+                        assert_eq!(
+                            self.accounts.get(&id).copied(),
+                            Some(*account),
+                            "accounts-groove prefetch must resolve the committed account"
+                        );
+                        self.accounts_objects.upsert(account);
+                    }
+                    None => assert!(
+                        !self.accounts.contains_key(&id),
+                        "accounts-groove prefetch must resolve every committed account"
+                    ),
+                }
+            }
+            return;
+        }
         for &id in prefetch.account_ids.iter() {
             if let Some(account) = self.accounts.get(&id) {
                 self.accounts_objects.upsert(account);
@@ -2620,9 +2718,21 @@ impl StateMachine {
     /// rolled back as a unit if it breaks.
     #[must_use]
     pub fn create_transfers(&mut self, events: &[Transfer], timestamp: u64) -> Vec<u8> {
+        self.create_transfers_with_storage(events, timestamp, None)
+    }
+
+    /// Execute a `create_transfers` batch, threading the forest's backing storage
+    /// (see [`Self::execute_with_storage`] for the mounted-path semantics).
+    #[must_use]
+    pub fn create_transfers_with_storage(
+        &mut self,
+        events: &[Transfer],
+        timestamp: u64,
+        storage: Option<&mut dyn Storage>,
+    ) -> Vec<u8> {
         assert!(self.commit_timestamp <= timestamp);
         let prefetch = prefetch_create_transfers(events, |id| self.transfers.get(&id).copied());
-        self.create_transfers_prefetch(&prefetch);
+        self.create_transfers_prefetch(&prefetch, storage);
         // The imported-timestamp collision check needs the _found_ subset of
         // the enqueued account timestamps (`accounts.indirect_lookup`).
         let mut account_timestamps = HashSet::new();
@@ -2656,7 +2766,103 @@ impl StateMachine {
     /// execution reads the same caches and every miss asserts its key was
     /// enqueued here (upstream's prefetch callbacks fill the groove caches,
     /// `state_machine.zig:1320-1385`).
-    fn create_transfers_prefetch(&mut self, prefetch: &TransferPrefetchKeys) {
+    fn create_transfers_prefetch(
+        &mut self,
+        prefetch: &TransferPrefetchKeys,
+        storage: Option<&mut dyn Storage>,
+    ) {
+        // Mounted with backing storage: resolve through the grooves' LSM
+        // prefetch seams, assert parity with the committed stores, and fill the
+        // embedded caches from the grooves' resolved caches (the imported
+        // accounts-by-timestamp found-subset still derives from the committed
+        // [`Self::accounts_by_timestamp`] store — see
+        // [`Self::create_accounts_prefetch`]'s DEVIATION).
+        if let (Some(forest), Some(storage)) = (self.forest.as_mut(), storage) {
+            let snapshot = self.prefetch_snapshot.unwrap_or(SNAPSHOT_LATEST - 1);
+
+            forest.accounts.prefetch_setup(snapshot);
+            for &id in prefetch.account_ids.iter() {
+                forest.accounts.prefetch_enqueue(
+                    &mut forest.grid,
+                    &mut forest.accounts_scratch.objects,
+                    IdTimestampPrefetchKey::Id(id),
+                );
+            }
+            for &ts in prefetch.account_timestamps.iter() {
+                forest.accounts.prefetch_enqueue(
+                    &mut forest.grid,
+                    &mut forest.accounts_scratch.objects,
+                    IdTimestampPrefetchKey::Timestamp(ts),
+                );
+            }
+            forest.transfers.prefetch_setup(snapshot);
+            for &id in prefetch.transfer_ids.iter() {
+                forest.transfers.prefetch_enqueue(
+                    &mut forest.grid,
+                    &mut forest.transfers_scratch.objects,
+                    IdTimestampPrefetchKey::Id(id),
+                );
+            }
+            forest.transfers_pending.prefetch_setup(snapshot);
+            for &ts in prefetch.pending_timestamps.iter() {
+                forest
+                    .transfers_pending
+                    .prefetch_enqueue(&mut forest.grid, TimestampPrefetchKey::Timestamp(ts));
+            }
+            forest.accounts.prefetch(&mut forest.grid, storage);
+            forest.transfers.prefetch(&mut forest.grid, storage);
+            forest.transfers_pending.prefetch(&mut forest.grid, storage);
+
+            for &id in prefetch.account_ids.iter() {
+                match forest.accounts.get(id) {
+                    Some(account) => {
+                        assert_eq!(
+                            self.accounts.get(&id).copied(),
+                            Some(*account),
+                            "accounts-groove prefetch must resolve the committed account"
+                        );
+                        self.accounts_objects.upsert(account);
+                    }
+                    None => assert!(
+                        !self.accounts.contains_key(&id),
+                        "accounts-groove prefetch must resolve every committed account"
+                    ),
+                }
+            }
+            for &id in prefetch.transfer_ids.iter() {
+                match forest.transfers.get(id) {
+                    Some(transfer) => {
+                        assert_eq!(
+                            self.transfers.get(&id).copied(),
+                            Some(*transfer),
+                            "transfers-groove prefetch must resolve the committed transfer"
+                        );
+                        self.transfers_objects.upsert(transfer);
+                    }
+                    None => assert!(
+                        !self.transfers.contains_key(&id),
+                        "transfers-groove prefetch must resolve every committed transfer"
+                    ),
+                }
+            }
+            for &ts in prefetch.pending_timestamps.iter() {
+                match forest.transfers_pending.get(ts) {
+                    Some(pending) => {
+                        assert_eq!(
+                            self.transfers_pending.get(&ts).copied(),
+                            Some(*pending),
+                            "transfers-pending-groove prefetch must resolve the committed row"
+                        );
+                        self.transfers_pending_objects.upsert(pending);
+                    }
+                    None => assert!(
+                        !self.transfers_pending.contains_key(&ts),
+                        "transfers-pending-groove prefetch must resolve every committed row"
+                    ),
+                }
+            }
+            return;
+        }
         for &id in prefetch.account_ids.iter() {
             if let Some(account) = self.accounts.get(&id) {
                 self.accounts_objects.upsert(account);
@@ -3910,34 +4116,43 @@ mod tests {
     /// Exercises every committed-write seam: plain transfers, pending transfers,
     /// a posted pending, a voided pending, an expired pending, and a transient
     /// failure that poisons its id into the orphaned set.
-    fn run_mirror_script(sm: &mut StateMachine) -> Vec<Vec<u8>> {
+    ///
+    /// `storage` (when `Some`) routes the batch prefetch step through the mounted
+    /// grooves' LSM prefetch seams, so the seam test doubles as an end-to-end
+    /// proof that the groove-backed resolution is byte-identical to the
+    /// committed-HashMap path.
+    fn run_mirror_script(sm: &mut StateMachine, storage: &mut dyn Storage) -> Vec<Vec<u8>> {
         // Accounts 1, 2. Plain transfer, pendings, post/void, and an orphaned id (see
         // below) — every committed-write seam a forest mirror must absorb.
         let replies = vec![
-            sm.create_accounts(
+            sm.create_accounts_with_storage(
                 &[
                     Account { id: 1, ledger: 1, code: 1, ..Account::default() },
                     Account { id: 2, ledger: 1, code: 1, ..Account::default() },
                 ],
                 10,
+                Some(&mut *storage),
             ),
             // Plain (posted) transfer.
-            sm.create_transfers(&[t(1, 2, 100)], 20),
+            sm.create_transfers_with_storage(&[t(1, 2, 100)], 20, Some(&mut *storage)),
             // Two pending transfers that stay pending for now.
-            sm.create_transfers(
+            sm.create_transfers_with_storage(
                 &[Transfer { id: 200, flags: TransferFlags::PENDING, timeout: 60, ..t(1, 2, 50) }],
                 30,
+                Some(&mut *storage),
             ),
-            sm.create_transfers(
+            sm.create_transfers_with_storage(
                 &[Transfer { id: 300, flags: TransferFlags::PENDING, timeout: 999, ..t(1, 2, 30) }],
                 40,
+                Some(&mut *storage),
             ),
-            sm.create_transfers(
+            sm.create_transfers_with_storage(
                 &[Transfer { id: 400, flags: TransferFlags::PENDING, timeout: 40, ..t(1, 2, 40) }],
                 50,
+                Some(&mut *storage),
             ),
             // Post / void two of them (the third, 400, expires at its timeout below).
-            sm.create_transfers(
+            sm.create_transfers_with_storage(
                 &[Transfer {
                     id: 310,
                     pending_id: 200,
@@ -3945,8 +4160,9 @@ mod tests {
                     ..t(1, 2, 0)
                 }],
                 60,
+                Some(&mut *storage),
             ),
-            sm.create_transfers(
+            sm.create_transfers_with_storage(
                 &[Transfer {
                     id: 320,
                     pending_id: 300,
@@ -3954,9 +4170,14 @@ mod tests {
                     ..t(1, 2, 0)
                 }],
                 70,
+                Some(&mut *storage),
             ),
             // Transient failure (missing credit account 3) poisons id 500.
-            sm.create_transfers(&[Transfer { id: 500, credit_account_id: 3, ..t(1, 2, 10) }], 80),
+            sm.create_transfers_with_storage(
+                &[Transfer { id: 500, credit_account_id: 3, ..t(1, 2, 10) }],
+                80,
+                Some(&mut *storage),
+            ),
         ];
         assert_eq!(
             reply_status(replies.last().expect("last reply")),
@@ -4012,14 +4233,40 @@ mod tests {
     #[test]
     fn committed_stream_mirrors_mounted_forest_grooves() {
         let mut mounted = StateMachine::default();
-        mounted.mount_forest(Forest::init(test_superblock(), forest_grid_options(), 32));
+        let mut forest = Forest::init(test_superblock(), forest_grid_options(), 32);
+        let mut storage = forest_storage();
+        open_forest(&mut forest, &mut storage);
+        mounted.mount_forest(forest);
         let mut bare = StateMachine::default();
 
-        let mounted_replies = run_mirror_script(&mut mounted);
-        let bare_replies = run_mirror_script(&mut bare);
+        // The mounted twin resolves through the grooves' LSM prefetch seams
+        // (backed by `storage`); the bare twin resolves through the committed
+        // HashMaps. Both must produce identical replies, and the groove caches
+        // must match the committed stores ("the grooves are the golden write").
+        let mounted_replies = run_mirror_script(&mut mounted, &mut storage);
+        let bare_replies = run_mirror_script(&mut bare, &mut storage);
         assert_eq!(mounted_replies, bare_replies);
 
         audit_mirror(&mut mounted);
+    }
+
+    /// The mounted grooves can only resolve accounts the committed stream has
+    /// actually mirrored into them. A forest that mounts after committed state
+    /// already exists must never resolve a half-visible world: the prefetch
+    /// parity asserts make the inconsistency loud instead of silently
+    /// populating a stale cache.
+    #[test]
+    #[should_panic(expected = "accounts-groove prefetch must resolve every committed account")]
+    fn mounted_prefetch_rejects_unmirrored_accounts() {
+        let mut sm = StateMachine::default();
+        let _ =
+            sm.create_accounts(&[Account { id: 1, ledger: 1, code: 1, ..Account::default() }], 10);
+        let mut forest = Forest::init(test_superblock(), forest_grid_options(), 32);
+        let mut storage = forest_storage();
+        open_forest(&mut forest, &mut storage);
+        sm.mount_forest(forest);
+        // Credit-account 1 exists in the committed store but never entered the grooves.
+        let _ = sm.create_transfers_with_storage(&[t(1, 2, 100)], 20, Some(&mut storage));
     }
 
     /// Compacting across a full bar through the state machine (including the last-beat
@@ -5375,7 +5622,7 @@ mod tests {
     ) -> Vec<CreateAccountResult> {
         let prefetch = prefetch_create_accounts(events);
         let mut state_machine = StateMachine::default();
-        state_machine.create_accounts_prefetch(&prefetch);
+        state_machine.create_accounts_prefetch(&prefetch, None);
         execute_create_accounts(
             events,
             timestamp,

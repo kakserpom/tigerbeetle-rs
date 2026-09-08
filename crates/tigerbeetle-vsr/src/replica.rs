@@ -2213,7 +2213,15 @@ impl Replica {
         // produces an empty reply.
         let result_body = if crate::state_machine::StateMachine::executes(prepare.operation) {
             let src_body = self.journal.body_with_op(op).map_or_else(Vec::new, ToOwned::to_owned);
-            self.state_machine.execute(prepare.operation, prepare.timestamp, &src_body)
+            // Thread the forest's backing storage (when mounted) so the batch
+            // prefetch step can resolve its key-set through the mounted grooves'
+            // LSM prefetch seams, exactly like `commit_compact`/`commit_checkpoint_data`.
+            self.state_machine.execute_with_storage(
+                prepare.operation,
+                prepare.timestamp,
+                &src_body,
+                self.grid_storage.as_mut().map(|s| s as &mut dyn Storage),
+            )
         } else {
             // While an upgrade is in flight, no operation other than `.upgrade`
             // may be committed (upstream replica.zig:5352).
