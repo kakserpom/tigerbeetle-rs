@@ -3728,6 +3728,9 @@ impl StateMachine {
     /// `:4227`), driving the `expires_at` index scan on the next pulse. Sans-IO
     /// the pending map is authoritative and cheap to scan, so recomputing is
     /// exact and always leaves `pulse_needed` pointing at the true next expiry.
+    /// A `Pending` transfer with `timeout == 0` (allowed upstream) never
+    /// derives an `expires_at` entry, so it is skipped here exactly as the
+    /// upstream scan skips it.
     fn update_pulse_next_timestamp(&mut self) {
         self.pulse_next_timestamp = TimestampRange::TIMESTAMP_MAX;
         for (&pending_ts, pending_status) in &self.transfers_pending {
@@ -3745,7 +3748,9 @@ impl StateMachine {
                 .copied()
                 .expect("the pending status index implies a committed pending transfer");
             assert!(p.flags.pending());
-            assert!(p.timeout > 0);
+            if p.timeout == 0 {
+                continue;
+            }
             let expires_at = p.timestamp + p.timeout_ns();
             self.pulse_next_timestamp = self.pulse_next_timestamp.min(expires_at);
         }
@@ -3764,7 +3769,9 @@ impl StateMachine {
     /// transfer, pending balances are returned to the accounts' pools
     /// (`closing_debit`/`closing_credit` accounts are reopened), the
     /// `transfers_pending` status becomes `Expired`, and an expired
-    /// [`AccountEvent`] is recorded.
+    /// [`AccountEvent`] is recorded. A pending with `timeout == 0` derives no
+    /// `expires_at` entry (state_machine.zig:445), stays `Pending` forever and
+    /// is never due.
     ///
     /// DEVIATION: `expire_pending_transfers` is invoked directly with the next
     /// expiry timestamp rather than through the VSR pulse/beat machinery, and
@@ -3803,7 +3810,12 @@ impl StateMachine {
                 .copied()
                 .expect("pending transfer status row implies a committed pending transfer");
             assert!(p.flags.pending());
-            assert!(p.timeout > 0);
+            // A `Pending` transfer with `timeout == 0` derives no `expires_at`
+            // entry (upstream `TransferExpiresAtIndex`, state_machine.zig:445),
+            // so the index scan never yields it and it is never due.
+            if p.timeout == 0 {
+                continue;
+            }
             let expires_at = p.timestamp + p.timeout_ns();
             if expires_at <= timestamp {
                 due.push((expires_at, pending_ts, id));
@@ -7842,6 +7854,75 @@ mod tests {
         assert_eq!(sm.accounts.get(&1).expect("account 1 stored").debits_pending, 7);
         assert_eq!(sm.accounts.get(&2).expect("account 2 stored").credits_pending, 7);
         assert_eq!(sm.commit_timestamp, 20 + NS_PER_S);
+    }
+
+    /// A pending transfer with `timeout == 0` is allowed — upstream only rejects
+    /// a *non*-pending transfer with `timeout != 0` (`state_machine.zig:3760`).
+    /// It derives no `expires_at` entry (`TransferExpiresAtIndex`,
+    /// `state_machine.zig:445`), so it is never due: the expiry scan skips it,
+    /// the pulse never arms on it (`update_pulse_next_timestamp` recomputes the
+    /// soonest expiry over the remaining `Pending` rows and skips it exactly as
+    /// the index scan would), and the post/void expiry gate is
+    /// `p.timeout != 0 && ...` (`state_machine.zig:4145-4156`) so it can still
+    /// be posted or voided like any outstanding pending.
+    #[test]
+    fn timeout_zero_pending_never_expires_and_can_still_be_posted() {
+        let mut sm = StateMachine::default();
+        let _ = sm.create_accounts(
+            &[
+                Account { id: 1, ledger: 1, code: 1, ..Account::default() },
+                Account { id: 2, ledger: 1, code: 1, ..Account::default() },
+            ],
+            10,
+        );
+        // p1: timeout 0 (never due), stamped 20; p2: timeout 1s, stamped 30.
+        let p1 = Transfer { flags: TransferFlags::PENDING, ..t(1, 2, 50) };
+        let _ = sm.create_transfers(&[p1], 20);
+        let p2 = Transfer { id: 1003, flags: TransferFlags::PENDING, timeout: 1, ..t(1, 2, 7) };
+        let _ = sm.create_transfers(&[p2], 30);
+        assert_eq!(sm.transfers_pending.len(), 2);
+        let pulse_armed = 30 + NS_PER_S;
+
+        // A pulse just before p2 is due expires nothing and re-arms the pulse
+        // at p2's exact expiry; p2's own expiry then expires only p2. p1 stays
+        // Pending through both.
+        sm.expire_pending_transfers(pulse_armed - 1);
+        assert_eq!(sm.pulse_next_timestamp(), pulse_armed);
+        assert!(sm.pulse_needed(pulse_armed));
+        assert!(!sm.pulse_needed(pulse_armed - 1));
+        sm.expire_pending_transfers(pulse_armed);
+        assert_eq!(
+            sm.transfers_pending.get(&20).expect("pending status row").status,
+            TransferPendingStatus::Pending
+        );
+        assert_eq!(
+            sm.transfers_pending.get(&30).expect("pending status row").status,
+            TransferPendingStatus::Expired
+        );
+        assert_eq!(sm.accounts.get(&1).expect("account 1 stored").debits_pending, 50);
+        assert_eq!(sm.accounts.get(&2).expect("account 2 stored").credits_pending, 50);
+        // Only p1 remains (timeout 0) → nothing can expire → pulse parks at max.
+        assert_eq!(sm.pulse_next_timestamp(), TimestampRange::TIMESTAMP_MAX);
+        assert!(!sm.pulse_needed(TimestampRange::TIMESTAMP_MAX - 1));
+
+        // p1 can still be posted: the expiry gate (`p.timeout != 0 && ...`)
+        // is bypassed, and its full hold releases like any posted pending.
+        let post = Transfer {
+            id: 1010,
+            amount: 50,
+            pending_id: 1002,
+            flags: TransferFlags::POST_PENDING_TRANSFER,
+            ..t(1, 2, 0)
+        };
+        let reply = sm.create_transfers(&[post], 40 + NS_PER_S);
+        assert_eq!(reply_status(&reply), CreateTransferStatus::Created as u32);
+        assert_eq!(
+            sm.transfers_pending.get(&20).expect("pending status row").status,
+            TransferPendingStatus::Posted
+        );
+        assert_eq!(sm.accounts.get(&1).expect("account 1 stored").debits_pending, 0);
+        assert_eq!(sm.accounts.get(&1).expect("account 1 stored").debits_posted, 50);
+        assert_eq!(sm.accounts.get(&2).expect("account 2 stored").credits_pending, 0);
     }
 
     #[test]
