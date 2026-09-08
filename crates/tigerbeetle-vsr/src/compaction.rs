@@ -2000,7 +2000,7 @@ mod tests {
             manifest_oldest_checksum: 0,
             manifest_newest_address: 0,
             manifest_newest_checksum: 0,
-            op_compacted: false,
+            checkpoint_op: 0,
         });
 
         // The output blocks are written to storage; size the grid zone generously.

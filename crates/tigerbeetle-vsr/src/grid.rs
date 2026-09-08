@@ -253,8 +253,26 @@ pub struct SuperBlockView {
     /// and walks back towards the oldest block.
     pub manifest_newest_address: u64,
     pub manifest_newest_checksum: u128,
-    /// Whether the given op has already been compacted (upstream `op_compacted`).
-    pub op_compacted: bool,
+    /// The op of the last checkpoint (upstream `vsr_state.checkpoint.header.op`). The
+    /// functional [`SuperBlockView::op_compacted`] derives from it exactly as upstream's
+    /// `vsr_state.op_compacted(op)` — a snapshot is fine because the checkpoint op is fixed
+    /// between checkpoints.
+    pub checkpoint_op: u64,
+}
+
+impl SuperBlockView {
+    /// Whether the given op has already been compacted (upstream `op_compacted`,
+    /// superblock.zig:310): compaction is one bar ahead of the superblock's commit_min, so
+    /// every op up to the current checkpoint's trigger was preserved in the checkpoint and
+    /// its `compact()` updates must not be repeated (nondeterministic storage otherwise).
+    #[must_use]
+    pub fn op_compacted(&self, op: u64) -> bool {
+        // If commit_min is 0, we have never checkpointed, so no compactions are checkpointed.
+        self.checkpoint_op > 0
+            && op
+                <= crate::checkpoint::trigger_for_checkpoint(self.checkpoint_op)
+                    .unwrap_or_else(|| unreachable!("nonzero checkpoint ops always have a trigger"))
+    }
 }
 
 /// Which grid-owned checkpoint trailer a state-machine step applies to.
@@ -2995,6 +3013,42 @@ mod tests {
     }
 
     #[test]
+    fn superblock_view_op_compacted_tracks_trigger() {
+        let view = super::SuperBlockView {
+            cluster: 0xAB,
+            release: Release { value: 7 },
+            storage_size: 0,
+            manifest_block_count: 0,
+            manifest_oldest_address: 0,
+            manifest_oldest_checksum: 0,
+            manifest_newest_address: 0,
+            manifest_newest_checksum: 0,
+            checkpoint_op: 0,
+        };
+        assert!(!view.op_compacted(1), "nothing is compacted before a checkpoint");
+        assert!(!view.op_compacted(u64::MAX));
+
+        // First checkpoint: everything through the trigger counts as compacted.
+        let checkpointed =
+            super::SuperBlockView { checkpoint_op: crate::checkpoint::checkpoint_after(0), ..view };
+        let trigger = crate::checkpoint::trigger_for_checkpoint(checkpointed.checkpoint_op)
+            .unwrap_or_else(|| unreachable!("nonzero checkpoints have triggers"));
+        assert!(checkpointed.op_compacted(checkpointed.checkpoint_op));
+        assert!(checkpointed.op_compacted(trigger));
+        assert!(!checkpointed.op_compacted(trigger + 1));
+
+        // The barrier advances with the checkpoint op.
+        let second = super::SuperBlockView {
+            checkpoint_op: crate::checkpoint::checkpoint_after(checkpointed.checkpoint_op),
+            ..view
+        };
+        let trigger2 = crate::checkpoint::trigger_for_checkpoint(second.checkpoint_op)
+            .unwrap_or_else(|| unreachable!("nonzero checkpoints have triggers"));
+        assert!(second.op_compacted(trigger2));
+        assert!(!second.op_compacted(trigger2 + 1));
+    }
+
+    #[test]
     fn open_with_empty_trailers_loads_an_empty_free_set() {
         let mut storage = MemoryStorage::new(Zone::Grid.start() + 64 * BLOCK_SIZE as u64);
         let mut grid = new_unopened_grid(FREE_SET_BLOCKS);
@@ -3008,7 +3062,7 @@ mod tests {
             manifest_oldest_checksum: 0,
             manifest_newest_address: 0,
             manifest_newest_checksum: 0,
-            op_compacted: false,
+            checkpoint_op: 0,
         });
         grid.open(&mut storage, empty_references());
         drive_until(&mut grid, &mut storage, &|event| matches!(event, Event::OpenDone));
@@ -3042,7 +3096,7 @@ mod tests {
             manifest_oldest_checksum: 0,
             manifest_newest_address: 0,
             manifest_newest_checksum: 0,
-            op_compacted: false,
+            checkpoint_op: 0,
         });
         assert!(
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -3075,7 +3129,7 @@ mod tests {
             manifest_oldest_checksum: 0,
             manifest_newest_address: 0,
             manifest_newest_checksum: 0,
-            op_compacted: false,
+            checkpoint_op: 0,
         });
         grid.open(&mut storage, empty_references());
         drive_until(&mut grid, &mut storage, &|event| matches!(event, Event::OpenDone));
@@ -3121,7 +3175,7 @@ mod tests {
             manifest_oldest_checksum: 0,
             manifest_newest_address: 0,
             manifest_newest_checksum: 0,
-            op_compacted: false,
+            checkpoint_op: 0,
         });
         reopened.open(&mut storage, references);
         drive_until(&mut reopened, &mut storage, &|event| matches!(event, Event::OpenDone));
@@ -3214,7 +3268,7 @@ mod tests {
             manifest_oldest_checksum: 0,
             manifest_newest_address: 0,
             manifest_newest_checksum: 0,
-            op_compacted: false,
+            checkpoint_op: 0,
         });
         grid.open(&mut storage, empty_references());
         drive_until(&mut grid, &mut storage, &|event| matches!(event, Event::OpenDone));
@@ -3268,7 +3322,7 @@ mod tests {
             manifest_oldest_checksum: 0,
             manifest_newest_address: 0,
             manifest_newest_checksum: 0,
-            op_compacted: false,
+            checkpoint_op: 0,
         });
         reopened.open(&mut storage, references);
         drive_until(&mut reopened, &mut storage, &|event| matches!(event, Event::OpenDone));

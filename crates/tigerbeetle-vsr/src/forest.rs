@@ -526,12 +526,13 @@ impl Forest {
     pub fn compact(&mut self, op: u64, storage: &mut dyn Storage) {
         // No compactions are run during the absolute first bar, or during the
         // first bar of the checkpoint that we are currently recovering from
-        // (upstream `Forest.compact`, forest.zig:429-437). Without this gate the
-        // tree driver would commence mid-bar: `compact_levels` only commences at
+        // (upstream `Forest.compact`, forest.zig:429-437, which computes the
+        // latter as `vsr_state.op_compacted(op)`). Without this gate the tree
+        // driver would commence mid-bar: `compact_levels` only commences at
         // `first_beat`/`half_beat`, but calls `half_bar_complete` at
         // `last_beat`/`last_half_beat` — a compaction that never began asserts
         // `stage == Inactive`.
-        if op < LSM_COMPACTION_OPS as u64 || self.grid.superblock_view().op_compacted {
+        if op < LSM_COMPACTION_OPS as u64 || self.grid.superblock_view().op_compacted(op) {
             return;
         }
 
@@ -948,7 +949,7 @@ mod tests {
             manifest_oldest_checksum: 0,
             manifest_newest_address: 0,
             manifest_newest_checksum: 0,
-            op_compacted: false,
+            checkpoint_op: 0,
         }
     }
 
