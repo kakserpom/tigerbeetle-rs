@@ -818,7 +818,7 @@ typed_header! {
         /// A client is allowed to have at most one request inflight at a time.
         192 pub request: u32,
         196 pub operation: crate::Operation,
-        197 previous_request_latency_padding: [u8; 3],
+        197 pub previous_request_latency_padding: [u8; 3],
         /// Microsecond (0.17.0+) / Nanosecond interval measuring the time between when the client
         /// first began to construct the previous request's body and the time that the client
         /// received the corresponding reply.
