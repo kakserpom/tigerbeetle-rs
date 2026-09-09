@@ -46,8 +46,8 @@ use crate::Operation;
 use crate::forest::Forest;
 use crate::grid::Grid;
 use crate::groove::{
-    AccountObjectsCache, IdTimestampPrefetchKey, TimestampPrefetchKey, TransferObjectSpec,
-    TransferObjectsCache, TransferPendingObjectsCache,
+    AccountEventObjectSpec, AccountObjectsCache, IdTimestampPrefetchKey, TimestampPrefetchKey,
+    TransferGroove, TransferObjectSpec, TransferObjectsCache, TransferPendingObjectsCache,
 };
 use crate::message_header::checksum_body_empty;
 use crate::storage::Storage;
@@ -1777,6 +1777,40 @@ pub fn account_balances_to_bytes(snapshots: &[AccountBalance]) -> Vec<u8> {
     bytes
 }
 
+/// Build an `AccountBalance` reply from `account_id`'s balance events (upstream
+/// `execute_get_account_balances`, `state_machine.zig:3312-3357`): one snapshot
+/// per event, taking the debit or credit side balances per which account of the
+/// event matches `account_id`.
+#[must_use]
+fn account_balances_from_events(events: &[AccountEvent], account_id: u128) -> Vec<u8> {
+    let mut results: Vec<AccountBalance> = Vec::with_capacity(events.len());
+    for event in events {
+        assert_ne!(event.dr_account_id, event.cr_account_id);
+        let snapshot = if account_id == event.dr_account_id {
+            AccountBalance {
+                timestamp: event.timestamp,
+                debits_pending: event.dr_debits_pending,
+                debits_posted: event.dr_debits_posted,
+                credits_pending: event.dr_credits_pending,
+                credits_posted: event.dr_credits_posted,
+                reserved: [0; 56],
+            }
+        } else {
+            assert_eq!(account_id, event.cr_account_id);
+            AccountBalance {
+                timestamp: event.timestamp,
+                debits_pending: event.cr_debits_pending,
+                debits_posted: event.cr_debits_posted,
+                credits_pending: event.cr_credits_pending,
+                credits_posted: event.cr_credits_posted,
+                reserved: [0; 56],
+            }
+        };
+        results.push(snapshot);
+    }
+    account_balances_to_bytes(&results)
+}
+
 /// Decode a request body into a batch of [`Transfer`]s.
 ///
 /// Returns `None` if the body length is not a whole number of records.
@@ -1942,6 +1976,118 @@ where
         .iter()
         .map(timestamp_of)
         .collect()
+}
+
+/// Enumerate the transfer timestamps satisfying an [`AccountFilter`] through the
+/// mounted transfers groove's derived-index scans (upstream
+/// `get_scan_from_account_filter`, `state_machine.zig:1737-1840`): the
+/// `debit_account_id`/`credit_account_id` scans are OR-unioned per
+/// `flags.debits`/`flags.credits`, and each non-zero `user_data_*`/`code` filter
+/// AND-intersects its own index scan. Unordered: callers sort and cap.
+#[must_use]
+fn scan_account_filter_timestamps(
+    transfers: &TransferGroove,
+    grid: &mut Grid,
+    storage: &mut dyn Storage,
+    filter: &AccountFilter,
+    min: u64,
+    max: u64,
+) -> Vec<u64> {
+    // The debit/credit side scans are an OR-union of timestamp sets: a
+    // transfer's `debit_account_id` and `credit_account_id` differ (and
+    // timestamps are unique), so the composites are disjoint.
+    let mut timestamps: Vec<u64> = Vec::new();
+    if filter.flags.debits() {
+        timestamps.extend(scan_index_timestamps(
+            &transfers.debit_account_id,
+            grid,
+            storage,
+            SNAPSHOT_LATEST,
+            U256::from_parts(filter.account_id, min),
+            U256::from_parts(filter.account_id, max),
+            |value| value.timestamp,
+        ));
+    }
+    if filter.flags.credits() {
+        timestamps.extend(scan_index_timestamps(
+            &transfers.credit_account_id,
+            grid,
+            storage,
+            SNAPSHOT_LATEST,
+            U256::from_parts(filter.account_id, min),
+            U256::from_parts(filter.account_id, max),
+            |value| value.timestamp,
+        ));
+    }
+
+    // Each non-zero equality filter adds an AND-intersection over the
+    // timestamps of its own non-empty index scan (upstream pushes one
+    // `scan_prefix` condition per non-zero field, state_machine.zig:1819-1834).
+    let mut constraints: Vec<HashSet<u64>> = Vec::new();
+    if filter.user_data_128 != 0 {
+        constraints.push(
+            scan_index_timestamps(
+                &transfers.user_data_128,
+                grid,
+                storage,
+                SNAPSHOT_LATEST,
+                U256::from_parts(filter.user_data_128, min),
+                U256::from_parts(filter.user_data_128, max),
+                |value| value.timestamp,
+            )
+            .into_iter()
+            .collect(),
+        );
+    }
+    if filter.user_data_64 != 0 {
+        constraints.push(
+            scan_index_timestamps(
+                &transfers.user_data_64,
+                grid,
+                storage,
+                SNAPSHOT_LATEST,
+                (u128::from(filter.user_data_64) << 64) | u128::from(min),
+                (u128::from(filter.user_data_64) << 64) | u128::from(max),
+                |value| value.timestamp,
+            )
+            .into_iter()
+            .collect(),
+        );
+    }
+    if filter.user_data_32 != 0 {
+        constraints.push(
+            scan_index_timestamps(
+                &transfers.user_data_32,
+                grid,
+                storage,
+                SNAPSHOT_LATEST,
+                (u128::from(u64::from(filter.user_data_32)) << 64) | u128::from(min),
+                (u128::from(u64::from(filter.user_data_32)) << 64) | u128::from(max),
+                |value| value.timestamp,
+            )
+            .into_iter()
+            .collect(),
+        );
+    }
+    if filter.code != 0 {
+        constraints.push(
+            scan_index_timestamps(
+                &transfers.code,
+                grid,
+                storage,
+                SNAPSHOT_LATEST,
+                (u128::from(filter.code) << 64) | u128::from(min),
+                (u128::from(filter.code) << 64) | u128::from(max),
+                |value| value.timestamp,
+            )
+            .into_iter()
+            .collect(),
+        );
+    }
+    for constraint in &constraints {
+        timestamps.retain(|ts| constraint.contains(ts));
+    }
+    timestamps
 }
 
 /// Validate a [`QueryFilter`] (upstream `get_scan_from_query_filter`,
@@ -2599,7 +2745,7 @@ impl StateMachine {
                 let Some(filter) = bytes_to_account_filter(body) else {
                     unreachable!("get_account_balances body must be a single AccountFilter");
                 };
-                self.get_account_balances(&filter)
+                self.get_account_balances_with_storage(&filter, storage)
             }
             Operation::QUERY_ACCOUNTS => {
                 let Some(filter) = bytes_to_query_filter(body) else {
@@ -3317,101 +3463,17 @@ impl StateMachine {
             let limit = (filter.limit as usize)
                 .min(result_max_multi_batch(core::mem::size_of::<Transfer>()));
 
-            // The debit/credit side scans are an OR-union of timestamp sets: a
-            // transfer's `debit_account_id` and `credit_account_id` differ (and
-            // timestamps are unique), so the composites are disjoint.
-            let mut timestamps: Vec<u64> = Vec::new();
-            if filter.flags.debits() {
-                timestamps.extend(scan_index_timestamps(
-                    &forest.transfers.debit_account_id,
-                    &mut forest.grid,
-                    storage,
-                    SNAPSHOT_LATEST,
-                    U256::from_parts(filter.account_id, min),
-                    U256::from_parts(filter.account_id, max),
-                    |value| value.timestamp,
-                ));
-            }
-            if filter.flags.credits() {
-                timestamps.extend(scan_index_timestamps(
-                    &forest.transfers.credit_account_id,
-                    &mut forest.grid,
-                    storage,
-                    SNAPSHOT_LATEST,
-                    U256::from_parts(filter.account_id, min),
-                    U256::from_parts(filter.account_id, max),
-                    |value| value.timestamp,
-                ));
-            }
-
-            // Each non-zero equality filter adds an AND-intersection over the
-            // timestamps of its own non-empty index scan (upstream pushes one
-            // `scan_prefix` condition per non-zero field,
-            // state_machine.zig:1785-1880).
-            let mut constraints: Vec<std::collections::HashSet<u64>> = Vec::new();
-            if filter.user_data_128 != 0 {
-                constraints.push(
-                    scan_index_timestamps(
-                        &forest.transfers.user_data_128,
-                        &mut forest.grid,
-                        storage,
-                        SNAPSHOT_LATEST,
-                        U256::from_parts(filter.user_data_128, min),
-                        U256::from_parts(filter.user_data_128, max),
-                        |value| value.timestamp,
-                    )
-                    .into_iter()
-                    .collect(),
-                );
-            }
-            if filter.user_data_64 != 0 {
-                constraints.push(
-                    scan_index_timestamps(
-                        &forest.transfers.user_data_64,
-                        &mut forest.grid,
-                        storage,
-                        SNAPSHOT_LATEST,
-                        (u128::from(filter.user_data_64) << 64) | u128::from(min),
-                        (u128::from(filter.user_data_64) << 64) | u128::from(max),
-                        |value| value.timestamp,
-                    )
-                    .into_iter()
-                    .collect(),
-                );
-            }
-            if filter.user_data_32 != 0 {
-                constraints.push(
-                    scan_index_timestamps(
-                        &forest.transfers.user_data_32,
-                        &mut forest.grid,
-                        storage,
-                        SNAPSHOT_LATEST,
-                        (u128::from(u64::from(filter.user_data_32)) << 64) | u128::from(min),
-                        (u128::from(u64::from(filter.user_data_32)) << 64) | u128::from(max),
-                        |value| value.timestamp,
-                    )
-                    .into_iter()
-                    .collect(),
-                );
-            }
-            if filter.code != 0 {
-                constraints.push(
-                    scan_index_timestamps(
-                        &forest.transfers.code,
-                        &mut forest.grid,
-                        storage,
-                        SNAPSHOT_LATEST,
-                        (u128::from(filter.code) << 64) | u128::from(min),
-                        (u128::from(filter.code) << 64) | u128::from(max),
-                        |value| value.timestamp,
-                    )
-                    .into_iter()
-                    .collect(),
-                );
-            }
-            for constraint in &constraints {
-                timestamps.retain(|ts| constraint.contains(ts));
-            }
+            // The derived-index scan union/intersection (upstream
+            // `get_scan_from_account_filter`): debit/credit side scans are
+            // OR-unioned, `user_data_*`/`code` filters AND-intersect.
+            let mut timestamps = scan_account_filter_timestamps(
+                &forest.transfers,
+                &mut forest.grid,
+                storage,
+                filter,
+                min,
+                max,
+            );
 
             if filter.flags.reversed() {
                 timestamps.sort_unstable_by_key(|&ts| std::cmp::Reverse(ts));
@@ -3509,14 +3571,17 @@ impl StateMachine {
     /// account must exist and advertise `AccountFlags::HISTORY`; otherwise the
     /// reply is empty.
     ///
-    /// DEVIATION: upstream scans the `account_events` groove's
-    /// `account_timestamp` derived index built from the transfers-groove scan
-    /// conditions — events are yielded only when a *transfer* exists at the
-    /// event's timestamp (`AccountBalancesScanLookup`), so expiry events,
-    /// which carry no transfer at their own timestamp, never appear in the
-    /// balance history; sans-IO the events are filtered in memory (including
-    /// excluding `Expired` events and resolving an event's originating
-    /// transfer to apply the `user_data_*`/`code` filters).
+    /// DEVIATION: upstream scans the account_events objects tree through the
+    /// transfers-groove scan conditions — events are yielded only when a
+    /// *transfer* exists at the event's timestamp (`AccountBalancesScanLookup`),
+    /// so expiry events, which carry no transfer at their own timestamp, never
+    /// appear in the balance history; sans-IO this path filters the committed
+    /// [`Self::account_events`] store in memory (including excluding `Expired`
+    /// events and resolving an event's originating transfer to apply the
+    /// `user_data_*`/`code` filters). The mounted + storage-threaded path
+    /// resolves the same events through those transfers-groove index scans and
+    /// the account_events objects tree instead (see
+    /// [`Self::get_account_balances_with_storage`]) — byte identical.
     #[must_use]
     pub fn get_account_balances(&self, filter: &AccountFilter) -> Vec<u8> {
         if !account_filter_valid(filter) {
@@ -3532,7 +3597,21 @@ impl StateMachine {
         let min = if filter.timestamp_min == 0 { u64::MIN } else { filter.timestamp_min };
         let max = if filter.timestamp_max == 0 { u64::MAX } else { filter.timestamp_max };
 
-        let mut events: Vec<&AccountEvent> = self
+        let events = self.account_balance_events_from_store(filter, min, max);
+        account_balances_from_events(&events, filter.account_id)
+    }
+
+    /// The committed account-events for a balance query, ordered per `reversed`
+    /// and capped at `filter.limit` (the parity target for the storage-groove
+    /// path of [`Self::get_account_balances_with_storage`]; upstream filters
+    /// the events in its prefetch scan, `state_machine.zig:1618-1662`).
+    fn account_balance_events_from_store(
+        &self,
+        filter: &AccountFilter,
+        min: u64,
+        max: u64,
+    ) -> Vec<AccountEvent> {
+        let mut events: Vec<AccountEvent> = self
             .account_events
             .iter()
             .filter(|(ts, e)| {
@@ -3543,7 +3622,7 @@ impl StateMachine {
                         .account_event_transfer(e)
                         .is_some_and(|t| transfer_matches_account_filter(&t, filter))
             })
-            .map(|(_, e)| e)
+            .map(|(_, e)| *e)
             .collect();
         if filter.flags.reversed() {
             events.sort_unstable_by_key(|e| std::cmp::Reverse(e.timestamp));
@@ -3559,33 +3638,136 @@ impl StateMachine {
             (filter.limit as usize)
                 .min(result_max_multi_batch(core::mem::size_of::<AccountBalance>())),
         );
+        events
+    }
 
-        let mut results: Vec<AccountBalance> = Vec::with_capacity(events.len());
-        for event in events {
-            assert_ne!(event.dr_account_id, event.cr_account_id);
-            let snapshot = if filter.account_id == event.dr_account_id {
-                AccountBalance {
-                    timestamp: event.timestamp,
-                    debits_pending: event.dr_debits_pending,
-                    debits_posted: event.dr_debits_posted,
-                    credits_pending: event.dr_credits_pending,
-                    credits_posted: event.dr_credits_posted,
-                    reserved: [0; 56],
-                }
-            } else {
-                assert_eq!(filter.account_id, event.cr_account_id);
-                AccountBalance {
-                    timestamp: event.timestamp,
-                    debits_pending: event.cr_debits_pending,
-                    debits_posted: event.cr_debits_posted,
-                    credits_pending: event.cr_credits_pending,
-                    credits_posted: event.cr_credits_posted,
-                    reserved: [0; 56],
-                }
-            };
-            results.push(snapshot);
+    /// Execute a `get_account_balances` query and return the reply body,
+    /// resolving the balance events through the mounted forest when `storage`
+    /// is supplied (see [`Self::execute_with_storage`] for the threaded-storage
+    /// semantics).
+    ///
+    /// The candidate timestamps are enumerated by the same transfers-groove
+    /// derived-index scans as get_account_transfers (upstream
+    /// `AccountBalancesScanLookup` reuses `get_scan_from_account_filter`'s
+    /// TransfersGroove indexes because both object trees key on the timestamp),
+    /// then each is resolved against the account_events objects tree in the
+    /// requested order, parity-asserted against the committed
+    /// [`Self::account_events`] store.
+    ///
+    /// DEVIATION: upstream drives the derived-index scans asynchronously
+    /// through `lsm/scan_lookup.zig`; this port resolves the same timestamps
+    /// synchronously (see [`crate::groove::scan_composite_key_range`]),
+    /// byte-identical to the committed-store path.
+    #[must_use]
+    pub fn get_account_balances_with_storage(
+        &mut self,
+        filter: &AccountFilter,
+        storage: Option<&mut dyn Storage>,
+    ) -> Vec<u8> {
+        if !account_filter_valid(filter) {
+            return Vec::new();
         }
-        account_balances_to_bytes(&results)
+        let Some(account) = self.accounts.get(&filter.account_id) else {
+            return Vec::new();
+        };
+        if !account.flags.history() {
+            return Vec::new();
+        }
+
+        let min = if filter.timestamp_min == 0 { u64::MIN } else { filter.timestamp_min };
+        let max = if filter.timestamp_max == 0 { u64::MAX } else { filter.timestamp_max };
+
+        if let (Some(forest), Some(storage)) = (self.forest.as_mut(), storage) {
+            let limit = (filter.limit as usize)
+                .min(result_max_multi_batch(core::mem::size_of::<AccountBalance>()));
+
+            let mut timestamps = scan_account_filter_timestamps(
+                &forest.transfers,
+                &mut forest.grid,
+                storage,
+                filter,
+                min,
+                max,
+            );
+            if filter.flags.reversed() {
+                timestamps.sort_unstable_by_key(|&ts| std::cmp::Reverse(ts));
+            } else {
+                timestamps.sort_unstable();
+            }
+            timestamps.truncate(limit);
+
+            // Resolve each transfer timestamp against the account_events
+            // objects tree (a balance event exists at every transfer's
+            // timestamp) with the groove's precedence: the mutable memory table
+            // first (freshly recorded objects, which `lookup_from_levels_cache`
+            // — an immutable/disk path — does not scan), then the grid cache,
+            // then a storage read.
+            let mut events: Vec<AccountEvent> = Vec::with_capacity(timestamps.len());
+            for ts in timestamps {
+                let event = if let Some(event) = forest
+                    .account_events
+                    .objects
+                    .table_mutable_ref()
+                    .values_used()
+                    .iter()
+                    .find(|value| value.timestamp == ts)
+                {
+                    *event
+                } else {
+                    match forest.account_events.objects.lookup_from_levels_cache(
+                        &mut forest.grid,
+                        SNAPSHOT_LATEST,
+                        ts,
+                    ) {
+                        LookupMemoryResult::Positive(event) => event,
+                        LookupMemoryResult::Possible { level } => forest
+                            .account_events
+                            .objects
+                            .lookup_from_levels_storage(
+                                &mut forest.grid,
+                                storage,
+                                SNAPSHOT_LATEST,
+                                ts,
+                                level,
+                            )
+                            .unwrap_or_else(|| {
+                                unreachable!(
+                                    "transfer-scan timestamps always resolve to committed account \
+                                     events"
+                                )
+                            }),
+                        LookupMemoryResult::Negative => {
+                            unreachable!(
+                                "transfer-scan timestamps always resolve to committed account \
+                                 events"
+                            )
+                        }
+                    }
+                };
+                assert!(!AccountEventObjectSpec::tombstone(&event));
+                assert_eq!(event.timestamp, ts);
+                assert_ne!(
+                    event.transfer_pending_status,
+                    TransferPendingStatus::Expired,
+                    "a balance event at a transfer's timestamp never records an expiry"
+                );
+                events.push(event);
+            }
+
+            // Parity with the committed store: the groove resolution must
+            // produce the same events in the same order (the replies are
+            // byte-identical).
+            let expected = self.account_balance_events_from_store(filter, min, max);
+            assert_eq!(
+                events,
+                expected[..events.len()],
+                "account_events-groove resolution must mirror the committed store"
+            );
+
+            return account_balances_from_events(&events, filter.account_id);
+        }
+
+        self.get_account_balances(filter)
     }
 
     /// Execute a `query_accounts` operation and return the reply body
@@ -9612,6 +9794,209 @@ mod tests {
         assert_eq!(filter_ts(&both), [20, 21]);
         assert_eq!(filter_ts(&code7), [21]);
         assert_eq!(filter_ts(&ud64), [20]);
+    }
+
+    #[test]
+    fn get_account_balances_resolves_through_mounted_groove() {
+        let mut sm = StateMachine::default();
+        let mut forest = Forest::init(test_superblock(), forest_grid_options(), 32);
+        let mut storage = forest_storage();
+        open_forest(&mut forest, &mut storage);
+        sm.mount_forest(forest);
+
+        let history = |id: u128| Account {
+            id,
+            ledger: 1,
+            code: 1,
+            flags: AccountFlags::HISTORY,
+            ..Account::default()
+        };
+        let _ = sm.create_accounts_with_storage(
+            &[history(1), history(2), history(3)],
+            10,
+            Some(&mut storage),
+        );
+        // a: dr=1, cr=2, amount=10, code=7, user_data_64=99 (20)
+        // b: dr=1, cr=2, amount=11, code=8, user_data_128=500 (21)
+        let mut a = t(1, 2, 10);
+        a.code = 7;
+        a.user_data_64 = 99;
+        let mut b = t(1, 2, 11);
+        b.id = 1003;
+        b.code = 8;
+        b.user_data_128 = 500;
+        let _ = sm.create_transfers_with_storage(&[a, b], 21, Some(&mut storage));
+        // c: dr=2, cr=3, code=7, user_data_64=99 (30)
+        // d: dr=2, cr=3, code=9 (40)
+        let mut c = t(2, 3, 12);
+        c.id = 2003;
+        c.code = 7;
+        c.user_data_64 = 99;
+        let mut d = t(2, 3, 13);
+        d.id = 2004;
+        d.code = 9;
+        let _ = sm.create_transfers_with_storage(&[c], 30, Some(&mut storage));
+        let _ = sm.create_transfers_with_storage(&[d], 40, Some(&mut storage));
+
+        let both = account_filter(2, AccountFilterFlags::DEBITS | AccountFilterFlags::CREDITS);
+        // The account's side is snapshotted: at ts 21 (b, amount 11) account 2's
+        // credits_posted after a+b = 21.
+        let two = sm.execute(Operation::GET_ACCOUNT_BALANCES, 0, &account_filter_bytes(&both));
+        let (records, _) = two.as_chunks::<128>();
+        assert_eq!(le_u128(&records[1], 48), 21);
+
+        let mut snapshots = |filter: &AccountFilter| -> Vec<u64> {
+            let body = sm.execute_with_storage(
+                Operation::GET_ACCOUNT_BALANCES,
+                0,
+                &account_filter_bytes(filter),
+                Some(&mut storage),
+            );
+            assert_eq!(
+                body,
+                sm.execute(Operation::GET_ACCOUNT_BALANCES, 0, &account_filter_bytes(filter)),
+                "groove get_account_balances byte-identical to the committed store"
+            );
+            let (records, _) = body.as_chunks::<128>();
+            records.iter().map(|record| le_u64(record, 64)).collect()
+        };
+
+        // Account 2 is credited by a (20) and b (21), and debited by c (30) and
+        // d (40); the whole for both sides sorts ascending by timestamp.
+        assert_eq!(snapshots(&both), [20, 21, 30, 40]);
+        let debits = account_filter(2, AccountFilterFlags::DEBITS);
+        assert_eq!(snapshots(&debits), [30, 40]);
+        let credits = account_filter(2, AccountFilterFlags::CREDITS);
+        assert_eq!(snapshots(&credits), [20, 21]);
+        let reversed = account_filter(
+            2,
+            AccountFilterFlags::DEBITS | AccountFilterFlags::CREDITS | AccountFilterFlags::REVERSED,
+        );
+        assert_eq!(snapshots(&reversed), [40, 30, 21, 20]);
+
+        // User-data and code filters AND-intersect their own index scans.
+        let code7 = AccountFilter { code: 7, ..both };
+        assert_eq!(snapshots(&code7), [20, 30]);
+        let code8 = AccountFilter { code: 8, ..both };
+        assert_eq!(snapshots(&code8), [21]);
+        let ud64 = AccountFilter { user_data_64: 99, ..both };
+        assert_eq!(snapshots(&ud64), [20, 30]);
+        let ud128 = AccountFilter { user_data_128: 500, ..both };
+        assert_eq!(snapshots(&ud128), [21]);
+        // A range narrows the side scan; a limit truncates the reply.
+        let range = AccountFilter { timestamp_min: 22, timestamp_max: 39, ..both };
+        assert_eq!(snapshots(&range), [30]);
+        let limited = AccountFilter { limit: 2, ..both };
+        assert_eq!(snapshots(&limited), [20, 21]);
+    }
+
+    #[test]
+    fn get_account_balances_resolves_through_mounted_groove_from_durable_disk() {
+        let mut storage = forest_storage();
+        let mut sm = StateMachine::default();
+        {
+            let mut forest = Forest::init(test_superblock(), forest_grid_options(), 32);
+            open_forest(&mut forest, &mut storage);
+            sm.mount_forest(forest);
+        }
+        let _ = sm.create_accounts_with_storage(
+            &[
+                Account {
+                    id: 1,
+                    ledger: 1,
+                    code: 1,
+                    flags: AccountFlags::HISTORY,
+                    ..Account::default()
+                },
+                Account {
+                    id: 2,
+                    ledger: 1,
+                    code: 1,
+                    flags: AccountFlags::HISTORY,
+                    ..Account::default()
+                },
+            ],
+            10,
+            Some(&mut storage),
+        );
+        let mut with_ud = t(1, 2, 5);
+        with_ud.user_data_64 = 99;
+        let mut with_code = t(1, 2, 6);
+        with_code.id = 1003;
+        with_code.code = 7;
+        let _ = sm.create_transfers_with_storage(&[with_ud, with_code], 21, Some(&mut storage));
+
+        let both = account_filter(1, AccountFilterFlags::DEBITS | AccountFilterFlags::CREDITS);
+        let code7 = AccountFilter { code: 7, ..both };
+        let ud64 = AccountFilter { user_data_64: 99, ..both };
+
+        // Flush to L0 and checkpoint, then reopen a fresh forest over the same
+        // storage (cold grid cache: every index and value block comes from disk).
+        let bar_ops = constants::LSM_COMPACTION_OPS as u64;
+        let bar_start = compaction::HALF_BAR_BEAT_COUNT as u64 * 2;
+        for _bar in 0..2 {
+            for op in bar_start..bar_start + bar_ops {
+                sm.compact(op, Some(&mut storage));
+            }
+        }
+        let (manifest_refs, free_set_refs) = sm.checkpoint(Some(&mut storage));
+        let highest_address = free_set_refs
+            .blocks_acquired
+            .last_block_address
+            .max(free_set_refs.blocks_released.last_block_address);
+        let reopen_view = SuperBlockView {
+            storage_size: DATA_FILE_SIZE_MIN as u64 + highest_address * BLOCK_SIZE as u64,
+            manifest_block_count: manifest_refs.block_count,
+            manifest_oldest_address: manifest_refs.oldest_address,
+            manifest_oldest_checksum: manifest_refs.oldest_checksum,
+            manifest_newest_address: manifest_refs.newest_address,
+            manifest_newest_checksum: manifest_refs.newest_checksum,
+            ..test_superblock()
+        };
+        let mut forest_b = Forest::init(reopen_view, forest_grid_options(), 32);
+        forest_b.open(
+            GridOpenReferences {
+                blocks_acquired: free_set_refs.blocks_acquired,
+                blocks_released: free_set_refs.blocks_released,
+            },
+            &mut storage,
+            0,
+        );
+        let mut done = false;
+        for _ in 0..1000 {
+            forest_b.poll(&mut storage);
+            if forest_b.account_events.objects.is_opened() && forest_b.is_idle() {
+                done = true;
+                break;
+            }
+        }
+        assert!(done, "reopen must complete");
+        assert!(
+            forest_b.account_events.objects.manifest_table_count() >= 1,
+            "the reopened forest restores the flushed account_events objects table"
+        );
+        sm.forest = Some(Box::new(forest_b));
+
+        // ── Disk tables (cold cache: index scans + object resolutions read
+        // from storage).
+        let mut snapshot_ts = |filter: &AccountFilter| -> Vec<u64> {
+            let body = sm.execute_with_storage(
+                Operation::GET_ACCOUNT_BALANCES,
+                0,
+                &account_filter_bytes(filter),
+                Some(&mut storage),
+            );
+            assert_eq!(
+                body,
+                sm.execute(Operation::GET_ACCOUNT_BALANCES, 0, &account_filter_bytes(filter)),
+                "disk-groove get_account_balances byte-identical to the committed store"
+            );
+            let (records, _) = body.as_chunks::<128>();
+            records.iter().map(|record| le_u64(record, 64)).collect()
+        };
+        assert_eq!(snapshot_ts(&both), [20, 21]);
+        assert_eq!(snapshot_ts(&code7), [21]);
+        assert_eq!(snapshot_ts(&ud64), [20]);
     }
 
     // ── get_account_balances tests ───────────────────────────────────────
