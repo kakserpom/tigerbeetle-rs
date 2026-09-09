@@ -35,7 +35,7 @@ use tigerbeetle_lsm::composite_key::{
 };
 use tigerbeetle_lsm::direction::Direction;
 use tigerbeetle_lsm::manifest::ManifestLog;
-use tigerbeetle_lsm::manifest_level::{LevelTableInfo, Visibility};
+use tigerbeetle_lsm::manifest_level::{KeyRange, LevelTableInfo, Visibility};
 use tigerbeetle_lsm::scratch_memory::ScratchMemory;
 use tigerbeetle_lsm::set_associative_cache::{Layout, SetAssociativeCacheSpec};
 use tigerbeetle_lsm::table_memory::{self, Usage};
@@ -3489,6 +3489,107 @@ fn merge_scan_values_into<
             }
         }
     }
+}
+
+/// Collect the newest value for every key of the derived-index `tree` within the
+/// inclusive `[key_min, key_max]` composite-key range, deduped across the memory
+/// tables (immutable then mutable, newest-wins) and every visible disk table at
+/// `snapshot` with upstream's stream precedence (mutable > immutable > L0 > L1 >
+/// …), returned in composite-key order.
+///
+/// This is the state-machine-facing seam for the index-scanned transfer queries
+/// (upstream `execute_get_account_transfers`'s `scan_prefix` conditions,
+/// `state_machine.zig:1737-1880`): a composite key of `(field, timestamp)` — e.g.
+/// `debit_account_id` (field = account id, timestamp = transfer timestamp), or
+/// `user_data_*`/`code` — lets a range predicate over the low fields pick exactly
+/// the keys whose timestamps fall in a window, and the timestamp of the returned
+/// value addresses the transfer object. The committed-store recompute stays as
+/// the storage-less fallback and the state machine asserts the scan mirrors it
+/// across the fully mounted AND flushed lifecycle.
+///
+/// DEVIATION (as [`merge_scan_values_into`]): upstream's scan streams are
+/// asynchronous K-way merge iterators (`lsm/scan_lookup.zig`) that prune the
+/// per-level tables by the requested key range as they descend; sans-I/O this
+/// asks the manifest level iterator for exactly the tables overlapping the range
+/// and aggregates a newest-wins per-key map, reading its index/value blocks via
+/// [`Grid::read_block_sync`]. The values carry no `Ord` derivation in this port
+/// (unlike their packed composite keys), so the newest-wins map is a [`BTreeMap`]
+/// keyed by the composite key.
+pub(crate) fn scan_composite_key_range<S, K, V>(
+    tree: &Tree<S>,
+    grid: &mut Grid,
+    storage: &mut dyn Storage,
+    snapshot: u64,
+    key_min: K,
+    key_max: K,
+) -> Vec<V>
+where
+    S: TreeSpec + table_memory::Table<Key = K, Value = V>,
+    K: Copy + Eq + Ord,
+    V: Copy,
+{
+    debug_assert_eq!(snapshot, SNAPSHOT_LATEST, "only the latest committed snapshot");
+    assert!(key_min <= key_max, "key_min must not exceed key_max");
+
+    let mut newest: std::collections::BTreeMap<K, V> = std::collections::BTreeMap::new();
+    for table in [tree.table_immutable_ref(), tree.table_mutable_ref()] {
+        for value in table.values_used() {
+            let key = <S as table_memory::Table>::key_from_value(value);
+            if key < key_min || key > key_max {
+                continue;
+            }
+            if let Some(entry) = newest.get_mut(&key) {
+                // Same key in immutable then mutable table: mutable must win.
+                *entry = *value;
+            } else {
+                newest.insert(key, *value);
+            }
+        }
+    }
+
+    let snapshots = [snapshot];
+    let manifest = tree.manifest_ref();
+    let layout = <S as TreeSpec>::LAYOUT;
+    let tree_id = tree.config_ref().id;
+    for level in 0..constants::LSM_LEVELS as usize {
+        let mut tables: Vec<
+            &tigerbeetle_lsm::manifest::TreeTableInfo<<S as table_memory::Table>::Key>,
+        > = Vec::new();
+        let mut iterator = manifest.levels[level].iterator(
+            Visibility::Visible,
+            &snapshots,
+            Direction::Ascending,
+            Some(KeyRange { key_min, key_max }),
+        );
+        while let Some(table) = iterator.next() {
+            tables.push(table);
+        }
+        if level == 0 {
+            // Overlapping L0 tables in the same bar: the later flush's
+            // `snapshot_min` is higher, so newest-first order wins.
+            tables.sort_by_key(|table| u64::MAX - table.snapshot_min());
+        }
+
+        for table in tables {
+            let index_block = grid.read_block_sync(storage, table.address(), table.checksum());
+            let index = layout.index.from_block_with_schema(&index_block, tree_id);
+            for block_index in 0..index.value_blocks_used(&index_block) {
+                let address = index.value_address(&index_block, block_index as usize);
+                let checksum = index.value_checksum(&index_block, block_index as usize);
+                let value_block = grid.read_block_sync(storage, address, checksum);
+                for value in table::value_block_values_used::<S>(&value_block, &layout.data) {
+                    let key = <S as table_memory::Table>::key_from_value(&value);
+                    if key < key_min || key > key_max {
+                        continue;
+                    }
+                    newest.entry(key).or_insert(value);
+                }
+            }
+        }
+    }
+
+    // `BTreeMap` iterates in key order, so no explicit sort is needed.
+    newest.into_values().collect()
 }
 
 // ===== AccountEvents (CDC) groove =====
