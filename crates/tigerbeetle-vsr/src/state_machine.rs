@@ -2222,7 +2222,7 @@ where
     F: Fn(&V) -> bool,
 {
     if let Some(value) =
-        objects.table_mutable_ref().values_used().iter().find(|&value| is_ts(value))
+        objects.table_mutable_ref().values_used().iter().rev().find(|&value| is_ts(value))
     {
         return *value;
     }
@@ -3266,10 +3266,12 @@ impl StateMachine {
     /// With a forest mounted and `storage` threaded, each id is enqueued into
     /// the accounts-groove prefetch seam (`prefetch_setup`, `prefetch_enqueue`,
     /// `prefetch`) and the resolved objects — read back from the objects tree's
-    /// synced levels in cache/disk order — are the reply, parity-asserted
-    /// against the committed [`Self::accounts`] store. This is upstream's
-    /// `execute_lookup_accounts` (`state_machine.zig:3259`), which reads the
-    /// groove objects cache after its prefetch callbacks settle the ids.
+    /// synced levels in cache/disk order — are the reply. Once the forest is
+    /// mounted the groove is the source of record; the committed
+    /// [`Self::accounts`] store is only the unmounted fallback and the tests'
+    /// oracle. This is upstream's `execute_lookup_accounts`
+    /// (`state_machine.zig:3259`), which reads the groove objects cache after
+    /// its prefetch callbacks settle the ids.
     ///
     /// DEVIATION: upstream drives the prefetched reads asynchronously; this
     /// port resolves the same reads synchronously (see the groove prefetch
@@ -3298,19 +3300,8 @@ impl StateMachine {
 
             let mut results: Vec<Account> = Vec::new();
             for &id in ids {
-                match forest.accounts.get(id) {
-                    Some(account) => {
-                        assert_eq!(
-                            self.accounts.get(&id).copied(),
-                            Some(*account),
-                            "accounts-groove lookup must resolve the committed account"
-                        );
-                        results.push(*account);
-                    }
-                    None => assert!(
-                        !self.accounts.contains_key(&id),
-                        "accounts-groove lookup must resolve every committed account"
-                    ),
+                if let Some(account) = forest.accounts.get(id) {
+                    results.push(*account);
                 }
             }
             return account_batch_to_bytes(&results);
@@ -3347,7 +3338,7 @@ impl StateMachine {
     ///
     /// As for [`Self::lookup_accounts_with_storage`], each id is enqueued into
     /// the transfers-groove prefetch seam and the resolved objects are the
-    /// reply, parity-asserted against the committed [`Self::transfers`] store.
+    /// reply — the groove is the source of record once the forest is mounted.
     /// An **orphaned** id — a transfer that failed with a transient status and
     /// is tagged in the groove's objects cache with a zeroed object (upstream
     /// `insert_orphaned_object`, `groove.zig:1935-1949`) — never committed, so
@@ -3379,22 +3370,8 @@ impl StateMachine {
                     // `Some` with a zeroed object is the orphan tag, never a
                     // committed transfer (upstream keeps orphans in a separate
                     // map, not the objects tree).
-                    Some(transfer) if transfer.timestamp != 0 => {
-                        assert_eq!(
-                            self.transfers.get(&id).copied(),
-                            Some(*transfer),
-                            "transfers-groove lookup must resolve the committed transfer"
-                        );
-                        results.push(*transfer);
-                    }
-                    Some(_orphan) => assert!(
-                        !self.transfers.contains_key(&id),
-                        "an orphaned transfer id never commits (groove.zig:1935-1949)"
-                    ),
-                    None => assert!(
-                        !self.transfers.contains_key(&id),
-                        "transfers-groove lookup must resolve every committed transfer"
-                    ),
+                    Some(transfer) if transfer.timestamp != 0 => results.push(*transfer),
+                    Some(_) | None => {}
                 }
             }
             return transfer_batch_to_bytes(&results);
@@ -3448,13 +3425,16 @@ impl StateMachine {
     ///
     /// The events are enumerated by a timestamp-range scan over the
     /// account_events objects tree — the memory tables plus every visible disk
-    /// table at `SNAPSHOT_LATEST` — parity-asserted against the committed
-    /// [`Self::account_events`] store, and the scanned events build the reply.
+    /// table at `SNAPSHOT_LATEST`. Each event's transfer (by timestamp, or by
+    /// id for expiry events) and its dr/cr accounts are then resolved through
+    /// the transfers/accounts grooves, and the reply is built entirely from the
+    /// grooves — none of the committed stores are consulted once the forest is
+    /// mounted (they remain only the unmounted fallback and the tests' oracle).
     /// This is upstream's `execute_get_change_events` (`state_machine.zig:3522`),
     /// which reads the events via its prefetch-then-derive CDC scan.
     ///
-    /// DEVIATION: upstream drives the CDC scan asynchronously; this port
-    /// resolves the same events synchronously (see
+    /// DEVIATION: upstream drives the CDC scan and prefetch reads asynchronously;
+    /// this port resolves the same events synchronously (see
     /// [`crate::groove::AccountEventsGroove::scan_events`]), byte-identical to
     /// the committed-store path.
     #[must_use]
@@ -3467,30 +3447,103 @@ impl StateMachine {
         let max = if filter.timestamp_max == 0 { u64::MAX } else { filter.timestamp_max };
 
         if let (Some(forest), Some(storage)) = (self.forest.as_mut(), storage) {
-            let events = forest.account_events.scan_events(
+            let mut events = forest.account_events.scan_events(
                 &mut forest.grid,
                 storage,
                 SNAPSHOT_LATEST,
                 min,
                 max,
             );
-
-            let mut store_events: Vec<AccountEvent> = self
-                .account_events
-                .iter()
-                .filter(|&(&ts, _)| ts >= min && ts <= max)
-                .map(|(_, e)| *e)
-                .collect();
-            store_events.sort_unstable_by_key(|e| e.timestamp);
-            assert_eq!(
-                events, store_events,
-                "account_events-groove scan must mirror the committed store"
+            // Cap the reply exactly like the committed-store path
+            // (`change_events_reply`; upstream `prefetch_get_change_events`,
+            // state_machine.zig:2245-2275).
+            events.truncate(
+                (filter.limit as usize).min(result_max(core::mem::size_of::<ChangeEvent>())),
             );
 
-            self.change_events_reply(events, filter.limit)
-        } else {
-            self.get_change_events(filter)
+            let snapshot = self.prefetch_snapshot.unwrap_or(SNAPSHOT_LATEST - 1);
+
+            // The accounts every event names, resolved through the
+            // accounts-groove prefetch seam (upstream reads them from its own
+            // prefetch output, `state_machine.zig:3441`).
+            let mut account_ids: Vec<u128> =
+                events.iter().flat_map(|e| [e.dr_account_id, e.cr_account_id]).collect();
+            account_ids.sort_unstable();
+            account_ids.dedup();
+            forest.accounts.prefetch_setup(snapshot);
+            for &id in &account_ids {
+                forest.accounts.prefetch_enqueue(
+                    &mut forest.grid,
+                    &mut forest.accounts_scratch.objects,
+                    IdTimestampPrefetchKey::Id(id),
+                );
+            }
+            forest.accounts.prefetch(&mut forest.grid, storage);
+
+            // An expiry event records a pending transfer with no object at the
+            // event's own timestamp; resolve those by id through the
+            // transfers-groove prefetch seam (`account_event_transfer`).
+            let mut pending_ids: Vec<u128> = events
+                .iter()
+                .filter(|e| e.transfer_pending_status == TransferPendingStatus::Expired)
+                .map(|e| e.transfer_pending_id)
+                .collect();
+            pending_ids.sort_unstable();
+            pending_ids.dedup();
+            forest.transfers.prefetch_setup(snapshot);
+            for &id in &pending_ids {
+                forest.transfers.prefetch_enqueue(
+                    &mut forest.grid,
+                    &mut forest.transfers_scratch.objects,
+                    IdTimestampPrefetchKey::Id(id),
+                );
+            }
+            forest.transfers.prefetch(&mut forest.grid, storage);
+
+            let mut reply = Vec::with_capacity(events.len() * core::mem::size_of::<ChangeEvent>());
+            for event in events {
+                // Every non-expiry event carries a transfer committed at its
+                // timestamp; resolve it from the objects tree with the groove's
+                // precedence (mutable memory table, then grid cache, then disk).
+                let transfer = if event.transfer_pending_status == TransferPendingStatus::Expired {
+                    forest
+                        .transfers
+                        .get(event.transfer_pending_id)
+                        .copied()
+                        .expect("expiry event references a committed pending transfer")
+                } else {
+                    let transfer = resolve_timestamp_object(
+                        &mut forest.transfers.objects,
+                        &mut forest.grid,
+                        storage,
+                        event.timestamp,
+                        |value| value.timestamp == event.timestamp,
+                    );
+                    assert!(!TransferObjectSpec::tombstone(&transfer));
+                    assert_eq!(transfer.timestamp, event.timestamp);
+                    transfer
+                };
+                let dr_account = forest
+                    .accounts
+                    .get(event.dr_account_id)
+                    .copied()
+                    .expect("debit account committed");
+                let cr_account = forest
+                    .accounts
+                    .get(event.cr_account_id)
+                    .copied()
+                    .expect("credit account committed");
+                let change = Self::build_change_event_from_objects(
+                    &event,
+                    &transfer,
+                    &dr_account,
+                    &cr_account,
+                );
+                reply.extend_from_slice(&change_bytes(&change));
+            }
+            return reply;
         }
+        self.get_change_events(filter)
     }
 
     /// The shared ChangeEvents reply tail: truncate `events` (already filtered
@@ -3588,8 +3641,10 @@ impl StateMachine {
     /// Every scan yields the transfer timestamps whose composite key
     /// `(filter value, timestamp)` falls in the inclusive
     /// `[timestamp_min, timestamp_max]` window, resolved into [`Transfer`]s
-    /// from the objects tree (by timestamp) in the requested order, then
-    /// parity-asserted against the committed [`Self::transfers`] store.
+    /// from the objects tree (by timestamp) in the requested order — the
+    /// groove is the source of record once the forest is mounted, and the
+    /// committed [`Self::transfers`] store is only the unmounted fallback and
+    /// the tests' oracle.
     ///
     /// DEVIATION: upstream drives the derived-index scans asynchronously
     /// through `lsm/scan_lookup.zig`; this port resolves the same timestamps
@@ -3648,29 +3703,6 @@ impl StateMachine {
                 results.push(transfer);
             }
 
-            // Parity with the committed store: the groove scan must resolve the
-            // same transfer set in the same order (the replies are byte-identical).
-            let mut expected: Vec<Transfer> = self
-                .transfers
-                .values()
-                .copied()
-                .filter(|t| {
-                    t.timestamp >= min
-                        && t.timestamp <= max
-                        && transfer_matches_account_filter(t, filter)
-                })
-                .collect();
-            if filter.flags.reversed() {
-                expected.sort_unstable_by_key(|t| std::cmp::Reverse(t.timestamp));
-            } else {
-                expected.sort_unstable_by_key(|t| t.timestamp);
-            }
-            assert_eq!(
-                results,
-                expected[..results.len()],
-                "transfers-groove index scan must mirror the committed store"
-            );
-
             return transfer_batch_to_bytes(&results);
         }
         self.get_account_transfers(filter)
@@ -3717,9 +3749,10 @@ impl StateMachine {
     }
 
     /// The committed account-events for a balance query, ordered per `reversed`
-    /// and capped at `filter.limit` (the parity target for the storage-groove
-    /// path of [`Self::get_account_balances_with_storage`]; upstream filters
-    /// the events in its prefetch scan, `state_machine.zig:1618-1662`).
+    /// and capped at `filter.limit` — the oracle the tests compare the
+    /// storage-groove path of [`Self::get_account_balances_with_storage`]
+    /// against (upstream filters the events in its prefetch scan,
+    /// `state_machine.zig:1618-1662`).
     fn account_balance_events_from_store(
         &self,
         filter: &AccountFilter,
@@ -3761,13 +3794,18 @@ impl StateMachine {
     /// is supplied (see [`Self::execute_with_storage`] for the threaded-storage
     /// semantics).
     ///
-    /// The candidate timestamps are enumerated by the same transfers-groove
+    /// The filter-named account is resolved through the accounts-groove objects
+    /// cache seeded by the prefetch seam (upstream
+    /// `prefetch_get_account_balances`, `state_machine.zig:1576`): it must
+    /// exist and advertise `AccountFlags::HISTORY`, else the reply is empty.
+    /// The candidate timestamps are then enumerated by the same transfers-groove
     /// derived-index scans as get_account_transfers (upstream
     /// `AccountBalancesScanLookup` reuses `get_scan_from_account_filter`'s
     /// TransfersGroove indexes because both object trees key on the timestamp),
-    /// then each is resolved against the account_events objects tree in the
-    /// requested order, parity-asserted against the committed
-    /// [`Self::account_events`] store.
+    /// and each event is resolved against the account_events objects tree in the
+    /// requested order. Once the forest is mounted the groove is the source of
+    /// record; the committed [`Self::account_events`] store is only the
+    /// unmounted fallback and the tests' oracle.
     ///
     /// DEVIATION: upstream drives the derived-index scans asynchronously
     /// through `lsm/scan_lookup.zig`; this port resolves the same timestamps
@@ -3782,17 +3820,29 @@ impl StateMachine {
         if !account_filter_valid(filter) {
             return Vec::new();
         }
-        let Some(account) = self.accounts.get(&filter.account_id) else {
-            return Vec::new();
-        };
-        if !account.flags.history() {
-            return Vec::new();
-        }
 
         let min = if filter.timestamp_min == 0 { u64::MIN } else { filter.timestamp_min };
         let max = if filter.timestamp_max == 0 { u64::MAX } else { filter.timestamp_max };
 
         if let (Some(forest), Some(storage)) = (self.forest.as_mut(), storage) {
+            // The filter-named account must exist and advertise HISTORY, decided
+            // by the groove (not the committed store): seed the accounts objects
+            // cache through the prefetch seam and resolve the live entry.
+            let snapshot = self.prefetch_snapshot.unwrap_or(SNAPSHOT_LATEST - 1);
+            forest.accounts.prefetch_setup(snapshot);
+            forest.accounts.prefetch_enqueue(
+                &mut forest.grid,
+                &mut forest.accounts_scratch.objects,
+                IdTimestampPrefetchKey::Id(filter.account_id),
+            );
+            forest.accounts.prefetch(&mut forest.grid, storage);
+            let Some(account) = forest.accounts.get(filter.account_id) else {
+                return Vec::new();
+            };
+            if !account.flags.history() {
+                return Vec::new();
+            }
+
             let limit = (filter.limit as usize)
                 .min(result_max_multi_batch(core::mem::size_of::<AccountBalance>()));
 
@@ -3833,16 +3883,6 @@ impl StateMachine {
                 );
                 events.push(event);
             }
-
-            // Parity with the committed store: the groove resolution must
-            // produce the same events in the same order (the replies are
-            // byte-identical).
-            let expected = self.account_balance_events_from_store(filter, min, max);
-            assert_eq!(
-                events,
-                expected[..events.len()],
-                "account_events-groove resolution must mirror the committed store"
-            );
 
             return account_balances_from_events(&events, filter.account_id);
         }
@@ -3960,14 +4000,14 @@ impl StateMachine {
     /// available (upstream `execute_query_accounts` over the
     /// `AccountsScanLookup` of [`crate::groove`]).
     ///
-    /// The committed store remains the golden source: one derived-index scan
-    /// per non-zero `user_data_*`/`ledger`/`code` condition yields candidate
-    /// timestamps, AND-intersected (upstream `get_scan_from_query_filter`); a
-    /// timestamp-only query scans the objects tree by timestamp range instead
-    /// (upstream `scan_timestamp`). Each timestamp resolves to its account with
-    /// the groove precedence (mutable memory table, then grid cache, then
-    /// disk), and the reply is parity-asserted byte-identical to the committed
-    /// store.
+    /// One derived-index scan per non-zero `user_data_*`/`ledger`/`code`
+    /// condition yields candidate timestamps, AND-intersected (upstream
+    /// `get_scan_from_query_filter`); a timestamp-only query scans the objects
+    /// tree by timestamp range instead (upstream `scan_timestamp`). Each
+    /// timestamp resolves to its account with the groove precedence (mutable
+    /// memory table, then grid cache, then disk). Once the forest is mounted
+    /// the groove is the source of record; the committed [`Self::accounts`]
+    /// store is only the unmounted fallback and the tests' oracle.
     ///
     /// DEVIATION: upstream scans the objects groove asynchronously via
     /// `lsm/scan_lookup.zig`; this port resolves the same timestamps
@@ -4041,39 +4081,6 @@ impl StateMachine {
                 results.push(account);
             }
 
-            // Parity with the committed store: the groove resolution must
-            // produce the same accounts in the same order (the replies are
-            // byte-identical).
-            let mut expected: Vec<Account> = self
-                .accounts
-                .values()
-                .copied()
-                .filter(|a| {
-                    query_matches(
-                        a.user_data_128,
-                        a.user_data_64,
-                        a.user_data_32,
-                        a.ledger,
-                        a.code,
-                        a.timestamp,
-                        min,
-                        max,
-                        filter,
-                    )
-                })
-                .collect();
-            if filter.flags.reversed() {
-                expected.sort_unstable_by_key(|a| std::cmp::Reverse(a.timestamp));
-            } else {
-                expected.sort_unstable_by_key(|a| a.timestamp);
-            }
-            expected.truncate(limit);
-            assert_eq!(
-                results,
-                expected[..results.len()],
-                "accounts-groove index scan must mirror the committed store"
-            );
-
             return account_batch_to_bytes(&results);
         }
         self.query_accounts(filter)
@@ -4087,8 +4094,9 @@ impl StateMachine {
     /// Same structure as [`Self::query_accounts_with_storage`]: one
     /// AND-intersected derived-index scan per non-zero filter condition (or the
     /// objects-tree timestamp scan), each resolved timestamp read back from the
-    /// `transfers.objects` tree and parity-asserted byte-identical to the
-    /// committed [`Self::transfers`] store.
+    /// `transfers.objects` tree. Once the forest is mounted the groove is the
+    /// source of record; the committed [`Self::transfers`] store is only the
+    /// unmounted fallback and the tests' oracle.
     #[must_use]
     pub fn query_transfers_with_storage(
         &mut self,
@@ -4154,47 +4162,17 @@ impl StateMachine {
                 results.push(transfer);
             }
 
-            // Parity with the committed store: the groove resolution must
-            // produce the same transfers in the same order (the replies are
-            // byte-identical).
-            let mut expected: Vec<Transfer> = self
-                .transfers
-                .values()
-                .copied()
-                .filter(|t| {
-                    query_matches(
-                        t.user_data_128,
-                        t.user_data_64,
-                        t.user_data_32,
-                        t.ledger,
-                        t.code,
-                        t.timestamp,
-                        min,
-                        max,
-                        filter,
-                    )
-                })
-                .collect();
-            if filter.flags.reversed() {
-                expected.sort_unstable_by_key(|t| std::cmp::Reverse(t.timestamp));
-            } else {
-                expected.sort_unstable_by_key(|t| t.timestamp);
-            }
-            expected.truncate(limit);
-            assert_eq!(
-                results,
-                expected[..results.len()],
-                "transfers-groove index scan must mirror the committed store"
-            );
-
             return transfer_batch_to_bytes(&results);
         }
         self.query_transfers(filter)
     }
 
     /// Build the [`ChangeEvent`] reported for a recorded account event
-    /// (upstream `get_change_event`, `state_machine.zig:3424-3527`).
-    #[must_use]
+    /// (upstream `get_change_event`, `state_machine.zig:3424-3527`), resolving
+    /// the event's transfer and dr/cr accounts from the committed stores (the
+    /// unmounted path; the mounted + storage path resolves the same objects
+    /// through the grooves and calls
+    /// [`build_change_event_from_objects`]).
     fn build_change_event(&self, result: &AccountEvent) -> ChangeEvent {
         let transfer = self
             .account_event_transfer(result)
@@ -4203,6 +4181,22 @@ impl StateMachine {
             self.accounts.get(&result.dr_account_id).copied().expect("debit account committed");
         let cr_account =
             self.accounts.get(&result.cr_account_id).copied().expect("credit account committed");
+        Self::build_change_event_from_objects(result, &transfer, &dr_account, &cr_account)
+    }
+
+    /// Build the [`ChangeEvent`] reported for a recorded account event from its
+    /// resolved objects (upstream `get_change_event`, `state_machine.zig:3424-3527`).
+    ///
+    /// The asserts are the invariants upstream implicitly relies on (the event
+    /// is derived from the transfer it references); on the mounted path they
+    /// validate the groove-resolved objects against the scanned event.
+    #[must_use]
+    fn build_change_event_from_objects(
+        result: &AccountEvent,
+        transfer: &Transfer,
+        dr_account: &Account,
+        cr_account: &Account,
+    ) -> ChangeEvent {
         assert_eq!(transfer.debit_account_id, dr_account.id);
         assert_eq!(transfer.credit_account_id, cr_account.id);
         assert_eq!(transfer.ledger, result.ledger);
@@ -10950,6 +10944,283 @@ mod tests {
         assert_eq!(q_transfers(&ud32), [21]);
         let code12 = QueryFilter { code: 12, ..query_filter() };
         assert_eq!(q_transfers(&code12), [22]);
+    }
+
+    /// Once a forest is mounted the grooves are the source of record: all seven
+    /// storage-threaded read families (lookups, account transfers, account
+    /// balances, change events, queries) resolve entirely through the grooves —
+    /// the committed `accounts`/`transfers`/`account_events` stores, which the
+    /// pre-`with_storage` path mirrored into the grooves, are only the unmounted
+    /// fallback and the tests' oracle. Here the oracle replies are captured
+    /// first, the committed stores are then deleted, and every read resolves
+    /// byte-identically from the grooves alone (against memory-table grooves).
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn mounted_reads_resolve_without_the_plain_stores() {
+        let mut storage = forest_storage();
+        let mut sm = StateMachine::default();
+        {
+            let mut forest = Forest::init(test_superblock(), forest_grid_options(), 32);
+            open_forest(&mut forest, &mut storage);
+            sm.mount_forest(forest);
+        }
+        // Account 1 advertises HISTORY and is the transfer-side counterpart of
+        // the two-phase flow; account 2 keeps a distinct user_data_64.
+        let mut with_ud = Account { id: 1, ledger: 1, code: 1, ..Account::default() };
+        with_ud.user_data_64 = 111;
+        with_ud.flags = AccountFlags::HISTORY;
+        let _ = sm.create_accounts_with_storage(&[with_ud], 10, Some(&mut storage));
+        let mut plain = Account { id: 2, ledger: 1, code: 2, ..Account::default() };
+        plain.user_data_64 = 222;
+        let _ = sm.create_accounts_with_storage(&[plain], 12, Some(&mut storage));
+        let _ = sm.create_accounts_with_storage(
+            &[
+                Account { id: 3, ledger: 1, code: 1, ..Account::default() },
+                Account { id: 4, ledger: 1, code: 1, ..Account::default() },
+            ],
+            14,
+            Some(&mut storage),
+        );
+        // A single-phase transfer (20), a pending (30) and its post (40); each
+        // of these lands in get_account_transfers(1), account 1's balance
+        // history, the change-events stream, and the transfer queries.
+        let _ = sm.create_transfers_with_storage(&[t(1, 2, 5)], 20, Some(&mut storage));
+        let pending = Transfer { id: 1003, flags: TransferFlags::PENDING, ..t(1, 2, 50) };
+        let _ = sm.create_transfers_with_storage(&[pending], 30, Some(&mut storage));
+        let post = Transfer {
+            id: 1004,
+            pending_id: 1003,
+            amount: u128::MAX,
+            flags: TransferFlags::POST_PENDING_TRANSFER,
+            ..Transfer::default()
+        };
+        let _ = sm.create_transfers_with_storage(&[post], 40, Some(&mut storage));
+
+        let lookup_accounts_body: Vec<u8> =
+            [1_u128, 2, 3, 4, 999].into_iter().flat_map(u128::to_le_bytes).collect();
+        let lookup_transfers_body: Vec<u8> =
+            [1002_u128, 1003, 1004, 999].into_iter().flat_map(u128::to_le_bytes).collect();
+
+        // One request per read family; every reply must be non-empty so the
+        // equivalence below is meaningful.
+        let refs: Vec<(Operation, Vec<u8>)> = vec![
+            (Operation::LOOKUP_ACCOUNTS, lookup_accounts_body),
+            (Operation::LOOKUP_TRANSFERS, lookup_transfers_body),
+            (
+                Operation::GET_ACCOUNT_TRANSFERS,
+                account_filter_bytes(&account_filter(
+                    1,
+                    AccountFilterFlags::DEBITS | AccountFilterFlags::CREDITS,
+                )),
+            ),
+            (
+                Operation::GET_ACCOUNT_BALANCES,
+                account_filter_bytes(&account_filter(
+                    1,
+                    AccountFilterFlags::DEBITS | AccountFilterFlags::CREDITS,
+                )),
+            ),
+            (Operation::GET_CHANGE_EVENTS, change_filter_bytes(&change_filter(0, 0, 100))),
+            (Operation::QUERY_ACCOUNTS, query_filter_bytes(&query_filter())),
+            (Operation::QUERY_TRANSFERS, query_filter_bytes(&query_filter())),
+        ];
+
+        // Capture the committed-store oracle and prove the grooves mirror it
+        // while the stores are still populated.
+        let oracle: Vec<Vec<u8>> = refs
+            .iter()
+            .map(|(operation, body)| {
+                let expected = sm.execute(*operation, 0, body);
+                assert_ne!(expected, Vec::new(), "oracle reply must be non-empty: {operation:?}");
+                let reply = sm.execute_with_storage(*operation, 0, body, Some(&mut storage));
+                assert_eq!(
+                    expected, reply,
+                    "mounted read must match the committed store before the clear: {operation:?}"
+                );
+                expected
+            })
+            .collect();
+
+        // Delete every committed store. With the forest mounted, all seven read
+        // families must still resolve byte-identically from the grooves alone.
+        sm.accounts.clear();
+        sm.transfers.clear();
+        sm.transfers_by_timestamp.clear();
+        sm.transfers_pending.clear();
+        sm.transfers_orphaned.clear();
+        sm.account_events.clear();
+        sm.account_events_index.clear();
+
+        // The unmounted path can no longer answer — the grooves now hold the
+        // only copy of the committed data.
+        assert!(
+            sm.execute(Operation::LOOKUP_ACCOUNTS, 0, &refs[0].1).is_empty(),
+            "the committed accounts store was cleared"
+        );
+        assert!(
+            sm.execute(Operation::GET_CHANGE_EVENTS, 0, &refs[4].1).is_empty(),
+            "the committed account_events store was cleared"
+        );
+
+        for ((operation, body), expected) in refs.iter().zip(oracle) {
+            let reply = sm.execute_with_storage(*operation, 0, body, Some(&mut storage));
+            assert_eq!(
+                reply, expected,
+                "mounted {operation:?} must resolve without the plain committed stores"
+            );
+        }
+    }
+
+    /// The same store-independence proof against a cold reopen: the fixtures
+    /// are flushed to L0, checkpointed, and re-read from brand-new object trees
+    /// restored from disk (cold grid cache), so every resolution — index scans,
+    /// object reads, the balance-query account gate, the change-events
+    /// enrichment — must come out of durable tables, not memory mirrors.
+    #[test]
+    #[allow(clippy::too_many_lines)] // flush + checkpoint + reopen scaffolding
+    fn mounted_reads_resolve_without_the_plain_stores_from_durable_disk() {
+        let mut storage = forest_storage();
+        let mut sm = StateMachine::default();
+        {
+            let mut forest = Forest::init(test_superblock(), forest_grid_options(), 32);
+            open_forest(&mut forest, &mut storage);
+            sm.mount_forest(forest);
+        }
+        let mut with_ud = Account { id: 1, ledger: 1, code: 1, ..Account::default() };
+        with_ud.user_data_64 = 111;
+        with_ud.flags = AccountFlags::HISTORY;
+        let _ = sm.create_accounts_with_storage(&[with_ud], 10, Some(&mut storage));
+        let mut plain = Account { id: 2, ledger: 1, code: 2, ..Account::default() };
+        plain.user_data_64 = 222;
+        let _ = sm.create_accounts_with_storage(&[plain], 12, Some(&mut storage));
+        let _ = sm.create_accounts_with_storage(
+            &[
+                Account { id: 3, ledger: 1, code: 1, ..Account::default() },
+                Account { id: 4, ledger: 1, code: 1, ..Account::default() },
+            ],
+            14,
+            Some(&mut storage),
+        );
+        let _ = sm.create_transfers_with_storage(&[t(1, 2, 5)], 20, Some(&mut storage));
+        let pending = Transfer { id: 1003, flags: TransferFlags::PENDING, ..t(1, 2, 50) };
+        let _ = sm.create_transfers_with_storage(&[pending], 30, Some(&mut storage));
+        let post = Transfer {
+            id: 1004,
+            pending_id: 1003,
+            amount: u128::MAX,
+            flags: TransferFlags::POST_PENDING_TRANSFER,
+            ..Transfer::default()
+        };
+        let _ = sm.create_transfers_with_storage(&[post], 40, Some(&mut storage));
+
+        // Flush the mirrored mutables to L0 disk tables (two full bars), then
+        // checkpoint durably and reopen a fresh forest over the same storage.
+        let bar_ops = constants::LSM_COMPACTION_OPS as u64;
+        let bar_start = compaction::HALF_BAR_BEAT_COUNT as u64 * 2;
+        for _bar in 0..2 {
+            for op in bar_start..bar_start + bar_ops {
+                sm.compact(op, Some(&mut storage));
+            }
+        }
+        let (manifest_refs, free_set_refs) = sm.checkpoint(Some(&mut storage));
+        let highest_address = free_set_refs
+            .blocks_acquired
+            .last_block_address
+            .max(free_set_refs.blocks_released.last_block_address);
+        let reopen_view = SuperBlockView {
+            storage_size: DATA_FILE_SIZE_MIN as u64 + highest_address * BLOCK_SIZE as u64,
+            manifest_block_count: manifest_refs.block_count,
+            manifest_oldest_address: manifest_refs.oldest_address,
+            manifest_oldest_checksum: manifest_refs.oldest_checksum,
+            manifest_newest_address: manifest_refs.newest_address,
+            manifest_newest_checksum: manifest_refs.newest_checksum,
+            ..test_superblock()
+        };
+        let mut forest_b = Forest::init(reopen_view, forest_grid_options(), 32);
+        forest_b.open(
+            GridOpenReferences {
+                blocks_acquired: free_set_refs.blocks_acquired,
+                blocks_released: free_set_refs.blocks_released,
+            },
+            &mut storage,
+            0,
+        );
+        let mut done = false;
+        for _ in 0..1000 {
+            forest_b.poll(&mut storage);
+            if forest_b.accounts.objects.is_opened()
+                && forest_b.transfers.objects.is_opened()
+                && forest_b.account_events.objects.is_opened()
+                && forest_b.is_idle()
+            {
+                done = true;
+                break;
+            }
+        }
+        assert!(done, "reopen must complete");
+        sm.forest = Some(Box::new(forest_b));
+
+        let lookup_accounts_body: Vec<u8> =
+            [1_u128, 2, 3, 4, 999].into_iter().flat_map(u128::to_le_bytes).collect();
+        let lookup_transfers_body: Vec<u8> =
+            [1002_u128, 1003, 1004, 999].into_iter().flat_map(u128::to_le_bytes).collect();
+
+        let refs: Vec<(Operation, Vec<u8>)> = vec![
+            (Operation::LOOKUP_ACCOUNTS, lookup_accounts_body),
+            (Operation::LOOKUP_TRANSFERS, lookup_transfers_body),
+            (
+                Operation::GET_ACCOUNT_TRANSFERS,
+                account_filter_bytes(&account_filter(
+                    1,
+                    AccountFilterFlags::DEBITS | AccountFilterFlags::CREDITS,
+                )),
+            ),
+            (
+                Operation::GET_ACCOUNT_BALANCES,
+                account_filter_bytes(&account_filter(
+                    1,
+                    AccountFilterFlags::DEBITS | AccountFilterFlags::CREDITS,
+                )),
+            ),
+            (Operation::GET_CHANGE_EVENTS, change_filter_bytes(&change_filter(0, 0, 100))),
+            (Operation::QUERY_ACCOUNTS, query_filter_bytes(&query_filter())),
+            (Operation::QUERY_TRANSFERS, query_filter_bytes(&query_filter())),
+        ];
+
+        // The committed stores still answer (oracle) and the cold-disk grooves
+        // must mirror them before the clear.
+        let oracle: Vec<Vec<u8>> = refs
+            .iter()
+            .map(|(operation, body)| {
+                let expected = sm.execute(*operation, 0, body);
+                assert_ne!(expected, Vec::new(), "oracle reply must be non-empty: {operation:?}");
+                assert_eq!(
+                    expected,
+                    sm.execute_with_storage(*operation, 0, body, Some(&mut storage)),
+                    "cold-disk mounted read must match the committed store before the clear"
+                );
+                expected
+            })
+            .collect();
+        sm.accounts.clear();
+        sm.transfers.clear();
+        sm.transfers_by_timestamp.clear();
+        sm.transfers_pending.clear();
+        sm.transfers_orphaned.clear();
+        sm.account_events.clear();
+        sm.account_events_index.clear();
+        assert!(
+            sm.execute(Operation::LOOKUP_ACCOUNTS, 0, &refs[0].1).is_empty(),
+            "the committed accounts store was cleared"
+        );
+
+        for ((operation, body), expected) in refs.iter().zip(oracle) {
+            let reply = sm.execute_with_storage(*operation, 0, body, Some(&mut storage));
+            assert_eq!(
+                reply, expected,
+                "cold-disk mounted {operation:?} must resolve without the plain stores"
+            );
+        }
     }
 
     // ── Upstream golden cross-validation ─────────────────────────────────
