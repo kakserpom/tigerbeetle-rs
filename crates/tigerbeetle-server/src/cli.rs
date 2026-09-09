@@ -2114,7 +2114,7 @@ fn parse_args_amqp(args: &[String]) -> Result<CommandAmqp, String> {
 // Runnable commands (port of `main.zig` subcommands that map onto in-scope infrastructure)
 // -----------------------------------------------------------------------------------
 
-/// Execute a parsed command. `format` (over in-memory storage) and `version` run; all other
+/// Execute a parsed command. `format` (over a real data file) and `version` run; all other
 /// subcommands parse and validate but the executor is deferred to the async-loop slice.
 pub fn run_command(command: &Command) -> CliResult<()> {
     match command {
@@ -2122,10 +2122,7 @@ pub fn run_command(command: &Command) -> CliResult<()> {
             command_version(cmd);
             Ok(())
         }
-        Command::Format(cmd) => {
-            command_format(cmd);
-            Ok(())
-        }
+        Command::Format(cmd) => command_format(cmd),
         other => Err(format!(
             "the '{name}' subcommand is parsed and validated but not yet implemented in this \
              port (the async event loop is deferred)",
@@ -2154,24 +2151,23 @@ pub fn command_version(cmd: &CommandVersion) {
     }
 }
 
-/// Format a replica data file over [`MemoryStorage`] and drive the superblock to completion.
+/// Format a replica data file over a [`dyn Storage`](tigerbeetle_vsr::storage::Storage):
+/// the WAL then the superblock, flushed and verified (port of `vsr.replica_format.format`).
 ///
 /// Matches `tbcross_format`'s parameters when `cluster=0, replica=0, replica_count=6,
 /// view=None, release=MINIMUM`, so the emitted superblock can be cross-checked against the
 /// upstream golden values.
 ///
-/// DEVIATION: upstream `command_format` also reads/examines the target file before reformatting
-/// and uses the real grid; the port formats an in-memory data file of [`DATA_FILE_SIZE_MIN`].
+/// DEVIATION: upstream `command_format` also fans the format I/O through a real grid; the
+/// sans-IO port drives the same [`SuperBlock`] through the caller's storage.
 pub fn drive_format(
-    storage: &mut tigerbeetle_vsr::storage::MemoryStorage,
+    storage: &mut dyn tigerbeetle_vsr::storage::Storage,
     cmd: &CommandFormat,
 ) -> tigerbeetle_vsr::superblock::SuperBlock {
     use tigerbeetle_vsr::multiversion::Release;
-    use tigerbeetle_vsr::superblock::{Event, FormatOptions, SuperBlock};
+    use tigerbeetle_vsr::superblock::FormatOptions;
 
-    let size = cmd_storage_size(cmd);
-    let mut sb = SuperBlock::new(size);
-    sb.format(
+    tigerbeetle_vsr::replica_format::format(
         storage,
         FormatOptions {
             cluster: cmd.cluster,
@@ -2180,25 +2176,29 @@ pub fn drive_format(
             replica_count: cmd.replica_count,
             view: None,
         },
-    );
-    sb.poll(storage);
-    let events = sb.take_events();
-    assert!(events.contains(&Event::FormatDone), "format did not complete: {events:?}");
-    sb
+    )
 }
 
 /// The data-file size chosen by `format` (upstream: `data_file_size_min`).
 ///
-/// DEVIATION: `cmd_cluster` is ignored; a real data file is created only in Phase 3.
+/// DEVIATION: `cmd_cluster` is ignored (upstream's grid is not attached during format).
 pub fn cmd_storage_size(_cmd: &CommandFormat) -> u64 {
     tigerbeetle_vsr::superblock::DATA_FILE_SIZE_MIN as u64
 }
 
-/// `main.zig command_format` over in-memory storage (the async/io slice adds disk + grid).
-pub fn command_format(cmd: &CommandFormat) {
-    // DEVIATION: no real file I/O yet — format an in-memory image of `data_file_size_min`.
+/// `main.zig command_format`: create (exclusively) the data file and format it for `cmd`.
+///
+/// Mirroring upstream's `open_data_file(.format)` (`O_CREAT|O_EXCL`), an existing path fails
+/// with `PathAlreadyExists` so a data file is never accidentally reformatted.
+pub fn command_format(cmd: &CommandFormat) -> CliResult<()> {
     let size = cmd_storage_size(cmd);
-    let mut storage = tigerbeetle_vsr::storage::MemoryStorage::new(size);
+    let mut storage = match tigerbeetle_vsr::storage::FileStorage::open_format(&cmd.path, size) {
+        Ok(storage) => storage,
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err("PathAlreadyExists".into());
+        }
+        Err(err) => return Err(err.to_string()),
+    };
     let sb = drive_format(&mut storage, cmd);
 
     println!("info(data_file): checking '{}'...", cmd.path);
@@ -2208,6 +2208,7 @@ pub fn command_format(cmd: &CommandFormat) {
     );
     println!("info(format): data_file_size = {size}");
     println!("info(format): superblock.sequence = {}", sb.working().sequence);
+    Ok(())
 }
 
 // -----------------------------------------------------------------------------------
@@ -2963,6 +2964,60 @@ mod tests {
             sb.working().vsr_state.checkpoint.header.checksum,
             0x5146_b8d0_e1f6_9ca2_e686_7c42_bb82_63b7
         );
+    }
+
+    /// `command_format` creates a real data file whose superblock reopens to the golden
+    /// values (cluster=0, replica=0, `replica_count=6`).
+    #[test]
+    fn format_creates_a_real_data_file() {
+        let path = std::env::temp_dir()
+            .join(format!("tigerbeetle-rs-cli-format-{}.tigerbeetle", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let cmd = CommandFormat {
+            cluster: 0,
+            replica: 0,
+            replica_count: 6,
+            development: false,
+            path: path.to_str().unwrap().to_owned(),
+            log_debug: false,
+        };
+
+        command_format(&cmd).unwrap();
+        assert_eq!(std::fs::metadata(&cmd.path).unwrap().len(), DATA_FILE_SIZE_MIN as u64);
+
+        let mut storage = tigerbeetle_vsr::storage::FileStorage::open(&cmd.path, 0).unwrap();
+        let mut sb = tigerbeetle_vsr::superblock::SuperBlock::new(DATA_FILE_SIZE_MIN as u64);
+        sb.open(&mut storage);
+        sb.poll(&mut storage);
+        assert!(sb.opened());
+        assert_eq!(sb.working().sequence, 1);
+        assert_eq!(sb.working().cluster, 0);
+        assert_eq!(sb.working().vsr_state.replica_id, tigerbeetle_vsr::root_members(0)[0]);
+        assert_eq!(sb.working().checksum, 0xe741_49b8_992b_5101_1bc1_5348_f1b5_dd77);
+
+        let _ = std::fs::remove_file(&cmd.path);
+    }
+
+    /// Upstream `open_data_file(.format)` uses `O_CREAT|O_EXCL`: a second format of the same
+    /// path must fail with `error.PathAlreadyExists` before touching the file.
+    #[test]
+    fn format_refuses_to_reformat_an_existing_file() {
+        let path = std::env::temp_dir()
+            .join(format!("tigerbeetle-rs-cli-reformat-{}.tigerbeetle", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let cmd = CommandFormat {
+            cluster: 0,
+            replica: 0,
+            replica_count: 1,
+            development: false,
+            path: path.to_str().unwrap().to_owned(),
+            log_debug: false,
+        };
+
+        command_format(&cmd).unwrap();
+        assert_eq!(command_format(&cmd).unwrap_err(), "PathAlreadyExists");
+
+        let _ = std::fs::remove_file(&cmd.path);
     }
 
     #[test]

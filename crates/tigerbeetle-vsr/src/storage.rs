@@ -85,6 +85,13 @@ pub trait Storage {
     /// is fatal (upstream panics/vsr.fatal).
     fn write_sectors(&mut self, request: WriteRequest);
 
+    /// Flush all writes issued so far durably to disk (upstream: `StorageType.flush_sectors`).
+    ///
+    /// The default is a no-op: both in-memory storages and the synchronous
+    /// [`FileStorage`]'s pread/pwrite path already apply reads/writes immediately, and only
+    /// [`FileStorage`] needs an explicit `fsync` to make the bytes survive a crash.
+    fn flush_sectors(&mut self) {}
+
     /// Dequeue one completed operation, if any.
     /// (Upstream: the callback invocation itself.)
     fn next_completion(&mut self) -> Option<Completion>;
@@ -320,6 +327,24 @@ impl FileStorage {
         Ok(Self { file, file_size, completions: Vec::new() })
     }
 
+    /// Creates a brand-new data file of exactly `size` bytes, failing if it already exists.
+    ///
+    /// Port of upstream's `open_data_file(.format)`, which opens with `O_CREAT|O_EXCL` so a
+    /// data file is never accidentally reformatted; an existing path yields
+    /// [`std::io::ErrorKind::AlreadyExists`] (upstream: `error.PathAlreadyExists`).
+    ///
+    /// DEVIATION: no advisory `flock`, no `F_NOCACHE`/direct I/O, and no `fs_allocate` (the
+    /// `set_len` below gives the file its final size), matching the interim `std::fs` storage.
+    ///
+    /// # Errors
+    /// Returns any filesystem error from create or resize, including `AlreadyExists`.
+    pub fn open_format(path: impl AsRef<std::path::Path>, size: u64) -> std::io::Result<Self> {
+        let file =
+            std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(path)?;
+        file.set_len(size)?;
+        Ok(Self { file, file_size: size, completions: Vec::new() })
+    }
+
     fn drive_read_request(&self, mut request: ReadRequest) -> Completion {
         let base_offset = verify_request(request.zone, &request.buffer, request.offset_in_zone);
         drive_read(&mut request, base_offset, |slice, offset| read_step(&self.file, slice, offset));
@@ -368,6 +393,10 @@ impl Storage for FileStorage {
     fn write_sectors(&mut self, request: WriteRequest) {
         let completion = self.drive_write_request(request);
         self.completions.push(completion);
+    }
+
+    fn flush_sectors(&mut self) {
+        self.file.sync_data().unwrap_or_else(|err| panic!("fsync failure: {err:?}"));
     }
 
     fn next_completion(&mut self) -> Option<Completion> {

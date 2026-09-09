@@ -35,6 +35,7 @@ pub mod multi_batch;
 pub mod multiversion;
 pub mod repair_budget;
 pub mod replica;
+pub mod replica_format;
 pub mod schema;
 pub mod socket;
 pub mod state_machine;
