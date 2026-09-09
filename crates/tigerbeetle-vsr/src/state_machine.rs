@@ -2551,13 +2551,13 @@ impl StateMachine {
                 let Some(ids) = bytes_to_lookup_ids(body) else {
                     unreachable!("lookup_accounts body must encode whole u128 ids");
                 };
-                self.lookup_accounts(&ids)
+                self.lookup_accounts_with_storage(&ids, storage)
             }
             Operation::LOOKUP_TRANSFERS => {
                 let Some(ids) = bytes_to_lookup_ids(body) else {
                     unreachable!("lookup_transfers body must encode whole u128 ids");
                 };
-                self.lookup_transfers(&ids)
+                self.lookup_transfers_with_storage(&ids, storage)
             }
             Operation::GET_ACCOUNT_TRANSFERS => {
                 let Some(filter) = bytes_to_account_filter(body) else {
@@ -2933,6 +2933,66 @@ impl StateMachine {
         account_batch_to_bytes(&results)
     }
 
+    /// Execute a `lookup_accounts` query and return the reply body, resolving
+    /// the requested ids through the mounted forest's accounts groove when
+    /// `storage` is supplied (see [`Self::execute_with_storage`] for the
+    /// threaded-storage semantics).
+    ///
+    /// With a forest mounted and `storage` threaded, each id is enqueued into
+    /// the accounts-groove prefetch seam (`prefetch_setup`, `prefetch_enqueue`,
+    /// `prefetch`) and the resolved objects — read back from the objects tree's
+    /// synced levels in cache/disk order — are the reply, parity-asserted
+    /// against the committed [`Self::accounts`] store. This is upstream's
+    /// `execute_lookup_accounts` (`state_machine.zig:3259`), which reads the
+    /// groove objects cache after its prefetch callbacks settle the ids.
+    ///
+    /// DEVIATION: upstream drives the prefetched reads asynchronously; this
+    /// port resolves the same reads synchronously (see the groove prefetch
+    /// DEVIATION), byte-identical to the committed-store path.
+    #[must_use]
+    pub fn lookup_accounts_with_storage(
+        &mut self,
+        ids: &[u128],
+        storage: Option<&mut dyn Storage>,
+    ) -> Vec<u8> {
+        // Field-disjoint borrows: `forest` aliases `self.forest`; the committed
+        // stores are read by direct field access, never through `&mut self`
+        // methods (mirrors `create_accounts_prefetch`).
+        if let (Some(forest), Some(storage)) = (self.forest.as_mut(), storage) {
+            let snapshot = self.prefetch_snapshot.unwrap_or(SNAPSHOT_LATEST - 1);
+
+            forest.accounts.prefetch_setup(snapshot);
+            for &id in ids {
+                forest.accounts.prefetch_enqueue(
+                    &mut forest.grid,
+                    &mut forest.accounts_scratch.objects,
+                    IdTimestampPrefetchKey::Id(id),
+                );
+            }
+            forest.accounts.prefetch(&mut forest.grid, storage);
+
+            let mut results: Vec<Account> = Vec::new();
+            for &id in ids {
+                match forest.accounts.get(id) {
+                    Some(account) => {
+                        assert_eq!(
+                            self.accounts.get(&id).copied(),
+                            Some(*account),
+                            "accounts-groove lookup must resolve the committed account"
+                        );
+                        results.push(*account);
+                    }
+                    None => assert!(
+                        !self.accounts.contains_key(&id),
+                        "accounts-groove lookup must resolve every committed account"
+                    ),
+                }
+            }
+            return account_batch_to_bytes(&results);
+        }
+        self.lookup_accounts(ids)
+    }
+
     /// Execute a `lookup_transfers` query and return the reply body (upstream
     /// `execute_lookup_transfers`, `state_machine.zig:3275`).
     ///
@@ -2953,6 +3013,68 @@ impl StateMachine {
             }
         }
         transfer_batch_to_bytes(&results)
+    }
+
+    /// Execute a `lookup_transfers` query and return the reply body, resolving
+    /// the requested ids through the mounted forest's transfers groove when
+    /// `storage` is supplied (see [`Self::execute_with_storage`] for the
+    /// threaded-storage semantics).
+    ///
+    /// As for [`Self::lookup_accounts_with_storage`], each id is enqueued into
+    /// the transfers-groove prefetch seam and the resolved objects are the
+    /// reply, parity-asserted against the committed [`Self::transfers`] store.
+    /// An **orphaned** id — a transfer that failed with a transient status and
+    /// is tagged in the groove's objects cache with a zeroed object (upstream
+    /// `insert_orphaned_object`, `groove.zig:1935-1949`) — never committed, so
+    /// it is omitted from the reply exactly as the committed-store path omits
+    /// it.
+    #[must_use]
+    pub fn lookup_transfers_with_storage(
+        &mut self,
+        ids: &[u128],
+        storage: Option<&mut dyn Storage>,
+    ) -> Vec<u8> {
+        // Field-disjoint borrows, as for [`Self::lookup_accounts_with_storage`].
+        if let (Some(forest), Some(storage)) = (self.forest.as_mut(), storage) {
+            let snapshot = self.prefetch_snapshot.unwrap_or(SNAPSHOT_LATEST - 1);
+
+            forest.transfers.prefetch_setup(snapshot);
+            for &id in ids {
+                forest.transfers.prefetch_enqueue(
+                    &mut forest.grid,
+                    &mut forest.transfers_scratch.objects,
+                    IdTimestampPrefetchKey::Id(id),
+                );
+            }
+            forest.transfers.prefetch(&mut forest.grid, storage);
+
+            let mut results: Vec<Transfer> = Vec::new();
+            for &id in ids {
+                match forest.transfers.get(id) {
+                    // `Some` with a zeroed object is the orphan tag, never a
+                    // committed transfer (upstream keeps orphans in a separate
+                    // map, not the objects tree).
+                    Some(transfer) if transfer.timestamp != 0 => {
+                        assert_eq!(
+                            self.transfers.get(&id).copied(),
+                            Some(*transfer),
+                            "transfers-groove lookup must resolve the committed transfer"
+                        );
+                        results.push(*transfer);
+                    }
+                    Some(_orphan) => assert!(
+                        !self.transfers.contains_key(&id),
+                        "an orphaned transfer id never commits (groove.zig:1935-1949)"
+                    ),
+                    None => assert!(
+                        !self.transfers.contains_key(&id),
+                        "transfers-groove lookup must resolve every committed transfer"
+                    ),
+                }
+            }
+            return transfer_batch_to_bytes(&results);
+        }
+        self.lookup_transfers(ids)
     }
 
     /// Execute a `get_change_events` query and return the reply body.
@@ -8537,6 +8659,149 @@ mod tests {
         let tparsed = bytes_to_transfer_batch(&transfers).expect("valid transfer batch");
         assert_eq!(tparsed.len(), 1);
         assert_eq!(tparsed[0].amount, 7);
+    }
+
+    /// Lookup reads resolve through the mounted forest's grooves: a
+    /// storage-threaded `lookup_accounts`/`lookup_transfers` enqueues each id
+    /// into the grooves' prefetch seams and the resolved objects are the reply,
+    /// parity-asserted against the committed stores — byte-identical to the
+    /// committed-HashMap path. Missing ids are omitted, and an orphaned
+    /// (transiently-failed) transfer id — tagged in the groove cache with a
+    /// zeroed object — is never surfaced.
+    ///
+    /// Run twice: against the freshly-mirrored (memory) grooves, then again
+    /// after a checkpoint + reopen, when the objects trees have been restored
+    /// from real L0 disk tables and every id must resolve through
+    /// `lookup_from_levels_storage`.
+    #[test]
+    #[allow(clippy::too_many_lines)] // flush + checkpoint + reopen scaffolding
+    fn lookup_resolves_through_mounted_grooves_from_memory_and_durable_disk() {
+        let mut storage = forest_storage();
+        let mut sm = StateMachine::default();
+        {
+            let mut forest = Forest::init(test_superblock(), forest_grid_options(), 32);
+            open_forest(&mut forest, &mut storage);
+            sm.mount_forest(forest);
+        }
+        let _ = sm.create_accounts_with_storage(
+            &[
+                Account { id: 1, ledger: 1, code: 1, ..Account::default() },
+                Account { id: 2, ledger: 1, code: 1, ..Account::default() },
+            ],
+            10,
+            Some(&mut storage),
+        );
+        let _ = sm.create_transfers_with_storage(
+            &[
+                Transfer { id: 100, ..t(1, 2, 100) },
+                // A pending transfer (id 200) — committed like any transfer.
+                Transfer { id: 200, flags: TransferFlags::PENDING, timeout: 60, ..t(1, 2, 50) },
+            ],
+            30,
+            Some(&mut storage),
+        );
+        // Transient failure (missing credit account 3) poisons id 500: the id
+        // is orphaned — tagged in the groove cache with a zeroed object — and
+        // never commits to the store.
+        let failed = sm.create_transfers_with_storage(
+            &[Transfer { id: 500, credit_account_id: 3, ..t(1, 2, 10) }],
+            40,
+            Some(&mut storage),
+        );
+        assert_eq!(reply_status(&failed), CreateTransferStatus::CreditAccountNotFound as u32);
+
+        // Requested accounts: [2, 99, 1] -> committed 2, 1. Transfers: [200, 500,
+        // 9998, 100] -> committed 200, 100 (500 orphaned, 9998 missing, both omitted).
+        let a_body: Vec<u8> = [2u128, 99, 1].into_iter().flat_map(u128::to_le_bytes).collect();
+        let t_body: Vec<u8> =
+            [200u128, 500, 9998, 100].into_iter().flat_map(u128::to_le_bytes).collect();
+
+        // ── Memory mirrors (freshly-mirrored grooves, no storage reads needed).
+        assert_eq!(
+            sm.execute_with_storage(Operation::LOOKUP_ACCOUNTS, 0, &a_body, Some(&mut storage)),
+            sm.execute(Operation::LOOKUP_ACCOUNTS, 0, &a_body),
+            "memory-groove lookup_accounts byte-identical to the committed store"
+        );
+        assert_eq!(
+            sm.execute_with_storage(Operation::LOOKUP_TRANSFERS, 0, &t_body, Some(&mut storage)),
+            sm.execute(Operation::LOOKUP_TRANSFERS, 0, &t_body),
+            "memory-groove lookup_transfers byte-identical to the committed store"
+        );
+        audit_mirror(&mut sm);
+
+        // ── Flush the mirrored mutables to L0 disk tables (two full bars), then
+        // checkpoint durably and reopen a fresh forest over the same storage.
+        let bar_ops = constants::LSM_COMPACTION_OPS as u64;
+        let bar_start = compaction::HALF_BAR_BEAT_COUNT as u64 * 2;
+        for _bar in 0..2 {
+            for op in bar_start..bar_start + bar_ops {
+                sm.compact(op, Some(&mut storage));
+            }
+        }
+        let (manifest_refs, free_set_refs) = sm.checkpoint(Some(&mut storage));
+        let highest_address = free_set_refs
+            .blocks_acquired
+            .last_block_address
+            .max(free_set_refs.blocks_released.last_block_address);
+        let reopen_view = SuperBlockView {
+            storage_size: DATA_FILE_SIZE_MIN as u64 + highest_address * BLOCK_SIZE as u64,
+            manifest_block_count: manifest_refs.block_count,
+            manifest_oldest_address: manifest_refs.oldest_address,
+            manifest_oldest_checksum: manifest_refs.oldest_checksum,
+            manifest_newest_address: manifest_refs.newest_address,
+            manifest_newest_checksum: manifest_refs.newest_checksum,
+            ..test_superblock()
+        };
+        let mut forest_b = Forest::init(reopen_view, forest_grid_options(), 32);
+        forest_b.open(
+            GridOpenReferences {
+                blocks_acquired: free_set_refs.blocks_acquired,
+                blocks_released: free_set_refs.blocks_released,
+            },
+            &mut storage,
+            0,
+        );
+        let mut done = false;
+        for _ in 0..1000 {
+            forest_b.poll(&mut storage);
+            if forest_b.accounts.objects.is_opened() && forest_b.is_idle() {
+                done = true;
+                break;
+            }
+        }
+        assert!(done, "reopen must complete");
+        assert!(
+            forest_b.accounts.objects.manifest_table_count() >= 1
+                && forest_b.transfers.objects.manifest_table_count() >= 1,
+            "the reopened forest restores the flushed L0 objects tables"
+        );
+        sm.forest = Some(Box::new(forest_b));
+
+        // ── Disk tables (reopened grooves: empty mutable tables + empty objects
+        // caches, so every requested id resolves from the L0 tables).
+        let accounts =
+            sm.execute_with_storage(Operation::LOOKUP_ACCOUNTS, 0, &a_body, Some(&mut storage));
+        assert_eq!(
+            accounts,
+            sm.execute(Operation::LOOKUP_ACCOUNTS, 0, &a_body),
+            "disk-groove lookup_accounts byte-identical to the committed store"
+        );
+        let decoded = bytes_to_account_batch(&accounts).expect("valid account batch");
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].id, 2);
+        assert_eq!(decoded[1].id, 1);
+
+        let transfers =
+            sm.execute_with_storage(Operation::LOOKUP_TRANSFERS, 0, &t_body, Some(&mut storage));
+        assert_eq!(
+            transfers,
+            sm.execute(Operation::LOOKUP_TRANSFERS, 0, &t_body),
+            "disk-groove lookup_transfers byte-identical to the committed store"
+        );
+        let tdecoded = bytes_to_transfer_batch(&transfers).expect("valid transfer batch");
+        assert_eq!(tdecoded.len(), 2);
+        assert_eq!(tdecoded[0].id, 200);
+        assert_eq!(tdecoded[1].id, 100);
     }
 
     // ── get_account_transfers tests ──────────────────────────────────────
