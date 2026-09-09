@@ -5,6 +5,7 @@ pub mod checksum;
 pub mod config;
 pub mod constants;
 pub mod ewah;
+pub mod net;
 pub mod stdx;
 pub mod testing;
 pub mod types;

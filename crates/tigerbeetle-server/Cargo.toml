@@ -5,6 +5,8 @@ edition = "2024"
 
 [dependencies]
 tigerbeetle-core = { path = "../tigerbeetle-core" }
+tigerbeetle-lsm = { path = "../tigerbeetle-lsm" }
+tigerbeetle-vsr = { path = "../tigerbeetle-vsr" }
 
 [[bin]]
 name = "tigerbeetle"

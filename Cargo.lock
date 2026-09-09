@@ -18,6 +18,8 @@ name = "tigerbeetle-server"
 version = "0.1.0"
 dependencies = [
  "tigerbeetle-core",
+ "tigerbeetle-lsm",
+ "tigerbeetle-vsr",
 ]
 
 [[package]]

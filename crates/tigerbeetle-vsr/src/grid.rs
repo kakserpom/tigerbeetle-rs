@@ -88,6 +88,13 @@ impl SetAssociativeCacheSpec for GridCacheAddress {
 
 type Cache = SetAssociativeCache<GridCacheAddress>;
 
+/// Port of `Grid.Cache.value_count_max_multiple` (upstream: `grid.zig` inline
+/// `SetAssociativeCache.value_count_max_multiple`), used by the CLI's `--cache-grid` desugar.
+#[must_use]
+pub fn cache_value_count_max_multiple() -> u64 {
+    SetAssociativeCache::<GridCacheAddress>::value_count_max_multiple()
+}
+
 /// Byte offset of a grid address within the `Grid` zone.
 ///
 /// # Panics

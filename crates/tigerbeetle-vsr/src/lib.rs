@@ -36,6 +36,7 @@ pub mod multiversion;
 pub mod repair_budget;
 pub mod replica;
 pub mod schema;
+pub mod socket;
 pub mod state_machine;
 pub mod storage;
 pub mod superblock;
