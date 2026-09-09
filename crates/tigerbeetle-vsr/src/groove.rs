@@ -33,7 +33,9 @@ use tigerbeetle_lsm::cache_map::{CacheMap, CacheMapOptions, CacheMapSpec, GetOrT
 use tigerbeetle_lsm::composite_key::{
     self, CompositeKey, CompositeKey64, CompositeKey128, CompositeKeyUnit, U256,
 };
+use tigerbeetle_lsm::direction::Direction;
 use tigerbeetle_lsm::manifest::ManifestLog;
+use tigerbeetle_lsm::manifest_level::{LevelTableInfo, Visibility};
 use tigerbeetle_lsm::scratch_memory::ScratchMemory;
 use tigerbeetle_lsm::set_associative_cache::{Layout, SetAssociativeCacheSpec};
 use tigerbeetle_lsm::table_memory::{self, Usage};
@@ -46,7 +48,7 @@ use tigerbeetle_lsm::unique_key::{UniqueKey, UniqueKey128};
 use crate::grid::Grid;
 use crate::storage::Storage;
 use crate::table::{self, BlockValue, IndexBlocks, TableLayout, TableSpec, TableUsage};
-use crate::tree::{LookupMemoryResult, Options, Tree};
+use crate::tree::{LookupMemoryResult, Options, Tree, TreeSpec};
 
 // ---------------------------------------------------------------------------
 // Prefetch seam
@@ -2849,30 +2851,21 @@ impl TransferGroove {
         }
     }
 
-    /// Enumerate the live `expires_at` derived-index entries held in the index
-    /// tree's memory tables (mutable + immutable), ascending by
-    /// `(expires_at, pending_timestamp)` — the order the derived index scan
-    /// yields an un-flushed index in (upstream's expiry pump scans the
-    /// `expires_at` index; `state_machine.zig:4516`).
+    /// Collect the newest value for every `expires_at` key across the index
+    /// tree's memory tables (immutable first — older — then the mutable's newer
+    /// appends), upstream's stream precedence for the two in-memory runs.
     ///
     /// Mirror of the read path's shadowing semantics: appends are chronological
     /// (mutable is newer than immutable), so later occurrences of a key
-    /// overwrite earlier ones; a reaped entry (its `remove_expires_at`
-    /// tombstone appended after the live put) therefore disappears exactly as
+    /// overwrite earlier ones; a reaped entry (its `remove_expires_at` tombstone
+    /// appended after the live put) therefore disappears exactly as
     /// `TableMemory::sort`'s `dedup_values` cancels the put/remove pair for
     /// secondary-index tables. A `timeout == 0` pending derives no entry
     /// (`state_machine.zig:445`), so it never appears.
-    ///
-    /// DEVIATION: entries compacted to disk are not included — reading them
-    /// needs the LSM disk-scan iterator (deferred until the forest becomes the
-    /// authoritative store). The state machine only consults this seam while
-    /// the tree is wholly in memory (`manifest_table_count() == 0`) and asserts
-    /// the scan equals the authoritative pending-store recompute.
-    #[must_use]
-    pub fn scan_expires_at_memory(&self) -> Vec<(u64, u64)> {
+    fn newest_expires_at_from_memory(&self) -> std::collections::HashMap<u128, CompositeKey64> {
         // Race-free stand-in for a sort: a per-key map, iterated in append order
         // (immutable's older values first, then the mutable's newer ones), so the
-        // newest value for each key wins and a key reaped since its put vanishes.
+        // newest value for each key wins.
         let mut newest: std::collections::HashMap<u128, CompositeKey64> =
             std::collections::HashMap::with_capacity(
                 self.expires_at.table_mutable_ref().count() as usize
@@ -2888,6 +2881,125 @@ impl TransferGroove {
                 }
             }
         }
+        newest
+    }
+
+    /// Merge the visible `expires_at` disk tables at `snapshot` into `newest`
+    /// (upstream's level streams in the scan, `scan_tree.zig` / `scan_merge.zig`).
+    ///
+    /// Only `SNAPSHOT_LATEST` (all committed tables) is a valid scan snapshot in
+    /// this port — a mid-bar scan must not see tables compacted away in the same
+    /// bar. Stream precedence follows upstream: simpler `level 0` covers the
+    /// input tables (newest flush first — overlapping key ranges), then `1..`
+    /// whose tables are level-disjoint. A key already in `newest` keeps the
+    /// higher-precedence value (`or_insert`), matching the scan's deduplicate
+    /// semantics: a newer tombstone suppresses an older live value, and a newer
+    /// live value wins over an older one.
+    fn merge_expires_at_disk_into(
+        &self,
+        grid: &mut Grid,
+        storage: &mut dyn Storage,
+        snapshot: u64,
+        newest: &mut std::collections::HashMap<u128, CompositeKey64>,
+    ) {
+        let snapshots = [snapshot];
+        let manifest = self.expires_at.manifest_ref();
+
+        // Each table is a single index block plus `value_blocks_used` value
+        // blocks: `Builder::index_block_finish` resets the builder and emits one
+        // manifest insertion per finished index block (compaction.rs
+        // `write_index_block`), so `table` walked below is always fully covered
+        // by its index block — no index-block chain traversal (upstream
+        // `Table.index_blocks_from_addr`) is needed.
+        let layout = CompositeKey64Spec::LAYOUT;
+        let tree_id = self.expires_at.config_ref().id;
+
+        for level in 0..constants::LSM_LEVELS as usize {
+            let mut tables: Vec<&tigerbeetle_lsm::manifest::TreeTableInfo<u128>> = Vec::new();
+            let mut iterator = manifest.levels[level].iterator(
+                Visibility::Visible,
+                &snapshots,
+                Direction::Ascending,
+                None,
+            );
+            while let Some(table) = iterator.next() {
+                tables.push(table);
+            }
+            if level == 0 {
+                // Overlapping L0 tables in the same bar: the later flush's
+                // `snapshot_min` is higher, so newest-first order wins.
+                tables.sort_by_key(|table| u64::MAX - table.snapshot_min());
+            }
+
+            for table in tables {
+                let index_block = grid.read_block_sync(storage, table.address(), table.checksum());
+                let index = layout.index.from_block_with_schema(&index_block, tree_id);
+                for block_index in 0..index.value_blocks_used(&index_block) {
+                    let address = index.value_address(&index_block, block_index as usize);
+                    let checksum = index.value_checksum(&index_block, block_index as usize);
+                    let value_block = grid.read_block_sync(storage, address, checksum);
+                    for value in table::value_block_values_used::<CompositeKey64Spec>(
+                        &value_block,
+                        &layout.data,
+                    ) {
+                        newest.entry(CompositeKey64Spec::key_from_value(&value)).or_insert(value);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Enumerate the live `expires_at` derived-index entries held in the index
+    /// tree — the memory tables plus every visible disk table at `snapshot` —
+    /// ascending by `(expires_at, pending_timestamp)`, the order the derived
+    /// index scan yields the index in (upstream's expiry pump scans the
+    /// `expires_at` index; `state_machine.zig:4516`).
+    ///
+    /// This is the state-machine-facing scan seam once the forest becomes the
+    /// authoritative store (the `by_map` recompute stays as the storage-less
+    /// fallback); the state machine asserts it equals the pending-store
+    /// recompute across the fully mounted AND flushed lifecycle.
+    ///
+    /// DEVIATION: upstream's scan streams are asynchronous K-way merge iterators
+    /// over the mutable, immutable, L0 and `1..` runs (`scan_tree.zig`, 973
+    /// lines). Sans-I/O this aggregates a newest-wins per-key map with the same
+    /// stream precedence (mutable > immutable > L0 > L1 > …) and reads the
+    /// index/value blocks via [`Grid::read_block_sync`], then filters out the
+    /// tombstone winners — semantically the `deduplicate` + tombstone-suppression
+    /// behaviour of the upstream merge.
+    #[must_use]
+    pub fn scan_expires_at(
+        &self,
+        grid: &mut Grid,
+        storage: &mut dyn Storage,
+        snapshot: u64,
+    ) -> Vec<(u64, u64)> {
+        debug_assert_eq!(snapshot, SNAPSHOT_LATEST, "only the latest committed snapshot");
+
+        let mut newest = self.newest_expires_at_from_memory();
+        self.merge_expires_at_disk_into(grid, storage, snapshot, &mut newest);
+
+        let mut entries: Vec<(u64, u64)> = newest
+            .into_values()
+            .filter(|value| !value.tombstone())
+            .map(|value| (value.field, value.timestamp))
+            .collect();
+        entries.sort_unstable();
+        entries
+    }
+
+    /// Enumerate the live `expires_at` derived-index entries held in the index
+    /// tree's memory tables (mutable + immutable) only, ascending by
+    /// `(expires_at, pending_timestamp)`.
+    ///
+    /// DEVIATION: entries compacted to disk are not included. The state machine
+    /// consults this seam only when no storage was threaded through (or the tree
+    /// is wholly in memory) and asserts the scan equals the authoritative
+    /// pending-store recompute; with storage available it uses the full
+    /// [`Self::scan_expires_at`] instead.
+    #[must_use]
+    pub fn scan_expires_at_memory(&self) -> Vec<(u64, u64)> {
+        let newest = self.newest_expires_at_from_memory();
 
         let mut entries: Vec<(u64, u64)> = newest
             .into_values()
