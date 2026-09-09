@@ -2545,7 +2545,7 @@ impl StateMachine {
                 let Some(filter) = bytes_to_change_events_filter(body) else {
                     unreachable!("get_change_events body must be a single ChangeEventsFilter");
                 };
-                self.get_change_events(&filter)
+                self.get_change_events_with_storage(&filter, storage)
             }
             Operation::LOOKUP_ACCOUNTS => {
                 let Some(ids) = bytes_to_lookup_ids(body) else {
@@ -3090,8 +3090,11 @@ impl StateMachine {
     ///
     /// DEVIATION: upstream drives this through an async scan over the
     /// `account_events` object groove plus account/transfer prefetch
-    /// (state_machine.zig:2198-2380). Sans-IO the store is a plain map and the
-    /// scan is synchronous; the produced [`ChangeEvent`]s are identical.
+    /// (state_machine.zig:2198-2380). Sans-IO the storage-less path reads the
+    /// plain map synchronously; the mounted + storage-threaded path resolves the
+    /// same events through the groove scan instead (see
+    /// [`Self::get_change_events_with_storage`]) — the produced
+    /// [`ChangeEvent`]s are identical.
     #[must_use]
     pub fn get_change_events(&self, filter: &ChangeEventsFilter) -> Vec<u8> {
         debug_assert!(
@@ -3103,20 +3106,78 @@ impl StateMachine {
         assert!(min <= max, "timestamp_max must not be less than timestamp_min");
         assert!(filter.limit != 0, "limit must not be zero");
 
-        let mut events: Vec<&AccountEvent> = self
+        let mut events: Vec<AccountEvent> = self
             .account_events
             .iter()
             .filter(|&(&ts, _)| ts >= min && ts <= max)
-            .map(|(_, e)| e)
+            .map(|(_, e)| *e)
             .collect();
         events.sort_unstable_by_key(|e| e.timestamp);
+        self.change_events_reply(events, filter.limit)
+    }
+
+    /// Execute a `get_change_events` query and return the reply body, resolving
+    /// the CDC events through the mounted forest's `account_events` groove when
+    /// `storage` is supplied (see [`Self::execute_with_storage`] for the
+    /// threaded-storage semantics).
+    ///
+    /// The events are enumerated by a timestamp-range scan over the
+    /// account_events objects tree — the memory tables plus every visible disk
+    /// table at `SNAPSHOT_LATEST` — parity-asserted against the committed
+    /// [`Self::account_events`] store, and the scanned events build the reply.
+    /// This is upstream's `execute_get_change_events` (`state_machine.zig:3522`),
+    /// which reads the events via its prefetch-then-derive CDC scan.
+    ///
+    /// DEVIATION: upstream drives the CDC scan asynchronously; this port
+    /// resolves the same events synchronously (see
+    /// [`crate::groove::AccountEventsGroove::scan_events`]), byte-identical to
+    /// the committed-store path.
+    #[must_use]
+    pub fn get_change_events_with_storage(
+        &mut self,
+        filter: &ChangeEventsFilter,
+        storage: Option<&mut dyn Storage>,
+    ) -> Vec<u8> {
+        let min = if filter.timestamp_min == 0 { u64::MIN } else { filter.timestamp_min };
+        let max = if filter.timestamp_max == 0 { u64::MAX } else { filter.timestamp_max };
+
+        if let (Some(forest), Some(storage)) = (self.forest.as_mut(), storage) {
+            let events = forest.account_events.scan_events(
+                &mut forest.grid,
+                storage,
+                SNAPSHOT_LATEST,
+                min,
+                max,
+            );
+
+            let mut store_events: Vec<AccountEvent> = self
+                .account_events
+                .iter()
+                .filter(|&(&ts, _)| ts >= min && ts <= max)
+                .map(|(_, e)| *e)
+                .collect();
+            store_events.sort_unstable_by_key(|e| e.timestamp);
+            assert_eq!(
+                events, store_events,
+                "account_events-groove scan must mirror the committed store"
+            );
+
+            self.change_events_reply(events, filter.limit)
+        } else {
+            self.get_change_events(filter)
+        }
+    }
+
+    /// The shared ChangeEvents reply tail: truncate `events` (already filtered
+    /// to the query range and sorted ascending by timestamp) to the reply cap
+    /// and encode.
+    fn change_events_reply(&self, mut events: Vec<AccountEvent>, limit: u32) -> Vec<u8> {
         // Upstream `prefetch_get_change_events` caps the reply at
         // `min(filter.limit, limit_max)` (state_machine.zig:2245-2275).
-        events
-            .truncate((filter.limit as usize).min(result_max(core::mem::size_of::<ChangeEvent>())));
+        events.truncate((limit as usize).min(result_max(core::mem::size_of::<ChangeEvent>())));
         let mut reply = Vec::with_capacity(events.len() * core::mem::size_of::<ChangeEvent>());
         for result in events {
-            let change = self.build_change_event(result);
+            let change = self.build_change_event(&result);
             reply.extend_from_slice(&change_bytes(&change));
         }
         reply
@@ -7917,6 +7978,16 @@ mod tests {
         ChangeEventsFilter { timestamp_min, timestamp_max, limit, reserved: [0; 44] }
     }
 
+    /// Encode a `ChangeEventsFilter` as a `GET_CHANGE_EVENTS` request body.
+    fn change_filter_bytes(filter: &ChangeEventsFilter) -> Vec<u8> {
+        let mut body = Vec::with_capacity(64);
+        body.extend_from_slice(&filter.timestamp_min.to_le_bytes());
+        body.extend_from_slice(&filter.timestamp_max.to_le_bytes());
+        body.extend_from_slice(&filter.limit.to_le_bytes());
+        body.extend_from_slice(&filter.reserved);
+        body
+    }
+
     #[test]
     fn get_change_events_returns_single_phase_event() {
         let mut sm = StateMachine::default();
@@ -8028,6 +8099,138 @@ mod tests {
         let reply = sm.execute(Operation::GET_CHANGE_EVENTS, 0, &body_bytes);
         assert_eq!(reply.len(), 384);
         assert_eq!(change_event_at(&reply, 0).timestamp, 20);
+    }
+
+    /// `get_change_events` resolves through the mounted forest's `account_events`
+    /// groove: the storage-threaded query enumerates the CDC events by a
+    /// timestamp-range scan over the objects tree — the memory tables plus every
+    /// visible disk table — parity-asserted against the committed store,
+    /// byte-identical to the committed-HashMap path.
+    ///
+    /// Run twice: against the freshly-mirrored (memory) grooves, then again after
+    /// a checkpoint + reopen, when the objects tree has been restored from real
+    /// L0 disk tables and every event must resolve through the disk scan.
+    #[test]
+    #[allow(clippy::too_many_lines)] // flush + checkpoint + reopen scaffolding
+    fn get_change_events_resolves_through_mounted_groove_from_memory_and_durable_disk() {
+        let mut storage = forest_storage();
+        let mut sm = StateMachine::default();
+        {
+            let mut forest = Forest::init(test_superblock(), forest_grid_options(), 32);
+            open_forest(&mut forest, &mut storage);
+            sm.mount_forest(forest);
+        }
+        let _ = sm.create_accounts_with_storage(
+            &[
+                Account { id: 1, ledger: 1, code: 1, ..Account::default() },
+                Account { id: 2, ledger: 1, code: 1, ..Account::default() },
+            ],
+            10,
+            Some(&mut storage),
+        );
+        // Three CDC events: a single-phase transfer (20), a pending (30) and its
+        // post (40).
+        let _ = sm.create_transfers_with_storage(&[t(1, 2, 7)], 20, Some(&mut storage));
+        let pending = Transfer { id: 1003, flags: TransferFlags::PENDING, ..t(1, 2, 50) };
+        let _ = sm.create_transfers_with_storage(&[pending], 30, Some(&mut storage));
+        let post = Transfer {
+            id: 1004,
+            pending_id: 1003,
+            amount: u128::MAX,
+            flags: TransferFlags::POST_PENDING_TRANSFER,
+            ..Transfer::default()
+        };
+        let _ = sm.create_transfers_with_storage(&[post], 40, Some(&mut storage));
+
+        let all = change_filter_bytes(&change_filter(0, 0, 100));
+
+        // ── Memory mirrors (freshly-mirrored grooves, everything in the mutable).
+        let reply =
+            sm.execute_with_storage(Operation::GET_CHANGE_EVENTS, 0, &all, Some(&mut storage));
+        assert_eq!(
+            reply,
+            sm.execute(Operation::GET_CHANGE_EVENTS, 0, &all),
+            "memory-groove get_change_events byte-identical to the committed store"
+        );
+        assert_eq!(reply.len(), 3 * 384);
+        let ts: Vec<u64> = (0..3).map(|i| change_event_at(&reply, i).timestamp).collect();
+        assert_eq!(ts, [20, 30, 40]);
+        assert_eq!(change_event_at(&reply, 0).r#type, ChangeEventType::SinglePhase);
+        assert_eq!(change_event_at(&reply, 1).r#type, ChangeEventType::TwoPhasePending);
+        assert_eq!(change_event_at(&reply, 2).r#type, ChangeEventType::TwoPhasePosted);
+        assert_eq!(change_event_at(&reply, 2).transfer_pending_id, 1003);
+
+        // Range and limit are still applied through the groove path.
+        let range = change_filter_bytes(&change_filter(21, 0, 100));
+        let reply =
+            sm.execute_with_storage(Operation::GET_CHANGE_EVENTS, 0, &range, Some(&mut storage));
+        assert_eq!(reply.len(), 2 * 384);
+        assert_eq!(change_event_at(&reply, 0).timestamp, 30);
+        let single = change_filter_bytes(&change_filter(0, 0, 1));
+        let reply =
+            sm.execute_with_storage(Operation::GET_CHANGE_EVENTS, 0, &single, Some(&mut storage));
+        assert_eq!(reply.len(), 384);
+        assert_eq!(change_event_at(&reply, 0).timestamp, 20);
+
+        // ── Flush the mirrored mutables to L0 disk tables (two full bars), then
+        // checkpoint durably and reopen a fresh forest over the same storage.
+        let bar_ops = constants::LSM_COMPACTION_OPS as u64;
+        let bar_start = compaction::HALF_BAR_BEAT_COUNT as u64 * 2;
+        for _bar in 0..2 {
+            for op in bar_start..bar_start + bar_ops {
+                sm.compact(op, Some(&mut storage));
+            }
+        }
+        let (manifest_refs, free_set_refs) = sm.checkpoint(Some(&mut storage));
+        let highest_address = free_set_refs
+            .blocks_acquired
+            .last_block_address
+            .max(free_set_refs.blocks_released.last_block_address);
+        let reopen_view = SuperBlockView {
+            storage_size: DATA_FILE_SIZE_MIN as u64 + highest_address * BLOCK_SIZE as u64,
+            manifest_block_count: manifest_refs.block_count,
+            manifest_oldest_address: manifest_refs.oldest_address,
+            manifest_oldest_checksum: manifest_refs.oldest_checksum,
+            manifest_newest_address: manifest_refs.newest_address,
+            manifest_newest_checksum: manifest_refs.newest_checksum,
+            ..test_superblock()
+        };
+        let mut forest_b = Forest::init(reopen_view, forest_grid_options(), 32);
+        forest_b.open(
+            GridOpenReferences {
+                blocks_acquired: free_set_refs.blocks_acquired,
+                blocks_released: free_set_refs.blocks_released,
+            },
+            &mut storage,
+            0,
+        );
+        let mut done = false;
+        for _ in 0..1000 {
+            forest_b.poll(&mut storage);
+            if forest_b.account_events.objects.is_opened() && forest_b.is_idle() {
+                done = true;
+                break;
+            }
+        }
+        assert!(done, "reopen must complete");
+        assert!(
+            forest_b.account_events.objects.manifest_table_count() >= 1,
+            "the reopened forest restores the flushed L0 account_events objects table"
+        );
+        sm.forest = Some(Box::new(forest_b));
+
+        // ── Disk tables (reopened groove: empty mutable tables, so every event
+        // resolves from the L0 tables).
+        let reply =
+            sm.execute_with_storage(Operation::GET_CHANGE_EVENTS, 0, &all, Some(&mut storage));
+        assert_eq!(
+            reply,
+            sm.execute(Operation::GET_CHANGE_EVENTS, 0, &all),
+            "disk-groove get_change_events byte-identical to the committed store"
+        );
+        assert_eq!(reply.len(), 3 * 384);
+        let ts: Vec<u64> = (0..3).map(|i| change_event_at(&reply, i).timestamp).collect();
+        assert_eq!(ts, [20, 30, 40]);
     }
 
     // ── id_already_failed orphan tests ───────────────────────────────────

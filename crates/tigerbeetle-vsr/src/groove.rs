@@ -2885,16 +2885,7 @@ impl TransferGroove {
     }
 
     /// Merge the visible `expires_at` disk tables at `snapshot` into `newest`
-    /// (upstream's level streams in the scan, `scan_tree.zig` / `scan_merge.zig`).
-    ///
-    /// Only `SNAPSHOT_LATEST` (all committed tables) is a valid scan snapshot in
-    /// this port — a mid-bar scan must not see tables compacted away in the same
-    /// bar. Stream precedence follows upstream: simpler `level 0` covers the
-    /// input tables (newest flush first — overlapping key ranges), then `1..`
-    /// whose tables are level-disjoint. A key already in `newest` keeps the
-    /// higher-precedence value (`or_insert`), matching the scan's deduplicate
-    /// semantics: a newer tombstone suppresses an older live value, and a newer
-    /// live value wins over an older one.
+    /// (see [`merge_scan_values_into`]).
     fn merge_expires_at_disk_into(
         &self,
         grid: &mut Grid,
@@ -2902,51 +2893,7 @@ impl TransferGroove {
         snapshot: u64,
         newest: &mut std::collections::HashMap<u128, CompositeKey64>,
     ) {
-        let snapshots = [snapshot];
-        let manifest = self.expires_at.manifest_ref();
-
-        // Each table is a single index block plus `value_blocks_used` value
-        // blocks: `Builder::index_block_finish` resets the builder and emits one
-        // manifest insertion per finished index block (compaction.rs
-        // `write_index_block`), so `table` walked below is always fully covered
-        // by its index block — no index-block chain traversal (upstream
-        // `Table.index_blocks_from_addr`) is needed.
-        let layout = CompositeKey64Spec::LAYOUT;
-        let tree_id = self.expires_at.config_ref().id;
-
-        for level in 0..constants::LSM_LEVELS as usize {
-            let mut tables: Vec<&tigerbeetle_lsm::manifest::TreeTableInfo<u128>> = Vec::new();
-            let mut iterator = manifest.levels[level].iterator(
-                Visibility::Visible,
-                &snapshots,
-                Direction::Ascending,
-                None,
-            );
-            while let Some(table) = iterator.next() {
-                tables.push(table);
-            }
-            if level == 0 {
-                // Overlapping L0 tables in the same bar: the later flush's
-                // `snapshot_min` is higher, so newest-first order wins.
-                tables.sort_by_key(|table| u64::MAX - table.snapshot_min());
-            }
-
-            for table in tables {
-                let index_block = grid.read_block_sync(storage, table.address(), table.checksum());
-                let index = layout.index.from_block_with_schema(&index_block, tree_id);
-                for block_index in 0..index.value_blocks_used(&index_block) {
-                    let address = index.value_address(&index_block, block_index as usize);
-                    let checksum = index.value_checksum(&index_block, block_index as usize);
-                    let value_block = grid.read_block_sync(storage, address, checksum);
-                    for value in table::value_block_values_used::<CompositeKey64Spec>(
-                        &value_block,
-                        &layout.data,
-                    ) {
-                        newest.entry(CompositeKey64Spec::key_from_value(&value)).or_insert(value);
-                    }
-                }
-            }
-        }
+        merge_scan_values_into(&self.expires_at, grid, storage, snapshot, newest);
     }
 
     /// Enumerate the live `expires_at` derived-index entries held in the index
@@ -3475,6 +3422,75 @@ impl TransferPendingGroove {
     }
 }
 
+/// Merge every visible disk table's values of `tree` at `snapshot` into `newest`
+/// (upstream's level streams in a scan, `scan_tree.zig` / `scan_merge.zig`).
+///
+/// Only `SNAPSHOT_LATEST` (all committed tables) is a valid scan snapshot in this
+/// port — a mid-bar scan must not see tables compacted away in the same bar.
+/// Stream precedence follows upstream: simpler `level 0` covers the input tables
+/// (newest flush first — overlapping key ranges), then `1..` whose tables are
+/// level-disjoint. A key already in `newest` keeps the higher-precedence value
+/// (`or_insert`), matching the scan's deduplicate semantics: a newer tombstone
+/// suppresses an older live value, and a newer live value wins over an older one.
+//
+// Each table is a single index block plus `value_blocks_used` value blocks:
+// `Builder::index_block_finish` resets the builder and emits one manifest
+// insertion per finished index block (compaction.rs `write_index_block`), so
+// `table` walked below is always fully covered by its index block — no
+// index-block chain traversal (upstream `Table.index_blocks_from_addr`) is needed.
+fn merge_scan_values_into<
+    S: TreeSpec + table_memory::Table<Key = K, Value = V>,
+    K: Copy + Eq + std::hash::Hash,
+    V: Copy,
+>(
+    tree: &Tree<S>,
+    grid: &mut Grid,
+    storage: &mut dyn Storage,
+    snapshot: u64,
+    newest: &mut std::collections::HashMap<K, V>,
+) {
+    let snapshots = [snapshot];
+    let manifest = tree.manifest_ref();
+
+    let layout = <S as TreeSpec>::LAYOUT;
+    let tree_id = tree.config_ref().id;
+
+    for level in 0..constants::LSM_LEVELS as usize {
+        let mut tables: Vec<
+            &tigerbeetle_lsm::manifest::TreeTableInfo<<S as table_memory::Table>::Key>,
+        > = Vec::new();
+        let mut iterator = manifest.levels[level].iterator(
+            Visibility::Visible,
+            &snapshots,
+            Direction::Ascending,
+            None,
+        );
+        while let Some(table) = iterator.next() {
+            tables.push(table);
+        }
+        if level == 0 {
+            // Overlapping L0 tables in the same bar: the later flush's
+            // `snapshot_min` is higher, so newest-first order wins.
+            tables.sort_by_key(|table| u64::MAX - table.snapshot_min());
+        }
+
+        for table in tables {
+            let index_block = grid.read_block_sync(storage, table.address(), table.checksum());
+            let index = layout.index.from_block_with_schema(&index_block, tree_id);
+            for block_index in 0..index.value_blocks_used(&index_block) {
+                let address = index.value_address(&index_block, block_index as usize);
+                let checksum = index.value_checksum(&index_block, block_index as usize);
+                let value_block = grid.read_block_sync(storage, address, checksum);
+                for value in table::value_block_values_used::<S>(&value_block, &layout.data) {
+                    newest
+                        .entry(<S as table_memory::Table>::key_from_value(&value))
+                        .or_insert(value);
+                }
+            }
+        }
+    }
+}
+
 // ===== AccountEvents (CDC) groove =====
 
 /// The AccountEvents objects tree, keyed by the event's `timestamp`.
@@ -3871,6 +3887,74 @@ impl AccountEventsGroove {
     #[must_use]
     pub fn objects_table_count(&self) -> u32 {
         self.objects.manifest_table_count()
+    }
+
+    /// Collect the newest value for every `objects`-tree key (the account-event
+    /// timestamp) across the memory tables (immutable first — older — then the
+    /// mutable's newer appends), upstream's stream precedence for the two
+    /// in-memory runs, mirroring [`TransferGroove`]'s expires-at seam.
+    ///
+    /// CDC account events are immutable one-shot records — a given timestamp is
+    /// never put twice or reaped — so this is only a defensive dedup against
+    /// replay; every event survives the merge.
+    #[must_use]
+    fn newest_account_events_from_memory(&self) -> std::collections::HashMap<u64, AccountEvent> {
+        let mut newest: std::collections::HashMap<u64, AccountEvent> =
+            std::collections::HashMap::with_capacity(
+                self.objects.table_mutable_ref().count() as usize
+                    + self.objects.table_immutable_ref().count() as usize,
+            );
+        for table in [self.objects.table_immutable_ref(), self.objects.table_mutable_ref()] {
+            for value in table.values_used() {
+                let key = AccountEventObjectSpec::key_from_value(value);
+                if let Some(entry) = newest.get_mut(&key) {
+                    *entry = *value;
+                } else {
+                    newest.insert(key, *value);
+                }
+            }
+        }
+        newest
+    }
+
+    /// Enumerate the CDC account events held in the `objects` tree — the memory
+    /// tables plus every visible disk table at `snapshot` — ascending by
+    /// timestamp within the inclusive `[timestamp_min, timestamp_max]` window.
+    ///
+    /// This is the state-machine-facing scan seam once the forest becomes the
+    /// authoritative store (the `account_events` store recompute stays as the
+    /// storage-less fallback); the state machine asserts the scan equals the
+    /// committed store across the fully mounted AND flushed lifecycle.
+    ///
+    /// DEVIATION: upstream's CDC scan is an asynchronous key-range stream over
+    /// the objects tree (`get_scan_from_timestamp_min_max`, stripped of the
+    /// `account_timestamp` index join, state_machine.zig:2258-2275). Sans-I/O
+    /// this aggregates a newest-wins per-key map with the same stream
+    /// precedence (mutable > immutable > L0 > L1 > …) via
+    /// [`merge_scan_values_into`] and reads the index/value blocks through
+    /// [`Grid::read_block_sync`] — semantically the `deduplicate` +
+    /// tombstone-suppression behaviour of the upstream merge.
+    #[must_use]
+    pub fn scan_events(
+        &self,
+        grid: &mut Grid,
+        storage: &mut dyn Storage,
+        snapshot: u64,
+        timestamp_min: u64,
+        timestamp_max: u64,
+    ) -> Vec<AccountEvent> {
+        debug_assert_eq!(snapshot, SNAPSHOT_LATEST, "only the latest committed snapshot");
+
+        let mut newest = self.newest_account_events_from_memory();
+        merge_scan_values_into(&self.objects, grid, storage, snapshot, &mut newest);
+
+        let mut events: Vec<AccountEvent> = newest
+            .into_values()
+            .filter(|value| !AccountEventObjectSpec::tombstone(value))
+            .filter(|value| value.timestamp >= timestamp_min && value.timestamp <= timestamp_max)
+            .collect();
+        events.sort_unstable_by_key(|value| value.timestamp);
+        events
     }
 }
 
