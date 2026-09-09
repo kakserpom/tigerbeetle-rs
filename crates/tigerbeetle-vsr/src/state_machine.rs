@@ -46,8 +46,9 @@ use crate::Operation;
 use crate::forest::Forest;
 use crate::grid::Grid;
 use crate::groove::{
-    AccountEventObjectSpec, AccountObjectsCache, IdTimestampPrefetchKey, TimestampPrefetchKey,
-    TransferGroove, TransferObjectSpec, TransferObjectsCache, TransferPendingObjectsCache,
+    AccountEventObjectSpec, AccountObjectSpec, AccountObjectsCache, CompositeKey64Spec,
+    CompositeKey128Spec, IdTimestampPrefetchKey, TimestampPrefetchKey, TransferGroove,
+    TransferObjectSpec, TransferObjectsCache, TransferPendingObjectsCache,
 };
 use crate::message_header::checksum_body_empty;
 use crate::storage::Storage;
@@ -2090,6 +2091,154 @@ fn scan_account_filter_timestamps(
     timestamps
 }
 
+/// Enumerate the timestamps satisfying a [`QueryFilter`]'s AND of the non-zero
+/// `user_data_128`/`user_data_64`/`user_data_32`/`ledger`/`code` conditions
+/// through the mounted groove's derived-index scans (upstream
+/// `get_scan_from_query_filter`, `state_machine.zig:2054-2123`: one
+/// `scan_prefix` condition per non-zero field, merged by `merge_intersection`).
+///
+/// Returns `None` for a timestamp-only query — no index conditions — in which
+/// case the caller scans the objects tree by timestamp range instead (upstream
+/// `scan_timestamp`). The returned timestamps are unordered: callers sort and
+/// cap.
+#[must_use]
+fn scan_query_index_timestamps(
+    user_data_128_tree: &Tree<CompositeKey128Spec>,
+    user_data_64_tree: &Tree<CompositeKey64Spec>,
+    user_data_32_tree: &Tree<CompositeKey64Spec>,
+    ledger_tree: &Tree<CompositeKey64Spec>,
+    code_tree: &Tree<CompositeKey64Spec>,
+    grid: &mut Grid,
+    storage: &mut dyn Storage,
+    filter: &QueryFilter,
+    min: u64,
+    max: u64,
+) -> Option<Vec<u64>> {
+    let mut constraints: Vec<HashSet<u64>> = Vec::new();
+    if filter.user_data_128 != 0 {
+        constraints.push(
+            scan_index_timestamps(
+                user_data_128_tree,
+                grid,
+                storage,
+                SNAPSHOT_LATEST,
+                U256::from_parts(filter.user_data_128, min),
+                U256::from_parts(filter.user_data_128, max),
+                |value| value.timestamp,
+            )
+            .into_iter()
+            .collect(),
+        );
+    }
+    if filter.user_data_64 != 0 {
+        constraints.push(
+            scan_index_timestamps(
+                user_data_64_tree,
+                grid,
+                storage,
+                SNAPSHOT_LATEST,
+                (u128::from(filter.user_data_64) << 64) | u128::from(min),
+                (u128::from(filter.user_data_64) << 64) | u128::from(max),
+                |value| value.timestamp,
+            )
+            .into_iter()
+            .collect(),
+        );
+    }
+    if filter.user_data_32 != 0 {
+        constraints.push(
+            scan_index_timestamps(
+                user_data_32_tree,
+                grid,
+                storage,
+                SNAPSHOT_LATEST,
+                (u128::from(u64::from(filter.user_data_32)) << 64) | u128::from(min),
+                (u128::from(u64::from(filter.user_data_32)) << 64) | u128::from(max),
+                |value| value.timestamp,
+            )
+            .into_iter()
+            .collect(),
+        );
+    }
+    if filter.ledger != 0 {
+        constraints.push(
+            scan_index_timestamps(
+                ledger_tree,
+                grid,
+                storage,
+                SNAPSHOT_LATEST,
+                (u128::from(u64::from(filter.ledger)) << 64) | u128::from(min),
+                (u128::from(u64::from(filter.ledger)) << 64) | u128::from(max),
+                |value| value.timestamp,
+            )
+            .into_iter()
+            .collect(),
+        );
+    }
+    if filter.code != 0 {
+        constraints.push(
+            scan_index_timestamps(
+                code_tree,
+                grid,
+                storage,
+                SNAPSHOT_LATEST,
+                (u128::from(u64::from(filter.code)) << 64) | u128::from(min),
+                (u128::from(u64::from(filter.code)) << 64) | u128::from(max),
+                |value| value.timestamp,
+            )
+            .into_iter()
+            .collect(),
+        );
+    }
+    if constraints.is_empty() {
+        return None;
+    }
+    let mut timestamps: Vec<u64> = constraints[0].iter().copied().collect();
+    for constraint in &constraints[1..] {
+        timestamps.retain(|ts| constraint.contains(ts));
+    }
+    Some(timestamps)
+}
+
+/// Resolve the object at `ts` from an object groove's `objects` tree with the
+/// groove resolution precedence (upstream scan-stream order): the mutable
+/// memory table first (freshly committed objects, which
+/// `lookup_from_levels_cache` — an immutable/disk path — does not scan), then
+/// the grid cache, then a synchronous storage read.
+///
+/// A timestamp yielded by a derived-index or objects scan always addresses a
+/// committed live object, so a `Negative`/`None` resolution is unreachable.
+#[must_use]
+fn resolve_timestamp_object<S, V, F>(
+    objects: &mut Tree<S>,
+    grid: &mut Grid,
+    storage: &mut dyn Storage,
+    ts: u64,
+    is_ts: F,
+) -> V
+where
+    S: TreeSpec + table_memory::Table<Key = u64, Value = V>,
+    V: Copy,
+    F: Fn(&V) -> bool,
+{
+    if let Some(value) =
+        objects.table_mutable_ref().values_used().iter().find(|&value| is_ts(value))
+    {
+        return *value;
+    }
+    match objects.lookup_from_levels_cache(grid, SNAPSHOT_LATEST, ts) {
+        LookupMemoryResult::Positive(value) => value,
+        LookupMemoryResult::Possible { level } => objects
+            .lookup_from_levels_storage(grid, storage, SNAPSHOT_LATEST, ts, level)
+            .unwrap_or_else(|| {
+                unreachable!("index-scan timestamps always resolve to committed objects")
+            }),
+        LookupMemoryResult::Negative => {
+            unreachable!("index-scan timestamps always resolve to committed objects")
+        }
+    }
+}
+
 /// Validate a [`QueryFilter`] (upstream `get_scan_from_query_filter`,
 /// `state_machine.zig:2062`): a query needs a non-zero `limit`, a well-formed
 /// timestamp range, no padding or reserved bits, and — unlike
@@ -2751,13 +2900,13 @@ impl StateMachine {
                 let Some(filter) = bytes_to_query_filter(body) else {
                     unreachable!("query_accounts body must be a single QueryFilter");
                 };
-                self.query_accounts(&filter)
+                self.query_accounts_with_storage(&filter, storage)
             }
             Operation::QUERY_TRANSFERS => {
                 let Some(filter) = bytes_to_query_filter(body) else {
                     unreachable!("query_transfers body must be a single QueryFilter");
                 };
-                self.query_transfers(&filter)
+                self.query_transfers_with_storage(&filter, storage)
             }
             operation => unreachable!("unsupported state-machine operation: {operation:?}"),
         }
@@ -3485,49 +3634,15 @@ impl StateMachine {
             let mut results: Vec<Transfer> = Vec::with_capacity(timestamps.len());
             for ts in timestamps {
                 // A timestamp yielded by a derived-index scan always addresses a
-                // committed transfer object. Resolve it with the groove's
-                // precedence: the mutable memory table first (the freshly
-                // created objects, which `lookup_from_levels_cache` — an
-                // immutable/disk path — does not scan), then the grid cache,
-                // then a storage read.
-                let transfer = if let Some(transfer) = forest
-                    .transfers
-                    .objects
-                    .table_mutable_ref()
-                    .values_used()
-                    .iter()
-                    .find(|value| value.timestamp == ts)
-                {
-                    *transfer
-                } else {
-                    match forest.transfers.objects.lookup_from_levels_cache(
-                        &mut forest.grid,
-                        SNAPSHOT_LATEST,
-                        ts,
-                    ) {
-                        LookupMemoryResult::Positive(transfer) => transfer,
-                        LookupMemoryResult::Possible { level } => forest
-                            .transfers
-                            .objects
-                            .lookup_from_levels_storage(
-                                &mut forest.grid,
-                                storage,
-                                SNAPSHOT_LATEST,
-                                ts,
-                                level,
-                            )
-                            .unwrap_or_else(|| {
-                                unreachable!(
-                                    "index-scan timestamps always resolve to committed transfers"
-                                )
-                            }),
-                        LookupMemoryResult::Negative => {
-                            unreachable!(
-                                "index-scan timestamps always resolve to committed transfers"
-                            )
-                        }
-                    }
-                };
+                // committed transfer object; resolve it with the groove's
+                // precedence (mutable memory table, then grid cache, then disk).
+                let transfer = resolve_timestamp_object(
+                    &mut forest.transfers.objects,
+                    &mut forest.grid,
+                    storage,
+                    ts,
+                    |value| value.timestamp == ts,
+                );
                 assert!(!TransferObjectSpec::tombstone(&transfer));
                 assert_eq!(transfer.timestamp, ts);
                 results.push(transfer);
@@ -3698,52 +3813,17 @@ impl StateMachine {
 
             // Resolve each transfer timestamp against the account_events
             // objects tree (a balance event exists at every transfer's
-            // timestamp) with the groove's precedence: the mutable memory table
-            // first (freshly recorded objects, which `lookup_from_levels_cache`
-            // — an immutable/disk path — does not scan), then the grid cache,
-            // then a storage read.
+            // timestamp) with the groove's precedence (mutable memory table,
+            // then grid cache, then disk).
             let mut events: Vec<AccountEvent> = Vec::with_capacity(timestamps.len());
             for ts in timestamps {
-                let event = if let Some(event) = forest
-                    .account_events
-                    .objects
-                    .table_mutable_ref()
-                    .values_used()
-                    .iter()
-                    .find(|value| value.timestamp == ts)
-                {
-                    *event
-                } else {
-                    match forest.account_events.objects.lookup_from_levels_cache(
-                        &mut forest.grid,
-                        SNAPSHOT_LATEST,
-                        ts,
-                    ) {
-                        LookupMemoryResult::Positive(event) => event,
-                        LookupMemoryResult::Possible { level } => forest
-                            .account_events
-                            .objects
-                            .lookup_from_levels_storage(
-                                &mut forest.grid,
-                                storage,
-                                SNAPSHOT_LATEST,
-                                ts,
-                                level,
-                            )
-                            .unwrap_or_else(|| {
-                                unreachable!(
-                                    "transfer-scan timestamps always resolve to committed account \
-                                     events"
-                                )
-                            }),
-                        LookupMemoryResult::Negative => {
-                            unreachable!(
-                                "transfer-scan timestamps always resolve to committed account \
-                                 events"
-                            )
-                        }
-                    }
-                };
+                let event = resolve_timestamp_object(
+                    &mut forest.account_events.objects,
+                    &mut forest.grid,
+                    storage,
+                    ts,
+                    |value| value.timestamp == ts,
+                );
                 assert!(!AccountEventObjectSpec::tombstone(&event));
                 assert_eq!(event.timestamp, ts);
                 assert_ne!(
@@ -3779,10 +3859,11 @@ impl StateMachine {
     /// `user_data_32`/`ledger`/`code` equality filters, up to `filter.limit`,
     /// in ascending or reverse-chronological order per `reversed`.
     ///
-    /// DEVIATION: upstream scans the `accounts` object groove via the
-    /// `user_data_*`/`ledger`/`code` derived index prefixes intersected with
-    /// the timestamp range (`get_scan_from_query_filter`); sans-IO the
-    /// committed accounts are filtered in memory.
+    /// DEVIATION: upstream scans the `accounts` object groove via the derived
+    /// index prefixes (`get_scan_from_query_filter`); sans-IO the committed
+    /// accounts are filtered in memory. When a forest + storage are mounted
+    /// the same query resolves through the groove's index + objects scans,
+    /// byte-identical (see [`Self::query_accounts_with_storage`]).
     #[must_use]
     pub fn query_accounts(&self, filter: &QueryFilter) -> Vec<u8> {
         if !query_filter_valid(filter) {
@@ -3834,7 +3915,9 @@ impl StateMachine {
     ///
     /// DEVIATION: upstream scans the `transfers` object groove via the derived
     /// index prefixes (`get_scan_from_query_filter`); sans-IO the committed
-    /// transfers are filtered in memory.
+    /// transfers are filtered in memory. When a forest + storage are mounted
+    /// the same query resolves through the groove's index + objects scans,
+    /// byte-identical (see [`Self::query_transfers_with_storage`]).
     #[must_use]
     pub fn query_transfers(&self, filter: &QueryFilter) -> Vec<u8> {
         if !query_filter_valid(filter) {
@@ -3870,6 +3953,243 @@ impl StateMachine {
             (filter.limit as usize).min(result_max_multi_batch(core::mem::size_of::<Transfer>())),
         );
         transfer_batch_to_bytes(&results)
+    }
+
+    /// Execute a `query_accounts` query and return the reply body, resolving the
+    /// results through the mounted accounts groove when a forest + storage are
+    /// available (upstream `execute_query_accounts` over the
+    /// `AccountsScanLookup` of [`crate::groove`]).
+    ///
+    /// The committed store remains the golden source: one derived-index scan
+    /// per non-zero `user_data_*`/`ledger`/`code` condition yields candidate
+    /// timestamps, AND-intersected (upstream `get_scan_from_query_filter`); a
+    /// timestamp-only query scans the objects tree by timestamp range instead
+    /// (upstream `scan_timestamp`). Each timestamp resolves to its account with
+    /// the groove precedence (mutable memory table, then grid cache, then
+    /// disk), and the reply is parity-asserted byte-identical to the committed
+    /// store.
+    ///
+    /// DEVIATION: upstream scans the objects groove asynchronously via
+    /// `lsm/scan_lookup.zig`; this port resolves the same timestamps
+    /// synchronously (see [`crate::groove::scan_composite_key_range`]).
+    #[must_use]
+    pub fn query_accounts_with_storage(
+        &mut self,
+        filter: &QueryFilter,
+        storage: Option<&mut dyn Storage>,
+    ) -> Vec<u8> {
+        if !query_filter_valid(filter) {
+            return Vec::new();
+        }
+        let min = if filter.timestamp_min == 0 { u64::MIN } else { filter.timestamp_min };
+        let max = if filter.timestamp_max == 0 { u64::MAX } else { filter.timestamp_max };
+
+        if let (Some(forest), Some(storage)) = (self.forest.as_mut(), storage) {
+            let limit = (filter.limit as usize)
+                .min(result_max_multi_batch(core::mem::size_of::<Account>()));
+
+            // The AND-intersected derived-index scan conditions, or the
+            // objects-tree timestamp scan for a timestamp-only query.
+            let mut timestamps = if let Some(timestamps) = scan_query_index_timestamps(
+                &forest.accounts.user_data_128,
+                &forest.accounts.user_data_64,
+                &forest.accounts.user_data_32,
+                &forest.accounts.ledger,
+                &forest.accounts.code,
+                &mut forest.grid,
+                storage,
+                filter,
+                min,
+                max,
+            ) {
+                timestamps
+            } else {
+                crate::groove::scan_composite_key_range(
+                    &forest.accounts.objects,
+                    &mut forest.grid,
+                    storage,
+                    SNAPSHOT_LATEST,
+                    min,
+                    max,
+                )
+                .into_iter()
+                .map(|account| account.timestamp)
+                .collect()
+            };
+            if filter.flags.reversed() {
+                timestamps.sort_unstable_by_key(|&ts| std::cmp::Reverse(ts));
+            } else {
+                timestamps.sort_unstable();
+            }
+            timestamps.truncate(limit);
+
+            let mut results: Vec<Account> = Vec::with_capacity(timestamps.len());
+            for ts in timestamps {
+                // A timestamp yielded by an index or objects scan always
+                // addresses a committed live account object; resolve it with
+                // the groove's precedence (mutable memory table, then grid
+                // cache, then disk).
+                let account = resolve_timestamp_object(
+                    &mut forest.accounts.objects,
+                    &mut forest.grid,
+                    storage,
+                    ts,
+                    |value| value.timestamp == ts,
+                );
+                assert!(!AccountObjectSpec::tombstone(&account));
+                assert_eq!(account.timestamp, ts);
+                results.push(account);
+            }
+
+            // Parity with the committed store: the groove resolution must
+            // produce the same accounts in the same order (the replies are
+            // byte-identical).
+            let mut expected: Vec<Account> = self
+                .accounts
+                .values()
+                .copied()
+                .filter(|a| {
+                    query_matches(
+                        a.user_data_128,
+                        a.user_data_64,
+                        a.user_data_32,
+                        a.ledger,
+                        a.code,
+                        a.timestamp,
+                        min,
+                        max,
+                        filter,
+                    )
+                })
+                .collect();
+            if filter.flags.reversed() {
+                expected.sort_unstable_by_key(|a| std::cmp::Reverse(a.timestamp));
+            } else {
+                expected.sort_unstable_by_key(|a| a.timestamp);
+            }
+            expected.truncate(limit);
+            assert_eq!(
+                results,
+                expected[..results.len()],
+                "accounts-groove index scan must mirror the committed store"
+            );
+
+            return account_batch_to_bytes(&results);
+        }
+        self.query_accounts(filter)
+    }
+
+    /// Execute a `query_transfers` query and return the reply body, resolving
+    /// the results through the mounted transfers groove when a forest + storage
+    /// are available (upstream `execute_query_transfers` over the
+    /// `TransfersScanLookup` of [`crate::groove`]).
+    ///
+    /// Same structure as [`Self::query_accounts_with_storage`]: one
+    /// AND-intersected derived-index scan per non-zero filter condition (or the
+    /// objects-tree timestamp scan), each resolved timestamp read back from the
+    /// `transfers.objects` tree and parity-asserted byte-identical to the
+    /// committed [`Self::transfers`] store.
+    #[must_use]
+    pub fn query_transfers_with_storage(
+        &mut self,
+        filter: &QueryFilter,
+        storage: Option<&mut dyn Storage>,
+    ) -> Vec<u8> {
+        if !query_filter_valid(filter) {
+            return Vec::new();
+        }
+        let min = if filter.timestamp_min == 0 { u64::MIN } else { filter.timestamp_min };
+        let max = if filter.timestamp_max == 0 { u64::MAX } else { filter.timestamp_max };
+
+        if let (Some(forest), Some(storage)) = (self.forest.as_mut(), storage) {
+            let limit = (filter.limit as usize)
+                .min(result_max_multi_batch(core::mem::size_of::<Transfer>()));
+
+            // The AND-intersected derived-index scan conditions, or the
+            // objects-tree timestamp scan for a timestamp-only query.
+            let mut timestamps = if let Some(timestamps) = scan_query_index_timestamps(
+                &forest.transfers.user_data_128,
+                &forest.transfers.user_data_64,
+                &forest.transfers.user_data_32,
+                &forest.transfers.ledger,
+                &forest.transfers.code,
+                &mut forest.grid,
+                storage,
+                filter,
+                min,
+                max,
+            ) {
+                timestamps
+            } else {
+                crate::groove::scan_composite_key_range(
+                    &forest.transfers.objects,
+                    &mut forest.grid,
+                    storage,
+                    SNAPSHOT_LATEST,
+                    min,
+                    max,
+                )
+                .into_iter()
+                .map(|transfer| transfer.timestamp)
+                .collect()
+            };
+            if filter.flags.reversed() {
+                timestamps.sort_unstable_by_key(|&ts| std::cmp::Reverse(ts));
+            } else {
+                timestamps.sort_unstable();
+            }
+            timestamps.truncate(limit);
+
+            let mut results: Vec<Transfer> = Vec::with_capacity(timestamps.len());
+            for ts in timestamps {
+                let transfer = resolve_timestamp_object(
+                    &mut forest.transfers.objects,
+                    &mut forest.grid,
+                    storage,
+                    ts,
+                    |value| value.timestamp == ts,
+                );
+                assert!(!TransferObjectSpec::tombstone(&transfer));
+                assert_eq!(transfer.timestamp, ts);
+                results.push(transfer);
+            }
+
+            // Parity with the committed store: the groove resolution must
+            // produce the same transfers in the same order (the replies are
+            // byte-identical).
+            let mut expected: Vec<Transfer> = self
+                .transfers
+                .values()
+                .copied()
+                .filter(|t| {
+                    query_matches(
+                        t.user_data_128,
+                        t.user_data_64,
+                        t.user_data_32,
+                        t.ledger,
+                        t.code,
+                        t.timestamp,
+                        min,
+                        max,
+                        filter,
+                    )
+                })
+                .collect();
+            if filter.flags.reversed() {
+                expected.sort_unstable_by_key(|t| std::cmp::Reverse(t.timestamp));
+            } else {
+                expected.sort_unstable_by_key(|t| t.timestamp);
+            }
+            expected.truncate(limit);
+            assert_eq!(
+                results,
+                expected[..results.len()],
+                "transfers-groove index scan must mirror the committed store"
+            );
+
+            return transfer_batch_to_bytes(&results);
+        }
+        self.query_transfers(filter)
     }
 
     /// Build the [`ChangeEvent`] reported for a recorded account event
@@ -9464,6 +9784,23 @@ mod tests {
         body
     }
 
+    /// Encode a [`QueryFilter`] into the 64-byte `query_accounts`/
+    /// `query_transfers` request body (mirroring [`bytes_to_query_filter`]).
+    fn query_filter_bytes(filter: &QueryFilter) -> Vec<u8> {
+        let mut body = Vec::with_capacity(64);
+        body.extend_from_slice(&filter.user_data_128.to_le_bytes());
+        body.extend_from_slice(&filter.user_data_64.to_le_bytes());
+        body.extend_from_slice(&filter.user_data_32.to_le_bytes());
+        body.extend_from_slice(&filter.ledger.to_le_bytes());
+        body.extend_from_slice(&filter.code.to_le_bytes());
+        body.extend_from_slice(&filter.reserved);
+        body.extend_from_slice(&filter.timestamp_min.to_le_bytes());
+        body.extend_from_slice(&filter.timestamp_max.to_le_bytes());
+        body.extend_from_slice(&filter.limit.to_le_bytes());
+        body.extend_from_slice(&filter.flags.as_raw().to_le_bytes());
+        body
+    }
+
     #[test]
     fn get_account_transfers_returns_transfers_for_debits_and_credits() {
         let mut sm = StateMachine::default();
@@ -10327,6 +10664,292 @@ mod tests {
         let transfers = sm.execute(Operation::QUERY_TRANSFERS, 0, &body);
         // No transfers exist; empty reply.
         assert!(transfers.is_empty());
+    }
+
+    #[test]
+    fn query_accounts_resolves_through_mounted_groove() {
+        let mut storage = forest_storage();
+        let mut sm = StateMachine::default();
+        {
+            let mut forest = Forest::init(test_superblock(), forest_grid_options(), 32);
+            open_forest(&mut forest, &mut storage);
+            sm.mount_forest(forest);
+        }
+        // One account per batch, so each has a distinct timestamp: 10/20/30/40.
+        let mut with_ud64 = Account { id: 1, ledger: 721, code: 9, ..Account::default() };
+        with_ud64.user_data_64 = 111;
+        let _ = sm.create_accounts_with_storage(&[with_ud64], 10, Some(&mut storage));
+        let mut with_all = Account { id: 2, ledger: 722, code: 10, ..Account::default() };
+        with_all.user_data_128 = 999;
+        with_all.user_data_32 = 5;
+        let _ = sm.create_accounts_with_storage(&[with_all], 20, Some(&mut storage));
+        let mut with_ud32 = Account { id: 3, ledger: 721, code: 9, ..Account::default() };
+        with_ud32.user_data_64 = 111;
+        with_ud32.user_data_32 = 7;
+        let _ = sm.create_accounts_with_storage(&[with_ud32], 30, Some(&mut storage));
+        let mut plain = Account { id: 4, ledger: 722, code: 10, ..Account::default() };
+        plain.user_data_64 = 222;
+        let _ = sm.create_accounts_with_storage(&[plain], 40, Some(&mut storage));
+
+        let mut q = |filter: &QueryFilter| -> Vec<u64> {
+            let body = sm.execute_with_storage(
+                Operation::QUERY_ACCOUNTS,
+                0,
+                &query_filter_bytes(filter),
+                Some(&mut storage),
+            );
+            assert_eq!(
+                body,
+                sm.execute(Operation::QUERY_ACCOUNTS, 0, &query_filter_bytes(filter)),
+                "groove query_accounts byte-identical to the committed store"
+            );
+            let accounts = bytes_to_account_batch(&body).expect("valid account batch");
+            accounts.iter().map(|account| account.timestamp).collect()
+        };
+
+        let all = query_filter();
+        assert_eq!(q(&all), [10, 20, 30, 40]);
+        let range = QueryFilter { timestamp_min: 11, timestamp_max: 35, ..query_filter() };
+        assert_eq!(q(&range), [20, 30]);
+        let open_ended = QueryFilter { timestamp_min: 31, ..query_filter() };
+        assert_eq!(q(&open_ended), [40]);
+        let desc = QueryFilter { flags: QueryFilterFlags::REVERSED, limit: 2, ..query_filter() };
+        assert_eq!(q(&desc), [40, 30]);
+        let limited = QueryFilter { limit: 2, ..query_filter() };
+        assert_eq!(q(&limited), [10, 20]);
+
+        // Each non-zero equality filter AND-intersects its own index scan.
+        let ud64 = QueryFilter { user_data_64: 111, ..query_filter() };
+        assert_eq!(q(&ud64), [10, 30]);
+        let ud128 = QueryFilter { user_data_128: 999, ..query_filter() };
+        assert_eq!(q(&ud128), [20]);
+        let ud32 = QueryFilter { user_data_32: 7, ..query_filter() };
+        assert_eq!(q(&ud32), [30]);
+        let ledger = QueryFilter { ledger: 721, ..query_filter() };
+        assert_eq!(q(&ledger), [10, 30]);
+        let code = QueryFilter { code: 9, ..query_filter() };
+        assert_eq!(q(&code), [10, 30]);
+        let and = QueryFilter { user_data_64: 111, code: 9, ..query_filter() };
+        assert_eq!(q(&and), [10, 30]);
+        let no_match = QueryFilter { user_data_64: 111, ledger: 722, ..query_filter() };
+        assert!(q(&no_match).is_empty());
+    }
+
+    #[test]
+    fn query_transfers_resolves_through_mounted_groove() {
+        let mut storage = forest_storage();
+        let mut sm = StateMachine::default();
+        {
+            let mut forest = Forest::init(test_superblock(), forest_grid_options(), 32);
+            open_forest(&mut forest, &mut storage);
+            sm.mount_forest(forest);
+        }
+        let _ = sm.create_accounts_with_storage(
+            &[
+                Account { id: 1, ledger: 1, code: 1, ..Account::default() },
+                Account { id: 2, ledger: 1, code: 1, ..Account::default() },
+            ],
+            10,
+            Some(&mut storage),
+        );
+        let _ = sm.create_accounts_with_storage(
+            &[
+                Account { id: 3, ledger: 50, code: 1, ..Account::default() },
+                Account { id: 4, ledger: 50, code: 1, ..Account::default() },
+            ],
+            12,
+            Some(&mut storage),
+        );
+        let _ = sm.create_accounts_with_storage(
+            &[
+                Account { id: 5, ledger: 1, code: 1, ..Account::default() },
+                Account { id: 6, ledger: 1, code: 1, ..Account::default() },
+            ],
+            14,
+            Some(&mut storage),
+        );
+        // One transfer per batch at t=20/30/40 (single-event batches keep the
+        // batch timestamp).
+        let mut with_ud128 = t(1, 2, 5);
+        with_ud128.user_data_128 = 777;
+        with_ud128.code = 11;
+        let _ = sm.create_transfers_with_storage(&[with_ud128], 20, Some(&mut storage));
+        let mut with_ud64 = Transfer { id: 1003, ..t(3, 4, 6) };
+        with_ud64.user_data_64 = 888;
+        with_ud64.ledger = 50;
+        let _ = sm.create_transfers_with_storage(&[with_ud64], 30, Some(&mut storage));
+        let mut with_ud32 = Transfer { id: 1004, ..t(5, 6, 7) };
+        with_ud32.user_data_32 = 9;
+        with_ud32.code = 12;
+        let _ = sm.create_transfers_with_storage(&[with_ud32], 40, Some(&mut storage));
+
+        let mut q = |filter: &QueryFilter| -> Vec<u64> {
+            let body = sm.execute_with_storage(
+                Operation::QUERY_TRANSFERS,
+                0,
+                &query_filter_bytes(filter),
+                Some(&mut storage),
+            );
+            assert_eq!(
+                body,
+                sm.execute(Operation::QUERY_TRANSFERS, 0, &query_filter_bytes(filter)),
+                "groove query_transfers byte-identical to the committed store"
+            );
+            let transfers = bytes_to_transfer_batch(&body).expect("valid transfer batch");
+            transfers.iter().map(|transfer| transfer.timestamp).collect()
+        };
+
+        let all = query_filter();
+        assert_eq!(q(&all), [20, 30, 40]);
+        let range = QueryFilter { timestamp_min: 21, timestamp_max: 39, ..query_filter() };
+        assert_eq!(q(&range), [30]);
+        let desc = QueryFilter { flags: QueryFilterFlags::REVERSED, limit: 2, ..query_filter() };
+        assert_eq!(q(&desc), [40, 30]);
+
+        let ud128 = QueryFilter { user_data_128: 777, ..query_filter() };
+        assert_eq!(q(&ud128), [20]);
+        let ud64 = QueryFilter { user_data_64: 888, ..query_filter() };
+        assert_eq!(q(&ud64), [30]);
+        let ud32 = QueryFilter { user_data_32: 9, ..query_filter() };
+        assert_eq!(q(&ud32), [40]);
+        let code = QueryFilter { code: 12, ..query_filter() };
+        assert_eq!(q(&code), [40]);
+        let ledger = QueryFilter { ledger: 50, ..query_filter() };
+        assert_eq!(q(&ledger), [30]);
+        let and = QueryFilter { user_data_128: 777, code: 11, ..query_filter() };
+        assert_eq!(q(&and), [20]);
+        let no_match = QueryFilter { user_data_64: 888, code: 11, ..query_filter() };
+        assert!(q(&no_match).is_empty());
+    }
+
+    #[test]
+    fn query_resolves_through_mounted_groove_from_durable_disk() {
+        let mut storage = forest_storage();
+        let mut sm = StateMachine::default();
+        {
+            let mut forest = Forest::init(test_superblock(), forest_grid_options(), 32);
+            open_forest(&mut forest, &mut storage);
+            sm.mount_forest(forest);
+        }
+        let mut with_ud = Account { id: 1, ledger: 721, code: 9, ..Account::default() };
+        with_ud.user_data_64 = 111;
+        let mut plain = Account { id: 2, ledger: 722, code: 10, ..Account::default() };
+        plain.user_data_64 = 222;
+        let _ = sm.create_accounts_with_storage(&[with_ud], 10, Some(&mut storage));
+        let _ = sm.create_accounts_with_storage(&[plain], 20, Some(&mut storage));
+        // A separate ledger-1 pair backs the transfers (account ledger == transfer
+        // ledger is required); those accounts land at ts 11/12.
+        let _ = sm.create_accounts_with_storage(
+            &[
+                Account { id: 3, ledger: 1, code: 1, ..Account::default() },
+                Account { id: 4, ledger: 1, code: 1, ..Account::default() },
+            ],
+            12,
+            Some(&mut storage),
+        );
+        let mut with_ud32 = t(3, 4, 5);
+        with_ud32.user_data_32 = 7;
+        with_ud32.code = 11;
+        let mut with_ud64 = Transfer { id: 1003, ..t(3, 4, 6) };
+        with_ud64.user_data_64 = 99;
+        with_ud64.code = 12;
+        let _ = sm.create_transfers_with_storage(&[with_ud32], 21, Some(&mut storage));
+        let _ = sm.create_transfers_with_storage(&[with_ud64], 22, Some(&mut storage));
+
+        // Flush to L0 and checkpoint, then reopen a fresh forest over the same
+        // storage (cold grid cache: every index and value block comes from disk).
+        let bar_ops = constants::LSM_COMPACTION_OPS as u64;
+        let bar_start = compaction::HALF_BAR_BEAT_COUNT as u64 * 2;
+        for _bar in 0..2 {
+            for op in bar_start..bar_start + bar_ops {
+                sm.compact(op, Some(&mut storage));
+            }
+        }
+        let (manifest_refs, free_set_refs) = sm.checkpoint(Some(&mut storage));
+        let highest_address = free_set_refs
+            .blocks_acquired
+            .last_block_address
+            .max(free_set_refs.blocks_released.last_block_address);
+        let reopen_view = SuperBlockView {
+            storage_size: DATA_FILE_SIZE_MIN as u64 + highest_address * BLOCK_SIZE as u64,
+            manifest_block_count: manifest_refs.block_count,
+            manifest_oldest_address: manifest_refs.oldest_address,
+            manifest_oldest_checksum: manifest_refs.oldest_checksum,
+            manifest_newest_address: manifest_refs.newest_address,
+            manifest_newest_checksum: manifest_refs.newest_checksum,
+            ..test_superblock()
+        };
+        let mut forest_b = Forest::init(reopen_view, forest_grid_options(), 32);
+        forest_b.open(
+            GridOpenReferences {
+                blocks_acquired: free_set_refs.blocks_acquired,
+                blocks_released: free_set_refs.blocks_released,
+            },
+            &mut storage,
+            0,
+        );
+        let mut done = false;
+        for _ in 0..1000 {
+            forest_b.poll(&mut storage);
+            if forest_b.accounts.objects.is_opened()
+                && forest_b.transfers.objects.is_opened()
+                && forest_b.is_idle()
+            {
+                done = true;
+                break;
+            }
+        }
+        assert!(done, "reopen must complete");
+        assert!(
+            forest_b.accounts.objects.manifest_table_count() >= 1
+                && forest_b.transfers.objects.manifest_table_count() >= 1,
+            "the reopened forest restores the flushed objects tables"
+        );
+        sm.forest = Some(Box::new(forest_b));
+
+        // ── Disk tables (cold cache: index scans + object resolutions read
+        // from storage).
+        let mut q_accounts = |filter: &QueryFilter| -> Vec<u64> {
+            let body = sm.execute_with_storage(
+                Operation::QUERY_ACCOUNTS,
+                0,
+                &query_filter_bytes(filter),
+                Some(&mut storage),
+            );
+            assert_eq!(
+                body,
+                sm.execute(Operation::QUERY_ACCOUNTS, 0, &query_filter_bytes(filter)),
+                "disk-groove query_accounts byte-identical to the committed store"
+            );
+            let accounts = bytes_to_account_batch(&body).expect("valid account batch");
+            accounts.iter().map(|account| account.timestamp).collect()
+        };
+        assert_eq!(q_accounts(&query_filter()), [10, 11, 12, 20]);
+        let ledger = QueryFilter { ledger: 721, ..query_filter() };
+        assert_eq!(q_accounts(&ledger), [10]);
+        let ud64 = QueryFilter { user_data_64: 111, ..query_filter() };
+        assert_eq!(q_accounts(&ud64), [10]);
+
+        let mut q_transfers = |filter: &QueryFilter| -> Vec<u64> {
+            let body = sm.execute_with_storage(
+                Operation::QUERY_TRANSFERS,
+                0,
+                &query_filter_bytes(filter),
+                Some(&mut storage),
+            );
+            assert_eq!(
+                body,
+                sm.execute(Operation::QUERY_TRANSFERS, 0, &query_filter_bytes(filter)),
+                "disk-groove query_transfers byte-identical to the committed store"
+            );
+            let transfers = bytes_to_transfer_batch(&body).expect("valid transfer batch");
+            transfers.iter().map(|transfer| transfer.timestamp).collect()
+        };
+        assert_eq!(q_transfers(&query_filter()), [21, 22]);
+        let ud32 = QueryFilter { user_data_32: 7, ..query_filter() };
+        assert_eq!(q_transfers(&ud32), [21]);
+        let code12 = QueryFilter { code: 12, ..query_filter() };
+        assert_eq!(q_transfers(&code12), [22]);
     }
 
     // ── Upstream golden cross-validation ─────────────────────────────────
