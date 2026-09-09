@@ -11223,6 +11223,334 @@ mod tests {
         }
     }
 
+    // ── Long-script drift sweep ───────────────────────────────────────────
+    //
+    // The cleared-stores tests above prove each read family resolves from the
+    // grooves over a single fixture. The sweep goes further: it interleaves a
+    // long deterministic script covering every write family — accounts (a
+    // HISTORY one, distinct user_data/ledger), a single-phase transfer,
+    // pendings, post/void, a linked chain, the pulse expiry pump, and an
+    // imported batch — and after EVERY committed write re-runs all six read
+    // families through both the committed-store path (the oracle) and the
+    // mounted grooves, asserting byte-identity before moving on. The grooves
+    // and the stores must never drift at any intermediate state, and the
+    // fixtures below exercise the exactly code that resolves an account updated
+    // in place by transfers (see the resolve_timestamp_object precedence that
+    // the pre-`ebf824d` staleness bug tripped over).
+
+    /// The six read families exercised by the sweep, with bodies that resolve
+    /// against the sweep script's fixture (accounts 1..4 + imported 5; transfers
+    /// 1002..1004; account 1's history).
+    fn sweep_read_families() -> Vec<(Operation, Vec<u8>)> {
+        let lookup_accounts_body: Vec<u8> =
+            [1_u128, 2, 3, 4, 999].into_iter().flat_map(u128::to_le_bytes).collect();
+        let lookup_transfers_body: Vec<u8> =
+            [1002_u128, 1003, 1004, 999].into_iter().flat_map(u128::to_le_bytes).collect();
+        vec![
+            (Operation::LOOKUP_ACCOUNTS, lookup_accounts_body),
+            (Operation::LOOKUP_TRANSFERS, lookup_transfers_body),
+            (
+                Operation::GET_ACCOUNT_TRANSFERS,
+                account_filter_bytes(&account_filter(
+                    1,
+                    AccountFilterFlags::DEBITS | AccountFilterFlags::CREDITS,
+                )),
+            ),
+            (
+                Operation::GET_ACCOUNT_BALANCES,
+                account_filter_bytes(&account_filter(
+                    1,
+                    AccountFilterFlags::DEBITS | AccountFilterFlags::CREDITS,
+                )),
+            ),
+            (Operation::GET_CHANGE_EVENTS, change_filter_bytes(&change_filter(0, 0, 100))),
+            (Operation::QUERY_ACCOUNTS, query_filter_bytes(&query_filter())),
+            (Operation::QUERY_TRANSFERS, query_filter_bytes(&query_filter())),
+        ]
+    }
+
+    /// Run all six read families through both the committed-store path (the
+    /// oracle) and the mounted grooves, asserting every reply is byte-identical
+    /// at the current state. Returns the oracle replies.
+    fn assert_read_families_match(
+        sm: &mut StateMachine,
+        storage: &mut dyn Storage,
+    ) -> Vec<Vec<u8>> {
+        sweep_read_families()
+            .into_iter()
+            .map(|(operation, body)| {
+                let oracle = sm.execute(operation, 0, &body);
+                let reply = sm.execute_with_storage(operation, 0, &body, Some(storage));
+                assert_eq!(
+                    reply, oracle,
+                    "mounted {operation:?} must match the committed-store oracle at this point"
+                );
+                oracle
+            })
+            .collect()
+    }
+
+    /// Assert the sweep oracle replies are all non-empty (so the clear-and-
+    /// re-assert is meaningful), naming the family that is not.
+    fn assert_sweep_replies_non_empty(oracle: &[Vec<u8>]) {
+        for (index, reply) in oracle.iter().enumerate() {
+            let family = sweep_read_families()[index].0;
+            assert!(!reply.is_empty(), "read family {family:?} must answer after the sweep script");
+        }
+    }
+
+    /// The first half of the sweep script: accounts (one HISTORY, distinct
+    /// user_data/ledger), a single-phase transfer, and three pendings — one
+    /// posted (1003), one voided (1007 in phase B), one due to expire via the
+    /// phase-B pulse (1005). `step` runs after every committed write.
+    fn mounted_sweep_phase_a(
+        sm: &mut StateMachine,
+        storage: &mut dyn Storage,
+        mut step: impl FnMut(&mut StateMachine, &mut dyn Storage),
+    ) {
+        let mut with_ud = Account { id: 1, ledger: 1, code: 1, ..Account::default() };
+        with_ud.user_data_64 = 111;
+        with_ud.flags = AccountFlags::HISTORY;
+        let mut plain = Account { id: 2, ledger: 1, code: 2, ..Account::default() };
+        plain.user_data_64 = 222;
+        let mut ud32 = Account { id: 3, ledger: 1, code: 1, ..Account::default() };
+        ud32.user_data_32 = 77;
+        let _ = sm.create_accounts_with_storage(
+            &[with_ud, plain, ud32, Account { id: 4, ledger: 2, ..Account::default() }],
+            10,
+            Some(storage),
+        );
+        step(sm, storage);
+        let _ = sm.create_transfers_with_storage(&[t(1, 2, 5)], 20, Some(storage));
+        step(sm, storage);
+        let _ = sm.create_transfers_with_storage(
+            &[Transfer { id: 1003, flags: TransferFlags::PENDING, timeout: 100, ..t(1, 2, 50) }],
+            25,
+            Some(storage),
+        );
+        step(sm, storage);
+        let _ = sm.create_transfers_with_storage(
+            &[Transfer { id: 1005, flags: TransferFlags::PENDING, timeout: 40, ..t(3, 2, 30) }],
+            30,
+            Some(storage),
+        );
+        step(sm, storage);
+        let _ = sm.create_transfers_with_storage(
+            &[Transfer { id: 1007, flags: TransferFlags::PENDING, timeout: 999, ..t(2, 3, 40) }],
+            32,
+            Some(storage),
+        );
+        step(sm, storage);
+        let _ = sm.create_transfers_with_storage(
+            &[Transfer {
+                id: 1004,
+                pending_id: 1003,
+                amount: u128::MAX,
+                flags: TransferFlags::POST_PENDING_TRANSFER,
+                ..Transfer::default()
+            }],
+            35,
+            Some(storage),
+        );
+        step(sm, storage);
+    }
+
+    /// The second half of the sweep script: a void of pending 1007, a two-member
+    /// linked chain, the pulse expiry pump (expiring pending 1005, due at 70),
+    /// and an imported transfer carrying its own timestamp. `step` runs after
+    /// every committed write.
+    fn mounted_sweep_phase_b(
+        sm: &mut StateMachine,
+        storage: &mut dyn Storage,
+        mut step: impl FnMut(&mut StateMachine, &mut dyn Storage),
+    ) {
+        let _ = sm.create_transfers_with_storage(
+            &[Transfer {
+                id: 1006,
+                pending_id: 1007,
+                amount: u128::MAX,
+                flags: TransferFlags::VOID_PENDING_TRANSFER,
+                ..Transfer::default()
+            }],
+            40,
+            Some(storage),
+        );
+        step(sm, storage);
+        let _ = sm.create_transfers_with_storage(
+            &[
+                Transfer { id: 2001, flags: TransferFlags::LINKED, ..t(2, 1, 7) },
+                Transfer { id: 3001, ..t(3, 1, 9) },
+            ],
+            45,
+            Some(storage),
+        );
+        step(sm, storage);
+        // Pending 1005 (created @30, timeout 40) is due at 70; the expiry event
+        // is stamped 70 and the committed stores' account history gains the
+        // posted→pending balance rollback for accounts 2 and 3.
+        sm.expire_pending_transfers_with_storage(70, Some(storage));
+        step(sm, storage);
+        let _ = sm.create_transfers_with_storage(
+            &[imported_transfer(5, 71, TransferFlags::IMPORTED)],
+            75,
+            Some(storage),
+        );
+        step(sm, storage);
+    }
+
+    /// A long interleaved write script is mirrored into the grooves without ever
+    /// drifting from the committed stores: after every committed write (including
+    /// the expiry pump and the imported batch) all six read families resolve
+    /// byte-identically through the grooves and the stores, and after the whole
+    /// script the grooves alone reproduce every reply once the stores are
+    /// deleted. This is the same oracle-vs-groove proof as the cleared-stores
+    /// tests, but exercised against every intermediate state of a mixed history
+    /// (in-place account updates included).
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn mounted_reads_never_drift_from_a_long_write_script() {
+        let mut storage = forest_storage();
+        let mut sm = StateMachine::default();
+        {
+            let mut forest = Forest::init(test_superblock(), forest_grid_options(), 32);
+            open_forest(&mut forest, &mut storage);
+            sm.mount_forest(forest);
+        }
+        mounted_sweep_phase_a(&mut sm, &mut storage, |sm, storage| {
+            assert_read_families_match(sm, storage);
+        });
+        let oracle_a = assert_read_families_match(&mut sm, &mut storage);
+        assert_sweep_replies_non_empty(&oracle_a);
+        mounted_sweep_phase_b(&mut sm, &mut storage, |sm, storage| {
+            assert_read_families_match(sm, storage);
+        });
+        let oracle = assert_read_families_match(&mut sm, &mut storage);
+        assert_sweep_replies_non_empty(&oracle);
+
+        // Delete every committed store and re-assert: the grooves alone resolve
+        // the whole mixed history for all six read families.
+        sm.accounts.clear();
+        sm.transfers.clear();
+        sm.transfers_by_timestamp.clear();
+        sm.transfers_pending.clear();
+        sm.transfers_orphaned.clear();
+        sm.account_events.clear();
+        sm.account_events_index.clear();
+        assert!(
+            sm.execute(Operation::LOOKUP_ACCOUNTS, 0, &sweep_read_families()[0].1).is_empty(),
+            "the committed accounts store was cleared"
+        );
+
+        for ((operation, body), expected) in sweep_read_families().into_iter().zip(oracle) {
+            let reply = sm.execute_with_storage(operation, 0, &body, Some(&mut storage));
+            assert_eq!(
+                reply, expected,
+                "mounted {operation:?} must resolve the full write script without the plain stores"
+            );
+        }
+    }
+
+    /// The durable version of the drift sweep: phase A is flushed to disk and
+    /// checkpointed, the forest is reopened cold, the cold grooves must still
+    /// match the stores across all six read families, and then phase B — the
+    /// expiry pump (which scans the cold `expires_at` index) and the imported
+    /// batch — executes against the reopened forest, with byte-identity asserted
+    /// after every write and after deleting the stores.
+    #[test]
+    #[allow(clippy::too_many_lines)] // flush + checkpoint + reopen scaffolding
+    fn mounted_reads_never_drift_from_a_long_write_script_on_durable_disk() {
+        let mut storage = forest_storage();
+        let mut sm = StateMachine::default();
+        {
+            let mut forest = Forest::init(test_superblock(), forest_grid_options(), 32);
+            open_forest(&mut forest, &mut storage);
+            sm.mount_forest(forest);
+        }
+        mounted_sweep_phase_a(&mut sm, &mut storage, |sm, storage| {
+            assert_read_families_match(sm, storage);
+        });
+
+        // Flush the phase-A mutables to L0 disk tables (two full bars), then
+        // checkpoint durably and reopen a fresh forest over the same storage.
+        let bar_ops = constants::LSM_COMPACTION_OPS as u64;
+        let bar_start = compaction::HALF_BAR_BEAT_COUNT as u64 * 2;
+        for _bar in 0..2 {
+            for op in bar_start..bar_start + bar_ops {
+                sm.compact(op, Some(&mut storage));
+            }
+        }
+        let (manifest_refs, free_set_refs) = sm.checkpoint(Some(&mut storage));
+        let highest_address = free_set_refs
+            .blocks_acquired
+            .last_block_address
+            .max(free_set_refs.blocks_released.last_block_address);
+        let reopen_view = SuperBlockView {
+            storage_size: DATA_FILE_SIZE_MIN as u64 + highest_address * BLOCK_SIZE as u64,
+            manifest_block_count: manifest_refs.block_count,
+            manifest_oldest_address: manifest_refs.oldest_address,
+            manifest_oldest_checksum: manifest_refs.oldest_checksum,
+            manifest_newest_address: manifest_refs.newest_address,
+            manifest_newest_checksum: manifest_refs.newest_checksum,
+            ..test_superblock()
+        };
+        let mut forest_b = Forest::init(reopen_view, forest_grid_options(), 32);
+        forest_b.open(
+            GridOpenReferences {
+                blocks_acquired: free_set_refs.blocks_acquired,
+                blocks_released: free_set_refs.blocks_released,
+            },
+            &mut storage,
+            0,
+        );
+        let mut done = false;
+        for _ in 0..1000 {
+            forest_b.poll(&mut storage);
+            if forest_b.accounts.objects.is_opened()
+                && forest_b.transfers.objects.is_opened()
+                && forest_b.account_events.objects.is_opened()
+                && forest_b.is_idle()
+            {
+                done = true;
+                break;
+            }
+        }
+        assert!(done, "reopen must complete");
+        sm.forest = Some(Box::new(forest_b));
+
+        // The cold phase-A reads still match the stores, byte for byte.
+        let oracle_a = assert_read_families_match(&mut sm, &mut storage);
+        assert_sweep_replies_non_empty(&oracle_a);
+
+        // Phase B against the reopened forest: the expiry pump scans the cold
+        // expires_at index, and the imported batch merges at op commit 75.
+        mounted_sweep_phase_b(&mut sm, &mut storage, |sm, storage| {
+            assert_read_families_match(sm, storage);
+        });
+        let oracle = assert_read_families_match(&mut sm, &mut storage);
+        assert_sweep_replies_non_empty(&oracle);
+
+        // Delete every committed store and re-assert from the durable grooves.
+        sm.accounts.clear();
+        sm.transfers.clear();
+        sm.transfers_by_timestamp.clear();
+        sm.transfers_pending.clear();
+        sm.transfers_orphaned.clear();
+        sm.account_events.clear();
+        sm.account_events_index.clear();
+        assert!(
+            sm.execute(Operation::LOOKUP_ACCOUNTS, 0, &sweep_read_families()[0].1).is_empty(),
+            "the committed accounts store was cleared"
+        );
+
+        for ((operation, body), expected) in sweep_read_families().into_iter().zip(oracle) {
+            let reply = sm.execute_with_storage(operation, 0, &body, Some(&mut storage));
+            assert_eq!(
+                reply, expected,
+                "cold-disk mounted {operation:?} must resolve the full write script without the plain stores"
+            );
+        }
+    }
+
     // ── Upstream golden cross-validation ─────────────────────────────────
 
     /// Snake-cases a [`CreateAccountStatus`] into upstream's `@tagName`
