@@ -271,6 +271,12 @@ fn get_u16(src: &[u8; SIZE], offset: usize) -> u16 {
     u16::from_le_bytes(buf)
 }
 
+fn get_u64(src: &[u8; SIZE], offset: usize) -> u64 {
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(&src[offset..offset + 8]);
+    u64::from_le_bytes(buf)
+}
+
 fn put_u128(dst: &mut [u8; SIZE], offset: usize, value: u128) {
     dst[offset..offset + 16].copy_from_slice(&value.to_le_bytes());
 }
@@ -1139,6 +1145,235 @@ impl Prepare {
     }
 }
 
+/// Helper: whether a value is all-zero, used to skip reserved/padding fields.
+///
+/// DEVIATION: upstream's `format_header_field_skip` calls `stdx.zeroed` with compile-time
+/// reflection; without that we implement a `Zeroed` trait for the concrete field types.
+trait Zeroed {
+    fn is_zeroed(&self) -> bool;
+}
+
+impl Zeroed for u128 {
+    fn is_zeroed(&self) -> bool {
+        *self == 0
+    }
+}
+impl Zeroed for u64 {
+    fn is_zeroed(&self) -> bool {
+        *self == 0
+    }
+}
+impl Zeroed for u32 {
+    fn is_zeroed(&self) -> bool {
+        *self == 0
+    }
+}
+impl Zeroed for u16 {
+    fn is_zeroed(&self) -> bool {
+        *self == 0
+    }
+}
+impl Zeroed for u8 {
+    fn is_zeroed(&self) -> bool {
+        *self == 0
+    }
+}
+impl Zeroed for crate::multiversion::Release {
+    fn is_zeroed(&self) -> bool {
+        self.value == 0
+    }
+}
+impl<const N: usize> Zeroed for [u8; N] {
+    fn is_zeroed(&self) -> bool {
+        self.iter().all(|&b| b == 0)
+    }
+}
+
+/// Returns true if the field should be skipped (reserved/padding field and value is zeroed).
+/// Mirrors upstream's `format_header_field_skip`.
+fn is_skipped<T: Zeroed>(name: &str, val: &T) -> bool {
+    let skippable =
+        name.starts_with("reserved") || name.ends_with("reserved") || name.ends_with("padding");
+    skippable && val.is_zeroed()
+}
+
+/// Returns the fully-qualified tag name upstream's `{any}` prints for a `vsr.Command` enum
+/// value, e.g. `vsr.Command.prepare`.
+fn command_name_vsr(command: Command) -> String {
+    format!("vsr.Command.{command}")
+}
+
+/// Returns the fully-qualified name upstream's `{any}` prints for a `vsr.Operation`, e.g.
+/// `vsr.Operation.root` / `vsr.Operation.pulse`. Values with no named tag (the `_` catch-all)
+/// print `vsr.Operation.{n}!` (matching Zig's enum `{any}`).
+fn operation_name_vsr(operation: crate::Operation) -> String {
+    let name = match operation {
+        crate::Operation::RESERVED => "reserved",
+        crate::Operation::ROOT => "root",
+        crate::Operation::REGISTER => "register",
+        crate::Operation::RECONFIGURE => "reconfigure",
+        crate::Operation::PULSE => "pulse",
+        crate::Operation::UPGRADE => "upgrade",
+        crate::Operation::NOOP => "noop",
+        _ => return format!("vsr.Operation.{}!", operation.0),
+    };
+    format!("vsr.Operation.{name}")
+}
+
+/// Format a `[u8; N]` field as Zig's `{any}` array format: `{ 2, 0, 0, 0, ... }`.
+fn write_u8_array<const N: usize>(
+    f: &mut impl core::fmt::Write,
+    name: &str,
+    val: &[u8; N],
+) -> core::fmt::Result {
+    write!(f, ", .{name}={{ ")?;
+    for (i, byte) in val.iter().enumerate() {
+        if i > 0 {
+            write!(f, ", ")?;
+        }
+        write!(f, "{byte}")?;
+    }
+    write!(f, " }}")
+}
+
+impl core::fmt::Display for Prepare {
+    /// Port of upstream's `format_header(Prepare)` / `format_header_field`, byte-for-byte against
+    /// the `message_header_zig "format_header"` snapshot.
+    ///
+    /// Field order matches upstream's `@typeInfo(Prepare).struct.fields` iteration.
+    /// Skip rule: fields starting with `reserved`, ending with `reserved`, or ending with
+    /// `padding` are omitted when zero (matching upstream's `format_header_field_skip`).
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // `, ` separator between fields; the first (checksum) field uses a space separator.
+        macro_rules! field {
+            // U128 checksum-style → `{x:0>32}` (bare 32-char hex, no `0x`), matching `{any}`.
+            ($name:expr, $val:expr, hex) => {
+                if !is_skipped($name, &$val) {
+                    write!(f, ", .{}={:032x}", $name, $val)?;
+                }
+            };
+            // U128 decimal-style (`cluster`, `client`).
+            ($name:expr, $val:expr, dec128) => {
+                if !is_skipped($name, &$val) {
+                    write!(f, ", .{}={}", $name, $val)?;
+                }
+            };
+            // Any Display type.
+            ($name:expr, $val:expr) => {
+                if !is_skipped($name, &$val) {
+                    write!(f, ", .{}={}", $name, $val)?;
+                }
+            };
+        }
+
+        write!(f, "Prepare{{ .checksum={:032x}", self.checksum)?;
+        field!("checksum_padding", self.checksum_padding, hex);
+        field!("checksum_body", self.checksum_body, hex);
+        field!("checksum_body_padding", self.checksum_body_padding, hex);
+        field!("nonce_reserved", self.nonce_reserved, dec128);
+        field!("cluster", self.cluster, dec128);
+        field!("size", self.size);
+        field!("epoch", self.epoch);
+        field!("view", self.view);
+        field!("release", self.release);
+        field!("protocol", self.protocol);
+        write!(f, ", .command={}", command_name_vsr(self.command))?;
+        field!("replica", self.replica);
+        if !is_skipped("reserved_frame", &self.reserved_frame) {
+            write_u8_array(f, "reserved_frame", &self.reserved_frame)?;
+        }
+        field!("parent", self.parent, hex);
+        field!("parent_padding", self.parent_padding, hex);
+        field!("request_checksum", self.request_checksum, hex);
+        field!("request_checksum_padding", self.request_checksum_padding, hex);
+        field!("checkpoint_id", self.checkpoint_id, hex);
+        field!("client", self.client, dec128);
+        field!("op", self.op);
+        field!("commit", self.commit);
+        field!("timestamp", self.timestamp);
+        field!("request", self.request);
+        write!(f, ", .operation={}", operation_name_vsr(self.operation))?;
+        if !is_skipped("reserved", &self.reserved) {
+            write_u8_array(f, "reserved", &self.reserved)?;
+        }
+        write!(f, " }}")
+    }
+}
+
+/// Format a `Prepare` directly from raw wire bytes, without requiring `command ==
+/// Command::Prepare`.
+///
+/// Used by `inspect superblock`: unoccupied view-header slots and corrupt frames are not
+/// valid `Prepare` frames (their command byte may be `reserved` or garbage), yet upstream's
+/// `bytesAsValue` + `format_header` still prints them field-by-field. DEVIATION: a command
+/// byte that maps to no [`Command`] prints the ordinal (`vsr.Command.{n}!`) rather than
+/// failing to decode.
+///
+/// Field order and skip rules match [`Prepare`]'s `Display` exactly.
+pub(crate) fn format_prepare_raw(
+    f: &mut impl core::fmt::Write,
+    bytes: &[u8; SIZE],
+) -> core::fmt::Result {
+    macro_rules! field {
+        // U128 checksum-style → `{x:0>32}` (bare 32-char hex, no `0x`), matching `{any}`.
+        ($name:expr, $val:expr, hex) => {
+            if !is_skipped($name, &$val) {
+                write!(f, ", .{}={:032x}", $name, $val)?;
+            }
+        };
+        // U128 decimal-style (`cluster`, `client`).
+        ($name:expr, $val:expr, dec128) => {
+            if !is_skipped($name, &$val) {
+                write!(f, ", .{}={}", $name, $val)?;
+            }
+        };
+        // Any Display type.
+        ($name:expr, $val:expr) => {
+            if !is_skipped($name, &$val) {
+                write!(f, ", .{}={}", $name, $val)?;
+            }
+        };
+    }
+
+    write!(f, "Prepare{{ .checksum={:032x}", get_u128(bytes, 0))?;
+    field!("checksum_padding", get_u128(bytes, 16), hex);
+    field!("checksum_body", get_u128(bytes, 32), hex);
+    field!("checksum_body_padding", get_u128(bytes, 48), hex);
+    field!("nonce_reserved", get_u128(bytes, 64), dec128);
+    field!("cluster", get_u128(bytes, 80), dec128);
+    field!("size", get_u32(bytes, 96));
+    field!("epoch", get_u32(bytes, 100));
+    field!("view", get_u32(bytes, 104));
+    field!("release", Release { value: get_u32(bytes, 108) });
+    field!("protocol", get_u16(bytes, 112));
+    let command = match Command::from_u8(bytes[114]) {
+        Some(command) => format!("vsr.Command.{command}"),
+        None => format!("vsr.Command.{}!", bytes[114]),
+    };
+    write!(f, ", .command={command}")?;
+    field!("replica", bytes[115]);
+    let reserved_frame = get_arr12(bytes, 116);
+    if !is_skipped("reserved_frame", &reserved_frame) {
+        write_u8_array(f, "reserved_frame", &reserved_frame)?;
+    }
+    field!("parent", get_u128(bytes, 128), hex);
+    field!("parent_padding", get_u128(bytes, 144), hex);
+    field!("request_checksum", get_u128(bytes, 160), hex);
+    field!("request_checksum_padding", get_u128(bytes, 176), hex);
+    field!("checkpoint_id", get_u128(bytes, 192), hex);
+    field!("client", get_u128(bytes, 208), dec128);
+    field!("op", get_u64(bytes, 224));
+    field!("commit", get_u64(bytes, 232));
+    field!("timestamp", get_u64(bytes, 240));
+    field!("request", get_u32(bytes, 248));
+    write!(f, ", .operation={}", operation_name_vsr(crate::Operation(bytes[252])))?;
+    let reserved = [bytes[253], bytes[254], bytes[255]];
+    if !is_skipped("reserved", &reserved) {
+        write_u8_array(f, "reserved", &reserved)?;
+    }
+    write!(f, " }}")
+}
+
 typed_header! {
     #[allow(clippy::struct_field_names)] // upstream field names
     pub struct PrepareOk : Command::PrepareOk,
@@ -1915,6 +2150,61 @@ mod tests {
     #[test]
     fn checksum_body_empty_is_the_empty_input_tag() {
         assert_eq!(checksum_body_empty(), tigerbeetle_core::checksum::checksum(&[]));
+    }
+
+    /// Pins `Display for Prepare` against the upstream `format_header` snapshots in
+    /// `src/vsr/message_header.zig:1744` (`test format_header`).
+    #[test]
+    fn prepare_display_matches_upstream_format_header() {
+        let prepare = Prepare {
+            checksum: 0x0123_4567_89ab_cdef,
+            checksum_body: 0xfedc_ba98_7654_3210,
+            cluster: 1,
+            size: 321,
+            view: 2,
+            release: Release::ZERO,
+            command: Command::Prepare,
+            replica: 3,
+            parent: 0xabc_deff_edcb_a001_2345_6789,
+            request_checksum: 0x0001_2345_6789_8765_4321,
+            checkpoint_id: 4,
+            client: 5,
+            op: 5,
+            commit: 6,
+            timestamp: 123_456_789,
+            request: 7,
+            operation: crate::Operation::PULSE,
+            ..Prepare::default()
+        };
+        assert_eq!(
+            prepare.to_string(),
+            "Prepare{ .checksum=00000000000000000123456789abcdef, \
+             .checksum_body=0000000000000000fedcba9876543210, .cluster=1, .size=321, .epoch=0, \
+             .view=2, .release=0.0.0, .protocol=0, .command=vsr.Command.prepare, .replica=3, \
+             .parent=000000000abcdeffedcba00123456789, \
+             .request_checksum=00000000000000012345678987654321, \
+             .checkpoint_id=00000000000000000000000000000004, .client=5, .op=5, .commit=6, \
+             .timestamp=123456789, .request=7, .operation=vsr.Operation.pulse }"
+        );
+
+        // Non-zero padding/reserved fields are printed:
+        let mut prepare_nonzero = prepare;
+        prepare_nonzero.checksum_padding = 1;
+        prepare_nonzero.reserved_frame[0] = 2;
+        prepare_nonzero.reserved[0] = 3;
+        assert_eq!(
+            prepare_nonzero.to_string(),
+            "Prepare{ .checksum=00000000000000000123456789abcdef, \
+             .checksum_padding=00000000000000000000000000000001, \
+             .checksum_body=0000000000000000fedcba9876543210, .cluster=1, .size=321, .epoch=0, \
+             .view=2, .release=0.0.0, .protocol=0, .command=vsr.Command.prepare, .replica=3, \
+             .reserved_frame={ 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, \
+             .parent=000000000abcdeffedcba00123456789, \
+             .request_checksum=00000000000000012345678987654321, \
+             .checkpoint_id=00000000000000000000000000000004, .client=5, .op=5, .commit=6, \
+             .timestamp=123456789, .request=7, .operation=vsr.Operation.pulse, \
+             .reserved={ 3, 0, 0 } }"
+        );
     }
     /// Pins the command-tail offsets of a typed header against upstream's extern struct layout,
     /// and verifies the frame prefix matches the base `Header` encoding exactly.

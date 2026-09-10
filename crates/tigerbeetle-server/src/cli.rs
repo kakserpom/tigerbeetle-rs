@@ -21,7 +21,7 @@ use tigerbeetle_core::constants::{
     LSM_MANIFEST_MEMORY_SIZE_MIN, LSM_MANIFEST_MEMORY_SIZE_MULTIPLIER, LSM_MANIFEST_NODE_SIZE,
     MESSAGE_BODY_SIZE_MAX, MESSAGE_SIZE_MAX, PIPELINE_PREPARE_QUEUE_MAX,
     PIPELINE_REQUEST_QUEUE_MAX, REPLICAS_MAX, SECTOR_SIZE, STANDBYS_MAX,
-    STORAGE_SIZE_LIMIT_DEFAULT, STORAGE_SIZE_LIMIT_MAX, TICK_MS,
+    STORAGE_SIZE_LIMIT_DEFAULT, STORAGE_SIZE_LIMIT_MAX, SUPERBLOCK_COPIES, TICK_MS,
 };
 use tigerbeetle_core::net::SocketAddress;
 use tigerbeetle_core::stdx::{
@@ -34,6 +34,7 @@ use tigerbeetle_vsr::groove::{
     AccountObjectsCacheSpec, TransferObjectsCacheSpec, TransferPendingObjectsCacheSpec,
 };
 use tigerbeetle_vsr::socket::{ClusterAddress, ParseAddressesError, parse_address_and_port};
+use tigerbeetle_vsr::storage::Storage;
 
 /// The build version printed by `version` (upstream `constants.semver`).
 ///
@@ -2114,8 +2115,9 @@ fn parse_args_amqp(args: &[String]) -> Result<CommandAmqp, String> {
 // Runnable commands (port of `main.zig` subcommands that map onto in-scope infrastructure)
 // -----------------------------------------------------------------------------------
 
-/// Execute a parsed command. `format` (over a real data file) and `version` run; all other
-/// subcommands parse and validate but the executor is deferred to the async-loop slice.
+/// Execute a parsed command. `format` (over a real data file), `inspect superblock`, and
+/// `version` run; all other subcommands parse and validate but the executor is deferred to the
+/// async-loop slice.
 pub fn run_command(command: &Command) -> CliResult<()> {
     match command {
         Command::Version(cmd) => {
@@ -2123,11 +2125,63 @@ pub fn run_command(command: &Command) -> CliResult<()> {
             Ok(())
         }
         Command::Format(cmd) => command_format(cmd),
+        Command::Inspect(cmd) => command_inspect(cmd),
         other => Err(format!(
             "the '{name}' subcommand is parsed and validated but not yet implemented in this \
              port (the async event loop is deferred)",
             name = other.name()
         )),
+    }
+}
+
+/// `main.zig command_inspect`: runs the read-only `inspect superblock` data-file query; the
+/// remaining inspect subcommands are parsed but deferred to the async-loop slice.
+pub fn command_inspect(cmd: &CommandInspect) -> CliResult<()> {
+    match cmd {
+        CommandInspect::DataFile(datafile) => match &datafile.query {
+            InspectQuery::Superblock => command_inspect_superblock(datafile),
+            // Upstream inspects these over spread/blocked grid blocks in the async loop.
+            InspectQuery::Wal { .. }
+            | InspectQuery::Replies { .. }
+            | InspectQuery::Grid { .. }
+            | InspectQuery::Manifest { .. }
+            | InspectQuery::Tables { .. } => Err(format!(
+                "inspect data-file query '{}' is parsed and validated but not yet implemented in \
+                 this port (the async event loop is deferred)",
+                inspect_query_name(&datafile.query)
+            )),
+        },
+        CommandInspect::Constants
+        | CommandInspect::Metrics
+        | CommandInspect::Op(_)
+        | CommandInspect::Integrity(_) => Err(format!(
+            "inspect subcommand '{}' is parsed and validated but not yet implemented in this \
+             port (the async event loop is deferred)",
+            inspect_subcommand_name(cmd)
+        )),
+    }
+}
+
+/// Human name of an [`InspectQuery`] variant (upstream switches on the Zig union).
+fn inspect_query_name(query: &InspectQuery) -> &'static str {
+    match query {
+        InspectQuery::Superblock => "superblock",
+        InspectQuery::Wal { .. } => "wal",
+        InspectQuery::Replies { .. } => "replies",
+        InspectQuery::Grid { .. } => "grid",
+        InspectQuery::Manifest { .. } => "manifest",
+        InspectQuery::Tables { .. } => "tables",
+    }
+}
+
+/// Human name of a non-data-file [`CommandInspect`] variant.
+fn inspect_subcommand_name(cmd: &CommandInspect) -> &'static str {
+    match cmd {
+        CommandInspect::Constants => "constants",
+        CommandInspect::Metrics => "metrics",
+        CommandInspect::Op(_) => "op",
+        CommandInspect::DataFile(_) => "data-file",
+        CommandInspect::Integrity(_) => "integrity",
     }
 }
 
@@ -2209,6 +2263,96 @@ pub fn command_format(cmd: &CommandFormat) -> CliResult<()> {
     println!("info(format): data_file_size = {size}");
     println!("info(format): superblock.sequence = {}", sb.working().sequence);
     Ok(())
+}
+
+/// `main.zig command_inspect_superblock`: read the superblock zone and print every field of
+/// the (grouped) copies.
+///
+/// Port of upstream `Inspector.create` + `MainType.inspect_superblock`: the zone is read
+/// raw, a working superblock quorum gates the version check, and the whole zone is then
+/// printed without ever decoding structurally (corrupt copies are shown, not rejected).
+pub fn command_inspect_superblock(datafile: &CommandInspectDataFile) -> CliResult<()> {
+    use tigerbeetle_vsr::storage::FileStorage;
+    use tigerbeetle_vsr::superblock::DATA_FILE_SIZE_MIN;
+
+    let mut storage = FileStorage::open_read_only(&datafile.path).map_err(|err| err.to_string())?;
+    // Upstream `open_data_file(.inspect)` panics if the file is shorter than
+    // `data_file_size_min`; per the no-panics-on-disk-input porting rule we return an error
+    // with the same wording.
+    if storage.size() < DATA_FILE_SIZE_MIN as u64 {
+        return Err("data file inode size was truncated or corrupted".into());
+    }
+
+    let output = drive_inspect_superblock(&mut storage, &datafile.path)?;
+    print!("{output}");
+    Ok(())
+}
+
+/// Feed the superblock zone of `storage` through the inspect exporter, returning the printed
+/// output (port of `MainType.inspect_superblock` with the `Inspector` read/verify prologue).
+///
+/// Mirrors upstream's sequencing: read the whole superblock zone, select the working quorum
+/// (failing the inspect if none reaches the open threshold), verify the version, then print.
+pub fn drive_inspect_superblock(
+    storage: &mut dyn tigerbeetle_vsr::storage::Storage,
+    path: &str,
+) -> CliResult<String> {
+    use tigerbeetle_vsr::Zone;
+    use tigerbeetle_vsr::inspect::inspect_superblock;
+    use tigerbeetle_vsr::storage::{Completion, ReadRequest};
+    use tigerbeetle_vsr::superblock::{
+        SUPERBLOCK_COPY_SIZE, SUPERBLOCK_HEADER_SIZE, SUPERBLOCK_VERSION, SUPERBLOCK_ZONE_SIZE,
+    };
+    use tigerbeetle_vsr::superblock_quorums::{SuperBlockQuorums, Threshold};
+
+    storage.read_sectors(ReadRequest {
+        zone: Zone::Superblock,
+        offset_in_zone: 0,
+        buffer: vec![0u8; SUPERBLOCK_ZONE_SIZE],
+    });
+    let buffer = match storage
+        .next_completion()
+        .unwrap_or_else(|| unreachable!("read completes synchronously"))
+    {
+        Completion::Read(request) => request.buffer,
+        Completion::Write(_) => unreachable!("only a read was submitted"),
+    };
+
+    // Upstream `bytesAsValue`s each copy directly out of the zone buffer.
+    let copies: Vec<[u8; SUPERBLOCK_HEADER_SIZE]> = (0..SUPERBLOCK_COPIES)
+        .map(|i| {
+            let offset = i * SUPERBLOCK_COPY_SIZE;
+            buffer[offset..offset + SUPERBLOCK_HEADER_SIZE]
+                .try_into()
+                .unwrap_or_else(|_| unreachable!("slice length checked"))
+        })
+        .collect();
+
+    // The working-quorum check + version gate replicate `Inspector.create`'s
+    // `read_superblock(null)`; printing then reads the raw copies back.
+    let headers: Vec<tigerbeetle_vsr::superblock::SuperBlockHeader> = copies
+        .iter()
+        .map(|copy| {
+            tigerbeetle_vsr::inspect::decode_lenient(copy)
+                .unwrap_or_else(|| unreachable!("lenient decode never fails"))
+        })
+        .collect();
+    let mut quorums = SuperBlockQuorums::default();
+    let quorum = quorums.working(&headers, Threshold::Open).map_err(|err| err.to_string())?;
+    if !quorum.valid() {
+        return Err("SuperBlockQuorumInvalid".into());
+    }
+    let version = quorum.header().version;
+    if version != SUPERBLOCK_VERSION {
+        return Err(format!(
+            "invalid superblock version; inspector supports version={SUPERBLOCK_VERSION}, \
+             version in {path}={version}"
+        ));
+    }
+
+    let mut output = String::new();
+    inspect_superblock(&mut output, &copies).map_err(|err| err.to_string())?;
+    Ok(output)
 }
 
 // -----------------------------------------------------------------------------------
@@ -2964,6 +3108,199 @@ mod tests {
             sb.working().vsr_state.checkpoint.header.checksum,
             0x5146_b8d0_e1f6_9ca2_e686_7c42_bb82_63b7
         );
+    }
+
+    #[test]
+    fn inspect_superblock_matches_format_golden() {
+        let mut storage = MemoryStorage::new(DATA_FILE_SIZE_MIN as u64);
+        storage.poison_image();
+        let cmd = CommandFormat {
+            cluster: 0,
+            replica: 0,
+            replica_count: 6,
+            development: false,
+            path: "0_0.tigerbeetle".into(),
+            log_debug: false,
+        };
+        drive_format(&mut storage, &cmd);
+
+        let output = drive_inspect_superblock(&mut storage, "0_0.tigerbeetle").unwrap();
+        let lines: Vec<&str> = output.lines().collect();
+
+        // All four copies are fresh-identical, so every non-`copy` field is a single `||||` group.
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("|||| checksum=0xe74149b8992b51011bc15348f1b5dd77"))
+        );
+        assert!(lines.iter().any(|line| line.starts_with("|||| version=2")));
+        assert!(lines.iter().any(|line| line.starts_with("|||| release_format=0.0.1")));
+        assert!(lines.iter().any(|line| line.starts_with("|||| sequence=1")));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("|||| cluster=0x00000000000000000000000000000000"))
+        );
+        assert!(lines.iter().any(|line| line.ends_with(" view_headers_count=1")));
+
+        // Only the `copy` field disagrees across copies → four single-member groups.
+        assert!(lines.contains(&"|___ copy=0"));
+        assert!(lines.contains(&"_|__ copy=1"));
+        assert!(lines.contains(&"__|_ copy=2"));
+        assert!(lines.contains(&"___| copy=3"));
+
+        // No group splits anywhere else, and the copy field uses its own mask.
+        assert_eq!(
+            lines.iter().filter(|line| !line.starts_with('|') && !line.starts_with('_')).count(),
+            0
+        );
+
+        // `vsr_state.members` = 12 members (test-min config), each printed as hex.
+        let member_lines: Vec<&&str> =
+            lines.iter().filter(|line| line.contains("vsr_state.members[")).collect();
+        assert_eq!(member_lines.len(), 12);
+        // replica_id and members[0] are root_members(0)[0] = 0x459d... (upstream golden,
+        // `tbcross_main.zig` root_members(0)).
+        assert!(lines.iter().any(|line| {
+            line.starts_with("|||| vsr_state.replica_id=0x459d6840872cd4709b6b08975dc2a6bb")
+        }));
+        assert!(lines.iter().any(|line| {
+            line.starts_with("|||| vsr_state.members[0]=0x459d6840872cd4709b6b08975dc2a6bb")
+        }));
+
+        // `view_headers_all` = 7 view headers, printed field-by-field as `Prepare`.
+        let view_header_lines: Vec<&&str> =
+            lines.iter().filter(|line| line.contains("view_headers_all[")).collect();
+        assert_eq!(view_header_lines.len(), 7);
+
+        // The checkpoint header is the root `Prepare` (command=prepare, operation=root) with
+        // checksum 0x5146... (upstream golden, `tbcross_format.zig`).
+        assert!(lines.iter().any(|line| line.starts_with(
+            "|||| vsr_state.checkpoint.header=Prepare{ .checksum=5146b8d0e1f69ca2e6867c42bb8263b7"
+        )));
+        assert!(lines.iter().any(|line| line.contains("vsr_state.checkpoint.header=Prepare{")
+            && line.ends_with(".operation=vsr.Operation.root }")));
+    }
+
+    /// `inspect superblock` over a real data file produced by `command_format`: the printed
+    /// checksum and headlines match the golden values, and `run_command` routes the parsed
+    /// `inspect superblock` subcommand here.
+    #[test]
+    fn inspect_superblock_real_data_file() {
+        let path = std::env::temp_dir()
+            .join(format!("tigerbeetle-rs-cli-inspect-{}.tigerbeetle", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let cmd = CommandFormat {
+            cluster: 0,
+            replica: 0,
+            replica_count: 6,
+            development: false,
+            path: path.to_str().unwrap().to_owned(),
+            log_debug: false,
+        };
+        command_format(&cmd).unwrap();
+
+        let mut storage = tigerbeetle_vsr::storage::FileStorage::open_read_only(&cmd.path).unwrap();
+        let output = drive_inspect_superblock(&mut storage, &cmd.path).unwrap();
+        assert!(output.contains("|||| checksum=0xe74149b8992b51011bc15348f1b5dd77"));
+        assert!(output.contains("|||| version=2"));
+        assert!(output.contains("_|__ copy=1"));
+
+        // The end-to-end `run_command` path also succeeds and prints.
+        let parsed = parse_args(&args(&["inspect", "superblock", &cmd.path])).unwrap();
+        run_command(&parsed).unwrap();
+        // Deferred inspect subcommands still report the deferred executor.
+        let wal = parse_args(&args(&["inspect", "wal", &cmd.path])).unwrap();
+        let err = run_command(&wal).unwrap_err();
+        assert!(err.contains("not yet implemented"), "unexpected: {err}");
+
+        let _ = std::fs::remove_file(&cmd.path);
+    }
+
+    /// Protocol deviations that abort `inspect superblock` (upstream `vsr.fatal`/errors) keep
+    /// the CLI quiet with an explicit error.
+    #[test]
+    fn inspect_superblock_errors() {
+        use tigerbeetle_core::checksum::checksum;
+        use tigerbeetle_vsr::Zone;
+        use tigerbeetle_vsr::storage::{Completion, ReadRequest, WriteRequest};
+        use tigerbeetle_vsr::superblock::{SUPERBLOCK_COPY_SIZE, SUPERBLOCK_HEADER_SIZE};
+
+        // Missing file → filesystem error.
+        let missing = std::env::temp_dir()
+            .join(format!("tigerbeetle-rs-cli-inspect-missing-{}.tigerbeetle", std::process::id()));
+        let _ = std::fs::remove_file(&missing);
+        assert!(
+            command_inspect_superblock(&CommandInspectDataFile {
+                path: missing.to_str().unwrap().to_owned(),
+                query: InspectQuery::Superblock,
+            })
+            .is_err()
+        );
+
+        // Truncated file → upstream's panic wording, surfaced as an error.
+        let truncated = std::env::temp_dir().join(format!(
+            "tigerbeetle-rs-cli-inspect-truncated-{}.tigerbeetle",
+            std::process::id()
+        ));
+        std::fs::write(&truncated, [0u8; SECTOR_SIZE]).unwrap();
+        let err = command_inspect_superblock(&CommandInspectDataFile {
+            path: truncated.to_str().unwrap().to_owned(),
+            query: InspectQuery::Superblock,
+        })
+        .unwrap_err();
+        assert_eq!(err, "data file inode size was truncated or corrupted");
+        let _ = std::fs::remove_file(&truncated);
+
+        // Bumped version (re-verified checksum) → upstream's fatal wording, no output.
+        let path = std::env::temp_dir()
+            .join(format!("tigerbeetle-rs-cli-inspect-version-{}.tigerbeetle", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        command_format(&CommandFormat {
+            cluster: 0,
+            replica: 0,
+            replica_count: 6,
+            development: false,
+            path: path.to_str().unwrap().to_owned(),
+            log_debug: false,
+        })
+        .unwrap();
+
+        let mut storage = tigerbeetle_vsr::storage::FileStorage::open(&path, 0).unwrap();
+        storage.read_sectors(ReadRequest {
+            zone: Zone::Superblock,
+            offset_in_zone: 0,
+            buffer: vec![0u8; tigerbeetle_vsr::superblock::SUPERBLOCK_ZONE_SIZE],
+        });
+        let mut zone = match storage
+            .next_completion()
+            .unwrap_or_else(|| unreachable!("read completes synchronously"))
+        {
+            Completion::Read(request) => request.buffer,
+            Completion::Write(_) => unreachable!("only a read was submitted"),
+        };
+        for copy in 0..SUPERBLOCK_COPIES {
+            let base = copy * SUPERBLOCK_COPY_SIZE;
+            zone[base + 34..base + 36].copy_from_slice(&3u16.to_le_bytes());
+            let sum = checksum(&zone[base + 34..base + SUPERBLOCK_HEADER_SIZE]);
+            zone[base..base + 16].copy_from_slice(&sum.to_le_bytes());
+        }
+        storage.write_sectors(WriteRequest {
+            zone: Zone::Superblock,
+            offset_in_zone: 0,
+            buffer: zone,
+        });
+        let _ = storage
+            .next_completion()
+            .unwrap_or_else(|| unreachable!("write completes synchronously"));
+
+        let mut storage = tigerbeetle_vsr::storage::FileStorage::open_read_only(&path).unwrap();
+        let err = drive_inspect_superblock(&mut storage, path.to_str().unwrap()).unwrap_err();
+        assert!(
+            err.contains("invalid superblock version; inspector supports version=2, version in")
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 
     /// `command_format` creates a real data file whose superblock reopens to the golden

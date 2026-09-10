@@ -79,6 +79,39 @@ impl Command {
     }
 }
 
+impl core::fmt::Display for Command {
+    /// Port of upstream's `{any}` format for `vsr.Command` enum: snake_case tag name.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Reserved => f.write_str("reserved"),
+            Self::Ping => f.write_str("ping"),
+            Self::Pong => f.write_str("pong"),
+            Self::PingClient => f.write_str("ping_client"),
+            Self::PongClient => f.write_str("pong_client"),
+            Self::Request => f.write_str("request"),
+            Self::Prepare => f.write_str("prepare"),
+            Self::PrepareOk => f.write_str("prepare_ok"),
+            Self::Reply => f.write_str("reply"),
+            Self::Commit => f.write_str("commit"),
+            Self::ExitView => f.write_str("exit_view"),
+            Self::JoinView => f.write_str("join_view"),
+            Self::GetView => f.write_str("get_view"),
+            Self::GetHeaders => f.write_str("get_headers"),
+            Self::GetPrepare => f.write_str("get_prepare"),
+            Self::GetReply => f.write_str("get_reply"),
+            Self::Headers => f.write_str("headers"),
+            Self::Eviction => f.write_str("eviction"),
+            Self::GetBlocks => f.write_str("get_blocks"),
+            Self::Block => f.write_str("block"),
+            Self::View => f.write_str("view"),
+            Self::Deprecated12 => f.write_str("deprecated_12"),
+            Self::Deprecated21 => f.write_str("deprecated_21"),
+            Self::Deprecated22 => f.write_str("deprecated_22"),
+            Self::Deprecated23 => f.write_str("deprecated_23"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

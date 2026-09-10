@@ -21,6 +21,7 @@ pub mod grid;
 pub mod grid_blocks_missing;
 pub mod grid_scrubber;
 pub mod groove;
+pub mod inspect;
 pub mod io;
 pub mod journal;
 pub mod jv_quorum;
@@ -145,6 +146,32 @@ impl Operation {
                 | Self::UPGRADE
                 | Self::NOOP
         )
+    }
+}
+
+impl core::fmt::Display for Operation {
+    /// Port of upstream's `print_value` for `vsr.Operation`:
+    /// - VSR-reserved ordinals (< `VSR_OPERATIONS_RESERVED`): prints `"{int}!"` (upstream
+    ///   `valid(StateMachine.Operation)` returns false for these).
+    /// - Known state-machine ordinals: prints the tag name (`"create_accounts"`, etc.).
+    /// - Unknown ordinals: prints `"{int}!"`.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.vsr_reserved() {
+            return write!(f, "{}!", self.0);
+        }
+        match *self {
+            Self::STATE_MACHINE_PULSE => write!(f, "pulse"),
+            Self::CREATE_ACCOUNTS => write!(f, "create_accounts"),
+            Self::CREATE_TRANSFERS => write!(f, "create_transfers"),
+            Self::GET_CHANGE_EVENTS => write!(f, "get_change_events"),
+            Self::LOOKUP_ACCOUNTS => write!(f, "lookup_accounts"),
+            Self::LOOKUP_TRANSFERS => write!(f, "lookup_transfers"),
+            Self::GET_ACCOUNT_TRANSFERS => write!(f, "get_account_transfers"),
+            Self::GET_ACCOUNT_BALANCES => write!(f, "get_account_balances"),
+            Self::QUERY_ACCOUNTS => write!(f, "query_accounts"),
+            Self::QUERY_TRANSFERS => write!(f, "query_transfers"),
+            _ => write!(f, "{}!", self.0),
+        }
     }
 }
 

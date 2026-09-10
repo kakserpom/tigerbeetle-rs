@@ -63,6 +63,14 @@ impl Release {
     }
 }
 
+impl core::fmt::Display for Release {
+    /// Port of upstream's `Release.format`: `{major}.{minor}.{patch}`.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let t = self.triple();
+        write!(f, "{}.{}.{}", t.major, t.minor, t.patch)
+    }
+}
+
 /// Port of `multiversion.ReleaseTriple`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReleaseTriple {

@@ -345,6 +345,19 @@ impl FileStorage {
         Ok(Self { file, file_size: size, completions: Vec::new() })
     }
 
+    /// Opens an existing data file for read-only inspection.
+    ///
+    /// DEVIATION: upstream opens with `purpose=.inspect`, `direct_io_optional`, and R/W; this
+    /// port opens read-only without `O_DIRECT`, matching the interim `std::fs` storage.
+    ///
+    /// # Errors
+    /// Returns any filesystem error from open/metadata.
+    pub fn open_read_only(path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
+        let file = std::fs::OpenOptions::new().read(true).open(path)?;
+        let file_size = file.metadata()?.len();
+        Ok(Self { file, file_size, completions: Vec::new() })
+    }
+
     fn drive_read_request(&self, mut request: ReadRequest) -> Completion {
         let base_offset = verify_request(request.zone, &request.buffer, request.offset_in_zone);
         drive_read(&mut request, base_offset, |slice, offset| read_step(&self.file, slice, offset));
