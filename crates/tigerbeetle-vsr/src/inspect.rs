@@ -1,5 +1,5 @@
-//! Port of upstream `src/tigerbeetle/inspect.zig`'s read-only `inspect superblock` and
-//! `inspect manifest` data-file exporters.
+//! Port of upstream `src/tigerbeetle/inspect.zig`'s read-only `inspect superblock`,
+//! `inspect manifest`, and `inspect wal` data-file exporters.
 //!
 //! `inspect_superblock` prints the four stored copies of the superblock (from a data file's
 //! superblock zone), grouping the copies by the value of each field, exactly as upstream does
@@ -9,6 +9,11 @@
 //! through the `previous_manifest_block_*` links, printing each block's address/checksum and
 //! its per-event, per-level table-entry counts.
 //!
+//! `inspect_wal` prints one line per journal slot: the two header copies (the `wal_headers`
+//! zone and the prepare's own header in `wal_prepares`) group by whole-header equality, and
+//! each group's line carries the header's checksum/fields with a `|`/`X` valid-mark label like
+//! `||___0: `. `inspect_wal_slot` prints a single slot the same way plus its prepare body.
+//!
 //! Upstream relies on Zig's comptime `std.meta.fields(SuperBlockHeader)` to enumerate the
 //! struct layout; Rust has no reflection over struct fields, so the layout is spelled out in
 //! the [`Field`] trees below (mirroring superblock.zig's declaration order) and pinned against
@@ -17,11 +22,16 @@
 use core::fmt;
 
 use tigerbeetle_core::checksum::checksum;
-use tigerbeetle_core::constants::{MEMBERS_MAX, SECTOR_SIZE, SUPERBLOCK_COPIES, VIEW_HEADERS_MAX};
+use tigerbeetle_core::constants::{
+    JOURNAL_SIZE_HEADERS, JOURNAL_SLOT_COUNT, MEMBERS_MAX, MESSAGE_SIZE_MAX, SECTOR_SIZE,
+    SUPERBLOCK_COPIES, VIEW_HEADERS_MAX,
+};
 
+use crate::Operation;
+use crate::Zone;
 use crate::message_header::{SIZE, format_prepare_raw};
 use crate::multiversion::Release;
-use crate::storage::Storage;
+use crate::storage::{Completion, ReadRequest, Storage};
 use crate::superblock::{SUPERBLOCK_HEADER_SIZE, SuperBlockHeader};
 
 /// Port of `SuperBlockHeader.CHECKSUM_IGNORE_SIZE` (src/vsr/superblock.zig): the checksum
@@ -381,6 +391,10 @@ fn get_u16(bytes: &[u8], offset: usize) -> u16 {
     )
 }
 
+fn get_u8(bytes: &[u8], offset: usize) -> u8 {
+    bytes[offset]
+}
+
 /// Port of `Inspector.read_block` (src/tigerbeetle/inspect.zig): read one grid block and
 /// verify its header checksum, body checksum, and (when given) expected block checksum.
 ///
@@ -563,6 +577,268 @@ pub fn inspect_op(output: &mut impl fmt::Write, op: u64) -> fmt::Result {
         write!(output, "{:<15}+{:<4}", pair[0].op, pair[1].op - pair[0].op)?;
     }
     writeln!(output, "{:<20}", points[4].op)
+}
+
+/// Port of `Inspector.read_buffer` (src/tigerbeetle/inspect.zig): submit a `read_sectors` from
+/// a zone and block for its (synchronous) completion, returning the buffer.
+#[must_use]
+fn read_buffer(storage: &mut dyn Storage, zone: Zone, offset_in_zone: u64, len: usize) -> Vec<u8> {
+    storage.read_sectors(ReadRequest { zone, offset_in_zone, buffer: vec![0_u8; len] });
+    match storage.next_completion() {
+        Some(Completion::Read(request)) => request.buffer,
+        None | Some(Completion::Write(_)) => unreachable!("a read completes synchronously"),
+    }
+}
+
+/// Port of `Header.valid_checksum()` on raw header bytes: for the WAL inspector the header is
+/// read as bytes (upstream `bytesAsValue`), not decoded, so the checksum is computed over
+/// `bytes[16..]` — the whole header minus its first (checksum-sum) 16 bytes, exactly as
+/// `Header.calculate_checksum` does.
+#[must_use]
+fn valid_header_checksum(bytes: &[u8; SIZE]) -> bool {
+    get_u128(bytes, 0) == checksum(&bytes[16..])
+}
+
+/// Port of `Header.valid_checksum_body()` on raw header bytes: the `checksum_body` field
+/// (offset 32) must match the checksum of `body`.
+#[must_use]
+fn valid_header_checksum_body(bytes: &[u8; SIZE], body: &[u8]) -> bool {
+    get_u128(bytes, 32) == checksum(body)
+}
+
+/// Group the two WAL header copies (the `wal_headers` slot header and the prepare's own header)
+/// by whole-header equality — upstream `GroupByType(2).compare(as_bytes)` for both copies.
+fn wal_groups(wal_header: &[u8; SIZE], wal_prepare: &[u8; SIZE]) -> Vec<u16> {
+    let copies: [&[u8; SIZE]; 2] = [wal_header, wal_prepare];
+    let mut groups = Vec::new();
+    for a in 0..copies.len() {
+        let mut matches = 0u16;
+        for b in 0..copies.len() {
+            if copies[a] == copies[b] {
+                matches |= 1 << b;
+            }
+        }
+        if first_set(matches) == a {
+            groups.push(matches);
+        }
+    }
+    groups
+}
+
+/// Whether `mask` has bit `copy` set (upstream `bitset.is_set`).
+const fn is_set(mask: u16, copy: usize) -> bool {
+    mask & (1 << copy) != 0
+}
+
+/// Port of `print_value` for `vsr.Operation`: `Operation.valid(StateMachine.Operation)` +
+/// `tag_name` — known control-plane and state-machine operations print their bare tag name,
+/// unknown ordinals print `{n}!`.
+///
+/// DEVIATION: upstream resolves tag names at comptime over both enums; the port matches the
+/// control-plane ordinals here and delegates state-machine ordinals (≥
+/// `vsr_operations_reserved`) to [`Operation`]'s `Display`, which prints the same names.
+fn write_operation_name(output: &mut impl fmt::Write, operation: Operation) -> fmt::Result {
+    match operation {
+        Operation::RESERVED => write!(output, "reserved"),
+        Operation::ROOT => write!(output, "root"),
+        Operation::REGISTER => write!(output, "register"),
+        Operation::RECONFIGURE => write!(output, "reconfigure"),
+        Operation::PULSE => write!(output, "pulse"),
+        Operation::UPGRADE => write!(output, "upgrade"),
+        Operation::NOOP => write!(output, "noop"),
+        _ => write!(output, "{operation}"),
+    }
+}
+
+/// Port of `Inspector.inspect_wal` (src/tigerbeetle/inspect.zig): print one line per journal
+/// slot, per group of equal header copies, showing the slot's header checksum and fields.
+///
+/// Each slot holds two header copies (the `wal_headers` zone and the `wal_prepares` zone);
+/// identical copies form a single `||` group, differing copies split into `|_` (redundant
+/// header) and `_|` (prepare header). The mark is `|` when the copy's checksum is valid — and
+/// for groups covering the prepare header, also when its body checksum is valid — `X`
+/// otherwise. The label's `{slot:_>4}: ` suffix reproduces upstream's `{:_>4}: ` slot prefix.
+///
+/// Upstream's four `log.info` preamble lines explaining the column meanings go to stderr, so
+/// they are not part of the printed output.
+///
+/// # Errors
+///
+/// Returns the underlying formatting error if writing to `output` fails.
+pub fn inspect_wal(output: &mut impl fmt::Write, storage: &mut dyn Storage) -> fmt::Result {
+    let headers_buffer = read_buffer(storage, Zone::WalHeaders, 0, JOURNAL_SIZE_HEADERS);
+
+    for slot in 0..JOURNAL_SLOT_COUNT as usize {
+        let prepare_buffer = read_buffer(
+            storage,
+            Zone::WalPrepares,
+            (slot * MESSAGE_SIZE_MAX as usize) as u64,
+            MESSAGE_SIZE_MAX as usize,
+        );
+
+        let wal_header: [u8; SIZE] = headers_buffer[slot * SIZE..(slot + 1) * SIZE]
+            .try_into()
+            .unwrap_or_else(|_| unreachable!("slice length checked"));
+        let wal_prepare: [u8; SIZE] = prepare_buffer[..SIZE]
+            .try_into()
+            .unwrap_or_else(|_| unreachable!("slice length checked"));
+
+        // Upstream slices `prepare_buffer[@sizeOf(Header)..wal_prepare.size]`; a corrupt `size`
+        // out of the buffer would OOB-panic there, so per the no-panics-on-disk-input rule the
+        // body is treated as invalid instead.
+        let wal_prepare_body_valid = {
+            let size = get_u32(&wal_prepare, 96) as usize;
+            if (SIZE..=prepare_buffer.len()).contains(&size) {
+                valid_header_checksum(&wal_prepare)
+                    && valid_header_checksum_body(&wal_prepare, &prepare_buffer[SIZE..size])
+            } else {
+                false
+            }
+        };
+
+        for group in wal_groups(&wal_header, &wal_prepare) {
+            let header_index = first_set(group);
+            let header: &[u8; SIZE] = if header_index == 0 { &wal_header } else { &wal_prepare };
+            let header_valid =
+                valid_header_checksum(header) && (!is_set(group, 1) || wal_prepare_body_valid);
+
+            let mark = if header_valid { '|' } else { 'X' };
+            // The two mark chars reproduce upstream's `GroupByType(2)` bit order: `wal_headers`
+            // (redundant) first, `wal_prepares` second.
+            write!(output, "{}", if is_set(group, 0) { mark } else { '_' })?;
+            write!(output, "{}", if is_set(group, 1) { mark } else { '_' })?;
+            write!(output, "{slot:_>4}: ")?;
+
+            let checksum = get_u128(header, 0);
+            let release = Release { value: get_u32(header, 108) };
+            let view = get_u32(header, 104);
+            let op = get_u64(header, 224);
+            let size = get_u32(header, 96);
+            let operation = Operation(get_u8(header, 252));
+
+            write!(
+                output,
+                "checksum=0x{checksum:032x} release={release} view={view} op={op} \
+                 size={size} operation=",
+            )?;
+            write_operation_name(output, operation)?;
+            writeln!(output, " ")?;
+        }
+    }
+    Ok(())
+}
+
+/// Port of `Inspector.inspect_wal_slot` (src/tigerbeetle/inspect.zig): print a single journal
+/// slot — the two header copies grouped as in [`inspect_wal`], each printed with
+/// `label=Prepare{…}`, then the prepare body.
+///
+/// The slot headers print via the `Prepare` format fn (`format_header`), reproduced here by
+/// [`format_prepare_raw`] on the raw bytes. The body prints `(no body)` for zero-length
+/// bodies; event decoding is deferred (see [`write_prepare_body`]).
+///
+/// # Errors
+///
+/// Returns the underlying formatting error if writing to `output` fails.
+///
+/// # Panics
+///
+/// Panics if `slot` does not fit in the journal (upstream asserts).
+pub fn inspect_wal_slot(
+    output: &mut impl fmt::Write,
+    storage: &mut dyn Storage,
+    slot: usize,
+) -> fmt::Result {
+    assert!(slot <= JOURNAL_SLOT_COUNT as usize, "slot exceeds {}", JOURNAL_SLOT_COUNT - 1);
+
+    let headers_buffer = read_buffer(storage, Zone::WalHeaders, 0, JOURNAL_SIZE_HEADERS);
+    let prepare_buffer = read_buffer(
+        storage,
+        Zone::WalPrepares,
+        (slot * MESSAGE_SIZE_MAX as usize) as u64,
+        MESSAGE_SIZE_MAX as usize,
+    );
+
+    let wal_header: [u8; SIZE] = headers_buffer[slot * SIZE..(slot + 1) * SIZE]
+        .try_into()
+        .unwrap_or_else(|_| unreachable!("slice length checked"));
+    let wal_prepare: [u8; SIZE] =
+        prepare_buffer[..SIZE].try_into().unwrap_or_else(|_| unreachable!("slice length checked"));
+
+    let prepare_body_valid = {
+        let size = get_u32(&wal_prepare, 96) as usize;
+        if (SIZE..=prepare_buffer.len()).contains(&size) {
+            valid_header_checksum(&wal_prepare)
+                && valid_header_checksum_body(&wal_prepare, &prepare_buffer[SIZE..size])
+        } else {
+            false
+        }
+    };
+
+    for group in wal_groups(&wal_header, &wal_prepare) {
+        let header_index = first_set(group);
+        let header: &[u8; SIZE] = if header_index == 0 { &wal_header } else { &wal_prepare };
+        let header_mark = if valid_header_checksum(header) { '|' } else { 'X' };
+
+        let mut label = String::new();
+        label.push(if is_set(group, 0) { header_mark } else { '_' });
+        label.push(if is_set(group, 1) { header_mark } else { '_' });
+
+        // `print_struct(label, header)` where `Prepare` has a format fn prints
+        // `{label}=Prepare{…}` (via `format_header` → `format_prepare_raw`).
+        write!(output, "{label}=")?;
+        format_prepare_raw(output, header)?;
+        writeln!(output)?;
+    }
+
+    write_prepare_body(output, &prepare_buffer)?;
+
+    if !prepare_body_valid {
+        writeln!(output, "error: invalid prepare body!")?;
+    }
+    Ok(())
+}
+
+/// Port of `print_prepare_body` (src/tigerbeetle/inspect.zig): decode a prepare's body against
+/// the operation schema.
+///
+/// The control-plane schemas that have bodies (`reconfigure`, `upgrade`) would be printed
+/// event-by-event via `print_struct`; decoding them is deferred, so a nonzero body on those
+/// prints `error: unexpected body size=…, @sizeOf(Event)=…` like upstream does for body sizes
+/// that don't divide evenly. `(no body)` is printed for zero-length bodies — the only case a
+/// freshly formatted WAL reaches.
+///
+/// DEVIATION: upstream's `else` branch prints `@tagName(header.operation)`; the port writes
+/// the same bare name via [`write_operation_name`].
+///
+/// # Errors
+///
+/// Returns the underlying formatting error if writing to `output` fails.
+fn write_prepare_body(output: &mut impl fmt::Write, prepare: &[u8]) -> fmt::Result {
+    let header: &[u8; SIZE] =
+        &prepare[..SIZE].try_into().unwrap_or_else(|_| unreachable!("slice length checked"));
+    let operation = Operation(get_u8(header, 252));
+    let size = get_u32(header, 96) as usize;
+    let body_size = size.saturating_sub(SIZE);
+
+    // Upstream `operation_schemas` entry sizes: `.reserved`/`.root`/`.pulse` and the register
+    // body are `extern struct {}` (size 0); `.reconfigure` is `ReconfigurationRequest` (256);
+    // `.upgrade` is `UpgradeRequest` (16). State-machine event types are not yet ported.
+    let event_size = match operation {
+        Operation::RECONFIGURE => size_of::<crate::ReconfigurationRequest>(),
+        Operation::UPGRADE => size_of::<crate::UpgradeRequest>(),
+        _ => 0,
+    };
+
+    if body_size == 0 {
+        writeln!(output, "(no body)")
+    } else if event_size != 0 && body_size.is_multiple_of(event_size) {
+        // DEVIATION: per-event `print_struct` decoding deferred (needs the event schemas).
+        write!(output, "error: unimplemented operation=")?;
+        write_operation_name(output, operation)?;
+        writeln!(output)
+    } else {
+        writeln!(output, "error: unexpected body size={size}, @sizeOf(Event)={event_size}")
+    }
 }
 
 #[cfg(test)]
@@ -954,5 +1230,198 @@ mod tests {
                 "19             +2   21             +2   23             +8   31             +8   39                  \n",
             )
         );
+    }
+
+    /// A `MemoryStorage` formatted like a fresh replica data file, so both WAL zones hold the
+    /// per-slot `slot_header` prepares (root at slot 0, reserved elsewhere).
+    fn wal_storage() -> MemoryStorage {
+        use crate::replica_format::format;
+        use crate::superblock::{DATA_FILE_SIZE_MIN, FormatOptions};
+
+        let mut storage = MemoryStorage::new(DATA_FILE_SIZE_MIN as u64);
+        let _ = format(
+            &mut storage,
+            FormatOptions {
+                cluster: 0,
+                release: crate::multiversion::Release::MINIMUM,
+                replica: 0,
+                replica_count: 1,
+                view: None,
+            },
+        );
+        storage
+    }
+
+    /// The exact `inspect_wal` line for a valid formatted slot: one `||` group, the slot
+    /// header's fields, and the trailing space upstream's tuple `print_struct` writes after
+    /// every value (including the last).
+    fn wal_line(slot: u64) -> String {
+        use crate::replica_format::slot_header;
+
+        let header = slot_header(0, slot);
+        let operation = if slot == 0 { "root" } else { "reserved" };
+        format!(
+            "||{slot:_>4}: checksum=0x{:032x} release=0.0.0 view=0 op={slot} size=256 \
+             operation={operation} ",
+            header.checksum,
+        )
+    }
+
+    /// A freshly formatted WAL prints one line per slot: every slot's two header copies are
+    /// byte-identical (`||`), with valid checksums and no body.
+    #[test]
+    fn inspect_wal_fresh_format() {
+        let mut storage = wal_storage();
+        let mut output = String::new();
+        inspect_wal(&mut output, &mut storage).unwrap();
+
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines.len(), JOURNAL_SLOT_COUNT as usize);
+        for slot in 0..JOURNAL_SLOT_COUNT {
+            assert_eq!(lines[slot as usize], wal_line(u64::from(slot)));
+        }
+    }
+
+    /// `--slot` prints the single slot as `label=Prepare{…}` (the prepare's format fn, through
+    /// `format_prepare_raw`) plus its body — `(no body)` for the root prepare of a fresh file.
+    #[test]
+    fn inspect_wal_slot_prints_prepare_and_body() {
+        use crate::replica_format::slot_header;
+
+        let mut storage = wal_storage();
+        let mut output = String::new();
+        inspect_wal_slot(&mut output, &mut storage, 0).unwrap();
+
+        let header = slot_header(0, 0);
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines.len(), 2);
+        // `prepare_at`-style Display (format_header) must equal the raw-bytes `format_prepare_raw`.
+        assert_eq!(lines[0], format!("||={header}"));
+        assert_eq!(lines[1], "(no body)");
+
+        // A reserved slot is identical except for op/operation.
+        let mut output = String::new();
+        inspect_wal_slot(&mut output, &mut storage, 5).unwrap();
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines[0], format!("||={}", slot_header(0, 5)));
+        assert_eq!(lines[1], "(no body)");
+    }
+
+    /// A prepare whose header is corrupted in the `wal_prepares` zone only splits the slot into
+    /// two groups: the valid redundant header (`|_`) and the corrupt prepare (`_X`), whose
+    /// stored checksum value is still printed (it is the bytes at the front of the header).
+    #[test]
+    fn inspect_wal_marks_differing_headers() {
+        use crate::message_header::TypedHeader;
+        use crate::replica_format::slot_header;
+        use crate::storage::{Completion, WriteRequest};
+        use tigerbeetle_core::constants::MESSAGE_SIZE_MAX;
+
+        let mut storage = wal_storage();
+
+        let header = slot_header(0, 3);
+        // Flip a checksum-covered byte (100 is covered by the range 16..256) in the prepare
+        // copy only, so the two header copies differ and the prepare's checksum is invalid.
+        // The slot's prepare buffer is one `message_size_max` frame (sector-aligned).
+        let mut corrupt = vec![0_u8; MESSAGE_SIZE_MAX as usize];
+        corrupt[..SIZE].copy_from_slice(&header.to_wire());
+        corrupt[100] ^= 0xFF;
+        storage.write_sectors(WriteRequest {
+            zone: crate::Zone::WalPrepares,
+            offset_in_zone: 3 * u64::from(MESSAGE_SIZE_MAX),
+            buffer: corrupt,
+        });
+        let Completion::Write(_) = storage.next_completion().unwrap() else {
+            unreachable!("write was expected");
+        };
+
+        let mut output = String::new();
+        inspect_wal(&mut output, &mut storage).unwrap();
+        let lines: Vec<&str> = output.lines().collect();
+        // Slot 3 gains a second (group) line.
+        assert_eq!(lines.len(), JOURNAL_SLOT_COUNT as usize + 1);
+        for slot in 0..JOURNAL_SLOT_COUNT as usize {
+            if slot != 3 {
+                let expected = wal_line(slot as u64);
+                let index = if slot < 3 { slot } else { slot + 1 };
+                assert_eq!(lines[index], expected);
+            }
+        }
+        // `|_` is the valid redundant (wal_headers) copy; `_X` is the corrupt prepare copy.
+        assert_eq!(
+            lines[3],
+            format!(
+                "|____3: checksum=0x{:032x} release=0.0.0 view=0 op=3 size=256 \
+                 operation=reserved ",
+                header.checksum,
+            )
+        );
+        assert_eq!(
+            lines[4],
+            format!(
+                "_X___3: checksum=0x{:032x} release=0.0.0 view=0 op=3 size=256 \
+                 operation=reserved ",
+                header.checksum,
+            )
+        );
+    }
+
+    /// A `--slot` whose header's size is out of range (in both copies) groups as one `||`/`XX`
+    /// line and reports both the unexpected body size and the invalid body checksum error.
+    #[test]
+    fn inspect_wal_slot_rejects_invalid_body_size() {
+        use crate::message_header::TypedHeader;
+        use crate::replica_format::slot_header;
+        use crate::storage::{Completion, WriteRequest};
+        use tigerbeetle_core::constants::MESSAGE_SIZE_MAX;
+
+        let mut storage = wal_storage();
+
+        // Corrupt the size of slot 5 (bytes 96..100, covered by the checksum) so the body size
+        // is out of the prepare buffer's range. Write the identical header into both zones so
+        // the slot still groups as one `||` line.
+        let corrupt_header = {
+            let mut header = slot_header(0, 5).to_wire();
+            header[96..100].copy_from_slice(&u32::MAX.to_le_bytes());
+            header
+        };
+
+        let mut prepare = vec![0_u8; MESSAGE_SIZE_MAX as usize];
+        prepare[..SIZE].copy_from_slice(&corrupt_header);
+        storage.write_sectors(WriteRequest {
+            zone: crate::Zone::WalPrepares,
+            offset_in_zone: 5 * u64::from(MESSAGE_SIZE_MAX),
+            buffer: prepare,
+        });
+        let Completion::Write(_) = storage.next_completion().unwrap() else {
+            unreachable!("write was expected");
+        };
+
+        // The slot-5 header sits inside the headers zone's first sector; reread the whole zone,
+        // swap in the corrupt header, and rewrite.
+        let mut headers =
+            read_buffer(&mut storage, crate::Zone::WalHeaders, 0, JOURNAL_SIZE_HEADERS);
+        headers[5 * SIZE..6 * SIZE].copy_from_slice(&corrupt_header);
+        storage.write_sectors(WriteRequest {
+            zone: crate::Zone::WalHeaders,
+            offset_in_zone: 0,
+            buffer: headers,
+        });
+        let Completion::Write(_) = storage.next_completion().unwrap() else {
+            unreachable!("write was expected");
+        };
+
+        let mut output = String::new();
+        inspect_wal_slot(&mut output, &mut storage, 5).unwrap();
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines.len(), 3);
+        // Equal copies → `||`; the size change breaks the checksum → `X`. The `Prepare`
+        // Display (format_header) must match the raw-bytes `format_prepare_raw`.
+        assert_eq!(
+            lines[0],
+            format!("XX={}", crate::message_header::Prepare::from_wire(&corrupt_header).unwrap())
+        );
+        assert_eq!(lines[1], "error: unexpected body size=4294967295, @sizeOf(Event)=0");
+        assert_eq!(lines[2], "error: invalid prepare body!");
     }
 }

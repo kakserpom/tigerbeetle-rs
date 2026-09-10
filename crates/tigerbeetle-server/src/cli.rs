@@ -16,7 +16,7 @@ use std::mem::size_of;
 
 use tigerbeetle_core::constants::{
     CACHE_ACCOUNTS_SIZE_DEFAULT, CACHE_TRANSFERS_PENDING_SIZE_DEFAULT,
-    CACHE_TRANSFERS_SIZE_DEFAULT, CLIENTS_MAX, GRID_CACHE_SIZE_DEFAULT,
+    CACHE_TRANSFERS_SIZE_DEFAULT, CLIENTS_MAX, GRID_CACHE_SIZE_DEFAULT, JOURNAL_SLOT_COUNT,
     LSM_COMPACTION_QUEUE_READ_MAX, LSM_MANIFEST_MEMORY_SIZE_DEFAULT, LSM_MANIFEST_MEMORY_SIZE_MAX,
     LSM_MANIFEST_MEMORY_SIZE_MIN, LSM_MANIFEST_MEMORY_SIZE_MULTIPLIER, LSM_MANIFEST_NODE_SIZE,
     MESSAGE_BODY_SIZE_MAX, MESSAGE_SIZE_MAX, PIPELINE_PREPARE_QUEUE_MAX,
@@ -2135,9 +2135,9 @@ pub fn run_command(command: &Command) -> CliResult<()> {
     }
 }
 
-/// `main.zig command_inspect`: runs the read-only `inspect superblock`/`inspect manifest`
-/// data-file queries; the remaining inspect subcommands are parsed but deferred to the
-/// async-loop slice.
+/// `main.zig command_inspect`: runs the read-only `inspect superblock`/`inspect manifest`/
+/// `inspect wal` data-file queries; the remaining inspect subcommands are parsed but deferred
+/// to the async-loop slice.
 pub fn command_inspect(cmd: &CommandInspect) -> CliResult<()> {
     match cmd {
         CommandInspect::DataFile(datafile) => match &datafile.query {
@@ -2153,9 +2153,16 @@ pub fn command_inspect(cmd: &CommandInspect) -> CliResult<()> {
                 }
                 command_inspect_manifest(datafile)
             }
+            // Upstream validates `--slot` before constructing the inspector (`run_inspect`,
+            // `.wal` arm):
+            InspectQuery::Wal { slot } => {
+                if slot.is_some_and(|slot| slot >= JOURNAL_SLOT_COUNT as usize) {
+                    return Err(format!("--slot: slot exceeds {}", JOURNAL_SLOT_COUNT - 1));
+                }
+                command_inspect_wal(datafile)
+            }
             // Upstream inspects these over spread/blocked grid blocks in the async loop.
-            InspectQuery::Wal { .. }
-            | InspectQuery::Replies { .. }
+            InspectQuery::Replies { .. }
             | InspectQuery::Grid { .. }
             | InspectQuery::Tables { .. } => Err(format!(
                 "inspect data-file query '{}' is parsed and validated but not yet implemented in \
@@ -2338,6 +2345,35 @@ pub fn command_inspect_manifest(datafile: &CommandInspectDataFile) -> CliResult<
     Ok(())
 }
 
+/// `main.zig command_inspect_wal`: read the superblock (version gate), then print the journal
+/// WAL — every slot, or a single `--slot`.
+///
+/// Port of upstream `Inspector.create` + `MainType.inspect_wal`/`inspect_wal_slot`; shares
+/// `command_inspect_superblock`'s size gate and `drive_inspect_*` prologue. The `--slot`
+/// range check happens before the inspector is created upstream (`run_inspect`), matching the
+/// `command_inspect` dispatch.
+pub fn command_inspect_wal(datafile: &CommandInspectDataFile) -> CliResult<()> {
+    use tigerbeetle_vsr::storage::FileStorage;
+    use tigerbeetle_vsr::superblock::DATA_FILE_SIZE_MIN;
+
+    let mut storage = FileStorage::open_read_only(&datafile.path).map_err(|err| err.to_string())?;
+    // Upstream `open_data_file(.inspect)` panics if the file is shorter than
+    // `data_file_size_min`; per the no-panics-on-disk-input porting rule we return an error
+    // with the same wording.
+    if storage.size() < DATA_FILE_SIZE_MIN as u64 {
+        return Err("data file inode size was truncated or corrupted".into());
+    }
+
+    let slot = match &datafile.query {
+        InspectQuery::Wal { slot } => *slot,
+        _ => unreachable!("only called for the wal query"),
+    };
+
+    let output = drive_inspect_wal(&mut storage, &datafile.path, slot)?;
+    print!("{output}");
+    Ok(())
+}
+
 /// Read the whole superblock zone of `storage` and slice the four raw copies out, as
 /// `Inspector.create`'s initial zone read does.
 fn inspect_read_superblock_copies(
@@ -2447,6 +2483,32 @@ pub fn drive_inspect_manifest(
 
     let mut output = String::new();
     inspect_manifest(&mut output, storage, &header).map_err(|err| err.to_string())?;
+    Ok(output)
+}
+
+/// Feed the WAL zones of `storage` through the wal exporter, returning the printed output
+/// (port of `MainType.inspect_wal`/`inspect_wal_slot` with the `Inspector` read/verify
+/// prologue).
+///
+/// Mirrors upstream's sequencing: read the whole superblock zone, select the working quorum
+/// (the version gate runs even for `--slot`, since `Inspector.create` always calls
+/// `read_superblock(null)`), then print the journal.
+pub fn drive_inspect_wal(
+    storage: &mut dyn tigerbeetle_vsr::storage::Storage,
+    path: &str,
+    slot: Option<usize>,
+) -> CliResult<String> {
+    use tigerbeetle_vsr::inspect::{inspect_wal, inspect_wal_slot};
+
+    let copies = inspect_read_superblock_copies(storage);
+    inspect_verify_superblock(&copies, path)?;
+
+    let mut output = String::new();
+    match slot {
+        Some(slot) => inspect_wal_slot(&mut output, storage, slot),
+        None => inspect_wal(&mut output, storage),
+    }
+    .map_err(|err| err.to_string())?;
     Ok(output)
 }
 
@@ -3304,10 +3366,9 @@ mod tests {
         // The end-to-end `run_command` path also succeeds and prints.
         let parsed = parse_args(&args(&["inspect", "superblock", &cmd.path])).unwrap();
         run_command(&parsed).unwrap();
-        // Deferred inspect subcommands still report the deferred executor.
+        // `inspect wal` is implemented end-to-end too (its own test asserts the exact lines).
         let wal = parse_args(&args(&["inspect", "wal", &cmd.path])).unwrap();
-        let err = run_command(&wal).unwrap_err();
-        assert!(err.contains("not yet implemented"), "unexpected: {err}");
+        run_command(&wal).unwrap();
 
         let _ = std::fs::remove_file(&cmd.path);
     }
@@ -3670,6 +3731,68 @@ mod tests {
             "manifest_log.blocks[1]: address=5 checksum=000000000000000000000000deadbeef \
              error: manifest block not found"
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `inspect wal` over a real data file produced by `command_format`: every slot prints a
+    /// single `||` group line (equal redundant + prepare copies), slot 0 root, rest reserved.
+    #[test]
+    fn inspect_wal_real_data_file() {
+        let path = std::env::temp_dir()
+            .join(format!("tigerbeetle-rs-cli-inspect-wal-{}.tigerbeetle", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        command_format(&manifest_command(&path)).unwrap();
+
+        let path_str = cmd_path(&path);
+        let mut storage = tigerbeetle_vsr::storage::FileStorage::open_read_only(&path).unwrap();
+        let output = drive_inspect_wal(&mut storage, &path_str, None).unwrap();
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines.len(), JOURNAL_SLOT_COUNT as usize);
+        for (slot, line) in lines.iter().enumerate() {
+            let expected = tigerbeetle_vsr::replica_format::slot_header(0, slot as u64);
+            assert_eq!(
+                *line,
+                format!(
+                    "||{slot:_>4}: checksum=0x{:032x} release=0.0.0 view=0 op={slot} \
+                     size=256 operation={} ",
+                    expected.checksum,
+                    if slot == 0 { "root" } else { "reserved" }
+                ),
+                "slot {slot}"
+            );
+        }
+
+        drop(storage);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `--slot` prints the single slot's prepare header plus its body, and `command_inspect`
+    /// rejects slots past the journal before opening the data file (upstream `run_inspect`).
+    #[test]
+    fn inspect_wal_slot_variant() {
+        let path = std::env::temp_dir().join(format!(
+            "tigerbeetle-rs-cli-inspect-wal-slot-{}.tigerbeetle",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        command_format(&manifest_command(&path)).unwrap();
+
+        let path_str = cmd_path(&path);
+        let mut storage = tigerbeetle_vsr::storage::FileStorage::open_read_only(&path).unwrap();
+        let output = drive_inspect_wal(&mut storage, &path_str, Some(9)).unwrap();
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], format!("||={}", tigerbeetle_vsr::replica_format::slot_header(0, 9)));
+        assert_eq!(lines[1], "(no body)");
+        drop(storage);
+
+        let err = command_inspect(&CommandInspect::DataFile(CommandInspectDataFile {
+            path: "memory://unused".to_owned(),
+            query: InspectQuery::Wal { slot: Some(JOURNAL_SLOT_COUNT as usize) },
+        }))
+        .unwrap_err();
+        assert_eq!(err, format!("--slot: slot exceeds {}", JOURNAL_SLOT_COUNT - 1));
+
         let _ = std::fs::remove_file(&path);
     }
 
