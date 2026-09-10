@@ -35,6 +35,7 @@ use tigerbeetle_vsr::groove::{
 };
 use tigerbeetle_vsr::socket::{ClusterAddress, ParseAddressesError, parse_address_and_port};
 use tigerbeetle_vsr::storage::Storage;
+use tigerbeetle_vsr::superblock::SUPERBLOCK_HEADER_SIZE;
 
 /// The build version printed by `version` (upstream `constants.semver`).
 ///
@@ -2134,17 +2135,28 @@ pub fn run_command(command: &Command) -> CliResult<()> {
     }
 }
 
-/// `main.zig command_inspect`: runs the read-only `inspect superblock` data-file query; the
-/// remaining inspect subcommands are parsed but deferred to the async-loop slice.
+/// `main.zig command_inspect`: runs the read-only `inspect superblock`/`inspect manifest`
+/// data-file queries; the remaining inspect subcommands are parsed but deferred to the
+/// async-loop slice.
 pub fn command_inspect(cmd: &CommandInspect) -> CliResult<()> {
     match cmd {
         CommandInspect::DataFile(datafile) => match &datafile.query {
             InspectQuery::Superblock => command_inspect_superblock(datafile),
+            // Upstream validates `--superblock-copy` before constructing the inspector
+            // (`run_inspect`, `.manifest` arm):
+            InspectQuery::Manifest { superblock_copy } => {
+                if superblock_copy.is_some_and(|copy| usize::from(copy) >= SUPERBLOCK_COPIES) {
+                    return Err(format!(
+                        "--superblock-copy: copy exceeds {}",
+                        SUPERBLOCK_COPIES - 1
+                    ));
+                }
+                command_inspect_manifest(datafile)
+            }
             // Upstream inspects these over spread/blocked grid blocks in the async loop.
             InspectQuery::Wal { .. }
             | InspectQuery::Replies { .. }
             | InspectQuery::Grid { .. }
-            | InspectQuery::Manifest { .. }
             | InspectQuery::Tables { .. } => Err(format!(
                 "inspect data-file query '{}' is parsed and validated but not yet implemented in \
                  this port (the async event loop is deferred)",
@@ -2288,22 +2300,43 @@ pub fn command_inspect_superblock(datafile: &CommandInspectDataFile) -> CliResul
     Ok(())
 }
 
-/// Feed the superblock zone of `storage` through the inspect exporter, returning the printed
-/// output (port of `MainType.inspect_superblock` with the `Inspector` read/verify prologue).
+/// `main.zig command_inspect_manifest`: read the superblock, then walk the manifest log from
+/// the checkpoint's newest block backwards.
 ///
-/// Mirrors upstream's sequencing: read the whole superblock zone, select the working quorum
-/// (failing the inspect if none reaches the open threshold), verify the version, then print.
-pub fn drive_inspect_superblock(
+/// Port of upstream `Inspector.create` + `MainType.inspect_manifest`; shares
+/// `command_inspect_superblock`'s size gate and `drive_inspect_*` prologue.
+pub fn command_inspect_manifest(datafile: &CommandInspectDataFile) -> CliResult<()> {
+    use tigerbeetle_vsr::storage::FileStorage;
+    use tigerbeetle_vsr::superblock::DATA_FILE_SIZE_MIN;
+
+    let mut storage = FileStorage::open_read_only(&datafile.path).map_err(|err| err.to_string())?;
+    // Upstream `open_data_file(.inspect)` panics if the file is shorter than
+    // `data_file_size_min`; per the no-panics-on-disk-input porting rule we return an error
+    // with the same wording.
+    if storage.size() < DATA_FILE_SIZE_MIN as u64 {
+        return Err("data file inode size was truncated or corrupted".into());
+    }
+
+    let superblock_copy = match &datafile.query {
+        InspectQuery::Manifest { superblock_copy } => *superblock_copy,
+        _ => unreachable!("only called for the manifest query"),
+    };
+
+    let output = drive_inspect_manifest(&mut storage, &datafile.path, superblock_copy)?;
+    print!("{output}");
+    Ok(())
+}
+
+/// Read the whole superblock zone of `storage` and slice the four raw copies out, as
+/// `Inspector.create`'s initial zone read does.
+fn inspect_read_superblock_copies(
     storage: &mut dyn tigerbeetle_vsr::storage::Storage,
-    path: &str,
-) -> CliResult<String> {
+) -> Vec<[u8; SUPERBLOCK_HEADER_SIZE]> {
     use tigerbeetle_vsr::Zone;
-    use tigerbeetle_vsr::inspect::inspect_superblock;
     use tigerbeetle_vsr::storage::{Completion, ReadRequest};
     use tigerbeetle_vsr::superblock::{
-        SUPERBLOCK_COPY_SIZE, SUPERBLOCK_HEADER_SIZE, SUPERBLOCK_VERSION, SUPERBLOCK_ZONE_SIZE,
+        SUPERBLOCK_COPY_SIZE, SUPERBLOCK_HEADER_SIZE, SUPERBLOCK_ZONE_SIZE,
     };
-    use tigerbeetle_vsr::superblock_quorums::{SuperBlockQuorums, Threshold};
 
     storage.read_sectors(ReadRequest {
         zone: Zone::Superblock,
@@ -2319,17 +2352,26 @@ pub fn drive_inspect_superblock(
     };
 
     // Upstream `bytesAsValue`s each copy directly out of the zone buffer.
-    let copies: Vec<[u8; SUPERBLOCK_HEADER_SIZE]> = (0..SUPERBLOCK_COPIES)
+    (0..SUPERBLOCK_COPIES)
         .map(|i| {
             let offset = i * SUPERBLOCK_COPY_SIZE;
             buffer[offset..offset + SUPERBLOCK_HEADER_SIZE]
                 .try_into()
                 .unwrap_or_else(|_| unreachable!("slice length checked"))
         })
-        .collect();
+        .collect()
+}
 
-    // The working-quorum check + version gate replicate `Inspector.create`'s
-    // `read_superblock(null)`; printing then reads the raw copies back.
+/// Port of `Inspector.create`'s `read_superblock(null)` gate: decode the copies leniently,
+/// require a working quorum at the open threshold, and verify the version — aborting the
+/// inspect exactly where upstream does.
+fn inspect_verify_superblock(
+    copies: &[[u8; SUPERBLOCK_HEADER_SIZE]],
+    path: &str,
+) -> CliResult<tigerbeetle_vsr::superblock::SuperBlockHeader> {
+    use tigerbeetle_vsr::superblock::SUPERBLOCK_VERSION;
+    use tigerbeetle_vsr::superblock_quorums::{SuperBlockQuorums, Threshold};
+
     let headers: Vec<tigerbeetle_vsr::superblock::SuperBlockHeader> = copies
         .iter()
         .map(|copy| {
@@ -2349,9 +2391,51 @@ pub fn drive_inspect_superblock(
              version in {path}={version}"
         ));
     }
+    Ok(quorum.header().clone())
+}
+
+/// Feed the superblock zone of `storage` through the inspect exporter, returning the printed
+/// output (port of `MainType.inspect_superblock` with the `Inspector` read/verify prologue).
+///
+/// Mirrors upstream's sequencing: read the whole superblock zone, select the working quorum
+/// (failing the inspect if none reaches the open threshold), verify the version, then print.
+pub fn drive_inspect_superblock(
+    storage: &mut dyn tigerbeetle_vsr::storage::Storage,
+    path: &str,
+) -> CliResult<String> {
+    use tigerbeetle_vsr::inspect::inspect_superblock;
+
+    let copies = inspect_read_superblock_copies(storage);
+    inspect_verify_superblock(&copies, path)?;
 
     let mut output = String::new();
     inspect_superblock(&mut output, &copies).map_err(|err| err.to_string())?;
+    Ok(output)
+}
+
+/// Feed the superblock zone of `storage` through the manifest exporter, returning the printed
+/// output (port of `MainType.inspect_manifest` with the `Inspector` read/verify prologue).
+///
+/// Mirrors upstream's sequencing: read the whole superblock zone, select the working quorum
+/// (the version gate runs even when a specific `--superblock-copy` is selected, since
+/// `Inspector.create` always calls `read_superblock(null)`), then walk the manifest.
+pub fn drive_inspect_manifest(
+    storage: &mut dyn tigerbeetle_vsr::storage::Storage,
+    path: &str,
+    superblock_copy: Option<u8>,
+) -> CliResult<String> {
+    use tigerbeetle_vsr::inspect::inspect_manifest;
+
+    let copies = inspect_read_superblock_copies(storage);
+    let working = inspect_verify_superblock(&copies, path)?;
+    let header = match superblock_copy {
+        Some(copy) => tigerbeetle_vsr::inspect::decode_lenient(&copies[usize::from(copy)])
+            .unwrap_or_else(|| unreachable!("lenient decode never fails")),
+        None => working,
+    };
+
+    let mut output = String::new();
+    inspect_manifest(&mut output, storage, &header).map_err(|err| err.to_string())?;
     Ok(output)
 }
 
@@ -3300,6 +3384,281 @@ mod tests {
             err.contains("invalid superblock version; inspector supports version=2, version in")
         );
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    fn manifest_command(path: &std::path::Path) -> CommandFormat {
+        CommandFormat {
+            cluster: 0,
+            replica: 0,
+            replica_count: 6,
+            development: false,
+            path: path.to_str().unwrap().to_owned(),
+            log_debug: false,
+        }
+    }
+
+    fn cmd_path(path: &std::path::Path) -> String {
+        path.to_str().unwrap().to_owned()
+    }
+
+    /// Write a valid manifest block (entries `(tree_id, level, event)`) into `storage`'s grid
+    /// zone at `address` (grid addresses are 1-based), linked to `previous_*`, returning its
+    /// checksum. Mirrors the `inspect.rs`/`forest.rs` test helper over the [`Storage`] trait.
+    fn put_manifest_block(
+        storage: &mut dyn tigerbeetle_vsr::storage::Storage,
+        address: u64,
+        entries: &[(u16, u8, tigerbeetle_lsm::schema::manifest_node::Event)],
+        previous_address: u64,
+        previous_checksum: u128,
+    ) -> u128 {
+        use tigerbeetle_core::checksum::checksum;
+        use tigerbeetle_lsm::schema::manifest_node::{ENTRY_SIZE, Label, Metadata, TableInfo};
+        use tigerbeetle_vsr::Zone;
+        use tigerbeetle_vsr::message_header::{Block, BlockType, SIZE as HEADER_SIZE, TypedHeader};
+        use tigerbeetle_vsr::schema::ManifestNode;
+        use tigerbeetle_vsr::storage::{Completion, WriteRequest};
+
+        let mut block = vec![0_u8; BLOCK_SIZE];
+        let size = ManifestNode::size(entries.len() as u32) as usize;
+        for (i, &(tree_id, level, event)) in entries.iter().enumerate() {
+            let table = TableInfo {
+                key_min: [u8::try_from(i).unwrap(); 32],
+                key_max: [u8::MAX; 32],
+                checksum: checksum(&address.to_le_bytes()),
+                address,
+                snapshot_min: 1,
+                snapshot_max: u64::MAX,
+                value_count: 1,
+                tree_id,
+                label: Label { level, event },
+            };
+            let wire = table.to_wire();
+            block[HEADER_SIZE + i * ENTRY_SIZE..HEADER_SIZE + (i + 1) * ENTRY_SIZE]
+                .copy_from_slice(&wire);
+        }
+
+        let mut header = Block::default();
+        header.cluster = 1;
+        header.address = address;
+        header.size = size as u32;
+        header.block_type_ordinal = BlockType::Manifest as u8;
+        header.release = tigerbeetle_vsr::multiversion::Release::MINIMUM;
+        header.metadata_bytes = Metadata {
+            previous_manifest_block_checksum: previous_checksum,
+            previous_manifest_block_address: previous_address,
+            entry_count: entries.len() as u32,
+        }
+        .to_wire();
+        block[..HEADER_SIZE].copy_from_slice(&TypedHeader::to_wire(&header));
+
+        let mut header = Block::from_wire(block[..HEADER_SIZE].try_into().unwrap()).unwrap();
+        header.set_checksum_body(&block[HEADER_SIZE..size]);
+        header.set_checksum();
+        let checksum = header.checksum;
+        block[..HEADER_SIZE].copy_from_slice(&TypedHeader::to_wire(&header));
+
+        storage.write_sectors(WriteRequest {
+            zone: Zone::Grid,
+            offset_in_zone: (address - 1) * BLOCK_SIZE as u64,
+            buffer: block,
+        });
+        match storage.next_completion().unwrap() {
+            Completion::Write(_) => {}
+            Completion::Read(_) => unreachable!("only a write was submitted"),
+        }
+        checksum
+    }
+
+    /// Point every superblock copy's checkpoint at a synthetic manifest log, re-checksumming
+    /// the copies. The `copy` byte is patchable per copy because it (and the padding) are not
+    /// covered by the checksum (which covers bytes `34..`).
+    fn install_manifest_superblock_refs(
+        storage: &mut dyn tigerbeetle_vsr::storage::Storage,
+        manifest_block_count: u32,
+        oldest_address: u64,
+        oldest_checksum: u128,
+        newest_address: u64,
+        newest_checksum: u128,
+    ) {
+        use tigerbeetle_vsr::Zone;
+        use tigerbeetle_vsr::storage::{Completion, ReadRequest, WriteRequest};
+        use tigerbeetle_vsr::superblock::{
+            SUPERBLOCK_COPY_SIZE, SUPERBLOCK_HEADER_SIZE, SUPERBLOCK_ZONE_SIZE, SuperBlockHeader,
+        };
+
+        storage.read_sectors(ReadRequest {
+            zone: Zone::Superblock,
+            offset_in_zone: 0,
+            buffer: vec![0_u8; SUPERBLOCK_ZONE_SIZE],
+        });
+        let zone = match storage.next_completion().unwrap() {
+            Completion::Read(request) => request.buffer,
+            Completion::Write(_) => unreachable!("only a read was submitted"),
+        };
+        let mut header =
+            SuperBlockHeader::from_wire(&zone[..SUPERBLOCK_HEADER_SIZE].try_into().unwrap())
+                .unwrap();
+        let checkpoint = &mut header.vsr_state.checkpoint;
+        checkpoint.manifest_block_count = manifest_block_count;
+        checkpoint.manifest_oldest_address = oldest_address;
+        checkpoint.manifest_oldest_checksum = oldest_checksum;
+        checkpoint.manifest_newest_address = newest_address;
+        checkpoint.manifest_newest_checksum = newest_checksum;
+        header.set_checksum();
+
+        let mut buffer = Vec::with_capacity(SUPERBLOCK_ZONE_SIZE);
+        for copy in 0..SUPERBLOCK_COPIES {
+            header.copy = copy as u16;
+            let wire = header.to_wire();
+            buffer.extend_from_slice(&wire);
+            buffer.resize(buffer.len() + SUPERBLOCK_COPY_SIZE - SUPERBLOCK_HEADER_SIZE, 0);
+        }
+        assert_eq!(buffer.len(), SUPERBLOCK_ZONE_SIZE);
+        storage.write_sectors(WriteRequest { zone: Zone::Superblock, offset_in_zone: 0, buffer });
+        match storage.next_completion().unwrap() {
+            Completion::Write(_) => {}
+            Completion::Read(_) => unreachable!("only a write was submitted"),
+        }
+    }
+
+    /// `inspect manifest` walks the checkpoint's manifest log newest→oldest and prints the
+    /// per-event (insert/update/remove) level counts; `--superblock-copy` selects a specific
+    /// copy's checkpoint, and out-of-range copies are rejected by the CLI (not panicked).
+    #[test]
+    fn inspect_manifest_walk_matches_expected() {
+        let path = std::env::temp_dir().join(format!(
+            "tigerbeetle-rs-cli-inspect-manifest-{}.tigerbeetle",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        command_format(&manifest_command(&path)).unwrap();
+
+        // Grow the file past the grid seam so the low grid addresses fit: reopening with a
+        // larger `size_min` extends the file (`FileStorage::open` ensures ≥ `size_min`), and
+        // zones live at fixed offsets so this never shifts them.
+        let mut storage = tigerbeetle_vsr::storage::FileStorage::open(
+            &path,
+            DATA_FILE_SIZE_MIN as u64 + 8 * BLOCK_SIZE as u64,
+        )
+        .unwrap();
+
+        let old_checksum = put_manifest_block(
+            &mut storage,
+            4,
+            &[(1, 0, tigerbeetle_lsm::schema::manifest_node::Event::Insert)],
+            0,
+            0,
+        );
+        let new_checksum = put_manifest_block(
+            &mut storage,
+            6,
+            &[
+                (1, 0, tigerbeetle_lsm::schema::manifest_node::Event::Insert),
+                (2, 0, tigerbeetle_lsm::schema::manifest_node::Event::Insert),
+                (1, 2, tigerbeetle_lsm::schema::manifest_node::Event::Update),
+                (3, 6, tigerbeetle_lsm::schema::manifest_node::Event::Remove),
+            ],
+            4,
+            old_checksum,
+        );
+        install_manifest_superblock_refs(&mut storage, 2, 4, old_checksum, 6, new_checksum);
+        drop(storage);
+
+        let path_str = cmd_path(&path);
+        let mut storage = tigerbeetle_vsr::storage::FileStorage::open_read_only(&path).unwrap();
+        let output = drive_inspect_manifest(&mut storage, &path_str, None).unwrap();
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            lines[0],
+            format!(
+                "manifest_log.blocks[0]: address=6 checksum={new_checksum:032x} \
+                 entries=4/{} insert=2,0,0,0,0,0,0 update=0,0,1,0,0,0,0 \
+                 remove=0,0,0,0,0,0,1",
+                tigerbeetle_lsm::schema::manifest_node::ENTRY_COUNT_MAX
+            )
+        );
+        assert_eq!(
+            lines[1],
+            format!(
+                "manifest_log.blocks[1]: address=4 checksum={old_checksum:032x} \
+                 entries=1/{} insert=1,0,0,0,0,0,0 update=0,0,0,0,0,0,0 \
+                 remove=0,0,0,0,0,0,0",
+                tigerbeetle_lsm::schema::manifest_node::ENTRY_COUNT_MAX
+            )
+        );
+
+        // All superblock copies carry the same checkpoint, so `--superblock-copy=1` (which
+        // still passes through the working-quorum version gate) matches the working header.
+        let output_copy = drive_inspect_manifest(&mut storage, &path_str, Some(1)).unwrap();
+        assert_eq!(output_copy, output);
+        drop(storage);
+
+        // The end-to-end command path routes here too and prints to stdout.
+        let parsed = parse_args(&args(&["inspect", "manifest", &path_str])).unwrap();
+        run_command(&parsed).unwrap();
+
+        // Out-of-range copies are rejected up front, not with a panic.
+        let parsed =
+            parse_args(&args(&["inspect", "manifest", "--superblock-copy=4", &path_str])).unwrap();
+        let err = run_command(&parsed).unwrap_err();
+        assert!(err.contains("--superblock-copy: copy exceeds 3"), "unexpected: {err}");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A freshly formatted data file has an empty manifest log (`manifest_block_count == 0`);
+    /// `inspect manifest` prints nothing.
+    #[test]
+    fn inspect_manifest_format_file_empty() {
+        let cmd = manifest_command(std::path::Path::new("memory://manifest-empty"));
+        let mut storage = MemoryStorage::new(DATA_FILE_SIZE_MIN as u64);
+        drive_format(&mut storage, &cmd);
+
+        let output = drive_inspect_manifest(&mut storage, &cmd.path, None).unwrap();
+        assert!(output.is_empty());
+    }
+
+    /// A manifest reference whose block is missing prints the error message on the same line
+    /// as the block header and stops the walk (upstream `read_block` error handling).
+    #[test]
+    fn inspect_manifest_missing_block_errors() {
+        let path = std::env::temp_dir().join(format!(
+            "tigerbeetle-rs-cli-inspect-manifest-missing-{}.tigerbeetle",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        command_format(&manifest_command(&path)).unwrap();
+
+        let mut storage = tigerbeetle_vsr::storage::FileStorage::open(
+            &path,
+            DATA_FILE_SIZE_MIN as u64 + 8 * BLOCK_SIZE as u64,
+        )
+        .unwrap();
+        // The newest block exists at address 6 and links back to address 5, which was never
+        // written — the second walk step reads an all-zero (corrupt) block.
+        let new_checksum = put_manifest_block(
+            &mut storage,
+            6,
+            &[(1, 0, tigerbeetle_lsm::schema::manifest_node::Event::Insert)],
+            5,
+            0xDEAD_BEEF,
+        );
+        install_manifest_superblock_refs(&mut storage, 2, 5, 0xDEAD_BEEF, 6, new_checksum);
+        drop(storage);
+
+        let path_str = cmd_path(&path);
+        let mut storage = tigerbeetle_vsr::storage::FileStorage::open_read_only(&path).unwrap();
+        let output = drive_inspect_manifest(&mut storage, &path_str, None).unwrap();
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].starts_with("manifest_log.blocks[0]: address=6 checksum="));
+        assert_eq!(
+            lines[1],
+            "manifest_log.blocks[1]: address=5 checksum=000000000000000000000000deadbeef \
+             error: manifest block not found"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
