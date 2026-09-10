@@ -1374,6 +1374,73 @@ pub(crate) fn format_prepare_raw(
     write!(f, " }}")
 }
 
+/// Port of `Reply.format` → `format_header` (src/vsr/message_header.zig:1628): format a raw
+/// `Reply` header for the inspector (`inspect_replies` / `inspect_replies_slot`).
+///
+/// Field order follows the `Reply` layout defined by `typed_header!` at offset 128 onwards;
+/// the common prefix (checksum..reserved_frame) is identical to [`format_prepare_raw`].
+pub(crate) fn format_reply_raw(
+    f: &mut impl core::fmt::Write,
+    bytes: &[u8; SIZE],
+) -> core::fmt::Result {
+    macro_rules! field {
+        ($name:expr, $val:expr, hex) => {
+            if !is_skipped($name, &$val) {
+                write!(f, ", .{}={:032x}", $name, $val)?;
+            }
+        };
+        ($name:expr, $val:expr, dec128) => {
+            if !is_skipped($name, &$val) {
+                write!(f, ", .{}={}", $name, $val)?;
+            }
+        };
+        ($name:expr, $val:expr) => {
+            if !is_skipped($name, &$val) {
+                write!(f, ", .{}={}", $name, $val)?;
+            }
+        };
+    }
+
+    write!(f, "Reply{{ .checksum={:032x}", get_u128(bytes, 0))?;
+    field!("checksum_padding", get_u128(bytes, 16), hex);
+    field!("checksum_body", get_u128(bytes, 32), hex);
+    field!("checksum_body_padding", get_u128(bytes, 48), hex);
+    field!("nonce_reserved", get_u128(bytes, 64), dec128);
+    field!("cluster", get_u128(bytes, 80), dec128);
+    field!("size", get_u32(bytes, 96));
+    field!("epoch", get_u32(bytes, 100));
+    field!("view", get_u32(bytes, 104));
+    field!("release", Release { value: get_u32(bytes, 108) });
+    field!("protocol", get_u16(bytes, 112));
+    let command = match Command::from_u8(bytes[114]) {
+        Some(command) => format!("vsr.Command.{command}"),
+        None => format!("vsr.Command.{}!", bytes[114]),
+    };
+    write!(f, ", .command={command}")?;
+    field!("replica", bytes[115]);
+    let reserved_frame = get_arr12(bytes, 116);
+    if !is_skipped("reserved_frame", &reserved_frame) {
+        write_u8_array(f, "reserved_frame", &reserved_frame)?;
+    }
+    // Reply-specific tail starts at offset 128.
+    field!("request_checksum", get_u128(bytes, 128), hex);
+    field!("request_checksum_padding", get_u128(bytes, 144), hex);
+    field!("context", get_u128(bytes, 160), hex);
+    field!("context_padding", get_u128(bytes, 176), hex);
+    field!("client", get_u128(bytes, 192), dec128);
+    field!("op", get_u64(bytes, 208));
+    field!("commit", get_u64(bytes, 216));
+    field!("timestamp", get_u64(bytes, 224));
+    field!("request", get_u32(bytes, 232));
+    write!(f, ", .operation={}", operation_name_vsr(crate::Operation(bytes[236])))?;
+    let reserved: [u8; 19] =
+        bytes[237..256].try_into().unwrap_or_else(|_| unreachable!("slice length checked"));
+    if !is_skipped("reserved", &reserved) {
+        write_u8_array(f, "reserved", &reserved)?;
+    }
+    write!(f, " }}")
+}
+
 typed_header! {
     #[allow(clippy::struct_field_names)] // upstream field names
     pub struct PrepareOk : Command::PrepareOk,

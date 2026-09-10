@@ -23,13 +23,13 @@ use core::fmt;
 
 use tigerbeetle_core::checksum::checksum;
 use tigerbeetle_core::constants::{
-    JOURNAL_SIZE_HEADERS, JOURNAL_SLOT_COUNT, MEMBERS_MAX, MESSAGE_SIZE_MAX, SECTOR_SIZE,
-    SUPERBLOCK_COPIES, VIEW_HEADERS_MAX,
+    CLIENTS_MAX, JOURNAL_SIZE_HEADERS, JOURNAL_SLOT_COUNT, MEMBERS_MAX, MESSAGE_SIZE_MAX,
+    SECTOR_SIZE, SUPERBLOCK_COPIES, VIEW_HEADERS_MAX,
 };
 
 use crate::Operation;
 use crate::Zone;
-use crate::message_header::{SIZE, format_prepare_raw};
+use crate::message_header::{SIZE, format_prepare_raw, format_reply_raw};
 use crate::multiversion::Release;
 use crate::storage::{Completion, ReadRequest, Storage};
 use crate::superblock::{SUPERBLOCK_HEADER_SIZE, SuperBlockHeader};
@@ -841,11 +841,232 @@ fn write_prepare_body(output: &mut impl fmt::Write, prepare: &[u8]) -> fmt::Resu
     }
 }
 
+/// The decoded `client_sessions` trailer block (upstream's `INSPECTOR.ClientSessions` extern
+/// struct, inspect.zig:1335): one reply header and one session value per client slot.
+struct InspectClientSessions {
+    headers: Vec<[u8; SIZE]>,
+    sessions: Vec<u64>,
+}
+
+/// Port of `Inspector.read_client_sessions` (src/tigerbeetle/inspect.zig:1340): read and decode
+/// the `client_sessions` trailer block recorded in the checkpoint, returning `None` when the
+/// checkpoint records no sessions.
+///
+/// The block body layout is fixed (`client_sessions.rs`): `CLIENTS_MAX` reply headers followed
+/// by `CLIENTS_MAX` `u64` sessions, matching the upstream `ClientSessions` extern struct.
+///
+/// DEVIATION: upstream asserts the block size and body checksum on the read path; per the
+/// no-panics-on-disk-input porting rule a mismatched block is treated as absent (printing
+/// `error: no client sessions` in the slot inspector) instead of panicking.
+fn read_client_sessions(
+    storage: &mut dyn Storage,
+    superblock: &SuperBlockHeader,
+) -> Option<InspectClientSessions> {
+    use crate::superblock::CLIENT_SESSIONS_ENCODE_SIZE;
+
+    let checkpoint = &superblock.vsr_state.checkpoint;
+    if checkpoint.client_sessions_size == 0 {
+        assert_eq!(checkpoint.client_sessions_last_block_address, 0);
+        assert_eq!(checkpoint.client_sessions_last_block_checksum, 0);
+        return None;
+    }
+    assert_eq!(checkpoint.client_sessions_size, CLIENT_SESSIONS_ENCODE_SIZE as u64);
+
+    let block = read_block(
+        storage,
+        checkpoint.client_sessions_last_block_address,
+        Some(checkpoint.client_sessions_last_block_checksum),
+    )?;
+
+    let block_header: &[u8; SIZE] =
+        block[..SIZE].try_into().unwrap_or_else(|_| unreachable!("slice length checked"));
+    let block_size = get_u32(block_header, 96) as usize;
+    if block_size != SIZE + CLIENT_SESSIONS_ENCODE_SIZE {
+        return None;
+    }
+    if checksum(&block[SIZE..block_size]) != checkpoint.client_sessions_checksum {
+        return None;
+    }
+
+    let clients = CLIENTS_MAX as usize;
+    let mut headers = vec![[0_u8; SIZE]; clients];
+    for (i, header) in headers.iter_mut().enumerate() {
+        let offset = SIZE + i * SIZE;
+        *header = block[offset..offset + SIZE]
+            .try_into()
+            .unwrap_or_else(|_| unreachable!("slice length checked"));
+    }
+    let sessions_offset = SIZE + clients * SIZE;
+    let mut sessions = vec![0_u64; clients];
+    for (i, session) in sessions.iter_mut().enumerate() {
+        let offset = sessions_offset + i * size_of::<u64>();
+        *session = u64::from_le_bytes(
+            block[offset..offset + size_of::<u64>()]
+                .try_into()
+                .unwrap_or_else(|_| unreachable!("slice length checked")),
+        );
+    }
+
+    Some(InspectClientSessions { headers, sessions })
+}
+
+/// Port of `Inspector.inspect_replies` (src/tigerbeetle/inspect.zig:794): print one line per
+/// client slot — its session value, then per group of equal header copies the slot label, the
+/// `|`/`X` marks, and the reply header formatted as `Reply{…}`.
+///
+/// For each slot the two copies are the client's session header (from the `client_sessions`
+/// trailer) and the reply header at `message_size_max * slot` in the `client_replies` zone.
+/// The session header itself is not checkedum-validated: upstream marks it with `valid_checksum`
+/// but the session may be stale (the reply body carries the authoritative checksum).
+///
+/// Returns immediately (printing nothing) when the checkpoint records no client sessions, as
+/// upstream does.
+///
+/// # Errors
+///
+/// Returns the underlying formatting error if writing to `output` fails.
+pub fn inspect_replies(
+    output: &mut impl fmt::Write,
+    storage: &mut dyn Storage,
+    superblock: &SuperBlockHeader,
+) -> fmt::Result {
+    let Some(entries) = read_client_sessions(storage, superblock) else {
+        return Ok(());
+    };
+
+    for (slot, (session_header, session)) in
+        entries.headers.iter().zip(&entries.sessions).enumerate()
+    {
+        let reply = read_buffer(
+            storage,
+            Zone::ClientReplies,
+            (slot * MESSAGE_SIZE_MAX as usize) as u64,
+            MESSAGE_SIZE_MAX as usize,
+        );
+        let reply_header: [u8; SIZE] =
+            reply[..SIZE].try_into().unwrap_or_else(|_| unreachable!("slice length checked"));
+
+        // The session is only recorded in the client sessions, so the label has no group diff
+        // marks — just the slot, the marks, and the reply header.
+        writeln!(output, "{slot:_>2}     session={session}")?;
+
+        for group in wal_groups(session_header, &reply_header) {
+            let header_index = first_set(group);
+            let header = if header_index == 0 { session_header } else { &reply_header };
+            let header_mark = if valid_header_checksum(header) { '|' } else { 'X' };
+
+            write!(output, "{slot:_>2}: ")?;
+            write!(output, "{}", if is_set(group, 0) { header_mark } else { '_' })?;
+            write!(output, "{}", if is_set(group, 1) { header_mark } else { '_' })?;
+            // `print_struct(label, header)` where `Reply` has a format fn prints
+            // `{label}=Reply{…}` (via `format_header` → `format_reply_raw`).
+            write!(output, " header=")?;
+            format_reply_raw(output, header)?;
+            writeln!(output)?;
+        }
+    }
+    Ok(())
+}
+
+/// Port of `Inspector.inspect_replies_slot` (src/tigerbeetle/inspect.zig:842): print a single
+/// client slot's reply — the two header copies grouped as in [`inspect_replies`], each printed
+/// with `label=Reply{…}`, then the reply body.
+///
+/// Prints `error: no client sessions` (and returns) when the checkpoint records no sessions.
+///
+/// # Errors
+///
+/// Returns the underlying formatting error if writing to `output` fails.
+///
+/// # Panics
+///
+/// Panics if `slot` does not fit in the client table (upstream asserts).
+pub fn inspect_replies_slot(
+    output: &mut impl fmt::Write,
+    storage: &mut dyn Storage,
+    superblock: &SuperBlockHeader,
+    slot: usize,
+) -> fmt::Result {
+    assert!(slot < CLIENTS_MAX as usize, "slot exceeds {}", CLIENTS_MAX - 1);
+
+    let Some(entries) = read_client_sessions(storage, superblock) else {
+        writeln!(output, "error: no client sessions")?;
+        return Ok(());
+    };
+
+    let reply = read_buffer(
+        storage,
+        Zone::ClientReplies,
+        (slot * MESSAGE_SIZE_MAX as usize) as u64,
+        MESSAGE_SIZE_MAX as usize,
+    );
+    let reply_header: [u8; SIZE] =
+        reply[..SIZE].try_into().unwrap_or_else(|_| unreachable!("slice length checked"));
+    let session_header = &entries.headers[slot];
+
+    for group in wal_groups(session_header, &reply_header) {
+        let header_index = first_set(group);
+        let header = if header_index == 0 { session_header } else { &reply_header };
+        let header_mark = if valid_header_checksum(header) { '|' } else { 'X' };
+
+        write!(output, "{}", if is_set(group, 0) { header_mark } else { '_' })?;
+        write!(output, "{}", if is_set(group, 1) { header_mark } else { '_' })?;
+        write!(output, "=")?;
+        format_reply_raw(output, header)?;
+        writeln!(output)?;
+    }
+
+    write_reply_body(output, &reply)
+}
+
+/// Port of `print_reply_body` (src/tigerbeetle/inspect.zig:1652): decode a reply's body against
+/// the operation schema.
+///
+/// `(no body)` is printed for zero-length bodies — the only case a data file with no client
+/// traffic reaches. Reply result decoding is deferred like the prepare event decoding, so a
+/// divisible nonzero body prints `error: unimplemented operation=…` and an indivisible one
+/// prints `error: unexpected body size=…, @sizeOf(Result)=…` exactly like upstream.
+///
+/// DEVIATION: upstream's `else` branch prints `@tagName(header.operation)`; the port writes the
+/// same bare name via [`write_operation_name`].
+///
+/// # Errors
+///
+/// Returns the underlying formatting error if writing to `output` fails.
+fn write_reply_body(output: &mut impl fmt::Write, reply: &[u8]) -> fmt::Result {
+    let header: &[u8; SIZE] =
+        &reply[..SIZE].try_into().unwrap_or_else(|_| unreachable!("slice length checked"));
+    let operation = Operation(get_u8(header, 236));
+    let size = get_u32(header, 96) as usize;
+    let body_size = size.saturating_sub(SIZE);
+
+    // Upstream `operation_schemas` entry result sizes: `.reserved`/`.root`/`.pulse`/`.upgrade`
+    // are `extern struct {}` (size 0); `.register` is `RegisterResult`; `.reconfigure` is
+    // `ReconfigurationResult`. State-machine result types are not yet ported.
+    let result_size = match operation {
+        Operation::REGISTER => size_of::<crate::RegisterResult>(),
+        Operation::RECONFIGURE => size_of::<crate::ReconfigurationResult>(),
+        _ => 0,
+    };
+
+    if body_size == 0 {
+        writeln!(output, "(no body)")
+    } else if result_size != 0 && body_size.is_multiple_of(result_size) {
+        // DEVIATION: per-result `print_struct` decoding deferred.
+        write!(output, "error: unimplemented operation=")?;
+        write_operation_name(output, operation)?;
+        writeln!(output)
+    } else {
+        writeln!(output, "error: unexpected body size={size}, @sizeOf(Result)={result_size}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+    use crate::message_header::TypedHeader;
     use crate::schema::ManifestNode::ENTRY_COUNT_MAX;
     use crate::storage::MemoryStorage;
     use tigerbeetle_lsm::schema::manifest_node::Event;
@@ -1423,5 +1644,312 @@ mod tests {
         );
         assert_eq!(lines[1], "error: unexpected body size=4294967295, @sizeOf(Event)=0");
         assert_eq!(lines[2], "error: invalid prepare body!");
+    }
+
+    /// A valid `Reply` header (empty body, `cluster=7`) used as both the session-table header
+    /// and the `.client_replies` slot frame.
+    fn make_reply(op: u64, request: u32) -> crate::message_header::Reply {
+        use crate::message_header::TypedHeader;
+
+        let mut header = crate::message_header::Reply {
+            cluster: 7,
+            op,
+            request,
+            ..crate::message_header::Reply::default()
+        };
+        header.set_checksum();
+        header
+    }
+
+    /// A `MemoryStorage` formatted like a fresh replica data file plus a `client_sessions`
+    /// trailer block: the checkpoint's client-sessions fields point at a grid block holding one
+    /// reply header and one session per client slot, and every `.client_replies` frame's header
+    /// equals its session header.
+    fn replies_storage() -> (MemoryStorage, SuperBlockHeader) {
+        use crate::message_header::{Block, TypedHeader};
+        use crate::storage::{Completion, WriteRequest};
+        use crate::superblock::CLIENT_SESSIONS_ENCODE_SIZE;
+        use tigerbeetle_core::constants::BLOCK_SIZE;
+
+        // `format` insists on a `DATA_FILE_SIZE_MIN`-sized file, which leaves no grid capacity;
+        // build storage past the grid start instead (mirrors `manifest_storage`). The replies
+        // inspector only reads the trailer block and the `.client_replies` zone.
+        let mut storage = MemoryStorage::new(crate::Zone::Grid.start() + 8 * BLOCK_SIZE as u64);
+
+        let clients = CLIENTS_MAX as usize;
+        let session_headers: Vec<[u8; SIZE]> =
+            (0..clients).map(|slot| make_reply(slot as u64, 0).to_wire()).collect();
+        let sessions: Vec<u64> = (0..clients).map(|slot| 1000 + slot as u64).collect();
+
+        // Build the `client_sessions` block body: headers then sessions (client_sessions.rs
+        // `encode` layout).
+        let mut body = vec![0_u8; CLIENT_SESSIONS_ENCODE_SIZE];
+        for (i, header) in session_headers.iter().enumerate() {
+            body[i * SIZE..(i + 1) * SIZE].copy_from_slice(header);
+        }
+        for (i, session) in sessions.iter().enumerate() {
+            let offset = clients * SIZE + i * size_of::<u64>();
+            body[offset..offset + size_of::<u64>()].copy_from_slice(&session.to_le_bytes());
+        }
+        let body_checksum = checksum(&body);
+
+        let address = 1;
+        let mut block = vec![0_u8; BLOCK_SIZE];
+        block[SIZE..SIZE + CLIENT_SESSIONS_ENCODE_SIZE].copy_from_slice(&body);
+        let mut header = Block::default();
+        header.cluster = 7;
+        header.address = address;
+        header.size = u32::try_from(SIZE).expect("fits")
+            + u32::try_from(CLIENT_SESSIONS_ENCODE_SIZE).expect("fits");
+        block[..SIZE].copy_from_slice(&header.to_wire());
+        let mut header = Block::from_wire(block[..SIZE].try_into().unwrap()).unwrap();
+        header.set_checksum_body(&block[SIZE..header.size as usize]);
+        header.set_checksum();
+        let block_checksum = header.checksum;
+        block[..SIZE].copy_from_slice(&header.to_wire());
+        storage.write_sectors(WriteRequest {
+            zone: crate::Zone::Grid,
+            offset_in_zone: (address - 1) * BLOCK_SIZE as u64,
+            buffer: block,
+        });
+        match storage.next_completion().unwrap() {
+            Completion::Write(_) => {}
+            Completion::Read(_) => unreachable!("only a write was submitted"),
+        }
+
+        // Point the header passed to the inspector at the trailer.
+        let mut superblock = superblock_with_manifest(0, 0, 0, 0, 0);
+        superblock.cluster = 7;
+        let checkpoint = &mut superblock.vsr_state.checkpoint;
+        checkpoint.client_sessions_size = CLIENT_SESSIONS_ENCODE_SIZE as u64;
+        checkpoint.client_sessions_last_block_address = address;
+        checkpoint.client_sessions_last_block_checksum = block_checksum;
+        checkpoint.client_sessions_checksum = body_checksum;
+        superblock.set_checksum();
+
+        // The `.client_replies` frames; slot `i`'s reply header equals its session header, so
+        // every slot's two copies group as `||`.
+        for (slot, session_header) in session_headers.iter().enumerate() {
+            let mut frame = vec![0_u8; MESSAGE_SIZE_MAX as usize];
+            frame[..SIZE].copy_from_slice(session_header);
+            storage.write_sectors(WriteRequest {
+                zone: crate::Zone::ClientReplies,
+                offset_in_zone: u64::try_from(slot).expect("fits") * u64::from(MESSAGE_SIZE_MAX),
+                buffer: frame,
+            });
+            match storage.next_completion().unwrap() {
+                Completion::Write(_) => {}
+                Completion::Read(_) => unreachable!("only a write was submitted"),
+            }
+        }
+
+        (storage, superblock)
+    }
+
+    /// Pins `format_reply_raw` against the `Reply.format` field set (mirroring the Prepare
+    /// snapshot in `message_header.rs`): the common frame prints checksum-style fields as bare
+    /// hex and all zero-valued non-`reserved`/`padding` fields; only the reserved/padding ones
+    /// are skipped.
+    #[test]
+    fn format_reply_raw_matches_header_fields() {
+        use crate::message_header::TypedHeader;
+
+        let reply = make_reply(42, 9);
+        let mut actual = String::new();
+        format_reply_raw(&mut actual, &reply.to_wire()).unwrap();
+        assert_eq!(
+            actual,
+            format!(
+                "Reply{{ .checksum={:032x}, \
+                 .checksum_body=00000000000000000000000000000000, .cluster=7, .size=256, \
+                 .epoch=0, .view=0, .release=0.0.0, .protocol=0, .command=vsr.Command.reply, \
+                 .replica=0, .request_checksum=00000000000000000000000000000000, \
+                 .context=00000000000000000000000000000000, .client=0, .op=42, .commit=0, \
+                 .timestamp=0, .request=9, .operation=vsr.Operation.reserved }}",
+                reply.checksum,
+            )
+        );
+    }
+
+    /// A freshly formatted checkpoint records no client sessions, so `inspect_replies` prints
+    /// nothing (upstream returns before printing).
+    #[test]
+    fn inspect_replies_empty_checkpoint_prints_nothing() {
+        let mut storage = wal_storage();
+        let superblock = superblock_with_manifest(0, 0, 0, 0, 0);
+
+        let mut output = String::new();
+        inspect_replies(&mut output, &mut storage, &superblock).unwrap();
+        assert!(output.is_empty());
+    }
+
+    /// `--slot` on a checkpoint with no client sessions prints the upstream error line.
+    #[test]
+    fn inspect_replies_slot_no_sessions_prints_error() {
+        let mut storage = wal_storage();
+        let superblock = superblock_with_manifest(0, 0, 0, 0, 0);
+
+        let mut output = String::new();
+        inspect_replies_slot(&mut output, &mut storage, &superblock, 0).unwrap();
+        assert_eq!(output, "error: no client sessions\n");
+    }
+
+    /// With a client-sessions trailer, `inspect_replies` prints one session line and one `||`
+    /// header group line per slot (`Reply{…}` via `format_reply_raw`).
+    #[test]
+    fn inspect_replies_prints_session_and_headers() {
+        let (mut storage, superblock) = replies_storage();
+
+        let mut output = String::new();
+        inspect_replies(&mut output, &mut storage, &superblock).unwrap();
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines.len(), CLIENTS_MAX as usize * 2);
+        for slot in 0..CLIENTS_MAX as usize {
+            let mut expected = String::new();
+            format_reply_raw(&mut expected, &make_reply(slot as u64, 0).to_wire()).unwrap();
+            assert_eq!(lines[slot * 2], format!("{slot:_>2}     session={}", 1000 + slot as u64));
+            assert_eq!(
+                lines[slot * 2 + 1],
+                format!("{slot:_>2}: || header={expected}"),
+                "slot {slot}"
+            );
+        }
+    }
+
+    /// A reply header corrupted in the `.client_replies` zone only (but not its session table
+    /// entry) splits the slot into a valid session group (`|_`) and a corrupt reply (`_X`).
+    #[test]
+    fn inspect_replies_groups_differing_copies() {
+        use crate::message_header::TypedHeader;
+        use crate::storage::{Completion, WriteRequest};
+
+        let (mut storage, superblock) = replies_storage();
+
+        // Flip a checksum-covered byte in slot 2's reply frame only (like
+        // `inspect_wal_marks_differing_headers`).
+        let corrupt_header = {
+            let mut wire = make_reply(2, 0).to_wire();
+            wire[100] ^= 0xFF;
+            wire
+        };
+        let mut frame = vec![0_u8; MESSAGE_SIZE_MAX as usize];
+        frame[..SIZE].copy_from_slice(&corrupt_header);
+        storage.write_sectors(WriteRequest {
+            zone: crate::Zone::ClientReplies,
+            offset_in_zone: 2 * u64::from(MESSAGE_SIZE_MAX),
+            buffer: frame,
+        });
+        match storage.next_completion().unwrap() {
+            Completion::Write(_) => {}
+            Completion::Read(_) => unreachable!("only a write was submitted"),
+        }
+
+        let mut output = String::new();
+        inspect_replies(&mut output, &mut storage, &superblock).unwrap();
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines.len(), CLIENTS_MAX as usize * 2 + 1);
+
+        let mut expected = String::new();
+        format_reply_raw(&mut expected, &make_reply(2, 0).to_wire()).unwrap();
+        assert_eq!(lines[4], "_2     session=1002");
+        assert_eq!(lines[5], format!("_2: |_ header={expected}"));
+        let mut corrupt_expected = String::new();
+        format_reply_raw(&mut corrupt_expected, &corrupt_header).unwrap();
+        assert_eq!(lines[6], format!("_2: _X header={corrupt_expected}"));
+    }
+
+    /// `--slot` prints the group labels plus the reply body — `(no body)` for a header with no
+    /// request body.
+    #[test]
+    fn inspect_replies_slot_prints_reply_and_body() {
+        let (mut storage, superblock) = replies_storage();
+
+        let mut output = String::new();
+        inspect_replies_slot(&mut output, &mut storage, &superblock, 3).unwrap();
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines.len(), 2);
+        let mut expected = String::new();
+        format_reply_raw(&mut expected, &make_reply(3, 0).to_wire()).unwrap();
+        assert_eq!(lines[0], format!("||={expected}"));
+        assert_eq!(lines[1], "(no body)");
+    }
+
+    /// A register reply with a divisible result body prints the deferred-decode error exactly
+    /// like the prepare side does.
+    #[test]
+    fn inspect_replies_slot_prints_register_body() {
+        use crate::message_header::TypedHeader;
+        use crate::storage::{Completion, WriteRequest};
+
+        let (mut storage, superblock) = replies_storage();
+
+        // Slot 0's reply is a register reply with a body — its header differs from the
+        // session header, splitting the slot into `|_` (session) and `_|` (reply) groups.
+        let mut header = make_reply(0, 0);
+        header.operation = crate::Operation::REGISTER;
+        header.size = u32::try_from(SIZE).expect("fits")
+            + u32::try_from(size_of::<crate::RegisterResult>()).expect("fits");
+        header.set_checksum();
+        let mut frame = vec![0_u8; MESSAGE_SIZE_MAX as usize];
+        frame[..SIZE].copy_from_slice(&header.to_wire());
+        storage.write_sectors(WriteRequest {
+            zone: crate::Zone::ClientReplies,
+            offset_in_zone: 0,
+            buffer: frame,
+        });
+        match storage.next_completion().unwrap() {
+            Completion::Write(_) => {}
+            Completion::Read(_) => unreachable!("only a write was submitted"),
+        }
+
+        let mut output = String::new();
+        inspect_replies_slot(&mut output, &mut storage, &superblock, 0).unwrap();
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines.len(), 3);
+        let mut session_expected = String::new();
+        format_reply_raw(&mut session_expected, &make_reply(0, 0).to_wire()).unwrap();
+        let mut reply_expected = String::new();
+        format_reply_raw(&mut reply_expected, &header.to_wire()).unwrap();
+        assert_eq!(lines[0], format!("|_={session_expected}"));
+        assert_eq!(lines[1], format!("_|={reply_expected}"));
+        assert_eq!(lines[2], "error: unimplemented operation=register");
+    }
+
+    /// A trailer block whose body checksum no longer matches the checkpoint is treated as
+    /// absent (the DEVIATION from upstream's assert), so the full variant prints nothing and
+    /// `--slot` reports no client sessions.
+    #[test]
+    fn read_client_sessions_rejects_mismatched_trailer_block() {
+        use crate::message_header::{Block, TypedHeader};
+        use crate::storage::{Completion, WriteRequest};
+        use tigerbeetle_core::constants::BLOCK_SIZE;
+
+        let (mut storage, superblock) = replies_storage();
+
+        // Flip one body byte and repair the block's own checksums, so only the checkpoint's
+        // `client_sessions_checksum` mismatch remains to reject the trailer.
+        let mut block = read_buffer(&mut storage, crate::Zone::Grid, 0, BLOCK_SIZE);
+        block[SIZE + 4] ^= 0xFF;
+        let mut header = Block::from_wire(block[..SIZE].try_into().unwrap()).unwrap();
+        header.set_checksum_body(&block[SIZE..header.size as usize]);
+        header.set_checksum();
+        block[..SIZE].copy_from_slice(&header.to_wire());
+        storage.write_sectors(WriteRequest {
+            zone: crate::Zone::Grid,
+            offset_in_zone: 0,
+            buffer: block,
+        });
+        match storage.next_completion().unwrap() {
+            Completion::Write(_) => {}
+            Completion::Read(_) => unreachable!("only a write was submitted"),
+        }
+
+        let mut output = String::new();
+        inspect_replies(&mut output, &mut storage, &superblock).unwrap();
+        assert!(output.is_empty());
+
+        let mut output = String::new();
+        inspect_replies_slot(&mut output, &mut storage, &superblock, 0).unwrap();
+        assert_eq!(output, "error: no client sessions\n");
     }
 }

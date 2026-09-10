@@ -2161,10 +2161,22 @@ pub fn command_inspect(cmd: &CommandInspect) -> CliResult<()> {
                 }
                 command_inspect_wal(datafile)
             }
+            // Upstream validates `--superblock-copy` before constructing the inspector
+            // (`run_inspect`, `.replies` arm):
+            InspectQuery::Replies { slot, superblock_copy } => {
+                if superblock_copy.is_some_and(|copy| usize::from(copy) >= SUPERBLOCK_COPIES) {
+                    return Err(format!(
+                        "--superblock-copy: copy exceeds {}",
+                        SUPERBLOCK_COPIES - 1
+                    ));
+                }
+                if slot.is_some_and(|slot| slot >= CLIENTS_MAX as usize) {
+                    return Err(format!("--slot: slot exceeds {}", CLIENTS_MAX - 1));
+                }
+                command_inspect_replies(datafile)
+            }
             // Upstream inspects these over spread/blocked grid blocks in the async loop.
-            InspectQuery::Replies { .. }
-            | InspectQuery::Grid { .. }
-            | InspectQuery::Tables { .. } => Err(format!(
+            InspectQuery::Grid { .. } | InspectQuery::Tables { .. } => Err(format!(
                 "inspect data-file query '{}' is parsed and validated but not yet implemented in \
                  this port (the async event loop is deferred)",
                 inspect_query_name(&datafile.query)
@@ -2374,6 +2386,35 @@ pub fn command_inspect_wal(datafile: &CommandInspectDataFile) -> CliResult<()> {
     Ok(())
 }
 
+/// `main.zig command_inspect_replies`: read the superblock (version gate), then print the
+/// client replies — all slots, or a single `--slot`.
+///
+/// Port of upstream `MainType.inspect_replies`/`inspect_replies_slot`; shares
+/// `command_inspect_superblock`'s size gate and `drive_inspect_*` prologue. The `--slot` and
+/// `--superblock-copy` range checks happen before the inspector is created upstream
+/// (`run_inspect`), matching the `command_inspect` dispatch.
+pub fn command_inspect_replies(datafile: &CommandInspectDataFile) -> CliResult<()> {
+    use tigerbeetle_vsr::storage::FileStorage;
+    use tigerbeetle_vsr::superblock::DATA_FILE_SIZE_MIN;
+
+    let mut storage = FileStorage::open_read_only(&datafile.path).map_err(|err| err.to_string())?;
+    // Upstream `open_data_file(.inspect)` panics if the file is shorter than
+    // `data_file_size_min`; per the no-panics-on-disk-input porting rule we return an error
+    // with the same wording.
+    if storage.size() < DATA_FILE_SIZE_MIN as u64 {
+        return Err("data file inode size was truncated or corrupted".into());
+    }
+
+    let (slot, superblock_copy) = match &datafile.query {
+        InspectQuery::Replies { slot, superblock_copy } => (*slot, *superblock_copy),
+        _ => unreachable!("only called for the replies query"),
+    };
+
+    let output = drive_inspect_replies(&mut storage, &datafile.path, slot, superblock_copy)?;
+    print!("{output}");
+    Ok(())
+}
+
 /// Read the whole superblock zone of `storage` and slice the four raw copies out, as
 /// `Inspector.create`'s initial zone read does.
 fn inspect_read_superblock_copies(
@@ -2507,6 +2548,39 @@ pub fn drive_inspect_wal(
     match slot {
         Some(slot) => inspect_wal_slot(&mut output, storage, slot),
         None => inspect_wal(&mut output, storage),
+    }
+    .map_err(|err| err.to_string())?;
+    Ok(output)
+}
+
+/// Feed the superblock and `client_replies` zones of `storage` through the replies exporter,
+/// returning the printed output (port of `MainType.inspect_replies`/`inspect_replies_slot` with
+/// the `Inspector` read/verify prologue).
+///
+/// Mirrors upstream's sequencing: read the whole superblock zone, select the working quorum
+/// (the version gate runs even for `--slot`, since `Inspector.create` always calls
+/// `read_superblock(null)`), then print the replies. When `superblock_copy` is set, upstream
+/// `read_client_sessions(copy)` decodes that specific copy leniently.
+pub fn drive_inspect_replies(
+    storage: &mut dyn tigerbeetle_vsr::storage::Storage,
+    path: &str,
+    slot: Option<usize>,
+    superblock_copy: Option<u8>,
+) -> CliResult<String> {
+    use tigerbeetle_vsr::inspect::{inspect_replies, inspect_replies_slot};
+
+    let copies = inspect_read_superblock_copies(storage);
+    let working = inspect_verify_superblock(&copies, path)?;
+    let header = match superblock_copy {
+        Some(copy) => tigerbeetle_vsr::inspect::decode_lenient(&copies[usize::from(copy)])
+            .unwrap_or_else(|| unreachable!("lenient decode never fails")),
+        None => working,
+    };
+
+    let mut output = String::new();
+    match slot {
+        Some(slot) => inspect_replies_slot(&mut output, storage, &header, slot),
+        None => inspect_replies(&mut output, storage, &header),
     }
     .map_err(|err| err.to_string())?;
     Ok(output)
@@ -3792,6 +3866,53 @@ mod tests {
         }))
         .unwrap_err();
         assert_eq!(err, format!("--slot: slot exceeds {}", JOURNAL_SLOT_COUNT - 1));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `inspect replies` over a freshly formatted real data file: the checkpoint records no
+    /// client sessions, so the full variant prints nothing, `--slot` prints the upstream error
+    /// line, and out-of-range slots/copies are rejected up front.
+    #[test]
+    fn inspect_replies_real_data_file() {
+        use tigerbeetle_core::constants::CLIENTS_MAX;
+
+        let path = std::env::temp_dir()
+            .join(format!("tigerbeetle-rs-cli-inspect-replies-{}.tigerbeetle", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        command_format(&manifest_command(&path)).unwrap();
+
+        let path_str = cmd_path(&path);
+        let mut storage = tigerbeetle_vsr::storage::FileStorage::open_read_only(&path).unwrap();
+
+        let full = drive_inspect_replies(&mut storage, &path_str, None, None).unwrap();
+        assert!(full.is_empty());
+
+        let slot = drive_inspect_replies(&mut storage, &path_str, Some(0), None).unwrap();
+        assert_eq!(slot, "error: no client sessions\n");
+
+        // `--superblock-copy` still runs the working-quorum version gate and yields the same
+        // empty result.
+        let copy = drive_inspect_replies(&mut storage, &path_str, None, Some(1)).unwrap();
+        assert!(copy.is_empty());
+        drop(storage);
+
+        // The end-to-end command path routes here too and prints to stdout.
+        let parsed = parse_args(&args(&["inspect", "replies", &path_str])).unwrap();
+        run_command(&parsed).unwrap();
+        let parsed = parse_args(&args(&["inspect", "replies", "--slot=0", &path_str])).unwrap();
+        run_command(&parsed).unwrap();
+
+        // Out-of-range slots/copies are rejected up front (upstream `run_inspect`), not with a
+        // panic.
+        let parsed = parse_args(&args(&["inspect", "replies", "--slot=7", &path_str])).unwrap();
+        let err = run_command(&parsed).unwrap_err();
+        assert_eq!(err, format!("--slot: slot exceeds {}", CLIENTS_MAX - 1));
+
+        let parsed =
+            parse_args(&args(&["inspect", "replies", "--superblock-copy=4", &path_str])).unwrap();
+        let err = run_command(&parsed).unwrap_err();
+        assert_eq!(err, "--superblock-copy: copy exceeds 3");
 
         let _ = std::fs::remove_file(&path);
     }
