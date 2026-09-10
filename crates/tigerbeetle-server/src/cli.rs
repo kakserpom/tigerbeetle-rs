@@ -2163,14 +2163,14 @@ pub fn command_inspect(cmd: &CommandInspect) -> CliResult<()> {
                 inspect_query_name(&datafile.query)
             )),
         },
-        CommandInspect::Constants
-        | CommandInspect::Metrics
-        | CommandInspect::Op(_)
-        | CommandInspect::Integrity(_) => Err(format!(
-            "inspect subcommand '{}' is parsed and validated but not yet implemented in this \
+        CommandInspect::Op(op) => command_inspect_op(*op),
+        CommandInspect::Constants | CommandInspect::Metrics | CommandInspect::Integrity(_) => {
+            Err(format!(
+                "inspect subcommand '{}' is parsed and validated but not yet implemented in this \
              port (the async event loop is deferred)",
-            inspect_subcommand_name(cmd)
-        )),
+                inspect_subcommand_name(cmd)
+            ))
+        }
     }
 }
 
@@ -2296,6 +2296,17 @@ pub fn command_inspect_superblock(datafile: &CommandInspectDataFile) -> CliResul
     }
 
     let output = drive_inspect_superblock(&mut storage, &datafile.path)?;
+    print!("{output}");
+    Ok(())
+}
+
+/// `main.zig command_inspect op`: print the checkpoint points adjacent to `op`.
+///
+/// Pure computation (no file access), so the CLI opens nothing — the output is determined
+/// entirely by the compile-time config.
+pub fn command_inspect_op(op: u64) -> CliResult<()> {
+    let mut output = String::new();
+    tigerbeetle_vsr::inspect::inspect_op(&mut output, op).map_err(|err| err.to_string())?;
     print!("{output}");
     Ok(())
 }
@@ -3726,5 +3737,23 @@ mod tests {
             parse_args(&args(&["inspect", "--help"])),
             Err(ParseFailure::Help(INSPECT_HELP))
         );
+    }
+
+    #[test]
+    fn inspect_op_pure_math_dispatches() {
+        // `inspect op` is pure computation (no file required) — the parser and dispatcher
+        // must accept it and `command_inspect_op` must succeed.
+        assert_eq!(
+            parse_args(&args(&["inspect", "op", "0"])).unwrap(),
+            Command::Inspect(CommandInspect::Op(0))
+        );
+        assert_eq!(
+            parse_args(&args(&["inspect", "op", "19"])).unwrap(),
+            Command::Inspect(CommandInspect::Op(19))
+        );
+        // The output is the same aligned table produced by the vsr::inspect module —
+        // smoke-test that the path runs end-to-end without error.
+        assert!(command_inspect_op(0).is_ok());
+        assert!(command_inspect_op(19).is_ok());
     }
 }

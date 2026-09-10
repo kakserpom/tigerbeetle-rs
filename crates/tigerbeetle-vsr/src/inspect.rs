@@ -504,6 +504,67 @@ pub fn inspect_manifest(
     Ok(())
 }
 
+/// Port of `inspect_op` (src/tigerbeetle/inspect.zig): print an aligned table of the five
+/// checkpoint points adjacent to `op` — `checkpoint`, `op`, `trigger`, `prepare_max`,
+/// `checkpoint_next` — with the delta to each point's successor.
+///
+/// Pure computation over [`crate::checkpoint`] (no file access), so it runs directly from the
+/// config; the column/width format is upstream's (`{label:<20}` header, then per pair the
+/// `{op:<15}` / `+{diff:<4}` body, and the final `{op:<20}`).
+///
+/// # Panics
+///
+/// Panics (matching upstream's `@divExact` assertion) when the op→checkpoint reduction would
+/// perform non-exact integer division. This cannot happen for any valid `u64` op value because
+/// `CHECKPOINT_OPS` always divides `(op + 1 - r)` exactly by construction.
+///
+/// # Errors
+///
+/// Propagates [`fmt::Error`] from the underlying writer — impossible with [`String`], but
+/// callers using a fallible writer must handle it.
+pub fn inspect_op(output: &mut impl fmt::Write, op: u64) -> fmt::Result {
+    use tigerbeetle_core::constants::VSR_CHECKPOINT_OPS as CHECKPOINT_OPS;
+
+    use crate::checkpoint::{checkpoint_after, prepare_max_for_checkpoint, trigger_for_checkpoint};
+
+    struct Point {
+        label: &'static str,
+        op: u64,
+    }
+
+    let checkpoints = CHECKPOINT_OPS as u64;
+    let checkpoint = if op < checkpoints - 1 {
+        0
+    } else {
+        // op = q * checkpoints - 1 + r; the division is exact (upstream `@divExact`).
+        let r = (op + 1) % checkpoints;
+        assert_eq!((op + 1 - r) % checkpoints, 0);
+        let q = (op + 1 - r) / checkpoints;
+        q * checkpoints - 1
+    };
+    let checkpoint_next = checkpoint_after(checkpoint);
+
+    let mut points = [
+        Point { label: "checkpoint", op: checkpoint },
+        // Upstream `orelse 0`: a checkpoint with no trigger/prepare_max prints 0.
+        Point { label: "trigger", op: trigger_for_checkpoint(checkpoint).unwrap_or(0) },
+        Point { label: "prepare_max", op: prepare_max_for_checkpoint(checkpoint).unwrap_or(0) },
+        Point { label: "checkpoint_next", op: checkpoint_next },
+        Point { label: "op", op },
+    ];
+    // Upstream sorts with insertion sort (stable), so equal op values keep the struct order.
+    points.sort_by_key(|point| point.op);
+
+    for point in &points {
+        write!(output, "{:<20}", point.label)?;
+    }
+    writeln!(output)?;
+    for pair in points.windows(2) {
+        write!(output, "{:<15}+{:<4}", pair[0].op, pair[1].op - pair[0].op)?;
+    }
+    writeln!(output, "{:<20}", points[4].op)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -849,5 +910,49 @@ mod tests {
             Completion::Read(_) => unreachable!("only a write was submitted"),
         }
         assert!(read_block(&mut storage, 5, Some(checksum)).is_none());
+    }
+
+    #[test]
+    fn inspect_op_at_zero() {
+        let mut output = String::new();
+        inspect_op(&mut output, 0).unwrap();
+        // Under test-min (VSR_CHECKPOINT_OPS=20, trigger+=4, prepare_max+=8),
+        // op=0 → checkpoint=0, trigger=0, prepare_max=0, op=0, checkpoint_next=19.
+        // Stable sort keeps the original array order among equal-keyed points.
+        assert_eq!(
+            output,
+            concat!(
+                "checkpoint          trigger             prepare_max         op                  checkpoint_next     \n",
+                "0              +0   0              +0   0              +0   0              +19  19                  \n",
+            )
+        );
+    }
+
+    #[test]
+    fn inspect_op_at_checkpoint_boundary() {
+        let mut output = String::new();
+        inspect_op(&mut output, 19).unwrap();
+        // checkpoint=19, trigger=23, prepare_max=31, checkpoint_next=39, op=19.
+        assert_eq!(
+            output,
+            concat!(
+                "checkpoint          op                  trigger             prepare_max         checkpoint_next     \n",
+                "19             +0   19             +4   23             +8   31             +8   39                  \n",
+            )
+        );
+    }
+
+    #[test]
+    fn inspect_op_between_checkpoints() {
+        let mut output = String::new();
+        inspect_op(&mut output, 21).unwrap();
+        // op=21 → same checkpoint=19; sorted op values: [19, 21, 23, 31, 39].
+        assert_eq!(
+            output,
+            concat!(
+                "checkpoint          op                  trigger             prepare_max         checkpoint_next     \n",
+                "19             +2   21             +2   23             +8   31             +8   39                  \n",
+            )
+        );
     }
 }
